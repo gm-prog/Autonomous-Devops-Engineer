@@ -1,3 +1,4 @@
+from typing import Any
 from ...domain.repository_interface import IncidentRepositoryPort
 
 class InvestigateRootCauseCommand:
@@ -9,6 +10,7 @@ class InvestigateRootCauseCommandHandler:
     def __init__(self, persistence: IncidentRepositoryPort, agent_client_mock: Any = None):
         self.repo = persistence
         self.agent = agent_client_mock
+
 
     def handle(self, cmd: InvestigateRootCauseCommand) -> str:
         incident = self.repo.get_incident_by_id(cmd.incident_id)
