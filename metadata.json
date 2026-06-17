@@ -1,0 +1,6 @@
+{
+  "name": "DevOps Agent",
+  "description": "An autonomous AI DevOps engineer client capable of repo analysis, Docker/Kubernetes/Terraform generation, real-time monitoring, and automated incident patching.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
