@@ -61,3 +61,7 @@ To build and experience DevOps.AI as a fully functional platform:
    Using Gradle:
    ```bash
    gradle assembleDebug
+   ```
+
+3. **Deploy or Export:**
+   * Export the workspace as a unified APK/AAB or push the source code directly to GitHub using your AI Studio profile integrations.

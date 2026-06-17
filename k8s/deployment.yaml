@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devops-production-namespace
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: devops-application-config
+  namespace: devops-production-namespace
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "info"
+  DB_HOST: "devops-postgres-service"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devops-gateway-deployment
+  namespace: devops-production-namespace
+  labels:
+    tier: api-gateway
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: devops-gateway
+  template:
+    metadata:
+      labels:
+        app: devops-gateway
+    spec:
+      containers:
+      - name: gateway-app
+        image: devops-registry/devops-gateway:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: devops-application-config
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1024Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: devops-gateway-loadbalancer
+  namespace: devops-production-namespace
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: devops-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: devops-gateway-hpa
+  namespace: devops-production-namespace
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: devops-gateway-deployment
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75
