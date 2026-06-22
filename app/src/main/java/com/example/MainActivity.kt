@@ -51,6 +51,9 @@ import com.example.ui.DevOpsViewModel
 import com.example.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.input.pointer.pointerInput
 
 // --- Styling Palette Constants ---
 val ColorDarkBg = Color(0xFF090A10)
@@ -126,7 +129,8 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
                             healthyNodeCount = healthyNodeCount,
                             totalNodeCount = totalNodeCount,
                             activeDeployments = activeDeployments,
-                            onSwitchTab = { viewModel.setTab(it) }
+                            onSwitchTab = { viewModel.setTab(it) },
+                            viewModel = viewModel
                         )
                         1 -> RepositoryScreen(
                             repos = repos,
@@ -326,7 +330,8 @@ fun DashboardScreen(
     healthyNodeCount: Int,
     totalNodeCount: Int,
     activeDeployments: Int,
-    onSwitchTab: (Int) -> Unit
+    onSwitchTab: (Int) -> Unit,
+    viewModel: DevOpsViewModel
 ) {
     LazyColumn(
         modifier = Modifier
@@ -482,67 +487,13 @@ fun DashboardScreen(
             }
         }
 
-        // Available Agents Showcase
+        // Available Agents Showcase & Gemini Cockpit Integration
         item {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    text = "Operational Multi-Agents",
-                    style = TextStyle(color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                )
-                Spacer(modifier = Modifier.height(10.dp))
+            SwarmStateMachineMonitor(viewModel = viewModel)
+        }
 
-                val agentsList = listOf(
-                    AgentMonitorData("Repository Analyzer", "Scanning workspace, detecting frameworks", true, ColorNeonBlue),
-                    AgentMonitorData("Containerization Docker Agent", "Generating optimized stages", true, ColorNeonPurple),
-                    AgentMonitorData("Terraform IaC Agent", "Reviewing AWS config changes", false, ColorNeonGreen),
-                    AgentMonitorData("Alert / Loki Observer", "Pinging cluster ports, analyzing Sentry logs", true, ColorNeonBlue),
-                    AgentMonitorData("Auto-Fix PR Operator", "Deploying automated patches", false, ColorNeonPink)
-                )
-
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    agentsList.forEach { agent ->
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = ColorCardBg.copy(alpha = 0.5f)),
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.05f))
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(8.dp)
-                                        .background(if (agent.active) agent.accent else ColorMutedGray, shape = CircleShape)
-                                )
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = agent.name,
-                                        color = Color.White,
-                                        fontWeight = FontWeight.SemiBold,
-                                        fontSize = 13.sp
-                                    )
-                                    Text(
-                                        text = agent.description,
-                                        color = ColorMutedGray,
-                                        fontSize = 11.sp
-                                    )
-                                }
-                                Text(
-                                    text = if (agent.active) "MONITORING" else "IDLE",
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 10.sp,
-                                    color = if (agent.active) agent.accent else ColorMutedGray,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+        item {
+            GeminiApiCockpit(viewModel = viewModel)
         }
     }
 }
@@ -1612,16 +1563,31 @@ fun IncidentScreen(
                             }
 
                             Button(
-                                onClick = { viewModel.startAutoFix(selectedIncident.id) },
-                                enabled = !viewModel.isInvestigating && !viewModel.isAutoFixing && selectedIncident.status == "RootCauseFound",
-                                colors = ButtonDefaults.buttonColors(containerColor = ColorNeonGreen),
+                                onClick = { /* Guides to swipe */ },
+                                enabled = false,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color.White.copy(alpha = 0.04f),
+                                    disabledContainerColor = Color.White.copy(alpha = 0.04f)
+                                ),
                                 modifier = Modifier.weight(1f),
                                 shape = RoundedCornerShape(6.dp)
                             ) {
-                                if (viewModel.isAutoFixing) {
-                                    CircularProgressIndicator(color = ColorDarkBg, modifier = Modifier.size(16.dp))
-                                } else {
-                                    Text("Trigger Auto-Fix", color = ColorDarkBg, fontWeight = FontWeight.Bold)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Lock,
+                                        contentDescription = "Bypass-Protection Lock",
+                                        tint = if (selectedIncident.status == "RootCauseFound") ColorNeonPink else ColorMutedGray,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Text(
+                                        text = if (selectedIncident.status == "RootCauseFound") "Locked: Swipe Below" else "Auto-Fix Pending",
+                                        color = if (selectedIncident.status == "RootCauseFound") ColorNeonPink else ColorMutedGray,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 11.sp
+                                    )
                                 }
                             }
                         }
@@ -1684,6 +1650,12 @@ fun IncidentScreen(
                             )
                         }
                     }
+                }
+
+                // HUMAN IN THE LOOP INTEGRATION GATEWAY
+                if (selectedIncident.status == "RootCauseFound") {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HumanInTheLoopAuthorizationView(viewModel = viewModel, incident = selectedIncident)
                 }
 
                 Spacer(modifier = Modifier.height(14.dp))
@@ -2001,3 +1973,782 @@ fun ConnectivitySettingsDialog(
         shape = RoundedCornerShape(12.dp)
     )
 }
+
+// --- CORE FEATURE UPGRADE: LIVE CHASSIS & EXPERT SYSTEM MODELS ---
+
+data class SwarmAgent(
+    val name: String,
+    val initial: String,
+    val specialty: String,
+    val task: String,
+    val status: String,
+    val color: Color
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SwarmStateMachineMonitor(
+    viewModel: DevOpsViewModel,
+    modifier: Modifier = Modifier
+) {
+    val swarmAgents = listOf(
+        SwarmAgent("Repo-Expert", "RE", "Workspace Parsing & Semantic Search", "Analyzing Git branches & frameworks...", "SCANNING", ColorNeonBlue),
+        SwarmAgent("IaC-Builder", "IB", "Infrastructure as Code Synthesis", "Writing and matching VPC / subnet modules...", "COMPILING", ColorNeonPurple),
+        SwarmAgent("Audit-Inspector", "AI", "Vulnerability & IAM Compliance", "Scanning security endpoints & port boundaries...", "INSPECTING", ColorNeonGreen),
+        SwarmAgent("Hotfix-Validator", "HV", "Chaos Testing & Active Validation", "Executing docker container test scripts...", "VERIFYING", ColorNeonPink)
+    )
+
+    var autoCycle by remember { mutableStateOf(true) }
+
+    // Automated cycling of active agents
+    if (autoCycle) {
+        LaunchedEffect(Unit) {
+            while (autoCycle) {
+                delay(3000)
+                viewModel.selectedAgentIndex = (viewModel.selectedAgentIndex + 1) % 4
+            }
+        }
+    }
+
+    val activeAgent = swarmAgents[viewModel.selectedAgentIndex]
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = ColorCardBg),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(0.5.dp, ColorNeonBlue.copy(alpha = 0.2f)),
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // Header Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "Swarm State Machine Monitor",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = "Realtime virtual multi-agent orchestration",
+                        color = ColorMutedGray,
+                        fontSize = 11.sp
+                    )
+                }
+                
+                // Pulsing Active Badge
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .background(ColorNeonGreen, shape = CircleShape)
+                    )
+                    Text(
+                        text = "SWARM_ACTIVE",
+                        color = ColorNeonGreen,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 9.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Graph and Details Split Layout
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                // Left interactive graph canvas
+                Box(
+                    modifier = Modifier
+                        .size(150.dp)
+                        .background(Color.Black.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+                        .border(1.dp, Color.White.copy(alpha = 0.03f), RoundedCornerShape(8.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    // Connective Network Lines Background Canvas
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val w = size.width
+                        val h = size.height
+                        val strokeColor = Color.White.copy(alpha = 0.1f)
+                        val pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+
+                        // Outer cross
+                        drawLine(color = strokeColor, start = Offset(w * 0.25f, h * 0.25f), end = Offset(w * 0.75f, h * 0.25f), strokeWidth = 1.dp.toPx(), pathEffect = pathEffect)
+                        drawLine(color = strokeColor, start = Offset(w * 0.75f, h * 0.25f), end = Offset(w * 0.75f, h * 0.75f), strokeWidth = 1.dp.toPx(), pathEffect = pathEffect)
+                        drawLine(color = strokeColor, start = Offset(w * 0.75f, h * 0.75f), end = Offset(w * 0.25f, h * 0.75f), strokeWidth = 1.dp.toPx(), pathEffect = pathEffect)
+                        drawLine(color = strokeColor, start = Offset(w * 0.25f, h * 0.75f), end = Offset(w * 0.25f, h * 0.25f), strokeWidth = 1.dp.toPx(), pathEffect = pathEffect)
+                        
+                        // Diagonal crossing
+                        drawLine(color = strokeColor, start = Offset(w * 0.25f, h * 0.25f), end = Offset(w * 0.75f, h * 0.75f), strokeWidth = 1.dp.toPx(), pathEffect = pathEffect)
+                        drawLine(color = strokeColor, start = Offset(w * 0.75f, h * 0.25f), end = Offset(w * 0.25f, h * 0.75f), strokeWidth = 1.dp.toPx(), pathEffect = pathEffect)
+                    }
+
+                    // 4 Interactive Nodes placed in Box boundaries
+                    val coords = listOf(
+                        Alignment.TopStart,
+                        Alignment.TopEnd,
+                        Alignment.BottomStart,
+                        Alignment.BottomEnd
+                    )
+
+                    swarmAgents.forEachIndexed { idx, agent ->
+                        val isSelected = viewModel.selectedAgentIndex == idx
+                        val transition = rememberInfiniteTransition(label = "ripple")
+                        
+                        // Glowing ripple radius animation
+                        val rippleScale by transition.animateFloat(
+                            initialValue = 0.8f,
+                            targetValue = 1.8f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(1400, easing = LinearEasing),
+                                repeatMode = RepeatMode.Restart
+                            ),
+                            label = "scale"
+                        )
+                        val rippleAlpha by transition.animateFloat(
+                            initialValue = 0.5f,
+                            targetValue = 0f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(1400, easing = LinearEasing),
+                                repeatMode = RepeatMode.Restart
+                            ),
+                            label = "alpha"
+                        )
+
+                        Box(
+                            modifier = Modifier
+                                .align(coords[idx])
+                                .padding(8.dp)
+                                .size(36.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            // Pulsing Ripple Outer Container
+                            if (isSelected) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .drawBehind {
+                                            drawCircle(
+                                                color = agent.color.copy(alpha = rippleAlpha),
+                                                radius = (size.minDimension / 1.8f) * rippleScale
+                                            )
+                                        }
+                                )
+                            }
+
+                            // Interactive Circle Badge Node
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(
+                                        if (isSelected) agent.color else Color.White.copy(alpha = 0.05f),
+                                        shape = CircleShape
+                                    )
+                                    .border(
+                                        1.dp,
+                                        if (isSelected) Color.White else agent.color.copy(alpha = 0.6f),
+                                        shape = CircleShape
+                                    )
+                                    .clickable {
+                                        viewModel.selectedAgentIndex = idx
+                                        autoCycle = false // Halt autocycle on user interaction
+                                    }
+                            ) {
+                                Text(
+                                    text = agent.initial,
+                                    color = if (isSelected) ColorDarkBg else Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Right: Details Panel
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .background(Color.Black.copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .background(activeAgent.color, shape = CircleShape)
+                            )
+                            Text(
+                                text = activeAgent.name.uppercase(),
+                                color = activeAgent.color,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp
+                            )
+                        }
+
+                        Text(
+                            text = activeAgent.specialty,
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 11.sp
+                        )
+
+                        Text(
+                            text = activeAgent.task,
+                            color = ColorMutedGray,
+                            fontSize = 10.sp,
+                            lineHeight = 14.sp,
+                            minLines = 2,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    // Bottom Action Panel in Details Card
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = activeAgent.color.copy(alpha = 0.12f)),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = activeAgent.status,
+                                color = activeAgent.color,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 8.sp,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+
+                        // Cycle switch button pill
+                        Box(
+                            modifier = Modifier
+                                .background(if (autoCycle) ColorNeonBlue.copy(alpha = 0.12f) else Color.White.copy(alpha = 0.04f), RoundedCornerShape(4.dp))
+                                .border(0.5.dp, if (autoCycle) ColorNeonBlue else ColorMutedGray.copy(alpha = 0.3f), RoundedCornerShape(4.dp))
+                                .clickable { autoCycle = !autoCycle }
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = if (autoCycle) "LOOP: ON" else "LOOP: OFF",
+                                color = if (autoCycle) ColorNeonBlue else ColorMutedGray,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 8.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
+    val breakerText = when (viewModel.circuitBreakerState) {
+        "CLOSED" -> "CLOSED"
+        "OPEN" -> "TRIPPED"
+        else -> "HALF_OPEN"
+    }
+
+    val breakerCol = when (viewModel.circuitBreakerState) {
+        "CLOSED" -> ColorNeonGreen
+        "OPEN" -> ColorNeonPink
+        else -> ColorNeonPurple
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = ColorCardBg),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(0.5.dp, ColorNeonPurple.copy(alpha = 0.2f)),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // Header Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "Gemini Resilient API Cockpit",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = "Realtime safety constraints & hardware budgets",
+                        color = ColorMutedGray,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // Circuit Breakers Indicator Badge
+
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = breakerCol.copy(alpha = 0.15f)),
+                    border = BorderStroke(1.dp, breakerCol.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        text = "BREAKER: $breakerText",
+                        color = breakerCol,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // Dials row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Dial 1: Rate limits (Requests Per Minute)
+                val rpmProportion = (viewModel.geminiRateLimitRPM.toFloat() / 100f).coerceIn(0f, 1f)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(64.dp)) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            drawArc(
+                                color = Color.White.copy(alpha = 0.05f),
+                                startAngle = 135f,
+                                sweepAngle = 270f,
+                                useCenter = false,
+                                style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                            drawArc(
+                                color = ColorNeonBlue,
+                                startAngle = 135f,
+                                sweepAngle = 270f * rpmProportion,
+                                useCenter = false,
+                                style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                "${viewModel.geminiRateLimitRPM}",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                "RPM",
+                                color = ColorNeonBlue,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 8.sp
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text("API Rate Load", color = ColorMutedGray, fontSize = 10.sp)
+                }
+
+                // Dial 2: Cost metrics (USD Charges accumulated)
+                val costProportion = (viewModel.geminiTokenCharges.toFloat() / 5.0f).coerceIn(0f, 1f)
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(64.dp)) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            drawArc(
+                                color = Color.White.copy(alpha = 0.05f),
+                                startAngle = 135f,
+                                sweepAngle = 270f,
+                                useCenter = false,
+                                style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                            drawArc(
+                                color = ColorNeonPurple,
+                                startAngle = 135f,
+                                sweepAngle = 270f * costProportion,
+                                useCenter = false,
+                                style = Stroke(width = 4.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                String.format("$%.2f", viewModel.geminiTokenCharges),
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                "USD",
+                                color = ColorNeonPurple,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 7.sp
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text("Token Cost", color = ColorMutedGray, fontSize = 10.sp)
+                }
+
+                // Dial 3: Circuit breaker visual gauge indicator
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(64.dp)) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            drawCircle(
+                                color = breakerCol.copy(alpha = 0.04f),
+                                radius = size.minDimension / 2.3f
+                            )
+                            drawCircle(
+                                color = breakerCol.copy(alpha = 0.2f),
+                                radius = size.minDimension / 2.3f,
+                                style = Stroke(width = 1.dp.toPx())
+                            )
+                        }
+
+                        // Inner blinking ring or static triangle
+                        val transition = rememberInfiniteTransition(label = "blink")
+                        val blinkAlpha by transition.animateFloat(
+                            initialValue = 0.2f,
+                            targetValue = 1.0f,
+                            animationSpec = infiniteRepeatable(
+                                animation = tween(1000, easing = LinearEasing),
+                                repeatMode = RepeatMode.Reverse
+                            ),
+                            label = "blink"
+                        )
+                        
+                        Box(
+                            modifier = Modifier
+                                .size(16.dp)
+                                .background(
+                                    breakerCol.copy(alpha = if (viewModel.isSimulatingSpike) blinkAlpha else 0.8f),
+                                    shape = CircleShape
+                                )
+                                .border(1.dp, Color.White.copy(alpha = 0.5f), CircleShape)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "BREAKER",
+                        color = breakerCol,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // Action triggers for spikes and resets
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Button(
+                    onClick = { viewModel.simulateLoadSpike() },
+                    enabled = !viewModel.isSimulatingSpike,
+                    colors = ButtonDefaults.buttonColors(containerColor = ColorNeonPurple.copy(alpha = 0.15f)),
+                    border = BorderStroke(1.dp, ColorNeonPurple.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    if (viewModel.isSimulatingSpike) {
+                        CircularProgressIndicator(
+                            color = ColorNeonPurple,
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "SPIKING REQ...",
+                            color = ColorNeonPurple,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    } else {
+                        Text(
+                            "SIMULATE LOAD SPIKE",
+                            color = ColorNeonPurple,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = { viewModel.resetCircuitBreaker() },
+                    colors = ButtonDefaults.buttonColors(containerColor = ColorMutedGray.copy(alpha = 0.1f)),
+                    border = BorderStroke(1.dp, ColorMutedGray.copy(alpha = 0.3f)),
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        "RESET COCKPIT",
+                        color = Color.White,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HumanInTheLoopAuthorizationView(
+    viewModel: DevOpsViewModel,
+    incident: IncidentEntity,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var swipeOffset by remember { mutableStateOf(0f) }
+    
+    val diffLines = when {
+        incident.title.contains("Database") -> listOf(
+            "// gateway/src/main/resources/application.yml",
+            "@@ -12,4 +12,4 @@",
+            "-  hikari:",
+            "-    maximum-pool-size: 10",
+            "-    connection-timeout: 1000",
+            "+  hikari:",
+            "+    maximum-pool-size: 250",
+            "+    connection-timeout: 5000"
+        )
+        incident.title.contains("Unauthorized") -> listOf(
+            "// terraform/modules/s3/main.tf",
+            "@@ -24,3 +24,3 @@",
+            "-  principal = \"*\"",
+            "-  action    = \"s3:*\"",
+            "+  principal = \"arn:aws:iam::123456:role/runner\"",
+            "+  action    = [\"s3:GetObject\", \"s3:PutObject\"]"
+        )
+        else -> listOf(
+            "// k8s/hpa-scaling-policy.yaml",
+            "@@ -5,4 +5,5 @@",
+            "-  minReplicas: 1",
+            "-  maxReplicas: 1",
+            "+  minReplicas: 2",
+            "+  maxReplicas: 8",
+            "+  targetCPUUtilizationPercentage: 75"
+        )
+    }
+
+    Card(
+        colors = CardDefaults.cardColors(containerColor = ColorCardBg),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, ColorNeonPink.copy(alpha = 0.3f)),
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            // Slack-style alerting feed header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(ColorNeonPink.copy(alpha = 0.08f), RoundedCornerShape(8.dp))
+                    .padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Custom Warning Avatar/Indicator
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .background(ColorNeonPink.copy(alpha = 0.2f), shape = CircleShape)
+                        .border(1.dp, ColorNeonPink, shape = CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Warning,
+                        contentDescription = "Alert",
+                        tint = ColorNeonPink,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column {
+                    Text(
+                        text = "HUMAN AUTHORIZATION GATEWAY",
+                        color = ColorNeonPink,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp
+                    )
+                    Text(
+                        text = "Deployment blocked. Operator sign-off requested to merge hotfix.",
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 11.sp,
+                        lineHeight = 14.sp
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Text(
+                "Proposed Code Patch Diff Visualizer",
+                color = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 12.sp
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Code terminal rendering unified Git Diff
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color.Black),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.05f)),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .padding(12.dp)
+                        .horizontalScroll(rememberScrollState())
+                ) {
+                    diffLines.forEach { line ->
+                        val (lineColor, bgCol) = when {
+                            line.startsWith("-") -> ColorNeonPink to ColorNeonPink.copy(alpha = 0.08f)
+                            line.startsWith("+") -> ColorNeonGreen to ColorNeonGreen.copy(alpha = 0.08f)
+                            line.startsWith("@@") -> ColorNeonPurple to Color.Transparent
+                            line.startsWith("//") -> ColorMutedGray to Color.Transparent
+                            else -> ColorLightGray to Color.Transparent
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(bgCol)
+                                .padding(vertical = 1.dp, horizontal = 4.dp)
+                        ) {
+                            Text(
+                                text = line,
+                                color = lineColor,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                                fontWeight = if (line.startsWith("-") || line.startsWith("+")) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // Interactive swipe button
+            Text(
+                "Verify and Drag Slider to Deploy & Merge:",
+                color = ColorLightGray,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Swipe track container
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+                    .background(Color.White.copy(alpha = 0.03f), RoundedCornerShape(27.dp))
+                    .border(1.dp, ColorNeonPink.copy(alpha = 0.4f), RoundedCornerShape(27.dp)),
+                contentAlignment = Alignment.CenterStart
+            ) {
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                val widthPx = constraints.maxWidth.toFloat()
+                val thumbWidth = 54.dp
+                val thumbWidthPx = with(density) { thumbWidth.toPx() }
+                val maxSwipePx = widthPx - thumbWidthPx
+
+                // Swipe Action triggers when sliding past 85% of track
+                val swipeThreshold = maxSwipePx * 0.85f
+
+                LaunchedEffect(viewModel.isAutoFixing) {
+                    if (!viewModel.isAutoFixing) {
+                        swipeOffset = 0f
+                    }
+                }
+
+                // Centered prompt text
+                Text(
+                    text = if (viewModel.isAutoFixing) "COMMITTING HOTFIX..." else "SWIPE TO AUTHORIZE & MERGE",
+                    color = ColorNeonPink,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 11.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 48.dp)
+                )
+
+                // Dragging thumb icon
+                val dragXModifier = Modifier
+                    .offset(x = with(density) { swipeOffset.toDp() })
+                    .size(54.dp)
+                    .clip(CircleShape)
+                    .background(ColorNeonPink)
+                    .pointerInput(Unit) {
+                        if (viewModel.isAutoFixing) return@pointerInput
+                        detectDragGestures(
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                swipeOffset = (swipeOffset + dragAmount.x).coerceIn(0f, maxSwipePx)
+                            },
+                            onDragEnd = {
+                                if (swipeOffset >= swipeThreshold) {
+                                    swipeOffset = maxSwipePx
+                                    viewModel.startAutoFix(incident.id)
+                                    android.widget.Toast.makeText(context, "Authorization Sign-Off Complete! Deploying...", android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    swipeOffset = 0f
+                                }
+                            }
+                        )
+                    }
+
+                Box(
+                    modifier = dragXModifier,
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (viewModel.isAutoFixing) {
+                        CircularProgressIndicator(
+                            color = ColorDarkBg,
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.ArrowForward,
+                            contentDescription = "Swipe Arrow",
+                            tint = ColorDarkBg,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+

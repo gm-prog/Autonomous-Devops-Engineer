@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 class DevOpsViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -38,6 +39,44 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     var isDeploying by mutableStateOf(false)
     var isInvestigating by mutableStateOf(false)
     var isAutoFixing by mutableStateOf(false)
+
+    // Interactive cockpit and swarm variables
+    var selectedAgentIndex by mutableStateOf(0)
+    var geminiRateLimitRPM by mutableStateOf(34)
+    var geminiTokenCharges by mutableStateOf(1.45)
+    var circuitBreakerState by mutableStateOf("CLOSED") // "CLOSED", "OPEN", "HALF_OPEN"
+    var isSimulatingSpike by mutableStateOf(false)
+
+    fun simulateLoadSpike() {
+        if (isSimulatingSpike) return
+        viewModelScope.launch {
+            isSimulatingSpike = true
+            // Step 1: Spikng
+            for (i in 1..3) {
+                geminiRateLimitRPM += 25
+                geminiTokenCharges += 1.20
+                delay(700)
+            }
+            // Step 2: Trip Circuit Breaker due to threshold violation
+            circuitBreakerState = "OPEN"
+            delay(3000)
+            // Step 3: Cool down to half open
+            circuitBreakerState = "HALF_OPEN"
+            geminiRateLimitRPM = 12
+            delay(2500)
+            // Step 4: Normal status restored
+            circuitBreakerState = "CLOSED"
+            geminiRateLimitRPM = 34
+            isSimulatingSpike = false
+        }
+    }
+
+    fun resetCircuitBreaker() {
+        circuitBreakerState = "CLOSED"
+        geminiRateLimitRPM = 34
+        geminiTokenCharges = 1.45
+        isSimulatingSpike = false
+    }
 
     // Api Gateway persistence & connection testing states
     private val prefs = application.getSharedPreferences("devops_api_prefs", android.content.Context.MODE_PRIVATE)
