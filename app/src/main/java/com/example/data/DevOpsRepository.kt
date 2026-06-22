@@ -144,20 +144,36 @@ class DevOpsRepository(private val dao: DevOpsDao) {
     }
 
     /**
-     * Executes Repository Analysis & Asset generation via live Gemini AI.
+     * Executes Repository Analysis & Asset generation via live Gemini AI or remote FastAPI Gateway.
      */
-    suspend fun analyzeRepoAsync(repoId: Int) {
+    suspend fun analyzeRepoAsync(repoId: Int, isRemote: Boolean = false, remoteUrl: String = "") {
         val repo = dao.getRepositoryById(repoId) ?: return
         dao.insertRepository(repo.copy(status = "Analyzing"))
 
         try {
-            // Live Gemini API Analysis
-            val result = GeminiClient.analyzeRepository(
-                repoName = repo.name,
-                repoUrl = repo.url,
-                framework = repo.framework,
-                technology = repo.technology
-            )
+            val result = if (isRemote && remoteUrl.isNotEmpty()) {
+                // Live FastAPI Gateway Query
+                BackendGatewayClient.queryRemoteAnalysis(
+                    baseUrlStr = remoteUrl,
+                    repoName = repo.name,
+                    repoUrl = repo.url,
+                    framework = repo.framework,
+                    technology = repo.technology
+                ) ?: GeminiClient.analyzeRepository(
+                    repoName = repo.name,
+                    repoUrl = repo.url,
+                    framework = repo.framework,
+                    technology = repo.technology
+                )
+            } else {
+                // Live Gemini API Analysis
+                GeminiClient.analyzeRepository(
+                    repoName = repo.name,
+                    repoUrl = repo.url,
+                    framework = repo.framework,
+                    technology = repo.technology
+                )
+            }
 
             val updatedRepo = repo.copy(
                 dockerfile = result.dockerfile,

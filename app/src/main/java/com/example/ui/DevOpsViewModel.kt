@@ -39,6 +39,41 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     var isInvestigating by mutableStateOf(false)
     var isAutoFixing by mutableStateOf(false)
 
+    // Api Gateway persistence & connection testing states
+    private val prefs = application.getSharedPreferences("devops_api_prefs", android.content.Context.MODE_PRIVATE)
+    
+    var isRemoteGatewayEnabled by mutableStateOf(prefs.getBoolean("is_remote_gateway_enabled", false))
+        private set
+    
+    var apiUrlGateway by mutableStateOf(prefs.getString("api_url_gateway", "http://10.0.2.2:8000") ?: "http://10.0.2.2:8000")
+        private set
+
+    var connectionStatus by mutableStateOf("UNCHECKED") // UNCHECKED, ONLINE, OFFLINE
+    var isCheckingConnection by mutableStateOf(false)
+    var isSettingsSheetOpen by mutableStateOf(false)
+
+    fun setRemoteGateway(enabled: Boolean) {
+        isRemoteGatewayEnabled = enabled
+        prefs.edit().putBoolean("is_remote_gateway_enabled", enabled).apply()
+        connectionStatus = "UNCHECKED"
+    }
+
+    fun updateApiUrl(newUrl: String) {
+        apiUrlGateway = newUrl
+        prefs.edit().putString("api_url_gateway", newUrl).apply()
+        connectionStatus = "UNCHECKED"
+    }
+
+    fun testBackendConnection() {
+        viewModelScope.launch {
+            isCheckingConnection = true
+            connectionStatus = "CHECKING"
+            val success = BackendGatewayClient.testConnection(apiUrlGateway)
+            connectionStatus = if (success) "ONLINE" else "OFFLINE"
+            isCheckingConnection = false
+        }
+    }
+
     init {
         val database = DevOpsDatabase.getDatabase(application)
         val dao = database.devOpsDao()
@@ -141,7 +176,11 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     fun startAnalysis(repoId: Int) {
         viewModelScope.launch {
             isAnalyzing = true
-            repository.analyzeRepoAsync(repoId)
+            repository.analyzeRepoAsync(
+                repoId = repoId,
+                isRemote = isRemoteGatewayEnabled,
+                remoteUrl = apiUrlGateway
+            )
             isAnalyzing = false
         }
     }

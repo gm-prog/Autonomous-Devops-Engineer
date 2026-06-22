@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: devops_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: devops_prod
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: devops_redis
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: devops_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./api-gateway/Dockerfile
+    container_name: devops_api_gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
+      - REDIS_HOST=redis
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: ./deployment-service/Dockerfile
+    container_name: devops_celery_worker
+    command: celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+
+volumes:
+  postgres_data:

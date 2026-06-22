@@ -101,7 +101,10 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             // High-fidelity Neon Header Bar
-            WebOpsHeader(apiKeyStatus = GeminiClient.isApiKeyPresent)
+            WebOpsHeader(
+                apiKeyStatus = GeminiClient.isApiKeyPresent,
+                onOpenSettings = { viewModel.isSettingsSheetOpen = true }
+            )
 
             // Primary Screen Content Switcher with animations
             Box(
@@ -157,12 +160,20 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
                 onDismiss = { viewModel.isImportDialogOpen = false }
             )
         }
+
+        // Connectivity and API Settings Dialog Overlay
+        if (viewModel.isSettingsSheetOpen) {
+            ConnectivitySettingsDialog(
+                viewModel = viewModel,
+                onDismiss = { viewModel.isSettingsSheetOpen = false }
+            )
+        }
     }
 }
 
 // --- Header Component ---
 @Composable
-fun WebOpsHeader(apiKeyStatus: Boolean) {
+fun WebOpsHeader(apiKeyStatus: Boolean, onOpenSettings: () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0F111E)),
         shape = RoundedCornerShape(0.dp),
@@ -244,6 +255,18 @@ fun WebOpsHeader(apiKeyStatus: Boolean) {
                         )
                     )
                 }
+            }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            // Settings Config trigger icon
+            IconButton(onClick = onOpenSettings, modifier = Modifier.size(28.dp)) {
+                Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = "Settings",
+                    tint = ColorNeonPurple,
+                    modifier = Modifier.size(18.dp)
+                )
             }
         }
     }
@@ -1806,6 +1829,172 @@ fun ImportRepositoryDialog(
                     maxLines = 1,
                     modifier = Modifier.fillMaxWidth()
                 )
+            }
+        },
+        containerColor = ColorCardBg,
+        shape = RoundedCornerShape(12.dp)
+    )
+}
+
+// --- GATEWAY CONNECTIVITY AND API SETTINGS DIALOG ---
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ConnectivitySettingsDialog(
+    viewModel: DevOpsViewModel,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                colors = ButtonDefaults.buttonColors(containerColor = ColorNeonPurple),
+                shape = RoundedCornerShape(6.dp)
+            ) {
+                Text("Apply & Close", fontWeight = FontWeight.Bold)
+            }
+        },
+        title = {
+            Text(
+                "Connectivity Settings",
+                color = Color.White,
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                fontFamily = FontFamily.SansSerif
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = "Configure the active execution bridge to route multi-agent deployments, alerts, and code reviews directly to your remote server architecture.",
+                    color = ColorMutedGray,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+
+                // Remote API Toggle
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.White.copy(alpha = 0.03f), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            "Connect to Remote Backend",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            "Queries active API services instead of simulated presets.",
+                            color = ColorMutedGray,
+                            fontSize = 10.sp
+                        )
+                    }
+                    Switch(
+                        checked = viewModel.isRemoteGatewayEnabled,
+                        onCheckedChange = { viewModel.setRemoteGateway(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = ColorNeonBlue,
+                            checkedTrackColor = ColorNeonBlue.copy(alpha = 0.3f)
+                        )
+                    )
+                }
+
+                if (viewModel.isRemoteGatewayEnabled) {
+                    // API Endpoint Input Card
+                    OutlinedTextField(
+                        value = viewModel.apiUrlGateway,
+                        onValueChange = { viewModel.updateApiUrl(it) },
+                        label = { Text("Base Gateway Endpoint URL") },
+                        placeholder = { Text("e.g. http://10.0.2.2:8000") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = ColorLightGray,
+                            focusedBorderColor = ColorNeonBlue,
+                            unfocusedBorderColor = ColorMutedGray
+                        ),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // Connection Testing Dashboard
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Button(
+                            onClick = { viewModel.testBackendConnection() },
+                            enabled = !viewModel.isCheckingConnection,
+                            colors = ButtonDefaults.buttonColors(containerColor = ColorNeonBlue.copy(alpha = 0.15f)),
+                            border = BorderStroke(1.dp, ColorNeonBlue.copy(alpha = 0.6f)),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            if (viewModel.isCheckingConnection) {
+                                CircularProgressIndicator(color = ColorNeonBlue, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                            } else {
+                                Text("Ping Endpoint", color = ColorNeonBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // Connection Status Pill
+                        val (text, color) = when (viewModel.connectionStatus) {
+                            "ONLINE" -> "CONNECTED" to ColorNeonGreen
+                            "OFFLINE" -> "UNREACHABLE" to ColorNeonPink
+                            "CHECKING" -> "PINGING..." to ColorNeonPurple
+                            else -> "UNCHECKED" to ColorMutedGray
+                        }
+
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = color.copy(alpha = 0.12f)),
+                            border = BorderStroke(1.dp, color.copy(alpha = 0.4f)),
+                            shape = RoundedCornerShape(4.dp),
+                            modifier = Modifier.height(36.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxHeight().padding(horizontal = 12.dp)) {
+                                Text(
+                                    text = text,
+                                    color = color,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 10.sp
+                                )
+                            }
+                        }
+                    }
+
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.3f)),
+                        border = BorderStroke(0.5.dp, Color.White.copy(alpha = 0.05f)),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Text(
+                                "✔ Set to http://10.0.2.2:8000 for standard localhost inside Android Emulators.",
+                                color = ColorMutedGray,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                "✔ Deploy live to Vercel or Render and enter the secure https URL to fetch live states.",
+                                color = ColorMutedGray,
+                                fontSize = 9.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
             }
         },
         containerColor = ColorCardBg,
