@@ -53,6 +53,9 @@ services:
       - REDIS_PORT=6379
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      - REPO_SERVICE_URL=http://repo-service:8010
+      - AGENT_SERVICE_URL=http://agent-service:8020
+      - DEPLOYMENT_SERVICE_URL=http://deployment-service:8030
     depends_on:
       db:
         condition: service_healthy
@@ -74,9 +77,46 @@ services:
       - REDIS_PORT=6379
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      - REPO_SERVICE_URL=http://repo-service:8010
+      - AGENT_SERVICE_URL=http://agent-service:8020
     depends_on:
       - redis
       - db
+      - repo-service
+      - agent-service
+
+  repo-service:
+    build:
+      context: ./devops-ai-platform/repo-service
+      dockerfile: Dockerfile
+    container_name: devops_repo_service
+    ports:
+      - "8010:8010"
+
+  agent-service:
+    build:
+      context: ./devops-ai-platform/agent-service
+      dockerfile: Dockerfile
+    container_name: devops_agent_service
+    ports:
+      - "8020:8020"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MONTHLY_BUDGET_USD=${GEMINI_MONTHLY_BUDGET_USD:-100}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
+
+  deployment-service:
+    build:
+      context: ./devops-ai-platform/deployment-service
+      dockerfile: Dockerfile
+    container_name: devops_deployment_service
+    ports:
+      - "8030:8030"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
 
   # --- OBSERVABILITY AND MONITORING STACK ---
   prometheus:
