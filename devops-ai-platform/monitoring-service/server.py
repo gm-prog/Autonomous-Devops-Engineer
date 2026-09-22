@@ -6,13 +6,14 @@ from application.queries.get_live_metrics import (
     GetLiveMetricsQuery,
     GetLiveMetricsQueryHandler,
 )
+from application.services.threshold_event_service import create_threshold_event
 from application.services.threshold_evaluator import ThresholdEvaluator
 from infrastructure.prometheus.scraper_client import PrometheusScraperClient
 
 
 app = FastAPI(
     title="DevOps.AI Monitoring Service",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 handler = GetLiveMetricsQueryHandler(
@@ -60,14 +61,18 @@ def evaluate_alerts(
                     "severity": None,
                     "breach_count": 0,
                 },
+                "event": None,
             }
 
         evaluation = threshold_evaluator.evaluate(metrics)
+        event = create_threshold_event(service, metrics, evaluation)
+
         return {
             "status": evaluation["status"],
             "service_id": service,
             "metrics": metrics,
             "evaluation": evaluation,
+            "event": event.to_dict() if event else None,
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
