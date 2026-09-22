@@ -55,6 +55,7 @@ services:
       - QDRANT_PORT=6333
       - REPO_SERVICE_URL=http://repo-service:8010
       - AGENT_SERVICE_URL=http://agent-service:8020
+      - DEPLOYMENT_SERVICE_URL=http://deployment-service:8030
     depends_on:
       db:
         condition: service_healthy
