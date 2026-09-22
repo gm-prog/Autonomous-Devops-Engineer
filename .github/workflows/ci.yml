@@ -60,6 +60,21 @@ jobs:
         working-directory: devops-ai-platform/deployment-service
         run: pytest -q
 
+  monitoring-service:
+    name: Monitoring service checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile monitoring service
+        working-directory: devops-ai-platform/monitoring-service
+        run: python -m compileall -q .
+      - name: Run Prometheus adapter tests
+        working-directory: devops-ai-platform/monitoring-service
+        run: python -m unittest infrastructure.prometheus.test_scraper_client -v
+
   compose:
     name: Validate Docker Compose
     runs-on: ubuntu-latest
