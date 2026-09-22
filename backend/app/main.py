@@ -197,9 +197,9 @@ def trigger_repository_analysis(repo_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Failed to publish to Celery pipeline: {e}")
         # Fallback inline mock update logic if celery broker is missing during integration
-        repo.status = "Generated"
+        repo.status = "Failed"
         db.commit()
-        return {"status": "Triggered (Async Bypass/Inline Mock Executed)", "error": str(e)}
+        raise HTTPException(status_code=503, detail="Analysis worker unavailable") from e
 
 @app.post("/api/repositories/{repo_id}/deploy")
 def trigger_agent_deployment(repo_id: int, db: Session = Depends(get_db)):
