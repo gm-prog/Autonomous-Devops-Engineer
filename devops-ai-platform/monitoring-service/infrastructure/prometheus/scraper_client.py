@@ -44,7 +44,9 @@ class PrometheusScraperClient:
 
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
-                status_code = getattr(response, "status", response.getcode())
+                status_code = getattr(response, "status", None)
+                if status_code is None:
+                    status_code = response.getcode()
                 if status_code < 200 or status_code >= 300:
                     raise PrometheusScraperError(
                         f"Prometheus returned unexpected HTTP status {status_code}"
