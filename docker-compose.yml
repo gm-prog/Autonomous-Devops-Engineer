@@ -76,6 +76,8 @@ services:
       - REDIS_PORT=6379
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      - REPO_SERVICE_URL=http://repo-service:8010
+      - AGENT_SERVICE_URL=http://agent-service:8020
     depends_on:
       - redis
       - db
@@ -100,6 +102,7 @@ services:
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - GEMINI_MONTHLY_BUDGET_USD=${GEMINI_MONTHLY_BUDGET_USD:-100}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
 
   # --- OBSERVABILITY AND MONITORING STACK ---
   prometheus:
