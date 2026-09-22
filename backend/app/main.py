@@ -59,7 +59,7 @@ class Repository(Base):
     terraform_tf = Column(Text, default="")
     pipeline_yaml = Column(Text, default="")
     analysis_report = Column(Text, default="")
-    status = Column(String(50), default="Idle") # Idle, Analyzing, Generated, Deploying, Deployed, Failed
+    status = Column(String(50), default="Idle") # Idle, Analyzing, Generated, Validating, ValidationFailed, DryRunPassed, DryRunFailed, DeploymentFailed
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class Incident(Base):
@@ -207,7 +207,9 @@ def trigger_agent_deployment(repo_id: int, db: Session = Depends(get_db)):
     if not repo:
         raise HTTPException(status_code=404, detail="Repository target not found")
     
-    repo.status = "Deploying"
+    if not repo.dockerfile and not repo.k8s_yaml and not repo.terraform_tf:
+        raise HTTPException(status_code=409, detail="Repository has no generated deployment artifacts. Analyze it first.")
+    repo.status = "Validating"
     db.commit()
     
     try:
@@ -218,9 +220,9 @@ def trigger_agent_deployment(repo_id: int, db: Session = Depends(get_db)):
         return {"status": "Deployment workflow dispatched", "task": "deploy_application_task"}
     except Exception as e:
         logger.error(f"Celery exception: {e}")
-        repo.status = "Deployed"
+        repo.status = "DeploymentFailed"
         db.commit()
-        return {"status": "Triggered (Async Bypass/Inline Mock Executed)"}
+        raise HTTPException(status_code=503, detail="Deployment worker unavailable") from e
 
 @app.get("/api/incidents", response_model=List[IncidentResponse])
 def get_incidents(db: Session = Depends(get_db)):
