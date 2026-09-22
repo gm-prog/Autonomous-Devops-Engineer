@@ -104,6 +104,19 @@ services:
       - GEMINI_MONTHLY_BUDGET_USD=${GEMINI_MONTHLY_BUDGET_USD:-100}
       - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
 
+  deployment-service:
+    build:
+      context: ./devops-ai-platform/deployment-service
+      dockerfile: Dockerfile
+    container_name: devops_deployment_service
+    ports:
+      - "8030:8030"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+
   # --- OBSERVABILITY AND MONITORING STACK ---
   prometheus:
     image: prom/prometheus:latest
