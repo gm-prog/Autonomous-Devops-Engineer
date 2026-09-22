@@ -58,6 +58,8 @@ jobs:
         run: python -m compileall -q .
       - name: Run deployment service tests
         working-directory: devops-ai-platform/deployment-service
+        env:
+          PYTHONPATH: ${{ github.workspace }}/devops-ai-platform/deployment-service
         run: pytest -q
 
   monitoring-service:
