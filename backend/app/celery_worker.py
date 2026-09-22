@@ -92,33 +92,61 @@ def analyze_repository_task(repo_id: int):
 
 @celery_app.task(name="tasks.deploy_application_task")
 def deploy_application_task(repo_id: int):
-    logger.info(f"Starting async Infrastructure deployment for Repository ID: {repo_id}")
+    """Run the deployment engine dry-run; never reports a deployment without verified execution."""
     db = SessionLocal()
     try:
         repo = db.query(Repository).filter(Repository.id == repo_id).first()
         if not repo:
+            logger.error("Repository not found: %s", repo_id)
             return
-        
-        # Simulate deployment stage ticks with logs
-        stages = [
-            "Initiating connection to AWS Kubernetes Cluster control-plane VPC...",
-            "Validating Terraform secrets configuration variables...",
-            "Applying Terraform state blueprints to provision target infrastructure...",
-            "Pushing compiled application container stages to cloud registry...",
-            "Scheduling replica sets in EKS cluster namespace...",
-            "Attaching target group metrics register nodes to Prometheus endpoint...",
-            "Running network verification endpoint calls for stable handshake...",
-            "SUCCESS: Autonomous Deployment Completed!"
-        ]
-        
-        for stage in stages:
-            logger.info(f"[{repo.name}] {stage}")
-            time.sleep(0.5)
 
-        repo.status = "Deployed"
+        repo.status = "Validating"
         db.commit()
-    except Exception as e:
-        logger.error(f"Deployment runner error: {e}")
+
+        deployment_service_url = os.getenv("DEPLOYMENT_SERVICE_URL", "http://deployment-service:8030")
+        payload = {
+            "repository_id": repo.id,
+            "repository_name": repo.name,
+            "dockerfile": repo.dockerfile or "",
+            "k8s_yaml": repo.k8s_yaml or "",
+            "terraform_tf": repo.terraform_tf or "",
+            "pipeline_yaml": repo.pipeline_yaml or "",
+        }
+
+        response = requests.post(
+            f"{deployment_service_url}/api/internal/deployments/dry-run",
+            json=payload,
+            timeout=360,
+        )
+        response.raise_for_status()
+        result = response.json()
+        state = result.get("state", "UNKNOWN")
+
+        if state == "DRY_RUN_PASSED":
+            repo.status = "DryRunPassed"
+        elif state == "VALIDATION_FAILED":
+            repo.status = "ValidationFailed"
+        elif state == "DRY_RUN_FAILED":
+            repo.status = "DryRunFailed"
+        else:
+            repo.status = "DeploymentBlocked"
+        repo.analysis_report = (
+            (repo.analysis_report or "")
+            + "\nDeployment Engine v1: "
+            + state
+            + "\n"
+            + "\n".join(result.get("logs", []))
+        )
+        db.commit()
+        logger.info("Deployment dry-run for %s finished in state %s", repo.name, state)
+    except Exception as exc:
+        db.rollback()
+        repo = db.query(Repository).filter(Repository.id == repo_id).first()
+        if repo:
+            repo.status = "DeploymentFailed"
+            repo.analysis_report = (repo.analysis_report or "") + f"\nDeployment engine failed: {type(exc).__name__}"
+            db.commit()
+        logger.exception("Deployment dry-run failed for %s", repo_id)
     finally:
         db.close()
 
