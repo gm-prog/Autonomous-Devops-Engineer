@@ -17,12 +17,19 @@ import org.robolectric.annotation.GraphicsMode
 @Config(qualifiers = RobolectricDeviceQualifiers.Pixel8, sdk = [36])
 class GreetingScreenshotTest {
 
-  @get:Rule val composeTestRule = createComposeRule()
+  @get:Rule
+  val composeTestRule = createComposeRule()
 
   @Test
-  fun greeting_screenshot() {
-    composeTestRule.setContent { MyApplicationTheme { Greeting("Robolectric") } }
+  fun app_header_screenshot() {
+    composeTestRule.setContent {
+      MyApplicationTheme(darkTheme = true, dynamicColor = false) {
+        WebOpsHeader(apiKeyStatus = false, onOpenSettings = {})
+      }
+    }
 
-    composeTestRule.onRoot().captureRoboImage(filePath = "src/test/screenshots/greeting.png")
+    composeTestRule.onRoot().captureRoboImage(
+      filePath = "src/test/screenshots/app_header.png"
+    )
   }
 }
