@@ -51,6 +51,9 @@ Do not include Markdown fences around the JSON. Do not invent application ports 
             "You are a senior DevOps architect. Produce conservative, reviewable infrastructure artifacts."
         )
         import json
-        cleaned = raw.strip()\n        if cleaned.startswith("```"):\n            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()\n        return json.loads(cleaned)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        return json.loads(cleaned)
     except Exception as exc:
         raise HTTPException(status_code=502, detail="AI artifact generation failed") from exc
