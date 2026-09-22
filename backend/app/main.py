@@ -171,7 +171,7 @@ def import_repository(repo_in: RepositoryCreate, db: Session = Depends(get_db)):
     logger.info(f"Imported repository catalog descriptor: {new_repo.name}")
     return new_repo
 
-@app.get("/api/repositories/{repo_id}", response_model="RepositoryDetailResponse")
+@app.get("/api/repositories/{repo_id}", response_model=RepositoryDetailResponse)
 def get_repository(repo_id: int, db: Session = Depends(get_db)):
     repo = db.query(Repository).filter(Repository.id == repo_id).first()
     if not repo:
