@@ -117,6 +117,13 @@ class RepositoryResponse(BaseModel):
     class Config:
         orm_mode = True
 
+class RepositoryDetailResponse(RepositoryResponse):
+    dockerfile: str
+    k8s_yaml: str
+    terraform_tf: str
+    pipeline_yaml: str
+    analysis_report: str = ""
+
 class IncidentResponse(BaseModel):
     id: int
     title: str
@@ -162,6 +169,13 @@ def import_repository(repo_in: RepositoryCreate, db: Session = Depends(get_db)):
     db.refresh(new_repo)
     logger.info(f"Imported repository catalog descriptor: {new_repo.name}")
     return new_repo
+
+@app.get("/api/repositories/{repo_id}", response_model="RepositoryDetailResponse")
+def get_repository(repo_id: int, db: Session = Depends(get_db)):
+    repo = db.query(Repository).filter(Repository.id == repo_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository target not found")
+    return repo
 
 @app.post("/api/repositories/{repo_id}/analyze")
 def trigger_repository_analysis(repo_id: int, db: Session = Depends(get_db)):
