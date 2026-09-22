@@ -58,6 +58,7 @@ class Repository(Base):
     k8s_yaml = Column(Text, default="")
     terraform_tf = Column(Text, default="")
     pipeline_yaml = Column(Text, default="")
+    analysis_report = Column(Text, default="")
     status = Column(String(50), default="Idle") # Idle, Analyzing, Generated, Deploying, Deployed, Failed
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
