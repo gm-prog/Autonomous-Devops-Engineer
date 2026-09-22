@@ -109,6 +109,8 @@ jobs:
         docker push devops-registry/{repo.name}:v1.0.0
 """
         
+        repo.analysis_report = f"""Remote repository analysis completed for {repo.name}. Generated Docker, Kubernetes, Terraform, and CI/CD artifacts from the repository descriptor."""
+        
         repo.status = "Generated"
         db.commit()
         logger.info(f"Asynchronous code-gen completed successfully for {repo.name}")
