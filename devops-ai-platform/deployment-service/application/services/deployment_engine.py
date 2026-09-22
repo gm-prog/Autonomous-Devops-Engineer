@@ -206,7 +206,9 @@ class DeploymentEngine:
             if terraform_plan.get("status") != "PASS":
                 run.error = "Terraform execution plan failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
+                run.add_log("DEPLOYMENT_FAILED: Terraform execution plan failed before infrastructure mutation; rollback is not required.")
+                self.store.save(run)
+                return run
 
             terraform_apply = self.terraform.apply_plan(temp_dir, paths["terraform_plan"])
             run.execution["terraform_apply"] = terraform_apply
