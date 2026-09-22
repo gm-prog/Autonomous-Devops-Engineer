@@ -73,7 +73,7 @@ jobs:
         run: python -m compileall -q .
       - name: Run monitoring service tests
         working-directory: devops-ai-platform/monitoring-service
-        run: python -m unittest infrastructure.prometheus.test_scraper_client infrastructure.prometheus.test_live_metrics application.services.test_threshold_evaluator -v
+        run: python -m unittest infrastructure.prometheus.test_scraper_client infrastructure.prometheus.test_live_metrics application.services.test_threshold_evaluator application.services.test_threshold_event_service -v
 
   compose:
     name: Validate Docker Compose
