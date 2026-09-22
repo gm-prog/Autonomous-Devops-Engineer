@@ -73,7 +73,7 @@ jobs:
         run: python -m compileall -q .
       - name: Run Prometheus adapter tests
         working-directory: devops-ai-platform/monitoring-service
-        run: python -m unittest infrastructure.prometheus.test_scraper_client -v
+        run: python -m unittest infrastructure.prometheus.test_scraper_client infrastructure.prometheus.test_live_metrics -v
 
   compose:
     name: Validate Docker Compose
