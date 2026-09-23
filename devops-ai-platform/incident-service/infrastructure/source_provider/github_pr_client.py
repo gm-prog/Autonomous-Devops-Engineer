@@ -205,6 +205,107 @@ class GitHubPRClient:
             )
         return url
 
+    def create_branch_from_commit(
+        self,
+        repo_slug: str,
+        branch: str,
+        commit_sha: str,
+        expected_parent_sha: str,
+    ) -> str:
+        """Create a remote branch exactly at a verified commit; never update an existing ref."""
+        self._require_token()
+        repo = self._validate_repo_slug(repo_slug)
+        normalized_branch = branch.strip()
+        normalized_commit = commit_sha.strip().lower()
+        normalized_parent = expected_parent_sha.strip().lower()
+
+        if not re.fullmatch(r"[0-9a-f]{40}", normalized_commit):
+            raise PRCreationFailedException("commit_sha must be a full Git SHA")
+        if not re.fullmatch(r"[0-9a-f]{40}", normalized_parent):
+            raise PRCreationFailedException("expected_parent_sha must be a full Git SHA")
+        if (
+            not normalized_branch.startswith("automation/remediation/")
+            or normalized_branch.startswith("-")
+            or ".." in normalized_branch
+            or any(part in {"", ".", ".."} for part in normalized_branch.split("/"))
+            or not re.fullmatch(r"[A-Za-z0-9._/-]+", normalized_branch)
+            or normalized_branch in self.protected_head_branches
+        ):
+            raise UnsafePullRequestTargetException(
+                "remediation branch violates the controlled branch policy"
+            )
+
+        commit_response = requests.get(
+            f"{self.api_base_url}/repos/{repo}/commits/{normalized_commit}",
+            headers=self._headers,
+            timeout=self.timeout_seconds,
+        )
+        if commit_response.status_code == 401:
+            raise InvalidGitHubTokenException("The provided GitHub OAuth token is invalid or expired.")
+        if commit_response.status_code == 404:
+            raise PRCreationFailedException("commit does not exist on the remote repository")
+        if commit_response.status_code != 200:
+            raise PRCreationFailedException(
+                f"GitHub rejected commit verification with HTTP {commit_response.status_code}"
+            )
+
+        try:
+            parents = commit_response.json().get("parents", [])
+        except ValueError as exc:
+            raise PRCreationFailedException("GitHub returned invalid commit JSON") from exc
+
+        if len(parents) != 1 or parents[0].get("sha", "").lower() != normalized_parent:
+            raise PRCreationFailedException(
+                "remote commit parent does not match the pinned source SHA"
+            )
+
+        try:
+            response = requests.post(
+                f"{self.api_base_url}/repos/{repo}/git/refs",
+                json={"ref": f"refs/heads/{normalized_branch}", "sha": normalized_commit},
+                headers=self._headers,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise PRCreationFailedException(
+                "network failure while publishing remediation branch"
+            ) from exc
+
+        if response.status_code == 401:
+            raise InvalidGitHubTokenException("The provided GitHub OAuth token is invalid or expired.")
+        if response.status_code == 422:
+            raise PRCreationFailedException(
+                "remediation branch already exists or GitHub rejected the ref"
+            )
+        if response.status_code != 201:
+            raise PRCreationFailedException(
+                f"GitHub rejected branch publication with HTTP {response.status_code}"
+            )
+
+        verification = requests.get(
+            f"{self.api_base_url}/repos/{repo}/git/ref/heads/{normalized_branch}",
+            headers=self._headers,
+            timeout=self.timeout_seconds,
+        )
+        if verification.status_code != 200:
+            raise PRCreationFailedException(
+                "GitHub branch publication could not be verified"
+            )
+        try:
+            verification_sha = (
+                verification.json().get("object", {}).get("sha", "").lower()
+            )
+        except ValueError as exc:
+            raise PRCreationFailedException(
+                "GitHub returned invalid branch verification JSON"
+            ) from exc
+        if verification_sha != normalized_commit:
+            raise PRCreationFailedException(
+                "remote remediation branch does not point to the created commit"
+            )
+
+        return f"https://github.com/{repo}/tree/{normalized_branch}"
+
     def mark_pr_ready_for_review(self, repo_slug: str, pr_number: int) -> bool:
         """Transition a draft PR to ready only when explicitly enabled."""
         self._require_token()
