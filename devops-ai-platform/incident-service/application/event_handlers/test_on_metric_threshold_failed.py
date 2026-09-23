@@ -4,7 +4,6 @@ from application.commands.ingest_webhook_alert import IngestWebhookAlertCommandH
 from application.event_handlers.on_metric_threshold_failed import (
     OnMetricThresholdFailedHandler,
 )
-from domain.events import DomainEvent
 
 
 class FakeIncidentRepository:
@@ -21,10 +20,6 @@ class FakeIncidentRepository:
         return []
 
 
-class ThreatEvent(DomainEvent):
-    pass
-
-
 class OnMetricThresholdFailedHandlerTests(unittest.TestCase):
     def test_threshold_event_becomes_triage_incident(self):
         repository = FakeIncidentRepository()
@@ -32,9 +27,12 @@ class OnMetricThresholdFailedHandlerTests(unittest.TestCase):
             IngestWebhookAlertCommandHandler(repository)
         )
 
-        event = ThreatEvent(
-            aggregate_id="gateway",
-            payload={
+        event = {
+            "event_id": "event-1",
+            "aggregate_id": "gateway",
+            "event_type": "ThreatThresholdExceededEvent",
+            "timestamp": "2026-09-23T00:00:00+00:00",
+            "payload": {
                 "severity": "critical",
                 "breach_count": 1,
                 "breaches": [
@@ -48,7 +46,7 @@ class OnMetricThresholdFailedHandlerTests(unittest.TestCase):
                 ],
                 "metrics": {"cpu_percent": 95.0},
             },
-        )
+        }
 
         incident_id = handler.handle(event)
 
@@ -67,23 +65,33 @@ class OnMetricThresholdFailedHandlerTests(unittest.TestCase):
             "OutOfBoundsIncidentLoggedEvent",
         )
 
-    def test_second_level_defaults_when_breach_details_are_sparse(self):
+    def test_sparse_event_uses_safe_defaults(self):
         repository = FakeIncidentRepository()
         handler = OnMetricThresholdFailedHandler(
             IngestWebhookAlertCommandHandler(repository)
         )
 
-        event = ThreatEvent(
-            aggregate_id="api",
-            payload={"severity": "high", "breach_count": 1, "breaches": []},
-        )
-
-        handler.handle(event)
+        handler.handle({
+            "aggregate_id": "api",
+            "payload": {"severity": "high", "breach_count": 1, "breaches": []},
+        })
 
         incident = repository.saved[0]
-        self.assertEqual(incident.title, "[PROMETHEUS-ALERT] unknown-threshold-breached")
+        self.assertEqual(
+            incident.title,
+            "[PROMETHEUS-ALERT] unknown-threshold-breached",
+        )
         self.assertEqual(incident.severity, "HIGH")
         self.assertIn("metric=unknown", incident.context)
+
+    def test_missing_aggregate_id_is_rejected(self):
+        repository = FakeIncidentRepository()
+        handler = OnMetricThresholdFailedHandler(
+            IngestWebhookAlertCommandHandler(repository)
+        )
+
+        with self.assertRaises(ValueError):
+            handler.handle({"payload": {}})
 
 
 if __name__ == "__main__":
