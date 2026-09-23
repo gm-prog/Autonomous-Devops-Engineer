@@ -64,15 +64,44 @@ class GitHubPRClientTests(unittest.TestCase):
 
     @patch("infrastructure.source_provider.github_pr_client.requests.get")
     @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    def test_existing_branch_at_same_commit_is_idempotent(self, post, get):
+        commit_response = Mock(status_code=200)
+        commit_response.json.return_value = {"sha": "b" * 40, "parents": [{"sha": "a" * 40}]}
+        existing_ref = Mock(status_code=200)
+        existing_ref.json.return_value = {"object": {"sha": "b" * 40}}
+        get.side_effect = [commit_response, existing_ref]
+
+        client = GitHubPRClient(oauth_token="secret")
+        url = client.create_branch_from_commit("owner/repo", "automation/remediation/inc-1/proposal-1", "b" * 40, "a" * 40)
+        self.assertTrue(url.endswith("/tree/automation/remediation/inc-1/proposal-1"))
+        post.assert_not_called()
+
+    @patch("infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    def test_existing_branch_at_different_commit_is_rejected(self, post, get):
+        commit_response = Mock(status_code=200)
+        commit_response.json.return_value = {"sha": "b" * 40, "parents": [{"sha": "a" * 40}]}
+        existing_ref = Mock(status_code=200)
+        existing_ref.json.return_value = {"object": {"sha": "c" * 40}}
+        get.side_effect = [commit_response, existing_ref]
+
+        client = GitHubPRClient(oauth_token="secret")
+        with self.assertRaises(PRCreationFailedException):
+            client.create_branch_from_commit("owner/repo", "automation/remediation/inc-1/proposal-1", "b" * 40, "a" * 40)
+        post.assert_not_called()
+
+    @patch("infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("infrastructure.source_provider.github_pr_client.requests.post")
     def test_branch_publication_verifies_parent_and_remote_ref(self, post, get):
         commit_response = Mock(status_code=200)
         commit_response.json.return_value = {
             "sha": "b" * 40,
             "parents": [{"sha": "a" * 40}],
         }
+        missing_ref = Mock(status_code=404)
         ref_response = Mock(status_code=200)
         ref_response.json.return_value = {"object": {"sha": "b" * 40}}
-        get.side_effect = [commit_response, ref_response]
+        get.side_effect = [commit_response, missing_ref, ref_response]
         post.return_value = Mock(status_code=201)
 
         client = GitHubPRClient(oauth_token="secret")
