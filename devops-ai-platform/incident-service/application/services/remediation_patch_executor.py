@@ -72,6 +72,7 @@ class RemediationPatchExecutor:
             raise PatchApplicationRejectedError("remediation workspace does not exist")
 
         patch_file = None
+        patch_temp_dir = None
         try:
             self._assert_clean_workspace(workspace_path)
 
@@ -84,11 +85,12 @@ class RemediationPatchExecutor:
                     "remediation target is not a tracked file in the pinned workspace"
                 )
 
+            patch_temp_dir = Path(tempfile.mkdtemp(prefix="devops-remediation-patch-"))
             with tempfile.NamedTemporaryFile(
                 mode="wb",
-                prefix=".remediation-patch-",
+                prefix="patch-",
                 suffix=".diff",
-                dir=workspace_path,
+                dir=patch_temp_dir,
                 delete=False,
             ) as handle:
                 handle.write(patch)
@@ -125,6 +127,11 @@ class RemediationPatchExecutor:
                     patch_file.unlink(missing_ok=True)
                 except OSError:
                     logger.warning("Could not remove temporary remediation patch file")
+            if patch_temp_dir is not None:
+                try:
+                    patch_temp_dir.rmdir()
+                except OSError:
+                    logger.warning("Could not remove temporary remediation patch directory")
 
     @staticmethod
     def _validate_source_binding(
