@@ -19,6 +19,7 @@ class DeploymentRun:
     repository_id: int
     repository_name: str
     requested_by: Optional[str] = None
+    source_revision: Dict[str, Any] = field(default_factory=dict)
     state: DeploymentState = DeploymentState.CREATED
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -50,6 +51,7 @@ class DeploymentRun:
             "repository_id": self.repository_id,
             "repository_name": self.repository_name,
             "requested_by": self.requested_by,
+            "source_revision": self.source_revision,
             "state": self.state.value,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -74,6 +76,7 @@ class DeploymentRun:
             repository_id=int(payload["repository_id"]),
             repository_name=str(payload["repository_name"]),
             requested_by=payload.get("requested_by"),
+            source_revision=payload.get("source_revision") or {},
             state=DeploymentState(payload.get("state", DeploymentState.CREATED.value)),
             created_at=_parse_datetime(payload.get("created_at"), now),
             updated_at=_parse_datetime(payload.get("updated_at"), now),
