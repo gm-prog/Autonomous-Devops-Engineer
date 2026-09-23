@@ -42,6 +42,23 @@ jobs:
         working-directory: devops-ai-platform/${{ matrix.service }}
         run: python -m compileall -q .
 
+  incident-service:
+    name: Incident service checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile incident service
+        working-directory: devops-ai-platform/incident-service
+        run: python -m compileall -q .
+      - name: Run incident threshold-ingestion tests
+        working-directory: devops-ai-platform/incident-service
+        env:
+          PYTHONPATH: .
+        run: python -m unittest application.event_handlers.test_on_metric_threshold_failed -v
+
   deployment-service:
     name: Deployment service checks
     runs-on: ubuntu-latest
