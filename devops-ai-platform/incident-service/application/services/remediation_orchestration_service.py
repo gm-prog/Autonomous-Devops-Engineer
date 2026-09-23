@@ -8,6 +8,10 @@ from application.services.remediation_workspace_service import RemediationWorksp
 from domain.entities.hotfix_proposal import HotfixProposal
 
 
+class RemediationOrchestrationError(RuntimeError):
+    """Raised when a remediation cannot safely reach publication."""
+
+
 @dataclass(frozen=True)
 class RemediationOrchestrationResult:
     proposal_id: str
@@ -81,11 +85,11 @@ class RemediationOrchestrationService:
                 target_filepath=proposal.target_filepath,
             )
             if not validation_result.passed:
-                raise RuntimeError(
+                raise RemediationOrchestrationError(
                     "remediation validation failed; refusing commit and publication"
                 )
             if validation_result.source_sha.lower() != proposal.source_sha.lower():
-                raise RuntimeError(
+                raise RemediationOrchestrationError(
                     "validation source SHA does not match the proposal source SHA"
                 )
 
@@ -97,11 +101,11 @@ class RemediationOrchestrationService:
             )
 
             if commit_result.parent_sha != proposal.source_sha.lower():
-                raise RuntimeError(
+                raise RemediationOrchestrationError(
                     "remediation commit parent does not match the pinned source SHA"
                 )
             if commit_result.target_filepath != patch_result.target_filepath:
-                raise RuntimeError(
+                raise RemediationOrchestrationError(
                     "remediation commit target differs from the applied patch target"
                 )
 
