@@ -70,30 +70,14 @@ class RedisIncidentEventConsumer:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    def consume_once(self, block_ms: int = 1000, count: int = 10) -> int:
-        self.ensure_group()
-
-        messages = self.client.xreadgroup(
-            groupname=self.group_name,
-            consumername=self.consumer_name,
-            streams={self.stream_name: ">"},
-            count=count,
-            block=block_ms,
-        )
-
+    def _process_messages(self, messages) -> int:
         processed = 0
         for _, entries in messages or []:
             for message_id, fields in entries:
-                event = self._deserialize(fields)
                 try:
+                    event = self._deserialize(fields)
                     if event.get("event_type") == "ThreatThresholdExceededEvent":
                         self.handler.handle(event)
-                    else:
-                        logger.info(
-                            "Ignoring unsupported event type=%s message_id=%s",
-                            event.get("event_type"),
-                            message_id,
-                        )
                     self.client.xack(self.stream_name, self.group_name, message_id)
                     processed += 1
                 except Exception:
@@ -101,9 +85,30 @@ class RedisIncidentEventConsumer:
                         "Failed processing event message_id=%s; leaving it pending for retry",
                         message_id,
                     )
-
         return processed
 
+    def consume_once(self, block_ms: int = 1000, count: int = 10) -> int:
+        self.ensure_group()
+
+        pending = self.client.xreadgroup(
+            groupname=self.group_name,
+            consumername=self.consumer_name,
+            streams={self.stream_name: "0"},
+            count=count,
+            block=0,
+        )
+        processed = self._process_messages(pending)
+        if processed:
+            return processed
+
+        fresh = self.client.xreadgroup(
+            groupname=self.group_name,
+            consumername=self.consumer_name,
+            streams={self.stream_name: ">"},
+            count=count,
+            block=block_ms,
+        )
+        return processed + self._process_messages(fresh)
     def run_forever(self) -> None:
         while True:
             try:
