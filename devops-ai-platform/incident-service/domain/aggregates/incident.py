@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Mapping
 from datetime import datetime, timezone
 
 from ..entities.hotfix_proposal import HotfixProposal
@@ -9,8 +9,8 @@ from ..entities.incident_evidence import IncidentEvidence
 class IncidentAggregate:
     """
     Incident Aggregate Root.
-    Encapsulates life states of operational alerts, auto-triage workflows,
-    and references back to autonomous patch plans.
+    Encapsulates all lifecycle state for an operational incident,
+    including structured evidence, RCA completion, and remediation proposals.
     """
 
     def __init__(self, id: str, title: str, severity: str, context_details: str):
@@ -32,6 +32,13 @@ class IncidentAggregate:
     def move_to_triage(self):
         if self.status == "Raised":
             self.status = "Triage"
+
+    def mark_root_cause_found(self):
+        if self.status not in {"Triage", "Investigating"}:
+            raise ValueError(
+                f"Cannot mark root cause found from incident state {self.status!r}"
+            )
+        self.status = "RootCauseFound"
 
     def attach_evidence(self, evidence: IncidentEvidence):
         if not evidence.id.strip():
