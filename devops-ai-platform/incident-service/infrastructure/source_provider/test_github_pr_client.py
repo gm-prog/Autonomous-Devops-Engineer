@@ -145,10 +145,13 @@ class GitHubPRClientTests(unittest.TestCase):
 
     @patch("infrastructure.source_provider.github_pr_client.requests.post")
     @patch("infrastructure.source_provider.github_pr_client.requests.get")
-    def test_branch_publication_never_updates_existing_ref(self, get, post):
-        get.return_value = Mock(status_code=200, **{"json.return_value": {
+    def test_branch_publication_rejects_create_race(self, get, post):
+        commit_response = Mock(status_code=200)
+        commit_response.json.return_value = {
             "sha": "b" * 40, "parents": [{"sha": "a" * 40}]
-        }})
+        }
+        missing_ref = Mock(status_code=404)
+        get.side_effect = [commit_response, missing_ref]
         post.return_value = Mock(status_code=422)
 
         client = GitHubPRClient(oauth_token="secret")
