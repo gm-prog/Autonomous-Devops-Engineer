@@ -1,7 +1,9 @@
-from typing import List, Optional
-from datetime import datetime
+from typing import List
+from datetime import datetime, timezone
+
 from ..entities.hotfix_proposal import HotfixProposal
-from ...shared_kernel.domain.events import OutOfBoundsIncidentLoggedEvent
+from ..events import OutOfBoundsIncidentLoggedEvent
+
 
 class IncidentAggregate:
     """
@@ -9,20 +11,21 @@ class IncidentAggregate:
     Encapsulates life states of operational alerts, auto-triage workflows,
     and references back to autonomous patch plans.
     """
+
     def __init__(self, id: str, title: str, severity: str, context_details: str):
         self.id = id
         self.title = title
-        self.severity = severity # Low, Medium, High, Critical
+        self.severity = severity
         self.context = context_details
-        self.created_at = datetime.utcnow()
-        self.status = "Raised" # Raised, Triage, RemediationVerified, Resolved
+        self.created_at = datetime.now(timezone.utc)
+        self.status = "Raised"
         self.patch_proposals: List[HotfixProposal] = []
-        self.domain_events = []
-
-        self.domain_events.append(OutOfBoundsIncidentLoggedEvent(
-            aggregate_id=self.id,
-            payload={"severity": self.severity, "reason": self.title}
-        ))
+        self.domain_events = [
+            OutOfBoundsIncidentLoggedEvent(
+                aggregate_id=self.id,
+                payload={"severity": self.severity, "reason": self.title},
+            )
+        ]
 
     def move_to_triage(self):
         if self.status == "Raised":
