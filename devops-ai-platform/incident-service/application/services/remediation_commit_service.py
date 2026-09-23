@@ -192,9 +192,8 @@ class RemediationCommitService:
         )
         return message[:_MAX_COMMIT_MESSAGE_LENGTH]
 
-    @staticmethod
-    def _assert_head(cwd: Path, expected_sha: str) -> None:
-        head = RemediationCommitService._run_git(
+    def _assert_head(self, cwd: Path, expected_sha: str) -> None:
+        head = self._run_git(
             ["git", "rev-parse", "HEAD"], cwd
         ).stdout.strip().lower()
         if head != expected_sha:
@@ -202,9 +201,8 @@ class RemediationCommitService:
                 "workspace HEAD does not match the pinned source SHA"
             )
 
-    @staticmethod
-    def _assert_only_target_modified(cwd: Path, target: str) -> None:
-        status = RemediationCommitService._run_git(
+    def _assert_only_target_modified(self, cwd: Path, target: str) -> None:
+        status = self._run_git(
             ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd
         ).stdout.splitlines()
         if status != [f" M {target}"]:
