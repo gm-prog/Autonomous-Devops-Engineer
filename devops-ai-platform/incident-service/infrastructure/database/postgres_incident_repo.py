@@ -122,7 +122,8 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
         }
 
     @staticmethod
-    def _get_evidence(self, incident_id: str) -> List[IncidentEvidence]:
+    @staticmethod
+    def _get_evidence(engine, incident_id: str) -> List[IncidentEvidence]:
         with self.engine.connect() as connection:
             rows = connection.execute(
                 select(evidence_table)
