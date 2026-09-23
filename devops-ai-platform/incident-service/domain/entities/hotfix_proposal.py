@@ -5,7 +5,7 @@ from typing import Optional
 
 @dataclass
 class HotfixProposal:
-    """A reviewable remediation proposal backed by a deterministic patch shape check."""
+    """A reviewable remediation proposal backed by deterministic validation."""
 
     id: str
     target_filepath: str
@@ -13,9 +13,10 @@ class HotfixProposal:
     is_verified: bool = False
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     pull_request_url: Optional[str] = None
+    source_sha: Optional[str] = None
 
     def apply_verification_pass(self) -> bool:
-        """Verify a single-file unified diff; compilation/execution belongs to a separate executor."""
+        """Verify a single-file unified diff; execution belongs to a separate executor."""
         path = self.target_filepath.replace("\\", "/").strip()
         patch = self.diff_patch_payload.strip()
 
@@ -38,8 +39,6 @@ class HotfixProposal:
             if line.startswith("+++ b/")
         ]
 
-        # The current remediation command models exactly one target file.
-        # Reject multiple file sections before a future patch executor exists.
         if len(old_headers) != 1 or len(new_headers) != 1:
             self.is_verified = False
             return False

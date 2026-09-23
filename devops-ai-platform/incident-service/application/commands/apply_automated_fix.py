@@ -1,12 +1,15 @@
 from typing import Any, Optional
 import logging
 import uuid
+import re
 
 from domain.entities.hotfix_proposal import HotfixProposal
 from domain.repository_interface import IncidentRepositoryPort
 from application.services.hotfix_validation_service import HotfixValidationService
 
 logger = logging.getLogger("ApplyAutomatedFixCommandHandler")
+
+_SOURCE_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class ApplyAutomatedFixCommand:
@@ -18,6 +21,7 @@ class ApplyAutomatedFixCommand:
         confidence_score: float = 0.85,
         repository_slug: Optional[str] = None,
         source_branch: Optional[str] = None,
+        source_sha: Optional[str] = None,
         base_branch: str = "main",
         pr_title: Optional[str] = None,
         pr_body: Optional[str] = None,
@@ -28,6 +32,7 @@ class ApplyAutomatedFixCommand:
         self.confidence_score = confidence_score
         self.repository_slug = repository_slug
         self.source_branch = source_branch
+        self.source_sha = source_sha
         self.base_branch = base_branch
         self.pr_title = pr_title
         self.pr_body = pr_body
@@ -77,6 +82,14 @@ class ApplyAutomatedFixCommandHandler:
             )
             return False
 
+        if not cmd.source_sha or not _SOURCE_SHA_PATTERN.fullmatch(cmd.source_sha.strip()):
+            logger.warning(
+                "Rejecting remediation %s because an immutable source SHA is required.",
+                proposal.id,
+            )
+            return False
+        proposal.source_sha = cmd.source_sha.strip().lower()
+
         # No GitHub client means the proposal can be inspected but must not be
         # reported as submitted. This preserves a safe dry-run boundary.
         if self.github is None:
@@ -101,7 +114,8 @@ class ApplyAutomatedFixCommandHandler:
                 body=cmd.pr_body or (
                     f"Incident: {incident.id}\n"
                     f"Proposal: {proposal.id}\n"
-                    f"Target: {proposal.target_filepath}\n\n"
+                    f"Target: {proposal.target_filepath}\n"
+                    f"Source SHA: {proposal.source_sha}\n\n"
                     "Generated remediation. Review CI and human approval before merge."
                 ),
                 draft=True,
