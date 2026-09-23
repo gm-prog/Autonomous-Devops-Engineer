@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from github_pr_client import (
+from infrastructure.source_provider.github_pr_client import (
     GitHubPRClient,
     InvalidGitHubTokenException,
     PRCreationFailedException,
@@ -41,7 +41,7 @@ class GitHubPRClientTests(unittest.TestCase):
                 base="production",
             )
 
-    @patch("github_pr_client.requests.post")
+    @patch("infrastructure.source_provider.github_pr_client.requests.post")
     def test_success_returns_github_url(self, post):
         response = Mock(status_code=201)
         response.json.return_value = {

@@ -15,20 +15,44 @@ class HotfixProposal:
     pull_request_url: Optional[str] = None
 
     def apply_verification_pass(self) -> bool:
-        """Verify patch structure only; compilation/execution belongs to a separate executor."""
+        """Verify a single-file unified diff; compilation/execution belongs to a separate executor."""
         path = self.target_filepath.replace("\\", "/").strip()
         patch = self.diff_patch_payload.strip()
 
         if not path or not patch:
+            self.is_verified = False
             return False
         if path.startswith("/") or ".." in path.split("/"):
+            self.is_verified = False
             return False
 
         lines = patch.splitlines()
-        has_hunk = any(line.startswith("@@") for line in lines)
-        old_marker = any(line.startswith("--- a/") for line in lines)
-        new_marker = any(line.startswith("+++ b/") for line in lines)
-        target_marker = f"+++ b/{path}" in lines
+        old_headers = [
+            (index, line[6:].strip())
+            for index, line in enumerate(lines)
+            if line.startswith("--- a/")
+        ]
+        new_headers = [
+            (index, line[6:].strip())
+            for index, line in enumerate(lines)
+            if line.startswith("+++ b/")
+        ]
 
-        self.is_verified = bool(has_hunk and old_marker and new_marker and target_marker)
+        # The current remediation command models exactly one target file.
+        # Reject multiple file sections before a future patch executor exists.
+        if len(old_headers) != 1 or len(new_headers) != 1:
+            self.is_verified = False
+            return False
+
+        old_index, old_path = old_headers[0]
+        new_index, new_path = new_headers[0]
+        if new_index != old_index + 1:
+            self.is_verified = False
+            return False
+        if old_path != path or new_path != path:
+            self.is_verified = False
+            return False
+
+        has_hunk = any(line.startswith("@@") for line in lines[new_index + 1 :])
+        self.is_verified = has_hunk
         return self.is_verified
