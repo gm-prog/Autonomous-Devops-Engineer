@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 from ..entities.hotfix_proposal import HotfixProposal
 from ..events import OutOfBoundsIncidentLoggedEvent
+from ..entities.incident_evidence import IncidentEvidence
 
 
 class IncidentAggregate:
@@ -20,6 +21,7 @@ class IncidentAggregate:
         self.created_at = datetime.now(timezone.utc)
         self.status = "Raised"
         self.patch_proposals: List[HotfixProposal] = []
+        self.evidence: List[IncidentEvidence] = []
         self.domain_events = [
             OutOfBoundsIncidentLoggedEvent(
                 aggregate_id=self.id,
@@ -30,6 +32,13 @@ class IncidentAggregate:
     def move_to_triage(self):
         if self.status == "Raised":
             self.status = "Triage"
+
+    def attach_evidence(self, evidence: IncidentEvidence):
+        if not evidence.id.strip():
+            raise ValueError("evidence id must not be empty")
+        if any(item.id == evidence.id for item in self.evidence):
+            return
+        self.evidence.append(evidence)
 
     def attach_verified_patch(self, proposal: HotfixProposal):
         if proposal.is_verified:
