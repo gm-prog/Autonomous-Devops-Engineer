@@ -7,7 +7,7 @@ from typing import List, Optional
 import redis
 import qdrant_client
 from qdrant_client.http import models as qmodels
-from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Text, Boolean, DateTime, ForeignKey, text as sql_text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import datetime
@@ -59,6 +59,7 @@ class Repository(Base):
     terraform_tf = Column(Text, default="")
     pipeline_yaml = Column(Text, default="")
     analysis_report = Column(Text, default="")
+    source_revision = Column(Text, default="")
     status = Column(String(50), default="Idle") # Idle, Analyzing, Generated, Validating, ValidationFailed, DryRunPassed, DryRunFailed, DeploymentFailed
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -79,6 +80,11 @@ class Incident(Base):
 def startup_event():
     try:
         Base.metadata.create_all(bind=engine)
+        with engine.begin() as connection:
+            try:
+                connection.execute(sql_text("ALTER TABLE repositories ADD COLUMN IF NOT EXISTS source_revision TEXT DEFAULT ''"))
+            except Exception as migration_error:
+                logger.warning("Source revision column migration skipped: %s", migration_error)
         logger.info("Created PostgreSQL tables successfully.")
     except Exception as e:
         logger.warning(f"PostgreSQL not yet fully online. DB connection bypassed: {e}")

@@ -32,14 +32,41 @@ class DeploymentEngine:
         self.health_checker = health_checker or HealthCheckService()
 
     @staticmethod
+    def _validated_source_revision(value: Any) -> Dict[str, Any]:
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise DeploymentActionError("source_revision must be an object")
+        head_sha = value.get("head_sha", "")
+        commits = value.get("commits", [])
+        summary = value.get("summary", {})
+        if head_sha and (not isinstance(head_sha, str) or len(head_sha) > 64):
+            raise DeploymentActionError("source_revision.head_sha is invalid")
+        if not isinstance(commits, list) or len(commits) > 5:
+            raise DeploymentActionError("source_revision.commits is invalid")
+        if not isinstance(summary, dict):
+            raise DeploymentActionError("source_revision.summary is invalid")
+        return {
+            "head_sha": head_sha,
+            "commits": commits[:5],
+            "summary": {
+                "commit_count": int(summary.get("commit_count", 0)),
+                "files_changed": int(summary.get("files_changed", 0)),
+                "additions": int(summary.get("additions", 0)),
+                "deletions": int(summary.get("deletions", 0)),
+            },
+        }
+
+    @staticmethod
     def _artifact_hash(payload: Dict[str, Any]) -> str:
         bundle = {k: payload.get(k, "") for k in ("dockerfile", "k8s_yaml", "terraform_tf", "pipeline_yaml")}
         return hashlib.sha256(json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
-    def _plan_hash(artifact_hash: str, terraform_result: Dict[str, Any], kubernetes_result: Dict[str, Any]) -> str:
+    def _plan_hash(artifact_hash: str, terraform_result: Dict[str, Any], kubernetes_result: Dict[str, Any], source_revision: Dict[str, Any] | None = None) -> str:
         material = {
             "artifact_hash": artifact_hash,
+            "source_revision": source_revision or {},
             "terraform": {"status": terraform_result.get("status"), "stdout": terraform_result.get("plan", {}).get("stdout", "")},
             "kubernetes": {"status": kubernetes_result.get("status"), "stdout": kubernetes_result.get("stdout", "")},
         }
@@ -80,6 +107,7 @@ class DeploymentEngine:
             repository_id=int(payload["repository_id"]),
             repository_name=payload["repository_name"],
             requested_by=payload.get("requested_by"),
+            source_revision=self._validated_source_revision(payload.get("source_revision")),
         )
         run.move(DeploymentState.VALIDATING)
         run.add_log("VALIDATING: static IaC safety and syntax checks started.")
@@ -101,7 +129,7 @@ class DeploymentEngine:
             run.terraform_plan = self.terraform.run_plan(temp_dir, execution=False)
             run.kubernetes_dry_run = self.kubectl.dry_run(paths["kubernetes"])
             run.artifact_hash = self._artifact_hash(payload)
-            run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run)
+            run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision)
             if run.terraform_plan["status"] == "PASS" and run.kubernetes_dry_run["status"] == "PASS":
                 run.move(DeploymentState.DRY_RUN_PASSED)
                 run.move(DeploymentState.AWAITING_APPROVAL)

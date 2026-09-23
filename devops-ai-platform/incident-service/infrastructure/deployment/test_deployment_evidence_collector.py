@@ -34,6 +34,7 @@ class DeploymentEvidenceCollectorTests(unittest.TestCase):
             "id": "run_123",
             "repository_id": 7,
             "repository_name": "checkout-api",
+            "source_revision": {"head_sha": "abc123", "commits": [], "summary": {"commit_count": 0, "files_changed": 0, "additions": 0, "deletions": 0}},
             "state": "DEPLOYED",
             "created_at": "2026-09-23T10:00:00+00:00",
             "updated_at": "2026-09-23T10:05:00+00:00",
@@ -52,6 +53,7 @@ class DeploymentEvidenceCollectorTests(unittest.TestCase):
         self.assertEqual(evidence.kind, "deployment_run")
         self.assertEqual(evidence.payload["state"], "DEPLOYED")
         self.assertEqual(evidence.payload["health_check_status"], "PASS")
+        self.assertEqual(evidence.payload["source_revision"]["head_sha"], "abc123")
         self.assertNotIn("logs", evidence.payload)
         self.assertNotIn("terraform_plan", evidence.payload)
         self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 5.0)

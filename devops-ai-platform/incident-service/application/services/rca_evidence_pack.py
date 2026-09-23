@@ -58,6 +58,7 @@ class RcaEvidencePackBuilder:
                         "deployment_run_id": payload.get("deployment_run_id"),
                         "repository_id": payload.get("repository_id"),
                         "repository_name": payload.get("repository_name"),
+                        "source_revision": payload.get("source_revision") or {},
                         "state": payload.get("state"),
                         "created_at": payload.get("created_at"),
                         "updated_at": payload.get("updated_at"),

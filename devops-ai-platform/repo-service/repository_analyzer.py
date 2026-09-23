@@ -29,6 +29,7 @@ TEXT_SUFFIXES = {
     ".properties", ".gradle", ".tf", ".tfvars", ".sh"
 }
 
+
 class RepositoryAnalyzer:
     """Clones a repository, performs bounded source inspection, and returns analysis input."""
 
@@ -44,6 +45,11 @@ class RepositoryAnalyzer:
             files = self._collect_files(Path(clone_dir))
             tech_stack = self.parser.evaluate_codebase(files)
             commits = self.git_client.get_commit_history(clone_dir, limit=5)
+            source_revision = self.git_client.get_source_revision(
+                clone_dir,
+                commit_limit=5,
+                changed_files_limit=25,
+            )
 
             source_files = [
                 {
@@ -66,6 +72,7 @@ class RepositoryAnalyzer:
                     "has_k8s_manifests": tech_stack.has_k8s_manifests,
                 },
                 "recent_commits": commits,
+                "source_revision": source_revision,
                 "files": source_files,
             }
         finally:
