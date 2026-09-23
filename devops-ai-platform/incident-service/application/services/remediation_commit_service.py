@@ -76,7 +76,6 @@ class RemediationCommitService:
             raise CommitCreationRejectedError("remediation workspace does not exist")
 
         self._assert_head(cwd, source_sha)
-        self._assert_clean(cwd)
 
         tracked = self._run_git(
             ["git", "ls-files", "--error-unmatch", "--", target], cwd
@@ -86,13 +85,7 @@ class RemediationCommitService:
                 "remediation target is not a tracked file"
             )
 
-        status = self._run_git(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd
-        ).stdout.splitlines()
-        if status:
-            raise CommitWorkspaceDirtyError(
-                "workspace must be clean before staging the verified remediation target"
-            )
+        self._assert_only_target_modified(cwd, target)
 
         self._run_git(["git", "add", "--", target], cwd)
 
@@ -210,13 +203,13 @@ class RemediationCommitService:
             )
 
     @staticmethod
-    def _assert_clean(cwd: Path) -> None:
+    def _assert_only_target_modified(cwd: Path, target: str) -> None:
         status = RemediationCommitService._run_git(
             ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd
-        ).stdout.strip()
-        if status:
+        ).stdout.splitlines()
+        if status != [f" M {target}"]:
             raise CommitWorkspaceDirtyError(
-                "workspace must be clean before remediation commit creation"
+                "workspace must contain exactly one modified remediation target"
             )
 
     def _run_git(
