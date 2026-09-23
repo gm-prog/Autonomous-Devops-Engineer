@@ -46,7 +46,7 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
             proposal = HotfixProposal(
                 id="patch-1",
                 target_filepath="app.py",
-                diff_patch_payload="@@ -1 +1 @@",
+                diff_patch_payload="""--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old()\n+new()\n""",
             )
             proposal.apply_verification_pass()
             incident.attach_verified_patch(proposal)
