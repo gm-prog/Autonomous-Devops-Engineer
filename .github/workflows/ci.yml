@@ -50,14 +50,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install incident service dependencies
+        working-directory: devops-ai-platform/incident-service
+        run: python -m pip install -r requirements.txt
       - name: Compile incident service
         working-directory: devops-ai-platform/incident-service
         run: python -m compileall -q .
-      - name: Run incident threshold-ingestion tests
+      - name: Run incident persistence and ingestion tests
         working-directory: devops-ai-platform/incident-service
         env:
           PYTHONPATH: .
-        run: python -m unittest application.event_handlers.test_on_metric_threshold_failed -v
+        run: python -m unittest infrastructure.database.test_postgres_incident_repo application.event_handlers.test_on_metric_threshold_failed -v
 
   deployment-service:
     name: Deployment service checks
