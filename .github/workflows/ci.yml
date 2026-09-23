@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  backend-tests:
+    name: Operator Gateway (FastAPI) tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run test suite
+        run: python -m pytest tests/ -v
+
+  platform-tests:
+    name: DDD Platform smoke tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: devops-ai-platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run smoke tests
+        run: python -m pytest tests/ -v

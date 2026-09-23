@@ -1,5 +1,9 @@
 version: "3.8"
 
+# DevOps.AI Operator Platform - full local stack.
+# Service hostnames/ports match the api-gateway routing matrix
+# (see api_gateway/routers/gateway_router.py SERVICES).
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -26,31 +30,82 @@ services:
       - "6333:6333"
       - "6334:6334"
 
+  # --- BFF GATEWAY (HS256 JWT auth) ---
   api-gateway:
     build:
       context: .
-      dockerfile: ./api-gateway/Dockerfile
+      dockerfile: ./api_gateway/Dockerfile
     container_name: devops_api_gateway
     ports:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
       - REDIS_HOST=redis
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # Strong secret for the gateway's HS256 JWT auth. Omit for local dev
+      # (a development fallback is used + warning logged); always set a real
+      # value before exposing the gateway.
+      - JWT_SECRET=${JWT_SECRET:-}
     depends_on:
       - postgres
       - redis
 
-  celery-worker:
+  # --- BOUNDED CONTEXT SERVICES ---
+  repo-service:
     build:
       context: .
-      dockerfile: ./deployment-service/Dockerfile
+      dockerfile: ./repo_service/Dockerfile
+    container_name: devops_repo_service
+    ports:
+      - "8010:8010"
+    depends_on:
+      - postgres
+
+  agent-service:
+    build:
+      context: .
+      dockerfile: ./agent_service/Dockerfile
+    container_name: devops_agent_service
+    ports:
+      - "8020:8020"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    depends_on:
+      - redis
+
+  deployment-service:
+    build:
+      context: .
+      dockerfile: ./deployment_service/Dockerfile
     container_name: devops_celery_worker
-    command: celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info
     environment:
       - REDIS_HOST=redis
     depends_on:
       - redis
+
+  monitoring-service:
+    build:
+      context: .
+      dockerfile: ./monitoring_service/Dockerfile
+    container_name: devops_monitoring_service
+    ports:
+      - "8040:8040"
+    depends_on:
+      - postgres
+
+  incident-service:
+    build:
+      context: .
+      dockerfile: ./incident_service/Dockerfile
+    container_name: devops_incident_service
+    ports:
+      - "8050:8050"
+    environment:
+      - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
+      # Enables HMAC verification of inbound Sentry webhooks
+      - SENTRY_WEBHOOK_SECRET=${SENTRY_WEBHOOK_SECRET:-}
+    depends_on:
+      - postgres
 
 volumes:
   postgres_data:

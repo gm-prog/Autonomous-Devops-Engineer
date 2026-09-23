@@ -1,6 +1,10 @@
 import json
+import logging
 import os
 import sys
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("MCPOperatorServer")
 
 # Simulating Model Context Protocol (MCP) tool structure and responses
 class MCPOperatorServer:
@@ -26,9 +30,9 @@ class MCPOperatorServer:
     def handle_tool_call(self, tool_name: str, arguments: dict) -> dict:
         if tool_name not in self.registered_tools:
             return {"status": "error", "message": f"Tool '{tool_name}' not defined in server schema."}
-        
-        logger_name = f"MCP_Execution[{tool_name}]"
-        
+
+        logger.info(f"MCP tool call received: {tool_name} args={arguments}")
+
         if tool_name == "analyze_code_repository":
             repo_name = arguments.get("name", "unnamed-project")
             return {
