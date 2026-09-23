@@ -46,7 +46,7 @@ class RcaOrchestrationTests(unittest.TestCase):
     def test_rca_agent_cannot_introduce_unknown_evidence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = PostgresIncidentRepositoryAdapter(
-                f"sqlite:///{os.path.join(temp_dir, "incidents.db")}"
+                f"sqlite:///{os.path.join(temp_dir, 'incidents.db')}"
             )
             incident = IncidentAggregate("inc-invalid", "CPU breach", "HIGH", "gateway CPU")
             incident.move_to_triage()
