@@ -1,74 +1,243 @@
-import os
-import requests
 import logging
-from typing import Optional, Dict, Any
+import os
+import re
+from typing import Optional
+
+import requests
 
 logger = logging.getLogger("GitHubPRClient")
 
-# Exceptions
-class PRCreationFailedException(Exception): pass
-class InvalidGitHubTokenException(Exception): pass
-class RepositoryNotFoundException(Exception): pass
+_GITHUB_API = "https://api.github.com"
+_GITHUB_API_VERSION = "2026-03-10"
+_REPO_SLUG_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+
+class PRCreationFailedException(Exception):
+    pass
+
+
+class InvalidGitHubTokenException(Exception):
+    pass
+
+
+class RepositoryNotFoundException(Exception):
+    pass
+
+
+class UnsafePullRequestTargetException(Exception):
+    pass
+
 
 class GitHubPRClient:
-    """Interacts with upstream GitHub REST APIs via authorization tokens to merge patches."""
-    def __init__(self, oauth_token: Optional[str] = None):
+    """Creates reviewable draft PRs through a bounded GitHub API surface.
+
+    This adapter intentionally never fabricates a PR URL and never changes a
+    branch directly. PR creation is limited to an allowlisted base branch and
+    a non-protected head branch.
+    """
+
+    def __init__(
+        self,
+        oauth_token: Optional[str] = None,
+        api_base_url: str = _GITHUB_API,
+        timeout_seconds: float = 30.0,
+        allowed_base_branches: Optional[set[str]] = None,
+        protected_head_branches: Optional[set[str]] = None,
+    ):
         self.oauth_token = oauth_token or os.getenv("GITHUB_OAUTH_TOKEN", "")
+        self.api_base_url = api_base_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero")
+
+        self.allowed_base_branches = allowed_base_branches or self._csv_env(
+            "GITHUB_ALLOWED_BASE_BRANCHES",
+            "main",
+        )
+        self.protected_head_branches = protected_head_branches or self._csv_env(
+            "GITHUB_PROTECTED_HEAD_BRANCHES",
+            "main,master,production,release",
+        )
+
+        if not self.allowed_base_branches:
+            raise ValueError("at least one allowed base branch is required")
+
+    @staticmethod
+    def _csv_env(name: str, default: str) -> set[str]:
+        return {
+            item.strip()
+            for item in os.getenv(name, default).split(",")
+            if item.strip()
+        }
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        if not self.oauth_token:
+            return {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": _GITHUB_API_VERSION,
+            }
+        return {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {self.oauth_token}",
+            "X-GitHub-Api-Version": _GITHUB_API_VERSION,
+        }
+
+    def _require_token(self) -> None:
+        if not self.oauth_token:
+            raise InvalidGitHubTokenException(
+                "GITHUB_OAUTH_TOKEN is required for GitHub operations"
+            )
+
+    @staticmethod
+    def _validate_repo_slug(repo_slug: str) -> str:
+        normalized = repo_slug.strip()
+        if not _REPO_SLUG_PATTERN.fullmatch(normalized):
+            raise RepositoryNotFoundException(
+                "repo_slug must use the owner/repository format"
+            )
+        owner, repository = normalized.split("/", 1)
+        repository = repository.removesuffix(".git")
+        if not owner or not repository:
+            raise RepositoryNotFoundException("GitHub repository is invalid")
+        return f"{owner}/{repository}"
+
+    def _validate_pr_target(self, head: str, base: str) -> tuple[str, str]:
+        normalized_head = head.strip()
+        normalized_base = base.strip()
+
+        if not normalized_head or not normalized_base:
+            raise UnsafePullRequestTargetException(
+                "both head and base branches are required"
+            )
+        if normalized_head == normalized_base:
+            raise UnsafePullRequestTargetException(
+                "head and base branches must differ"
+            )
+        if normalized_head in self.protected_head_branches:
+            raise UnsafePullRequestTargetException(
+                f"automation cannot use protected head branch: {normalized_head}"
+            )
+        if normalized_base not in self.allowed_base_branches:
+            raise UnsafePullRequestTargetException(
+                f"base branch is not allowlisted: {normalized_base}"
+            )
+        return normalized_head, normalized_base
 
     def verify_credentials(self) -> bool:
-        if not self.oauth_token:
-            return False
-        headers = {
-            "Authorization": f"token {self.oauth_token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        resp = requests.get("https://api.github.com/user", headers=headers)
-        return resp.status_code == 200
+        self._require_token()
+        response = requests.get(
+            f"{self.api_base_url}/user",
+            headers=self._headers,
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code == 401:
+            raise InvalidGitHubTokenException(
+                "The provided GitHub OAuth token is invalid or expired."
+            )
+        return response.status_code == 200
 
-    def create_pull_request(self, repo_slug: str, branch: str, title: str, body: str, draft: bool = True) -> str:
-        logger.info(f"Opening automated {'DRAFT ' if draft else ''}Pull Request on slug '{repo_slug}' targeting changes in '{branch}'")
-        if not self.oauth_token:
-            logger.warning("No GitHub configuration key provided. Bypassing upstream REST push.")
-            return "https://github.com/production/ops-control/pull/1842"
-            
-        endpoint = f"https://api.github.com/repos/{repo_slug}/pulls"
-        headers = {
-            "Authorization": f"token {self.oauth_token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
+    def create_pull_request(
+        self,
+        repo_slug: str,
+        branch: str,
+        title: str,
+        body: str,
+        draft: bool = True,
+        base: Optional[str] = None,
+    ) -> str:
+        self._require_token()
+        repo = self._validate_repo_slug(repo_slug)
+        head, target_base = self._validate_pr_target(
+            branch,
+            base or os.getenv("GITHUB_DEFAULT_BASE_BRANCH", "main"),
+        )
+
+        if not title.strip():
+            raise PRCreationFailedException("pull request title must not be empty")
+
         payload = {
-            "title": title,
+            "title": title.strip(),
             "body": body,
-            "head": branch,
-            "base": "main",
-            "draft": draft
+            "head": head,
+            "base": target_base,
+            "draft": bool(draft),
+            "maintainer_can_modify": False,
         }
-        
+
         try:
-            response = requests.post(endpoint, json=payload, headers=headers, timeout=30)
-            if response.status_code == 401:
-                raise InvalidGitHubTokenException("The provided GitHub OAuth token is invalid or expired.")
-            elif response.status_code == 404:
-                raise RepositoryNotFoundException(f"Target repository slug {repo_slug} was not found on GitHub.")
-            elif response.status_code != 201:
-                raise PRCreationFailedException(f"Failed to compile GitHub PR: {response.text}")
-                
+            response = requests.post(
+                f"{self.api_base_url}/repos/{repo}/pulls",
+                json=payload,
+                headers=self._headers,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise PRCreationFailedException(
+                "network failure while communicating with GitHub API"
+            ) from exc
+
+        if response.status_code == 401:
+            raise InvalidGitHubTokenException(
+                "The provided GitHub OAuth token is invalid or expired."
+            )
+        if response.status_code == 404:
+            raise RepositoryNotFoundException(
+                f"Target repository {repo} was not found on GitHub."
+            )
+        if response.status_code != 201:
+            raise PRCreationFailedException(
+                f"GitHub rejected pull request creation with HTTP {response.status_code}"
+            )
+
+        try:
             data = response.json()
-            return data.get("html_url", "https://github.com/production/ops-control/pull/1842")
-        except requests.RequestException as e:
-            raise PRCreationFailedException(f"Network failure while communicating with GitHub API: {e}")
+        except ValueError as exc:
+            raise PRCreationFailedException(
+                "GitHub returned invalid JSON after creating the pull request"
+            ) from exc
+
+        url = data.get("html_url")
+        if not isinstance(url, str) or not url.startswith("https://github.com/"):
+            raise PRCreationFailedException(
+                "GitHub response did not contain a valid pull request URL"
+            )
+        return url
 
     def mark_pr_ready_for_review(self, repo_slug: str, pr_number: int) -> bool:
-        """Removes Draft status from a PR making it visible to core maintainers."""
-        if not self.oauth_token:
-            return True
-        endpoint = f"https://api.github.com/repos/{repo_slug}/pulls/{pr_number}/requested_reviewers"
-        headers = {
-            "Authorization": f"token {self.oauth_token}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        # In mock setups we pass logs
-        logger.info(f"Requesting reviewer status transition for PR #{pr_number} in {repo_slug}")
-        return True
+        """Transition a draft PR to ready only when explicitly enabled."""
+        self._require_token()
+        if os.getenv("GITHUB_ALLOW_READY_FOR_REVIEW", "false").lower() != "true":
+            raise UnsafePullRequestTargetException(
+                "ready-for-review transition is disabled by policy"
+            )
+        if pr_number <= 0:
+            raise ValueError("pr_number must be positive")
 
+        repo = self._validate_repo_slug(repo_slug)
+        try:
+            response = requests.patch(
+                f"{self.api_base_url}/repos/{repo}/pulls/{pr_number}",
+                json={"draft": False},
+                headers=self._headers,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise PRCreationFailedException(
+                "network failure while updating GitHub pull request"
+            ) from exc
+
+        if response.status_code == 401:
+            raise InvalidGitHubTokenException(
+                "The provided GitHub OAuth token is invalid or expired."
+            )
+        if response.status_code == 404:
+            raise RepositoryNotFoundException(
+                f"Pull request #{pr_number} or repository {repo} was not found."
+            )
+        if response.status_code != 200:
+            raise PRCreationFailedException(
+                f"GitHub rejected ready-for-review transition with HTTP {response.status_code}"
+            )
+        return True
