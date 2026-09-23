@@ -70,6 +70,7 @@ def analyze_repository_task(repo_id: int):
         repo.k8s_yaml = artifacts["k8s_yaml"]
         repo.terraform_tf = artifacts["terraform_tf"]
         repo.pipeline_yaml = artifacts["pipeline_yaml"]
+        repo.source_revision = json.dumps(analysis.get("source_revision") or {}, sort_keys=True)
         repo.analysis_report = (
             f"Repository intelligence: {analysis.get('total_files', 0)} bounded source files inspected. "
             f"Recent commits: {len(analysis.get('recent_commits', []))}. "
@@ -111,6 +112,7 @@ def deploy_application_task(repo_id: int):
             "k8s_yaml": repo.k8s_yaml or "",
             "terraform_tf": repo.terraform_tf or "",
             "pipeline_yaml": repo.pipeline_yaml or "",
+            "source_revision": json.loads(repo.source_revision or "{}"),
         }
 
         response = requests.post(
