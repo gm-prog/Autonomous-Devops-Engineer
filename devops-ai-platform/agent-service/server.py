@@ -1,3 +1,4 @@
+import json
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -54,7 +55,6 @@ Do not include Markdown fences around the JSON. Do not invent application ports 
             prompt,
             "You are a senior DevOps architect. Produce conservative, reviewable infrastructure artifacts."
         )
-        import json
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
