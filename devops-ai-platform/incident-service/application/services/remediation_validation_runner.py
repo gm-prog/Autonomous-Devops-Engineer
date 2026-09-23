@@ -249,6 +249,11 @@ class RemediationValidationRunner:
         for reader in readers:
             reader.join(timeout=2.0)
 
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
+
         exit_code = process.returncode if process.returncode is not None else -signal.SIGKILL
         output_truncated = stdout_truncated[0] or stderr_truncated[0]
 
