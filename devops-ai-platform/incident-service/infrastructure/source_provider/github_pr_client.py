@@ -259,6 +259,33 @@ class GitHubPRClient:
                 "remote commit parent does not match the pinned source SHA"
             )
 
+        ref_url = f"{self.api_base_url}/repos/{repo}/git/ref/heads/{normalized_branch}"
+        existing = requests.get(
+            ref_url,
+            headers=self._headers,
+            timeout=self.timeout_seconds,
+        )
+        if existing.status_code == 200:
+            try:
+                existing_sha = existing.json().get("object", {}).get("sha", "").lower()
+            except ValueError as exc:
+                raise PRCreationFailedException(
+                    "GitHub returned invalid existing branch JSON"
+                ) from exc
+            if existing_sha == normalized_commit:
+                return f"https://github.com/{repo}/tree/{normalized_branch}"
+            raise PRCreationFailedException(
+                "remediation branch already exists at a different commit"
+            )
+        if existing.status_code not in {404}:
+            if existing.status_code == 401:
+                raise InvalidGitHubTokenException(
+                    "The provided GitHub OAuth token is invalid or expired."
+                )
+            raise PRCreationFailedException(
+                f"GitHub rejected branch existence check with HTTP {existing.status_code}"
+            )
+
         try:
             response = requests.post(
                 f"{self.api_base_url}/repos/{repo}/git/refs",
