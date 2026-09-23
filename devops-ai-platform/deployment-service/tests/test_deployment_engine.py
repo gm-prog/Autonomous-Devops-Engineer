@@ -43,6 +43,11 @@ VALID_PAYLOAD = {
     "k8s_yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: demo\nspec:\n  template:\n    spec:\n      containers:\n        - name: demo\n          image: demo:latest\n",
     "terraform_tf": 'terraform { required_version = ">= 1.5.0" }\n',
     "pipeline_yaml": "name: ci\n",
+    "source_revision": {
+        "head_sha": "a" * 40,
+        "commits": [{"sha": "a" * 40, "subject": "deploy change", "files_changed_count": 1}],
+        "summary": {"commit_count": 1, "files_changed": 1, "additions": 10, "deletions": 2},
+    },
 }
 
 
@@ -90,3 +95,19 @@ def test_approved_execution_reaches_deployed(monkeypatch):
     assert completed.state == DeploymentState.DEPLOYED
     assert completed.execution["terraform_applied"] is True
     assert completed.execution["kubernetes_applied"] is True
+
+
+def test_source_revision_is_persisted_and_bound_to_plan_hash():
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    assert run.source_revision["head_sha"] == "a" * 40
+    assert run.source_revision["summary"]["files_changed"] == 1
+    assert len(run.plan_hash) == 64
+
+
+def test_source_revision_changes_plan_hash():
+    first = build_engine().create_dry_run(VALID_PAYLOAD)
+    changed = dict(VALID_PAYLOAD)
+    changed["source_revision"] = dict(VALID_PAYLOAD["source_revision"], head_sha="b" * 40)
+    second = build_engine().create_dry_run(changed)
+    assert first.plan_hash != second.plan_hash
