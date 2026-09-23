@@ -5,7 +5,6 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from application.dependencies import get_incident_repository
 from domain.aggregates.incident import IncidentAggregate
 from domain.entities.incident_evidence import IncidentEvidence
 from infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
@@ -16,7 +15,7 @@ class RcaOrchestrationTests(unittest.TestCase):
     def test_rca_result_is_persisted_as_evidence_and_advances_state(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = PostgresIncidentRepositoryAdapter(
-                f"sqlite:///{os.path.join(temp_dir, "incidents.db")}"
+                f"sqlite:///{os.path.join(temp_dir, 'incidents.db')}"
             )
             incident = IncidentAggregate("inc-rca", "CPU breach", "CRITICAL", "gateway CPU")
             incident.move_to_triage()
