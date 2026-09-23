@@ -17,6 +17,16 @@ def _serialize_incident(incident) -> Dict[str, Any]:
         "status": incident.status,
         "context": incident.context,
         "created_at": incident.created_at.isoformat(),
+        "evidence": [
+            {
+                "id": evidence.id,
+                "kind": evidence.kind,
+                "source": evidence.source,
+                "observed_at": evidence.observed_at.isoformat(),
+                "payload": dict(evidence.payload),
+            }
+            for evidence in incident.evidence
+        ],
         "patch_proposals": [
             {
                 "id": proposal.id,
