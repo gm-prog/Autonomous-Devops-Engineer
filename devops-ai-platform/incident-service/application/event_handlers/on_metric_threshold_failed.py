@@ -1,5 +1,8 @@
 import logging
+from datetime import datetime, timezone
 from typing import Any, Mapping
+
+from domain.entities.incident_evidence import IncidentEvidence
 
 from application.commands.ingest_webhook_alert import (
     IngestWebhookAlertCommand,
@@ -39,6 +42,27 @@ class OnMetricThresholdFailedHandler:
             or "high"
         ).upper()
 
+        observed_at = _parse_timestamp(event.get("timestamp"))
+
+        evidence = IncidentEvidence(
+            kind="threshold_breach",
+            source="monitoring-service",
+            observed_at=observed_at,
+            payload={
+                "event_id": str(event.get("event_id", "")),
+                "event_type": str(event.get("event_type", "ThreatThresholdExceededEvent")),
+                "service": aggregate_id,
+                "metric": metric,
+                "value": value,
+                "threshold": threshold,
+                "operator": operator,
+                "severity": severity,
+                "breach_count": payload.get("breach_count", len(breaches)),
+                "breaches": breaches,
+                "metrics": payload.get("metrics") or {},
+            },
+        )
+
         command = IngestWebhookAlertCommand(
             raw_source="prometheus-alert",
             alert_name=f"{metric}-threshold-breached",
@@ -49,6 +73,7 @@ class OnMetricThresholdFailedHandler:
                 f"threshold={operator} {threshold}; "
                 f"breach_count={payload.get('breach_count', len(breaches))}"
             ),
+            evidence=[evidence],
         )
 
         logger.warning(
@@ -58,3 +83,14 @@ class OnMetricThresholdFailedHandler:
             severity,
         )
         return self.triage.handle(command)
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.warning("Invalid monitoring event timestamp=%r; using ingestion time", raw)
+    return datetime.now(timezone.utc)
