@@ -53,6 +53,9 @@ services:
       - REDIS_PORT=6379
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      - REPO_SERVICE_URL=http://repo-service:8010
+      - AGENT_SERVICE_URL=http://agent-service:8020
+      - DEPLOYMENT_SERVICE_URL=http://deployment-service:8030
     depends_on:
       db:
         condition: service_healthy
@@ -74,9 +77,97 @@ services:
       - REDIS_PORT=6379
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      - REPO_SERVICE_URL=http://repo-service:8010
+      - AGENT_SERVICE_URL=http://agent-service:8020
     depends_on:
       - redis
       - db
+      - repo-service
+      - agent-service
+
+  repo-service:
+    build:
+      context: ./devops-ai-platform/repo-service
+      dockerfile: Dockerfile
+    container_name: devops_repo_service
+    ports:
+      - "8010:8010"
+
+  agent-service:
+    build:
+      context: ./devops-ai-platform/agent-service
+      dockerfile: Dockerfile
+    container_name: devops_agent_service
+    ports:
+      - "8020:8020"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MONTHLY_BUDGET_USD=${GEMINI_MONTHLY_BUDGET_USD:-100}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.5-flash}
+
+  deployment-service:
+    build:
+      context: ./devops-ai-platform/deployment-service
+      dockerfile: Dockerfile
+    container_name: devops_deployment_service
+    ports:
+      - "8030:8030"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+
+  monitoring-service:
+    build:
+      context: ./devops-ai-platform/monitoring-service
+      dockerfile: Dockerfile
+    container_name: devops_monitoring_service
+    ports:
+      - "8040:8040"
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+      - PROMETHEUS_TIMEOUT_SECONDS=5
+      - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+      - EVENT_BUS_STREAM=devops:events
+    depends_on:
+      - prometheus
+      - redis
+
+  incident-service:
+    build:
+      context: ./devops-ai-platform/incident-service
+      dockerfile: Dockerfile
+    container_name: devops_incident_service
+    ports:
+      - "8050:8050"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/devops_prod
+      - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+      - EVENT_BUS_STREAM=devops:events
+      - INCIDENT_EVENT_GROUP=incident-service
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  incident-event-worker:
+    build:
+      context: ./devops-ai-platform/incident-service
+      dockerfile: Dockerfile
+    container_name: devops_incident_event_worker
+    command: python worker.py
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/devops_prod
+      - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+      - EVENT_BUS_STREAM=devops:events
+      - INCIDENT_EVENT_GROUP=incident-service
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
 
   # --- OBSERVABILITY AND MONITORING STACK ---
   prometheus:
