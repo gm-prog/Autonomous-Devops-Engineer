@@ -1,3 +1,4 @@
+import json
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -54,7 +55,6 @@ Do not include Markdown fences around the JSON. Do not invent application ports 
             prompt,
             "You are a senior DevOps architect. Produce conservative, reviewable infrastructure artifacts."
         )
-        import json
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -73,13 +73,13 @@ code changes, infrastructure facts, or causal links that are not supported by
 the evidence.
 
 Return ONLY valid JSON with exactly these keys:
-{
+{{
   "root_cause": "concise evidence-grounded root cause",
   "confidence": 0.0,
   "supporting_evidence_ids": ["..."],
   "contributing_factors": ["..."],
   "recommended_next_actions": ["..."]
-}
+}}
 
 Rules:
 - confidence must be a number from 0.0 to 1.0.

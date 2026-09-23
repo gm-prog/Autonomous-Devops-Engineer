@@ -2,9 +2,9 @@ import json
 import unittest
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
-from server import app
+from server import RcaRequest, analyze_rca
 
 
 class FakeLLM:
@@ -37,13 +37,8 @@ class RcaEndpointTests(unittest.TestCase):
         }
 
         with patch("server.llm", FakeLLM()):
-            response = TestClient(app).post(
-                "/api/internal/analyze-rca",
-                json={"evidence_pack": pack},
-            )
+            body = analyze_rca(RcaRequest(evidence_pack=pack))
 
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
         self.assertEqual(body["supporting_evidence_ids"], ["ev-1"])
         self.assertEqual(body["confidence"], 0.8)
 
@@ -60,12 +55,10 @@ class RcaEndpointTests(unittest.TestCase):
                 return json.dumps(result)
 
         with patch("server.llm", InvalidLLM()):
-            response = TestClient(app).post(
-                "/api/internal/analyze-rca",
-                json={"evidence_pack": pack},
-            )
+            with self.assertRaises(HTTPException) as context:
+                analyze_rca(RcaRequest(evidence_pack=pack))
 
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(context.exception.status_code, 502)
 
 
 if __name__ == "__main__":

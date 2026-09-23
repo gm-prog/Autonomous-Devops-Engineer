@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from application.dependencies import get_incident_repository
 from domain.repository_interface import IncidentRepositoryPort
+from domain.entities.incident_evidence import IncidentEvidence
+from infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
 from application.services.rca_evidence_pack import RcaEvidencePackBuilder
 
 
@@ -69,3 +71,48 @@ def get_rca_evidence_pack(
         return RcaEvidencePackBuilder(repository).build(incident_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{incident_id}/rca", response_model=Dict[str, Any])
+def investigate_root_cause(
+    incident_id: str,
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Build evidence, invoke the RCA agent, then persist the validated RCA."""
+    try:
+        pack = RcaEvidencePackBuilder(repository).build(incident_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    try:
+        result = RcaAgentClient().analyze(pack)
+    except (RcaAgentUnavailable, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    valid_ids = {item["evidence_id"] for item in pack["evidence"]["timeline"]}
+    cited_ids = result.get("supporting_evidence_ids", [])
+    if not isinstance(cited_ids, list) or not all(item in valid_ids for item in cited_ids):
+        raise HTTPException(status_code=502, detail="RCA agent returned invalid evidence references")
+
+    incident = repository.get_incident_by_id(incident_id.strip())
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    incident.attach_evidence(IncidentEvidence(
+        id=f"rca-{incident.id}",
+        kind="rca_result",
+        source="agent-service",
+        payload=result,
+    ))
+    incident.move_to_triage()
+    incident.mark_root_cause_found()
+    repository.save_incident(incident)
+
+    return {
+        "incident_id": incident.id,
+        "status": incident.status,
+        "rca": result,
+        "evidence_pack_version": pack["pack_version"],
+    }
