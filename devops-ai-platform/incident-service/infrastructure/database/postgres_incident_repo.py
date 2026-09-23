@@ -151,7 +151,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             "payload": json.dumps(dict(evidence.payload)),
         }
 
-    def _from_row(row, evidence: Optional[List[IncidentEvidence]] = None) -> IncidentAggregate:
+    def _from_row(self, row, evidence: Optional[List[IncidentEvidence]] = None) -> IncidentAggregate:
         incident = IncidentAggregate(
             id=row["id"],
             title=row["title"],
