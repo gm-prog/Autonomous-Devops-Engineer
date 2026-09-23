@@ -5,6 +5,7 @@ from datetime import timezone
 
 from domain.aggregates.incident import IncidentAggregate
 from domain.entities.hotfix_proposal import HotfixProposal
+from domain.entities.incident_evidence import IncidentEvidence
 from infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
 
 
@@ -21,6 +22,12 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
                 context_details="Service=gateway; metric=cpu_percent; value=95.0",
             )
             incident.move_to_triage()
+            incident.attach_evidence(IncidentEvidence(
+                id="evidence-1",
+                kind="threshold_breach",
+                source="monitoring-service",
+                payload={"metric": "cpu_percent", "value": 95.0},
+            ))
             repository.save_incident(incident)
 
             restored = repository.get_incident_by_id("incident-1")
@@ -30,6 +37,9 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
             self.assertEqual(restored.severity, "CRITICAL")
             self.assertEqual(restored.status, "Triage")
             self.assertEqual(restored.context, incident.context)
+            self.assertEqual(len(restored.evidence), 1)
+            self.assertEqual(restored.evidence[0].id, "evidence-1")
+            self.assertEqual(restored.evidence[0].payload["value"], 95.0)
             self.assertEqual(restored.created_at.tzinfo, timezone.utc)
             self.assertEqual(restored.domain_events, [])
 
