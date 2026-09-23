@@ -2,10 +2,11 @@ import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, Text, create_engine, select, update
+from sqlalchemy import Column, DateTime, ForeignKey, MetaData, String, Table, Text, create_engine, delete, select, update
 
 from domain.aggregates.incident import IncidentAggregate
 from domain.entities.hotfix_proposal import HotfixProposal
+from domain.entities.incident_evidence import IncidentEvidence
 from domain.repository_interface import IncidentRepositoryPort
 
 
@@ -23,6 +24,16 @@ incidents_table = Table(
     Column("patch_proposals", Text, nullable=False, default="[]"),
 )
 
+evidence_table = Table(
+    "devops_incident_evidence",
+    metadata,
+    Column("id", String(64), primary_key=True),
+    Column("incident_id", String(64), ForeignKey("devops_incidents.id"), nullable=False, index=True),
+    Column("kind", String(64), nullable=False),
+    Column("source", String(128), nullable=False),
+    Column("observed_at", DateTime(timezone=True), nullable=False),
+    Column("payload", Text, nullable=False),
+)
 
 class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
     """Persists incident aggregates without leaking database concerns into the domain."""
@@ -56,13 +67,26 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             else:
                 connection.execute(incidents_table.insert().values(**values))
 
+            connection.execute(
+                delete(evidence_table).where(evidence_table.c.incident_id == incident.id)
+            )
+            if incident.evidence:
+                connection.execute(
+                    evidence_table.insert(),
+                    [self._evidence_row(incident.id, item) for item in incident.evidence],
+                )
+
     def get_incident_by_id(self, id: str) -> Optional[IncidentAggregate]:
         with self.engine.connect() as connection:
             row = connection.execute(
                 select(incidents_table).where(incidents_table.c.id == id)
             ).mappings().first()
 
-        return self._from_row(row) if row else None
+        if not row:
+            return None
+
+        evidence = self._get_evidence(id)
+        return self._from_row(row, evidence)
 
     def get_active_incidents(self) -> List[IncidentAggregate]:
         with self.engine.connect() as connection:
@@ -72,7 +96,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 .order_by(incidents_table.c.created_at.desc())
             ).mappings().all()
 
-        return [self._from_row(row) for row in rows]
+        return [self._from_row(row, self._get_evidence(row["id"])) for row in rows]
 
     @staticmethod
     def _to_row(incident: IncidentAggregate) -> dict:
@@ -98,7 +122,37 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
         }
 
     @staticmethod
-    def _from_row(row) -> IncidentAggregate:
+    def _get_evidence(self, incident_id: str) -> List[IncidentEvidence]:
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(evidence_table)
+                .where(evidence_table.c.incident_id == incident_id)
+                .order_by(evidence_table.c.observed_at.asc(), evidence_table.c.id.asc())
+            ).mappings().all()
+
+        return [
+            IncidentEvidence(
+                id=item["id"],
+                kind=item["kind"],
+                source=item["source"],
+                observed_at=_normalize_created_at(item["observed_at"]),
+                payload=json.loads(item["payload"] or "{}"),
+            )
+            for item in rows
+        ]
+
+    @staticmethod
+    def _evidence_row(incident_id: str, evidence: IncidentEvidence) -> dict:
+        return {
+            "id": evidence.id,
+            "incident_id": incident_id,
+            "kind": evidence.kind,
+            "source": evidence.source,
+            "observed_at": evidence.observed_at,
+            "payload": json.dumps(dict(evidence.payload)),
+        }
+
+    def _from_row(row, evidence: Optional[List[IncidentEvidence]] = None) -> IncidentAggregate:
         incident = IncidentAggregate(
             id=row["id"],
             title=row["title"],
@@ -108,6 +162,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
         incident.created_at = _normalize_created_at(row["created_at"])
         incident.status = row["status"]
         incident.domain_events = []
+        incident.evidence = list(evidence or [])
 
         proposals = json.loads(row["patch_proposals"] or "[]")
         incident.patch_proposals = [
