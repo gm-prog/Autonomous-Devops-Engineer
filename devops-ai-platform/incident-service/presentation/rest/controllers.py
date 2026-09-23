@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from application.dependencies import get_incident_repository
 from domain.repository_interface import IncidentRepositoryPort
+from application.services.rca_evidence_pack import RcaEvidencePackBuilder
 
 
 router = APIRouter(prefix="/incidents", tags=["Active Incidents Controller"])
@@ -56,3 +57,15 @@ def get_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
     return _serialize_incident(incident)
+
+
+@router.get("/{incident_id}/rca/evidence", response_model=Dict[str, Any])
+def get_rca_evidence_pack(
+    incident_id: str,
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Returns the deterministic evidence package consumed by future RCA agents."""
+    try:
+        return RcaEvidencePackBuilder(repository).build(incident_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
