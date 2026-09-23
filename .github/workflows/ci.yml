@@ -60,7 +60,7 @@ jobs:
         working-directory: devops-ai-platform/incident-service
         env:
           PYTHONPATH: .
-        run: python -m unittest infrastructure.database.test_postgres_incident_repo application.event_handlers.test_on_metric_threshold_failed -v
+        run: python -m unittest infrastructure.database.test_postgres_incident_repo application.event_handlers.test_on_metric_threshold_failed application.commands.test_attach_deployment_evidence infrastructure.deployment.test_deployment_evidence_collector -v
 
   deployment-service:
     name: Deployment service checks
