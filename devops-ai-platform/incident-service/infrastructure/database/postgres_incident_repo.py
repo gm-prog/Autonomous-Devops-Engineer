@@ -107,6 +107,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 "diff_patch_payload": proposal.diff_patch_payload,
                 "is_verified": proposal.is_verified,
                 "generated_at": proposal.generated_at.isoformat(),
+                "pull_request_url": proposal.pull_request_url,
             }
             for proposal in incident.patch_proposals
         ]
@@ -171,6 +172,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 diff_patch_payload=item["diff_patch_payload"],
                 is_verified=bool(item.get("is_verified", False)),
                 generated_at=datetime.fromisoformat(item["generated_at"]),
+                pull_request_url=item.get("pull_request_url"),
             )
             for item in proposals
         ]
