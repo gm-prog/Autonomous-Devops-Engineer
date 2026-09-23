@@ -1,0 +1,236 @@
+# Remediation patch 04 - see README.md in this directory
+# Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
+# Apply from the repository root:  git apply 04-api-gateway-real-jwt.patch
+
+--- a/devops-ai-platform/api-gateway/config/__init__.py
++++ b/devops-ai-platform/api-gateway/config/__init__.py
+@@ -1,9 +1,26 @@
++import logging
+ import os
+ 
++# Committed development-only fallback. Using it outside local dev is a
++# security hole: anyone reading the repo can mint valid admin tokens.
++_DEV_FALLBACK_SECRET = "super-secret-devops-platform-signature-token"
++
++
+ class GatewaySettings:
+     """API Gateway specific environmental variables and JWT authenticators."""
+-    JWT_SECRET: str = os.getenv("JWT_SECRET", "super-secret-devops-platform-signature-token")
++    JWT_SECRET: str = os.getenv("JWT_SECRET", _DEV_FALLBACK_SECRET)
+     RATE_LIMIT_MAX_REQUESTS: int = int(os.getenv("RATE_LIMIT_MAX_REQUESTS", 100)) # per minute
++
++    @classmethod
++    def using_dev_fallback_secret(cls) -> bool:
++        return cls.JWT_SECRET == _DEV_FALLBACK_SECRET
++
++
++if GatewaySettings.using_dev_fallback_secret():
++    logging.getLogger("GatewayConfig").warning(
++        "JWT_SECRET is not set - falling back to the committed development secret. "
++        "Set a strong JWT_SECRET before exposing this gateway beyond local dev."
++    )
+     
+     # Downstream Internal gRPC connection coordinates
+     REPO_SERVICE_GRPC: str = os.getenv("REPO_SERVICE_GRPC", "repo-service:50051")
+--- a/devops-ai-platform/api-gateway/core/auth.py
++++ b/devops-ai-platform/api-gateway/core/auth.py
+@@ -1,36 +1,179 @@
++"""
++Real HS256 JWT authentication for the operator platform gateway.
++
++The previous implementation accepted ANY token of length >= 10 as a valid
++identity (and a hardcoded literal as admin) - authorization was an illusion.
++This module verifies properly signed tokens instead:
++
++* tokens are signed with the `JWT_SECRET` environment variable (the secret
++  that was declared in config but never actually used);
++* tokens carry `sub`, `roles`, `iat` and `exp` claims;
++* expired or badly signed tokens are rejected with 401.
++
++Dev workflow: mint a token with
++
++    python -m api_gateway.core.auth <subject> [Role1 Role2 ...]
++
++and pass it as `Authorization: Bearer <token>`.
++
++Only stdlib crypto (hmac/hashlib/base64/json) is used - no extra dependency.
++"""
++
++import base64
++import hashlib
++import hmac
++import json
++import logging
++import sys
+ import time
+-from fastapi import Request, HTTPException, Security
+-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
++
++from fastapi import HTTPException, Security
++from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
++
+ from ..config import GatewaySettings
+ 
++logger = logging.getLogger("GatewayAuth")
++
+ security_bearer = HTTPBearer()
+ 
+-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security_bearer)) -> dict:
+-    """Verifies incoming JWT signatures validating client identity credentials."""
++_TOKEN_TTL_SECONDS = 3600
++
++
++# ---------------------------------------------------------------------------
++# HS256 primitives (stdlib only)
++# ---------------------------------------------------------------------------
++
++def _b64url_encode(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
++
++
++def _b64url_decode(data: str) -> bytes:
++    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
++
++
++def _sign(header_b64: str, payload_b64: str, secret: str) -> str:
++    digest = hmac.new(
++        secret.encode("utf-8"),
++        f"{header_b64}.{payload_b64}".encode("utf-8"),
++        hashlib.sha256,
++    ).digest()
++    return _b64url_encode(digest)
++
++
++def mint_token(
++    subject: str,
++    roles: list[str] | None = None,
++    secret: str | None = None,
++    ttl_seconds: int = _TOKEN_TTL_SECONDS,
++) -> str:
++    """Create a signed HS256 JWT. Used by the dev CLI and by tests."""
++    secret = secret or GatewaySettings.JWT_SECRET
++    now = int(time.time())
++    header = {"alg": "HS256", "typ": "JWT"}
++    payload = {
++        "sub": subject,
++        "roles": roles or ["Developer"],
++        "iat": now,
++        "exp": now + ttl_seconds,
++    }
++    h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
++    p = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
++    return f"{h}.{p}.{_sign(h, p, secret)}"
++
++
++def decode_and_verify(token: str, secret: str) -> dict:
++    """Verify signature + expiry. Raises ValueError on any failure."""
++    parts = token.split(".")
++    if len(parts) != 3:
++        raise ValueError("malformed token structure")
++    header_b64, payload_b64, signature = parts
++
++    expected = _sign(header_b64, payload_b64, secret)
++    if not hmac.compare_digest(signature, expected):
++        raise ValueError("token signature verification failed")
++
++    try:
++        payload = json.loads(_b64url_decode(payload_b64))
++    except (ValueError, TypeError) as exc:
++        raise ValueError("token payload is not valid JSON") from exc
++
++    if int(payload.get("exp", 0)) < int(time.time()):
++        raise ValueError("token expired")
++    return payload
++
++
++# ---------------------------------------------------------------------------
++# FastAPI dependency
++# ---------------------------------------------------------------------------
++
++def verify_token(
++    credentials: HTTPAuthorizationCredentials = Security(security_bearer),
++) -> dict:
++    """Verifies the incoming JWT signature and returns the identity claims."""
+     token = credentials.credentials
+-    # Mock decoding logic
+-    if token == "mock-devops-admin-token-1842":
+-        return {"sub": "admin", "roles": ["DevOpsLead", "ClusterAdmin"]}
+-    
+-    if len(token) < 10:
+-        raise HTTPException(status_code=401, detail="Invalid token signature")
+-        
+-    return {"sub": "user", "roles": ["Developer"]}
++    try:
++        payload = decode_and_verify(token, GatewaySettings.JWT_SECRET)
++    except ValueError as exc:
++        logger.warning("JWT rejected: %s", exc)
++        raise HTTPException(status_code=401, detail="Invalid or expired token signature")
++    return {"sub": payload.get("sub", "unknown"), "roles": payload.get("roles", [])}
++
++
++# ---------------------------------------------------------------------------
++# Bounded sliding-window rate limiter
++# ---------------------------------------------------------------------------
+ 
+ class GatewayRateLimiter:
+-    """Simple Sliding-window memory rate limiter safeguarding downstream microservices."""
++    """Sliding-window in-memory rate limiter safeguarding downstream services.
++
++    The history dict is pruned once it exceeds `_MAX_TRACKED_CLIENTS` so a
++    flood of distinct client IPs cannot grow it without bound.
++    """
++
++    _MAX_TRACKED_CLIENTS = 10_000
++    _WINDOW_SECONDS = 60
++
+     def __init__(self):
+-        self.history = {}
++        self.history: dict[str, list[float]] = {}
++
++    def _prune_stale(self, now: float) -> None:
++        if len(self.history) <= self._MAX_TRACKED_CLIENTS:
++            return
++        stale = [
++            ip
++            for ip, requests in self.history.items()
++            if not requests or now - requests[-1] > self._WINDOW_SECONDS
++        ]
++        for ip in stale:
++            del self.history[ip]
+ 
+     def is_rate_limited(self, client_ip: str) -> bool:
+         now = time.time()
+-        requests = self.history.get(client_ip, [])
+-        # Filter requests in the last 60 seconds
+-        requests = [req for req in requests if now - req < 60]
++        self._prune_stale(now)
++
++        requests = [
++            t for t in self.history.get(client_ip, [])
++            if now - t < self._WINDOW_SECONDS
++        ]
+         self.history[client_ip] = requests
+-        
++
+         if len(requests) >= GatewaySettings.RATE_LIMIT_MAX_REQUESTS:
+             return True
+-            
+-        self.history[client_ip].append(now)
++
++        requests.append(now)
+         return False
++
++
++if __name__ == "__main__":
++    # Dev token minter:
++    #   python -m api_gateway.core.auth devops-operator DevOpsLead
++    if len(sys.argv) < 2:
++        print("usage: python -m api_gateway.core.auth <subject> [Role1 Role2 ...]")
++        print("example: python -m api_gateway.core.auth devops-operator DevOpsLead")
++        sys.exit(1)
++    subject = sys.argv[1]
++    roles = sys.argv[2:] or ["Developer"]
++    if not GatewaySettings.JWT_SECRET:
++        print("error: JWT_SECRET is not set", file=sys.stderr)
++        sys.exit(1)
++    print(mint_token(subject, roles))
