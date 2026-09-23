@@ -1,7 +1,7 @@
 import uuid
 
-from ...domain.aggregates.incident import IncidentAggregate
-from ...domain.repository_interface import IncidentRepositoryPort
+from domain.aggregates.incident import IncidentAggregate
+from domain.repository_interface import IncidentRepositoryPort
 
 
 class IngestWebhookAlertCommand:
@@ -20,7 +20,7 @@ class IngestWebhookAlertCommand:
 
 
 class IngestWebhookAlertCommandHandler:
-    """Turns external alert-shaped commands into persisted incident aggregates."""
+    """Turns external alert-shaped commands into incident aggregates."""
 
     def __init__(self, persistence: IncidentRepositoryPort):
         self.repo = persistence
