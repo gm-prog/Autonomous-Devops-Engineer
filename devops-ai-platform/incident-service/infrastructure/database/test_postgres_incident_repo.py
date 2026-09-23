@@ -46,7 +46,13 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
             proposal = HotfixProposal(
                 id="patch-1",
                 target_filepath="app.py",
-                diff_patch_payload="""--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old()\n+new()\n""",
+                diff_patch_payload="""--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-old()
++new()
+""",
+                source_sha="b" * 40,
             )
             proposal.apply_verification_pass()
             incident.attach_verified_patch(proposal)
@@ -58,6 +64,7 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
             self.assertEqual(len(updated.patch_proposals), 1)
             self.assertEqual(updated.patch_proposals[0].id, "patch-1")
             self.assertTrue(updated.patch_proposals[0].is_verified)
+            self.assertEqual(updated.patch_proposals[0].source_sha, "b" * 40)
 
     def test_active_incidents_excludes_resolved_states(self):
         with tempfile.TemporaryDirectory() as temp_dir:

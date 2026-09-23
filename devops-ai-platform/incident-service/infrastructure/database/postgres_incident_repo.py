@@ -108,6 +108,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 "is_verified": proposal.is_verified,
                 "generated_at": proposal.generated_at.isoformat(),
                 "pull_request_url": proposal.pull_request_url,
+                "source_sha": proposal.source_sha,
             }
             for proposal in incident.patch_proposals
         ]
@@ -173,6 +174,7 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 is_verified=bool(item.get("is_verified", False)),
                 generated_at=datetime.fromisoformat(item["generated_at"]),
                 pull_request_url=item.get("pull_request_url"),
+                source_sha=item.get("source_sha"),
             )
             for item in proposals
         ]

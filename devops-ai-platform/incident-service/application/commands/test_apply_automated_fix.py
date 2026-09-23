@@ -16,6 +16,8 @@ PATCH = """--- a/src/service.py
 +new()
 """
 
+SOURCE_SHA = "a" * 40
+
 
 class FakeRepository:
     def __init__(self):
@@ -52,6 +54,7 @@ class ApplyAutomatedFixTests(unittest.TestCase):
                 PATCH,
                 repository_slug="owner/repo",
                 source_branch="automation/fix-inc-1",
+                source_sha=SOURCE_SHA,
             )
         )
 
@@ -60,6 +63,7 @@ class ApplyAutomatedFixTests(unittest.TestCase):
         self.assertEqual(len(repository.incident.patch_proposals), 1)
         proposal = repository.incident.patch_proposals[0]
         self.assertTrue(proposal.is_verified)
+        self.assertEqual(proposal.source_sha, SOURCE_SHA)
         self.assertEqual(proposal.pull_request_url, "https://github.com/owner/repo/pull/42")
         self.assertTrue(github.calls[0]["draft"])
         self.assertEqual(repository.saved, 1)
@@ -76,6 +80,7 @@ class ApplyAutomatedFixTests(unittest.TestCase):
                 "not a unified diff",
                 repository_slug="owner/repo",
                 source_branch="automation/fix-inc-1",
+                source_sha=SOURCE_SHA,
             )
         )
 
@@ -94,11 +99,30 @@ class ApplyAutomatedFixTests(unittest.TestCase):
                 PATCH,
                 repository_slug="owner/repo",
                 source_branch="automation/fix-inc-1",
+                source_sha=SOURCE_SHA,
             )
         )
 
         self.assertFalse(result)
         self.assertEqual(repository.incident.patch_proposals, [])
+
+    def test_missing_source_sha_is_rejected(self):
+        repository = FakeRepository()
+        github = FakeGitHub()
+        handler = ApplyAutomatedFixCommandHandler(repository, github)
+
+        result = handler.handle(
+            ApplyAutomatedFixCommand(
+                "inc-1",
+                "src/service.py",
+                PATCH,
+                repository_slug="owner/repo",
+                source_branch="automation/fix-inc-1",
+            )
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(github.calls, [])
 
     def test_multiple_file_patch_is_rejected(self):
         patch = PATCH + """--- a/other.py
