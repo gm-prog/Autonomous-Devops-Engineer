@@ -1,11 +1,14 @@
 import uuid
+from typing import List, Optional
+
+from domain.entities.incident_evidence import IncidentEvidence
 
 from domain.aggregates.incident import IncidentAggregate
 from domain.repository_interface import IncidentRepositoryPort
 
 
 class IngestWebhookAlertCommand:
-    def __init__(self, raw_source: str, alert_name: str, severity: str, details: str):
+    def __init__(self, raw_source: str, alert_name: str, severity: str, details: str, evidence: Optional[List[IncidentEvidence]] = None):
         if not raw_source.strip():
             raise ValueError("raw_source must not be empty")
         if not alert_name.strip():
@@ -17,6 +20,7 @@ class IngestWebhookAlertCommand:
         self.alert_name = alert_name.strip()
         self.severity = severity.strip().upper() or "HIGH"
         self.details = details.strip()
+        self.evidence = list(evidence or [])
 
 
 class IngestWebhookAlertCommandHandler:
@@ -33,6 +37,8 @@ class IngestWebhookAlertCommandHandler:
             severity=cmd.severity,
             context_details=cmd.details,
         )
+        for evidence in cmd.evidence:
+            incident.attach_evidence(evidence)
         incident.move_to_triage()
         self.repo.save_incident(incident)
         return incident.id
