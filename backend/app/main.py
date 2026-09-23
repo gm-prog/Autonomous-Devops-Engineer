@@ -59,6 +59,7 @@ class Repository(Base):
     terraform_tf = Column(Text, default="")
     pipeline_yaml = Column(Text, default="")
     analysis_report = Column(Text, default="")
+    source_revision = Column(Text, default="")
     status = Column(String(50), default="Idle") # Idle, Analyzing, Generated, Validating, ValidationFailed, DryRunPassed, DryRunFailed, DeploymentFailed
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
