@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from application.dependencies import get_incident_repository
 from domain.repository_interface import IncidentRepositoryPort
 from domain.entities.incident_evidence import IncidentEvidence
+from domain.entities.hotfix_proposal import HotfixProposal
 from infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
 from application.services.rca_evidence_pack import RcaEvidencePackBuilder
 from application.services.hotfix_validation_service import HotfixValidationService
@@ -161,7 +162,7 @@ def create_remediation(
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    proposal = __import__("domain.entities.hotfix_proposal", fromlist=["HotfixProposal"]).HotfixProposal(
+    proposal = HotfixProposal(
         id=f"remediation-{incident.id}",
         target_filepath=request.target_filepath,
         diff_patch_payload=request.patch,
