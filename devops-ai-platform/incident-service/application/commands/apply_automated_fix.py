@@ -2,9 +2,9 @@ from typing import Any, Optional
 import logging
 import uuid
 
-from ...domain.entities.hotfix_proposal import HotfixProposal
-from ...domain.repository_interface import IncidentRepositoryPort
-from ..services.hotfix_validation_service import HotfixValidationService
+from domain.entities.hotfix_proposal import HotfixProposal
+from domain.repository_interface import IncidentRepositoryPort
+from application.services.hotfix_validation_service import HotfixValidationService
 
 logger = logging.getLogger("ApplyAutomatedFixCommandHandler")
 

@@ -100,6 +100,28 @@ class ApplyAutomatedFixTests(unittest.TestCase):
         self.assertFalse(result)
         self.assertEqual(repository.incident.patch_proposals, [])
 
+    def test_multiple_file_patch_is_rejected(self):
+        patch = PATCH + """--- a/other.py
++++ b/other.py
+@@ -1 +1 @@
+-old_other()
++new_other()
+"""
+        proposal = HotfixProposal("patch-multi", "src/service.py", patch)
+        self.assertFalse(proposal.apply_verification_pass())
+        self.assertFalse(proposal.is_verified)
+
+    def test_mismatched_old_path_is_rejected(self):
+        patch = """--- a/other.py
++++ b/src/service.py
+@@ -1 +1 @@
+-old()
++new()
+"""
+        proposal = HotfixProposal("patch-mismatch", "src/service.py", patch)
+        self.assertFalse(proposal.apply_verification_pass())
+        self.assertFalse(proposal.is_verified)
+
 
 if __name__ == "__main__":
     unittest.main()

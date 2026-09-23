@@ -62,7 +62,7 @@ class GitHubPRClientTests(unittest.TestCase):
         self.assertTrue(payload["draft"])
         self.assertFalse(payload["maintainer_can_modify"])
 
-    @patch("github_pr_client.requests.post")
+    @patch("infrastructure.source_provider.github_pr_client.requests.post")
     def test_github_failure_does_not_return_placeholder_url(self, post):
         post.return_value = Mock(status_code=500, text="server error")
 
