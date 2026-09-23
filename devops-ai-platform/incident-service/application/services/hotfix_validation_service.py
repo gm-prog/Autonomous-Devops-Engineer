@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Tuple, List, Set
 import logging
-from ...domain.entities.hotfix_proposal import HotfixProposal
+from domain.entities.hotfix_proposal import HotfixProposal
 
 logger = logging.getLogger("HotfixValidationService")
 
