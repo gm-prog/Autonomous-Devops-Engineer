@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Tuple, List
+from typing import Tuple, List, Set
 import logging
 from ...domain.entities.hotfix_proposal import HotfixProposal
 
@@ -44,6 +44,26 @@ class ConfidenceScoreRule(RejectionRule):
             return False, f"Confidence score validation failed: {confidence_score * 100:.1f}% (Required: {self.min_score * 100:.1f}%)"
         return True, ""
 
+class ProtectedPathRule(RejectionRule):
+    """Blocks generated patches from crossing infrastructure/control-plane paths."""
+    def __init__(self, protected_paths: Set[str] = None):
+        self.protected_paths = protected_paths or {
+            ".github/workflows/",
+            "terraform/",
+            "k8s/",
+            "kubernetes/",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+        }
+
+    def evaluate(self, hotfix: HotfixProposal, confidence_score: float) -> Tuple[bool, str]:
+        target = hotfix.target_filepath.replace("\\", "/").lstrip("./").lower()
+        for protected in self.protected_paths:
+            if target == protected.rstrip("/") or target.startswith(protected):
+                return False, f"Protected automation path requires explicit human review: {hotfix.target_filepath}"
+        return True, ""
+
+
 class HotfixValidationService:
     """
     Decoupled rule validation checking AI actions against enterprise policies,
@@ -53,6 +73,7 @@ class HotfixValidationService:
         self.rules = rules or [
             DiffSizeRule(),
             SecurityFilesRule(),
+            ProtectedPathRule(),
             ConfidenceScoreRule()
         ]
 
