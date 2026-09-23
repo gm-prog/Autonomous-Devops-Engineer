@@ -60,6 +60,11 @@ class OnMetricThresholdFailedHandlerTests(unittest.TestCase):
         self.assertEqual(incident.severity, "CRITICAL")
         self.assertEqual(incident.status, "Triage")
         self.assertIn("value=95.0", incident.context)
+        self.assertEqual(len(incident.evidence), 1)
+        self.assertEqual(incident.evidence[0].kind, "threshold_breach")
+        self.assertEqual(incident.evidence[0].source, "monitoring-service")
+        self.assertEqual(incident.evidence[0].payload["metric"], "cpu_percent")
+        self.assertEqual(incident.evidence[0].payload["value"], 95.0)
         self.assertEqual(
             incident.domain_events[0].to_dict()["event_type"],
             "OutOfBoundsIncidentLoggedEvent",
