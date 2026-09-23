@@ -8,12 +8,13 @@ from application.queries.get_live_metrics import (
 )
 from application.services.threshold_event_service import create_threshold_event
 from application.services.threshold_evaluator import ThresholdEvaluator
+from infrastructure.messaging.redis_event_publisher import RedisStreamEventPublisher
 from infrastructure.prometheus.scraper_client import PrometheusScraperClient
 
 
 app = FastAPI(
     title="DevOps.AI Monitoring Service",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 handler = GetLiveMetricsQueryHandler(
@@ -23,6 +24,7 @@ handler = GetLiveMetricsQueryHandler(
     )
 )
 threshold_evaluator = ThresholdEvaluator()
+event_publisher = RedisStreamEventPublisher()
 
 
 @app.get("/health")
@@ -31,6 +33,7 @@ def health():
         "status": "healthy",
         "service": "monitoring-service",
         "prometheus_url": os.getenv("PROMETHEUS_URL", "http://prometheus:9090"),
+        "event_stream": os.getenv("EVENT_BUS_STREAM", "devops:events"),
     }
 
 
@@ -62,17 +65,41 @@ def evaluate_alerts(
                     "breach_count": 0,
                 },
                 "event": None,
+                "event_delivery": None,
             }
 
         evaluation = threshold_evaluator.evaluate(metrics)
         event = create_threshold_event(service, metrics, evaluation)
+
+        if event is None:
+            return {
+                "status": evaluation["status"],
+                "service_id": service,
+                "metrics": metrics,
+                "evaluation": evaluation,
+                "event": None,
+                "event_delivery": None,
+            }
+
+        try:
+            message_id = event_publisher.publish(event)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Threshold event delivery failed: {type(exc).__name__}",
+            ) from exc
 
         return {
             "status": evaluation["status"],
             "service_id": service,
             "metrics": metrics,
             "evaluation": evaluation,
-            "event": event.to_dict() if event else None,
+            "event": event.to_dict(),
+            "event_delivery": {
+                "status": "PUBLISHED",
+                "stream": event_publisher.stream_name,
+                "message_id": message_id,
+            },
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
