@@ -67,6 +67,12 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
 
             active = IncidentAggregate("active", "active", "HIGH", "details")
             active.move_to_triage()
+            active.attach_evidence(IncidentEvidence(
+                id="active-evidence",
+                kind="threshold_breach",
+                source="monitoring-service",
+                payload={"metric": "latency_ms", "value": 1200.0},
+            ))
             repository.save_incident(active)
 
             resolved = IncidentAggregate("resolved", "resolved", "HIGH", "details")
@@ -80,6 +86,8 @@ class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):
             incidents = repository.get_active_incidents()
 
             self.assertEqual([item.id for item in incidents], ["active"])
+            self.assertEqual(incidents[0].evidence[0].id, "active-evidence")
+            self.assertEqual(incidents[0].evidence[0].payload["value"], 1200.0)
 
 
 if __name__ == "__main__":
