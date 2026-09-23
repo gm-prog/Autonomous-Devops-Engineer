@@ -47,6 +47,12 @@ class IncidentAggregate:
             return
         self.evidence.append(evidence)
 
+    def attach_remediation_proposal(self, proposal: HotfixProposal):
+        if not proposal.is_verified:
+            raise ValueError("remediation proposal must pass deterministic patch verification")
+        self.patch_proposals.append(proposal)
+        self.status = "RemediationProposed"
+
     def attach_verified_patch(self, proposal: HotfixProposal):
         if proposal.is_verified:
             self.patch_proposals.append(proposal)
