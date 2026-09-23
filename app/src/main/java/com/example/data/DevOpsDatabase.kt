@@ -61,6 +61,9 @@ interface DevOpsDao {
     @Query("SELECT * FROM repositories WHERE name = :name")
     suspend fun getRepositoryByName(name: String): RepoEntity?
 
+    @Query("SELECT COUNT(*) FROM repositories")
+    suspend fun getRepositoryCount(): Int
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertRepository(repo: RepoEntity): Long
 
