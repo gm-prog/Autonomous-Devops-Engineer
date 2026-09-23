@@ -73,13 +73,13 @@ code changes, infrastructure facts, or causal links that are not supported by
 the evidence.
 
 Return ONLY valid JSON with exactly these keys:
-{
+{{
   "root_cause": "concise evidence-grounded root cause",
   "confidence": 0.0,
   "supporting_evidence_ids": ["..."],
   "contributing_factors": ["..."],
   "recommended_next_actions": ["..."]
-}
+}}
 
 Rules:
 - confidence must be a number from 0.0 to 1.0.
