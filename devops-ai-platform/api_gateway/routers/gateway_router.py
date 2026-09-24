@@ -51,11 +51,10 @@ def dispatch_service_proxy(
     request: Request,
     user: dict = Depends(verify_token),
 ):
-    """Forwards the payload to the target microservice's internal endpoint.
+    """Forward the payload to the target service and relay its response.
 
-    The previous implementation echoed the payload back without ever sending
-    it (PROXY_PASSTHROUGH fiction). It now performs a real HTTP POST and
-    relays the downstream status/body, or 502 when the target is unreachable.
+    This performs a real downstream POST and never fabricates a successful
+    forwarding result.
     """
     if service_name not in SERVICES:
         raise HTTPException(
@@ -84,7 +83,7 @@ def dispatch_service_proxy(
         body = {"raw": downstream.text[:1000]}
 
     return {
-        "status": "PROXY_PASSTHROUGH",
+        "status": "FORWARDED",
         "forwarded_to": target_url,
         "authorizing_identity": user["sub"],
         "upstream_status": downstream.status_code,
