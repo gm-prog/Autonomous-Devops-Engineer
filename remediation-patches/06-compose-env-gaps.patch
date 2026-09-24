@@ -1,0 +1,26 @@
+# Remediation patch 06 - see README.md in this directory
+# Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
+# Apply from the repository root:  git apply 06-compose-env-gaps.patch
+
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -146,6 +146,11 @@
+       - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+       - EVENT_BUS_STREAM=devops:events
+       - INCIDENT_EVENT_GROUP=incident-service
++      # RCA adapter target (was missing: RCA unavailable under default compose)
++      - AGENT_SERVICE_URL=http://agent-service:8020
++      # Real remediation publication requires a GitHub token (secret-safe:
++      # empty by default; the pipeline fails closed without it)
++      - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
+     depends_on:
+       db:
+         condition: service_healthy
+@@ -163,6 +168,7 @@
+       - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+       - EVENT_BUS_STREAM=devops:events
+       - INCIDENT_EVENT_GROUP=incident-service
++      - AGENT_SERVICE_URL=http://agent-service:8020
+     depends_on:
+       db:
+         condition: service_healthy

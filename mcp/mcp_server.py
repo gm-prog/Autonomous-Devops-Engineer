@@ -1,6 +1,10 @@
 import json
+import logging
 import os
 import sys
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("MCPOperatorServer")
 
 # Simulating Model Context Protocol (MCP) tool structure and responses
 class MCPOperatorServer:
@@ -26,9 +30,9 @@ class MCPOperatorServer:
     def handle_tool_call(self, tool_name: str, arguments: dict) -> dict:
         if tool_name not in self.registered_tools:
             return {"status": "error", "message": f"Tool '{tool_name}' not defined in server schema."}
-        
-        logger_name = f"MCP_Execution[{tool_name}]"
-        
+
+        logger.info(f"MCP tool call received: {tool_name} args={arguments}")
+
         if tool_name == "analyze_code_repository":
             repo_name = arguments.get("name", "unnamed-project")
             return {
@@ -51,14 +55,9 @@ class MCPOperatorServer:
             }
 
         elif tool_name == "apply_git_patch_hotfix":
-            issue_id = arguments.get("issue_id", "N/A")
             return {
-                "status": "success",
-                "handshake": {
-                    "branch_created": f"hotfix/remediate-incident-{issue_id}",
-                    "commit_hash": "a4dffd3ebd1ff91a03e1e",
-                    "target_pull_request": f"https://github.com/production/ops-control/pull/1842"
-                }
+                "status": "error",
+                "message": "GitHub hotfix publication is not configured for this mock adapter; refusing to fabricate branch, commit, or Pull Request results.",
             }
 
 if __name__ == "__main__":
