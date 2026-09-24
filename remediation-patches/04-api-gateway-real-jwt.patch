@@ -1,6 +1,6 @@
-# Remediation patch 04 - see README.md in this directory
+# Remediation patch 4 - see README.md in this directory
 # Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
-# Apply from the repository root:  git apply 04-api-gateway-real-jwt.patch
+# Apply from the repository root:  git apply 4-api-gateway-real-jwt.patch
 
 --- a/devops-ai-platform/api-gateway/config/__init__.py
 +++ b/devops-ai-platform/api-gateway/config/__init__.py
@@ -49,7 +49,7 @@
 +
 +Dev workflow: mint a token with
 +
-+    python -m api_gateway.core.auth <subject> [Role1 Role2 ...]
++    python -m core.auth <subject> [Role1 Role2 ...]
 +
 +and pass it as `Authorization: Bearer <token>`.
 +
@@ -65,14 +65,15 @@
  import time
 -from fastapi import Request, HTTPException, Security
 -from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+-from ..config import GatewaySettings
 +
 +from fastapi import HTTPException, Security
 +from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 +
- from ..config import GatewaySettings
- 
-+logger = logging.getLogger("GatewayAuth")
++from config import GatewaySettings
 +
++logger = logging.getLogger("GatewayAuth")
+ 
  security_bearer = HTTPBearer()
  
 -def verify_token(credentials: HTTPAuthorizationCredentials = Security(security_bearer)) -> dict:
@@ -223,10 +224,10 @@
 +
 +if __name__ == "__main__":
 +    # Dev token minter:
-+    #   python -m api_gateway.core.auth devops-operator DevOpsLead
++    #   python -m core.auth devops-operator DevOpsLead
 +    if len(sys.argv) < 2:
-+        print("usage: python -m api_gateway.core.auth <subject> [Role1 Role2 ...]")
-+        print("example: python -m api_gateway.core.auth devops-operator DevOpsLead")
++        print("usage: python -m core.auth <subject> [Role1 Role2 ...]")
++        print("example: python -m core.auth devops-operator DevOpsLead")
 +        sys.exit(1)
 +    subject = sys.argv[1]
 +    roles = sys.argv[2:] or ["Developer"]
