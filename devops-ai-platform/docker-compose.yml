@@ -45,7 +45,7 @@ services:
       # Strong secret for the gateway's HS256 JWT auth. Omit for local dev
       # (a development fallback is used + warning logged); always set a real
       # value before exposing the gateway.
-      - JWT_SECRET=${JWT_SECRET:-}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set}
     depends_on:
       - postgres
       - redis
@@ -104,6 +104,8 @@ services:
       - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
       # Enables HMAC verification of inbound Sentry webhooks
       - SENTRY_WEBHOOK_SECRET=${SENTRY_WEBHOOK_SECRET:-}
+      - AGENT_SERVICE_URL=http://agent-service:8020
+      - DEPLOYMENT_SERVICE_URL=http://deployment-service:8030
     depends_on:
       - postgres
 
