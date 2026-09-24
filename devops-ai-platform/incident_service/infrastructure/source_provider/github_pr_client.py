@@ -60,7 +60,10 @@ class GitHubPRClient:
                 raise PRCreationFailedException(f"Failed to compile GitHub PR: {response.text}")
                 
             data = response.json()
-            return data.get("html_url", "https://github.com/production/ops-control/pull/1842")
+            url = data.get("html_url")
+            if not isinstance(url, str) or not url.startswith("https://github.com/"):
+                raise PRCreationFailedException("GitHub response did not contain a valid Pull Request URL")
+            return url
         except requests.RequestException as e:
             raise PRCreationFailedException(f"Network failure while communicating with GitHub API: {e}")
 
