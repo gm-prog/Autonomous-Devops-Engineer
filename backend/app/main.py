@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
         if qdrant.collection_exists(QDRANT_COLLECTION):
             logger.info("Qdrant collection '%s' already present - preserving stored data.", QDRANT_COLLECTION)
         else:
-            qdrant.recreate_collection(
+            qdrant.create_collection(
                 collection_name=QDRANT_COLLECTION,
                 vectors_config=qmodels.VectorParams(size=1536, distance=qmodels.Distance.COSINE),
             )
