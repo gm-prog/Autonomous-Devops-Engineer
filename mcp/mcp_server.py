@@ -55,14 +55,9 @@ class MCPOperatorServer:
             }
 
         elif tool_name == "apply_git_patch_hotfix":
-            issue_id = arguments.get("issue_id", "N/A")
             return {
-                "status": "success",
-                "handshake": {
-                    "branch_created": f"hotfix/remediate-incident-{issue_id}",
-                    "commit_hash": "a4dffd3ebd1ff91a03e1e",
-                    "target_pull_request": f"https://github.com/production/ops-control/pull/1842"
-                }
+                "status": "error",
+                "message": "GitHub hotfix publication is not configured for this mock adapter; refusing to fabricate branch, commit, or Pull Request results.",
             }
 
 if __name__ == "__main__":
