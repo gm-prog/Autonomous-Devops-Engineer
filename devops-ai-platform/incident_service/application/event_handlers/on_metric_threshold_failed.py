@@ -1,20 +1,96 @@
 import logging
-from shared_kernel.domain.events import ThreatThresholdExceededEvent
-from ..commands.ingest_webhook_alert import IngestWebhookAlertCommand, IngestWebhookAlertCommandHandler
+from datetime import datetime, timezone
+from typing import Any, Mapping
+
+from domain.entities.incident_evidence import IncidentEvidence
+
+from application.commands.ingest_webhook_alert import (
+    IngestWebhookAlertCommand,
+    IngestWebhookAlertCommandHandler,
+)
 
 logger = logging.getLogger("OnMetricThresholdFailed")
 
+
 class OnMetricThresholdFailedHandler:
-    """Consumes load limit breach events to raise automated incident workflows."""
+    """Maps the public monitoring event payload into incident ingestion."""
+
     def __init__(self, triage_handler: IngestWebhookAlertCommandHandler):
         self.triage = triage_handler
 
-    def handle(self, event: ThreatThresholdExceededEvent):
-        logger.warning(f"[AMQP] Threat limit breached event received from Service scope {event.aggregate_id}.")
-        cmd = IngestWebhookAlertCommand(
-            raw_source="prometheus-alert",
-            alert_name="NodeMemorySaturationAlarm",
-            severity="High",
-            details=f"Usage metric: {event.payload.get('average', 'N/A')}"
+    def handle(self, event: Mapping[str, Any]) -> str:
+        aggregate_id = str(event.get("aggregate_id", "")).strip()
+        payload = event.get("payload") or {}
+        if not aggregate_id:
+            raise ValueError("monitoring event aggregate_id is required")
+        if not isinstance(payload, Mapping):
+            raise ValueError("monitoring event payload must be an object")
+
+        breaches = payload.get("breaches") or []
+        if not isinstance(breaches, list):
+            raise ValueError("monitoring event breaches must be a list")
+
+        primary = breaches[0] if breaches and isinstance(breaches[0], Mapping) else {}
+
+        metric = primary.get("metric", "unknown")
+        value = primary.get("value", "N/A")
+        threshold = primary.get("threshold", "N/A")
+        operator = primary.get("operator", ">=")
+        severity = str(
+            primary.get("severity")
+            or payload.get("severity")
+            or "high"
+        ).upper()
+
+        observed_at = _parse_timestamp(event.get("timestamp"))
+
+        evidence = IncidentEvidence(
+            kind="threshold_breach",
+            source="monitoring-service",
+            observed_at=observed_at,
+            payload={
+                "event_id": str(event.get("event_id", "")),
+                "event_type": str(event.get("event_type", "ThreatThresholdExceededEvent")),
+                "service": aggregate_id,
+                "metric": metric,
+                "value": value,
+                "threshold": threshold,
+                "operator": operator,
+                "severity": severity,
+                "breach_count": payload.get("breach_count", len(breaches)),
+                "breaches": breaches,
+                "metrics": payload.get("metrics") or {},
+            },
         )
-        self.triage.handle(cmd)
+
+        command = IngestWebhookAlertCommand(
+            raw_source="prometheus-alert",
+            alert_name=f"{metric}-threshold-breached",
+            severity=severity,
+            details=(
+                f"Service={aggregate_id}; "
+                f"metric={metric}; value={value}; "
+                f"threshold={operator} {threshold}; "
+                f"breach_count={payload.get('breach_count', len(breaches))}"
+            ),
+            evidence=[evidence],
+        )
+
+        logger.warning(
+            "Threshold breach mapped to incident ingestion: service=%s metric=%s severity=%s",
+            aggregate_id,
+            metric,
+            severity,
+        )
+        return self.triage.handle(command)
+
+
+def _parse_timestamp(value: Any) -> datetime:
+    raw = str(value or "").strip()
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.warning("Invalid monitoring event timestamp=%r; using ingestion time", raw)
+    return datetime.now(timezone.utc)
