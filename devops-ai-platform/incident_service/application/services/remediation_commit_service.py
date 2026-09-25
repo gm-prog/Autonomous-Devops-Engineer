@@ -4,7 +4,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from application.services.remediation_workspace_service import (
+from incident_service.application.services.remediation_workspace_service import (
     RemediationWorkspace,
     UnsafeRemediationBranchError,
 )
@@ -173,7 +173,7 @@ class RemediationCommitService:
 
     @staticmethod
     def _build_expected_branch(incident_id: str, proposal_id: str) -> str:
-        from application.services.remediation_workspace_service import (
+        from incident_service.application.services.remediation_workspace_service import (
             RemediationWorkspaceService,
         )
         return RemediationWorkspaceService.build_branch_name(

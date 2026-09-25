@@ -4,13 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from application.services.remediation_validation_runner import (
+from incident_service.application.services.remediation_validation_runner import (
     RemediationValidationRunner,
     UnknownValidationProfileError,
     ValidationStep,
     ValidationWorkspaceMutationError,
 )
-from application.services.remediation_workspace_service import RemediationWorkspace
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspace
 
 SOURCE_SHA = "a" * 40
 

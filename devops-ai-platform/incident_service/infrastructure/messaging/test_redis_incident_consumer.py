@@ -1,6 +1,6 @@
 import unittest
 
-from infrastructure.messaging.redis_incident_consumer import RedisIncidentEventConsumer
+from incident_service.infrastructure.messaging.redis_incident_consumer import RedisIncidentEventConsumer
 
 
 class FakeRedis:

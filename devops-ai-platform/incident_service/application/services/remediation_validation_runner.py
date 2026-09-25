@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
 
-from application.services.remediation_patch_executor import (
+from incident_service.application.services.remediation_patch_executor import (
     PatchPostconditionError,
 )
-from application.services.remediation_workspace_service import RemediationWorkspace
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspace
 
 logger = logging.getLogger("RemediationValidationRunner")
 
@@ -74,21 +74,29 @@ _DEFAULT_PROFILES: Dict[str, tuple[ValidationStep, ...]] = {
     "incident_service": (
         ValidationStep(
             name="incident-service-unit-tests",
-            working_directory="devops-ai-platform/incident-service",
+            # Arena package layout: run from the platform root so every module
+            # imports as `incident_service.*` (the old hyphenated flat-layout
+            # working directory no longer exists).
+            working_directory="devops-ai-platform",
             argv=(
                 "python",
                 "-m",
                 "unittest",
-                "infrastructure.database.test_postgres_incident_repo",
-                "application.event_handlers.test_on_metric_threshold_failed",
-                "application.commands.test_attach_deployment_evidence",
-                "infrastructure.deployment.test_deployment_evidence_collector",
-                "application.services.test_rca_evidence_pack",
-                "presentation.rest.test_rca_orchestration",
-                "application.commands.test_apply_automated_fix",
-                "infrastructure.source_provider.test_github_pr_client",
-                "application.services.test_remediation_workspace_service",
-                "application.services.test_remediation_patch_executor",
+                "incident_service.infrastructure.database.test_postgres_incident_repo",
+                "incident_service.application.event_handlers.test_on_metric_threshold_failed",
+                "incident_service.application.commands.test_attach_deployment_evidence",
+                "incident_service.infrastructure.deployment.test_deployment_evidence_collector",
+                "incident_service.application.services.test_rca_evidence_pack",
+                "incident_service.presentation.rest.test_rca_orchestration",
+                "incident_service.application.commands.test_apply_automated_fix",
+                "incident_service.infrastructure.source_provider.test_github_pr_client",
+                "incident_service.application.services.test_remediation_workspace_service",
+                "incident_service.application.services.test_remediation_workspace_push",
+                "incident_service.application.services.test_remediation_patch_executor",
+                "incident_service.application.services.test_remediation_validation_runner",
+                "incident_service.application.services.test_remediation_commit_service",
+                "incident_service.application.services.test_remediation_orchestration_service",
+                "incident_service.infrastructure.messaging.test_redis_incident_consumer",
             ),
             timeout_seconds=MAX_RUNTIME_SECONDS,
             max_output_bytes=MAX_OUTPUT_BYTES,

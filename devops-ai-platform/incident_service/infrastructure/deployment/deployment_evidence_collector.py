@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from domain.entities.incident_evidence import IncidentEvidence
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
 
 
 class DeploymentEvidenceCollectorError(RuntimeError):

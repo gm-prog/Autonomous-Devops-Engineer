@@ -1,7 +1,7 @@
 import unittest
 
-from application.commands.ingest_webhook_alert import IngestWebhookAlertCommandHandler
-from application.event_handlers.on_metric_threshold_failed import (
+from incident_service.application.commands.ingest_webhook_alert import IngestWebhookAlertCommandHandler
+from incident_service.application.event_handlers.on_metric_threshold_failed import (
     OnMetricThresholdFailedHandler,
 )
 

@@ -5,10 +5,10 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from domain.aggregates.incident import IncidentAggregate
-from domain.entities.incident_evidence import IncidentEvidence
-from infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
-from presentation.rest.controllers import investigate_root_cause
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
+from incident_service.infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
+from incident_service.presentation.rest.controllers import investigate_root_cause
 
 
 class RcaOrchestrationTests(unittest.TestCase):
@@ -27,7 +27,7 @@ class RcaOrchestrationTests(unittest.TestCase):
             ))
             repository.save_incident(incident)
 
-            with patch("presentation.rest.controllers.RcaAgentClient") as client_cls:
+            with patch("incident_service.presentation.rest.controllers.RcaAgentClient") as client_cls:
                 client_cls.return_value.analyze.return_value = {
                     "root_cause": "CPU threshold exceeded with deployment evidence present",
                     "confidence": 0.72,
@@ -58,7 +58,7 @@ class RcaOrchestrationTests(unittest.TestCase):
             ))
             repository.save_incident(incident)
 
-            with patch("presentation.rest.controllers.RcaAgentClient") as client_cls:
+            with patch("incident_service.presentation.rest.controllers.RcaAgentClient") as client_cls:
                 client_cls.return_value.analyze.return_value = {
                     "root_cause": "unsupported",
                     "confidence": 0.2,

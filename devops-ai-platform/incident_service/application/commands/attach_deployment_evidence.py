@@ -1,6 +1,6 @@
-from domain.entities.incident_evidence import IncidentEvidence
-from infrastructure.deployment.deployment_evidence_collector import DeploymentEvidenceCollector
-from domain.repository_interface import IncidentRepositoryPort
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
+from incident_service.infrastructure.deployment.deployment_evidence_collector import DeploymentEvidenceCollector
+from incident_service.domain.repository_interface import IncidentRepositoryPort
 
 
 class AttachDeploymentEvidenceCommand:

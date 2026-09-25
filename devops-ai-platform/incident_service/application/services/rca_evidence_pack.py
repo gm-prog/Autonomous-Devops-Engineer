@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any, Dict, List
 
-from domain.repository_interface import IncidentRepositoryPort
+from incident_service.domain.repository_interface import IncidentRepositoryPort
 
 
 class RcaEvidencePackBuilder:

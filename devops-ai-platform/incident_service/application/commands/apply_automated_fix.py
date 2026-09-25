@@ -3,9 +3,9 @@ import logging
 import uuid
 import re
 
-from domain.entities.hotfix_proposal import HotfixProposal
-from domain.repository_interface import IncidentRepositoryPort
-from application.services.hotfix_validation_service import HotfixValidationService
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.domain.repository_interface import IncidentRepositoryPort
+from incident_service.application.services.hotfix_validation_service import HotfixValidationService
 
 logger = logging.getLogger("ApplyAutomatedFixCommandHandler")
 

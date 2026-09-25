@@ -4,15 +4,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from application.services.remediation_patch_executor import (
+from incident_service.application.services.remediation_patch_executor import (
     PatchApplicationRejectedError,
     PatchPostconditionError,
     PatchSourceMismatchError,
     PatchWorkspaceDirtyError,
     RemediationPatchExecutor,
 )
-from application.services.remediation_workspace_service import RemediationWorkspace
-from domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspace
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 
 
 SOURCE_SHA = "a" * 40

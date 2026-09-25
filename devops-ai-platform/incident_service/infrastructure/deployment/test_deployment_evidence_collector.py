@@ -3,7 +3,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from infrastructure.deployment.deployment_evidence_collector import (
+from incident_service.infrastructure.deployment.deployment_evidence_collector import (
     DeploymentEvidenceCollector,
     DeploymentEvidenceCollectorError,
 )
@@ -28,7 +28,7 @@ class FakeResponse:
 
 
 class DeploymentEvidenceCollectorTests(unittest.TestCase):
-    @patch("infrastructure.deployment.deployment_evidence_collector.urlopen")
+    @patch("incident_service.infrastructure.deployment.deployment_evidence_collector.urlopen")
     def test_collects_bounded_deployment_metadata(self, mock_urlopen):
         mock_urlopen.return_value = FakeResponse({
             "id": "run_123",
@@ -58,7 +58,7 @@ class DeploymentEvidenceCollectorTests(unittest.TestCase):
         self.assertNotIn("terraform_plan", evidence.payload)
         self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 5.0)
 
-    @patch("infrastructure.deployment.deployment_evidence_collector.urlopen")
+    @patch("incident_service.infrastructure.deployment.deployment_evidence_collector.urlopen")
     def test_not_found_is_normalized(self, mock_urlopen):
         from urllib.error import HTTPError
         mock_urlopen.side_effect = HTTPError(

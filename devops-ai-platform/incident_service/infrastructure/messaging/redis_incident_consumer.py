@@ -5,7 +5,7 @@ import socket
 import time
 from typing import Any, Mapping
 
-from application.event_handlers.on_metric_threshold_failed import (
+from incident_service.application.event_handlers.on_metric_threshold_failed import (
     OnMetricThresholdFailedHandler,
 )
 

@@ -2,9 +2,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from domain.entities.incident_evidence import IncidentEvidence
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
 
-from application.commands.ingest_webhook_alert import (
+from incident_service.application.commands.ingest_webhook_alert import (
     IngestWebhookAlertCommand,
     IngestWebhookAlertCommandHandler,
 )

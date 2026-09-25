@@ -1,7 +1,7 @@
 import os
 from functools import lru_cache
 
-from infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
+from incident_service.infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
 
 
 @lru_cache(maxsize=1)

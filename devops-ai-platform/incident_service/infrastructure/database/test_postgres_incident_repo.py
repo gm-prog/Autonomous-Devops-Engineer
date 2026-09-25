@@ -3,10 +3,10 @@ import tempfile
 import unittest
 from datetime import timezone
 
-from domain.aggregates.incident import IncidentAggregate
-from domain.entities.hotfix_proposal import HotfixProposal
-from domain.entities.incident_evidence import IncidentEvidence
-from infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
+from incident_service.infrastructure.database.postgres_incident_repo import PostgresIncidentRepositoryAdapter
 
 
 class PostgresIncidentRepositoryAdapterTests(unittest.TestCase):

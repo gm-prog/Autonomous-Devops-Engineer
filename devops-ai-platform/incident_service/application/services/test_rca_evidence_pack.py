@@ -1,9 +1,9 @@
 import unittest
 from datetime import datetime, timezone
 
-from application.services.rca_evidence_pack import RcaEvidencePackBuilder
-from domain.aggregates.incident import IncidentAggregate
-from domain.entities.incident_evidence import IncidentEvidence
+from incident_service.application.services.rca_evidence_pack import RcaEvidencePackBuilder
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
 
 
 class FakeRepository:

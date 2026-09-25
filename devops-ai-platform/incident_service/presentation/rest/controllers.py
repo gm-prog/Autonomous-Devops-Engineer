@@ -3,22 +3,22 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from application.dependencies import get_incident_repository
-from domain.repository_interface import IncidentRepositoryPort
-from domain.entities.incident_evidence import IncidentEvidence
-from domain.entities.hotfix_proposal import HotfixProposal
-from infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
-from application.services.rca_evidence_pack import RcaEvidencePackBuilder
-from application.services.hotfix_validation_service import HotfixValidationService
-from application.services.remediation_commit_service import RemediationCommitService
-from application.services.remediation_orchestration_service import (
+from incident_service.application.dependencies import get_incident_repository
+from incident_service.domain.repository_interface import IncidentRepositoryPort
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
+from incident_service.application.services.rca_evidence_pack import RcaEvidencePackBuilder
+from incident_service.application.services.hotfix_validation_service import HotfixValidationService
+from incident_service.application.services.remediation_commit_service import RemediationCommitService
+from incident_service.application.services.remediation_orchestration_service import (
     RemediationOrchestrationError,
     RemediationOrchestrationService,
 )
-from application.services.remediation_patch_executor import RemediationPatchExecutor
-from application.services.remediation_validation_runner import RemediationValidationRunner
-from application.services.remediation_workspace_service import RemediationWorkspaceService
-from infrastructure.source_provider.github_pr_client import GitHubPRClient
+from incident_service.application.services.remediation_patch_executor import RemediationPatchExecutor
+from incident_service.application.services.remediation_validation_runner import RemediationValidationRunner
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspaceService
+from incident_service.infrastructure.source_provider.github_pr_client import GitHubPRClient
 
 
 

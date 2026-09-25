@@ -4,10 +4,10 @@ from typing import List, Optional
 
 from sqlalchemy import Column, DateTime, ForeignKey, MetaData, String, Table, Text, create_engine, delete, select, update
 
-from domain.aggregates.incident import IncidentAggregate
-from domain.entities.hotfix_proposal import HotfixProposal
-from domain.entities.incident_evidence import IncidentEvidence
-from domain.repository_interface import IncidentRepositoryPort
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
+from incident_service.domain.repository_interface import IncidentRepositoryPort
 
 
 metadata = MetaData()

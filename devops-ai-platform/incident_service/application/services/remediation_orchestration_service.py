@@ -1,11 +1,11 @@
 from dataclasses import dataclass
 from typing import Any
 
-from application.services.remediation_commit_service import RemediationCommitResult
-from application.services.remediation_patch_executor import RemediationPatchExecutionResult
-from application.services.remediation_validation_runner import RemediationValidationResult
-from application.services.remediation_workspace_service import RemediationWorkspaceService
-from domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.application.services.remediation_commit_service import RemediationCommitResult
+from incident_service.application.services.remediation_patch_executor import RemediationPatchExecutionResult
+from incident_service.application.services.remediation_validation_runner import RemediationValidationResult
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspaceService
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 
 
 class RemediationOrchestrationError(RuntimeError):

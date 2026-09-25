@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from application.services.remediation_workspace_service import (
+from incident_service.application.services.remediation_workspace_service import (
     InvalidSourceRevisionError,
     RemediationWorkspaceService,
     UnsafeRemediationBranchError,

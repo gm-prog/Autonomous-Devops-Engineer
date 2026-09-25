@@ -6,8 +6,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from domain.entities.hotfix_proposal import HotfixProposal
-from application.services.remediation_workspace_service import RemediationWorkspace
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspace
 
 logger = logging.getLogger("RemediationPatchExecutor")
 

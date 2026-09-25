@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from infrastructure.source_provider.github_pr_client import (
+from incident_service.infrastructure.source_provider.github_pr_client import (
     GitHubPRClient,
     InvalidGitHubTokenException,
     PRCreationFailedException,
@@ -41,7 +41,7 @@ class GitHubPRClientTests(unittest.TestCase):
                 base="production",
             )
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.post")
     def test_success_returns_github_url(self, post):
         response = Mock(status_code=201)
         response.json.return_value = {
@@ -62,8 +62,8 @@ class GitHubPRClientTests(unittest.TestCase):
         self.assertTrue(payload["draft"])
         self.assertFalse(payload["maintainer_can_modify"])
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.get")
-    @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.post")
     def test_existing_branch_at_same_commit_is_idempotent(self, post, get):
         commit_response = Mock(status_code=200)
         commit_response.json.return_value = {"sha": "b" * 40, "parents": [{"sha": "a" * 40}]}
@@ -76,8 +76,8 @@ class GitHubPRClientTests(unittest.TestCase):
         self.assertTrue(url.endswith("/tree/automation/remediation/inc-1/proposal-1"))
         post.assert_not_called()
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.get")
-    @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.post")
     def test_existing_branch_at_different_commit_is_rejected(self, post, get):
         commit_response = Mock(status_code=200)
         commit_response.json.return_value = {"sha": "b" * 40, "parents": [{"sha": "a" * 40}]}
@@ -90,8 +90,8 @@ class GitHubPRClientTests(unittest.TestCase):
             client.create_branch_from_commit("owner/repo", "automation/remediation/inc-1/proposal-1", "b" * 40, "a" * 40)
         post.assert_not_called()
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.get")
-    @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.post")
     def test_branch_publication_verifies_parent_and_remote_ref(self, post, get):
         commit_response = Mock(status_code=200)
         commit_response.json.return_value = {
@@ -125,7 +125,7 @@ class GitHubPRClientTests(unittest.TestCase):
             },
         )
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
     def test_branch_publication_rejects_parent_mismatch(self, get):
         response = Mock(status_code=200)
         response.json.return_value = {
@@ -143,8 +143,8 @@ class GitHubPRClientTests(unittest.TestCase):
                 "a" * 40,
             )
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.post")
-    @patch("infrastructure.source_provider.github_pr_client.requests.get")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.post")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
     def test_branch_publication_rejects_create_race(self, get, post):
         commit_response = Mock(status_code=200)
         commit_response.json.return_value = {
@@ -164,7 +164,7 @@ class GitHubPRClientTests(unittest.TestCase):
             )
         self.assertEqual(post.call_count, 1)
 
-    @patch("infrastructure.source_provider.github_pr_client.requests.post")
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.post")
     def test_github_failure_does_not_return_placeholder_url(self, post):
         post.return_value = Mock(status_code=500, text="server error")
 

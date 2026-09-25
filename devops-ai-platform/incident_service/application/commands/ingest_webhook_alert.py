@@ -1,10 +1,10 @@
 import uuid
 from typing import List, Optional
 
-from domain.entities.incident_evidence import IncidentEvidence
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
 
-from domain.aggregates.incident import IncidentAggregate
-from domain.repository_interface import IncidentRepositoryPort
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.repository_interface import IncidentRepositoryPort
 
 
 class IngestWebhookAlertCommand:

@@ -4,12 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from application.services.remediation_commit_service import (
+from incident_service.application.services.remediation_commit_service import (
     CommitSourceMismatchError,
     CommitWorkspaceDirtyError,
     RemediationCommitService,
 )
-from application.services.remediation_workspace_service import (
+from incident_service.application.services.remediation_workspace_service import (
     RemediationWorkspace,
     RemediationWorkspaceService,
     UnsafeRemediationBranchError,

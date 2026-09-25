@@ -1,9 +1,9 @@
 import unittest
 from unittest.mock import Mock
 
-from application.services.remediation_orchestration_service import RemediationOrchestrationService
-from application.services.remediation_workspace_service import RemediationWorkspace
-from domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.application.services.remediation_orchestration_service import RemediationOrchestrationService
+from incident_service.application.services.remediation_workspace_service import RemediationWorkspace
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 
 
 class RemediationOrchestrationServiceTests(unittest.TestCase):

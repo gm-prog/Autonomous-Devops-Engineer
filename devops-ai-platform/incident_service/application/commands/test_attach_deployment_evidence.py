@@ -1,11 +1,11 @@
 import unittest
 
-from application.commands.attach_deployment_evidence import (
+from incident_service.application.commands.attach_deployment_evidence import (
     AttachDeploymentEvidenceCommand,
     AttachDeploymentEvidenceCommandHandler,
 )
-from domain.aggregates.incident import IncidentAggregate
-from domain.entities.incident_evidence import IncidentEvidence
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.incident_evidence import IncidentEvidence
 
 
 class FakeRepository:

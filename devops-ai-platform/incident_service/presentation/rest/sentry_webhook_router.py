@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from application.commands.ingest_webhook_alert import (
+from incident_service.application.commands.ingest_webhook_alert import (
     IngestWebhookAlertCommand,
     IngestWebhookAlertCommandHandler,
 )
-from application.dependencies import get_incident_repository
-from domain.repository_interface import IncidentRepositoryPort
+from incident_service.application.dependencies import get_incident_repository
+from incident_service.domain.repository_interface import IncidentRepositoryPort
 
 
 router = APIRouter(prefix="/alerts/webhooks", tags=["Webhook Alerting Receiver"])

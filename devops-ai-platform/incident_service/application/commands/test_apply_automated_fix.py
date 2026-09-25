@@ -1,12 +1,12 @@
 import unittest
 from unittest.mock import Mock
 
-from application.commands.apply_automated_fix import (
+from incident_service.application.commands.apply_automated_fix import (
     ApplyAutomatedFixCommand,
     ApplyAutomatedFixCommandHandler,
 )
-from domain.aggregates.incident import IncidentAggregate
-from domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 
 
 PATCH = """--- a/src/service.py
