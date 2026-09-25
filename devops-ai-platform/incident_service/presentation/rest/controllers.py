@@ -18,6 +18,10 @@ from incident_service.application.services.remediation_orchestration_service imp
 from incident_service.application.services.remediation_patch_executor import RemediationPatchExecutor
 from incident_service.application.services.remediation_validation_runner import RemediationValidationRunner
 from incident_service.application.services.remediation_workspace_service import RemediationWorkspaceService
+from incident_service.application.services.remediation_target_binding import (
+    RemediationTargetBindingError,
+    authorize_remediation_target,
+)
 from incident_service.infrastructure.source_provider.github_pr_client import GitHubPRClient
 
 
@@ -161,6 +165,18 @@ def create_remediation(
     incident = repository.get_incident_by_id(incident_id.strip())
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
+
+    # Authorization boundary: the requested repository + source SHA must be
+    # provably bound to this incident's own deployment evidence, otherwise the
+    # endpoint is an arbitrary GitHub write primitive (403 before any work).
+    try:
+        authorize_remediation_target(
+            incident=incident,
+            repository_slug=request.repository_slug,
+            source_sha=request.source_sha,
+        )
+    except RemediationTargetBindingError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     proposal = HotfixProposal(
         id=f"remediation-{incident.id}",
