@@ -78,8 +78,20 @@ services:
       context: .
       dockerfile: ./deployment_service/Dockerfile
     container_name: devops_celery_worker
+    ports:
+      # Internal evidence API (GET /api/internal/deployments/{run_id}) consumed
+      # by incident-service; never publish outside the compose network in prod.
+      - "8030:8030"
+    command:
+      - sh
+      - -c
+      - >
+        celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info &
+        exec uvicorn deployment_service.main:app --host 0.0.0.0 --port 8030
     environment:
       - REDIS_HOST=redis
+      # Cluster execution stays disabled unless explicitly enabled.
+      - DEPLOYMENT_EXECUTION_ENABLED=${DEPLOYMENT_EXECUTION_ENABLED:-false}
     depends_on:
       - redis
 
@@ -106,8 +118,26 @@ services:
       - SENTRY_WEBHOOK_SECRET=${SENTRY_WEBHOOK_SECRET:-}
       - AGENT_SERVICE_URL=http://agent-service:8020
       - DEPLOYMENT_SERVICE_URL=http://deployment-service:8030
+      - INCIDENT_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
     depends_on:
       - postgres
+
+  # Redis Streams consumer for monitoring threshold events
+  # (event-bus defaults live in redis_incident_consumer.py)
+  incident-event-worker:
+    build:
+      context: .
+      dockerfile: ./incident_service/Dockerfile
+    container_name: devops_incident_event_worker
+    command: ["python", "-m", "incident_service.worker"]
+    environment:
+      - INCIDENT_DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
+      - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+      - EVENT_BUS_STREAM=devops:events
+      - INCIDENT_EVENT_GROUP=incident-service
+    depends_on:
+      - postgres
+      - redis
 
 volumes:
   postgres_data:
