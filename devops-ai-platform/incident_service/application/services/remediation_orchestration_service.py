@@ -1,10 +1,14 @@
+import os
 from dataclasses import dataclass
 from typing import Any
 
 from incident_service.application.services.remediation_commit_service import RemediationCommitResult
 from incident_service.application.services.remediation_patch_executor import RemediationPatchExecutionResult
 from incident_service.application.services.remediation_validation_runner import RemediationValidationResult
-from incident_service.application.services.remediation_workspace_service import RemediationWorkspaceService
+from incident_service.application.services.remediation_workspace_service import (
+    RemediationWorkspaceError,
+    RemediationWorkspaceService,
+)
 from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 
 
@@ -35,12 +39,18 @@ class RemediationOrchestrationService:
         validation_runner: Any,
         commit_service: Any,
         github_client: Any,
+        github_oauth_token: str | None = None,
     ):
         self.workspace_service = workspace_service or RemediationWorkspaceService()
         self.patch_executor = patch_executor
         self.validation_runner = validation_runner
         self.commit_service = commit_service
         self.github = github_client
+        self.github_oauth_token = (
+            github_oauth_token
+            if github_oauth_token is not None
+            else os.getenv("GITHUB_OAUTH_TOKEN", "")
+        )
 
         required = (
             self.patch_executor,
@@ -62,13 +72,14 @@ class RemediationOrchestrationService:
         validation_profile: str = "incident_service",
         pr_title: str | None = None,
         pr_body: str | None = None,
+        prepared_workspace: Any | None = None,
     ) -> RemediationOrchestrationResult:
         if not proposal.is_verified:
             raise ValueError("remediation proposal must be verified before orchestration")
         if not proposal.source_sha:
             raise ValueError("remediation proposal requires an immutable source SHA")
 
-        workspace = self.workspace_service.prepare(
+        workspace = prepared_workspace or self.workspace_service.prepare(
             repository_slug=repository_slug,
             source_sha=proposal.source_sha,
             incident_id=incident_id,
@@ -108,6 +119,20 @@ class RemediationOrchestrationService:
                 raise RemediationOrchestrationError(
                     "remediation commit target differs from the applied patch target"
                 )
+
+            # Transfer the verified local commit to GitHub before any REST
+            # ref/PR operation: a commit SHA only exists on the remote after
+            # it has been pushed (GitHub cannot create a ref to an object it
+            # has never received).
+            try:
+                self.workspace_service.publish_branch(
+                    workspace=workspace,
+                    oauth_token=self.github_oauth_token,
+                )
+            except RemediationWorkspaceError as exc:
+                raise RemediationOrchestrationError(
+                    "remediation commit could not be published to the remote repository"
+                ) from exc
 
             self.github.create_branch_from_commit(
                 repo_slug=repository_slug,

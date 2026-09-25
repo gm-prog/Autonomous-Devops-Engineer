@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 logger = logging.getLogger("RemediationWorkspaceService")
 
@@ -37,6 +37,10 @@ class UnsafeRemediationBranchError(RemediationWorkspaceError):
 
 class RemediationWorkspaceCommandError(RemediationWorkspaceError):
     """Raised when a bounded Git command cannot prepare the workspace."""
+
+
+class RemediationRemotePublishError(RemediationWorkspaceError):
+    """Raised when a verified remediation commit cannot be published to the remote repository."""
 
 
 @dataclass(frozen=True)
@@ -209,6 +213,70 @@ class RemediationWorkspaceService:
                 "unexpected failure while preparing remediation workspace"
             ) from exc
 
+    def publish_branch(self, workspace: RemediationWorkspace, oauth_token: str) -> str:
+        """Publish the workspace HEAD commit to its controlled remote branch.
+
+        The remediation commit is created locally, so it does not exist in
+        GitHub's object database until it is transferred over the wire. This
+        step pushes exactly that commit to the controlled remediation ref and
+        verifies the remote ref points at the exact verified SHA before the
+        GitHub REST layer (create_branch_from_commit / create_pull_request)
+        is allowed to proceed.
+
+        Credentials travel only through the process environment via Git's
+        GIT_CONFIG_* variables (an http.extraHeader Authorization value) -
+        never in the remote URL or in command arguments.
+        """
+        if not oauth_token or not oauth_token.strip():
+            raise RemediationRemotePublishError(
+                "GITHUB_OAUTH_TOKEN is required to publish the remediation commit"
+            )
+
+        cwd = Path(workspace.path).resolve()
+        if not cwd.is_dir():
+            raise RemediationRemotePublishError("remediation workspace does not exist")
+
+        branch = workspace.branch_name
+        head_sha = self._run_git(["git", "rev-parse", "HEAD"], cwd).stdout.strip().lower()
+        if not _GIT_SHA_PATTERN.fullmatch(head_sha):
+            raise RemediationRemotePublishError(
+                "workspace HEAD is not a full 40-character Git commit SHA"
+            )
+
+        credential_env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {oauth_token.strip()}",
+        }
+
+        try:
+            self._run_git(
+                ["git", "push", "--no-tags", "origin", f"HEAD:refs/heads/{branch}"],
+                cwd=cwd,
+                extra_env=credential_env,
+            )
+        except subprocess.CalledProcessError as exc:
+            # Do not echo stderr: it can contain credential-bearing URLs in some Git builds.
+            raise RemediationRemotePublishError(
+                "Git push of the verified remediation commit was rejected by the remote"
+            ) from exc
+
+        remote_listing = self._run_git(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=cwd,
+            extra_env=credential_env,
+        ).stdout.strip()
+        expected_line = f"{head_sha}\trefs/heads/{branch}"
+        if remote_listing != expected_line:
+            raise RemediationRemotePublishError(
+                "remote branch does not point at the verified remediation commit"
+            )
+
+        logger.info(
+            "Published remediation commit %s to refs/heads/%s", head_sha[:12], branch
+        )
+        return head_sha
+
     def cleanup(self, workspace: RemediationWorkspace) -> None:
         cleanup_root = Path(workspace.cleanup_path).resolve()
         if cleanup_root not in self._active_workspaces:
@@ -220,6 +288,7 @@ class RemediationWorkspaceService:
         self,
         args: Sequence[str],
         cwd: Path | None = None,
+        extra_env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         if not args or args[0] != "git":
             raise RemediationWorkspaceCommandError(
@@ -236,6 +305,8 @@ class RemediationWorkspaceService:
             if key not in {"GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
         }
         env["GIT_TERMINAL_PROMPT"] = "0"
+        if extra_env:
+            env.update(extra_env)
 
         try:
             return subprocess.run(
