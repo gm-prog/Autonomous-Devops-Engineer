@@ -33,7 +33,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # Comma-separated list of allowed CORS origins. Default "*" (no credentials,
 # which is the spec-valid combination). Set e.g. "https://myapp.example.com"
 # for credentialed browser clients.
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000",
+    ).split(",")
+    if o.strip()
+]
 
 QDRANT_COLLECTION = "devops_knowledge_base"
 
