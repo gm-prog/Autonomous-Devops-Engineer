@@ -98,6 +98,27 @@ approve/execute) and persisted in the run store; unknown run ids return
 endpoint through `DeploymentEvidenceCollector` (`DEPLOYMENT_SERVICE_URL`)
 when attaching evidence.
 
+## Network & authentication trust boundary
+
+* **External boundary = API gateway only.** `docker-compose.yml` publishes a
+  host port for `api-gateway` (8000) and for **nothing else** - incident,
+  deployment, repo, agent, monitoring and the data stores have no host
+  publication and are reachable exclusively over the private compose network
+  (service-name DNS). Direct external requests to internal services are
+  therefore impossible in the production topology; guessing `/api/internal/*`
+  grants nothing (a URL prefix is not authorization).
+* **Authentication** happens at the gateway (HS256 JWT, `JWT_SECRET` is
+  fail-fast `${JWT_SECRET:?}` in compose). Internal service-to-service calls
+  stay inside the trusted private network - no second token system, no
+  secrets in source.
+* **Development:** `docker-compose.dev.yml` is an explicit, opt-in override
+  that re-publishes internal ports for local debugging:
+  `docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d`
+* **Layered authorization:** even in-network callers must pass the
+  remediation target binding (canonical repository + exact 40-hex SHA in one
+  *DEPLOYED* evidence record of the same incident) before the remediation
+  orchestrator is even constructed.
+
 ## Known limits (honest)
 
 * The `dispatch` route forwards to service hostnames

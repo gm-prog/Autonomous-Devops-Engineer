@@ -12,23 +12,16 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: devops_prod
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
     container_name: devops_redis
-    ports:
-      - "6379:6379"
 
   qdrant:
     image: qdrant/qdrant:latest
     container_name: devops_qdrant
-    ports:
-      - "6333:6333"
-      - "6334:6334"
 
   # --- BFF GATEWAY (HS256 JWT auth) ---
   api-gateway:
@@ -37,6 +30,9 @@ services:
       dockerfile: ./api_gateway/Dockerfile
     container_name: devops_api_gateway
     ports:
+      # The API gateway is the ONLY externally reachable service: everything
+      # else stays on the private compose network (see docker-compose.dev.yml
+      # for an explicit development-only override).
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
@@ -56,8 +52,6 @@ services:
       context: .
       dockerfile: ./repo_service/Dockerfile
     container_name: devops_repo_service
-    ports:
-      - "8010:8010"
     depends_on:
       - postgres
 
@@ -66,8 +60,6 @@ services:
       context: .
       dockerfile: ./agent_service/Dockerfile
     container_name: devops_agent_service
-    ports:
-      - "8020:8020"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     depends_on:
@@ -78,10 +70,6 @@ services:
       context: .
       dockerfile: ./deployment_service/Dockerfile
     container_name: devops_celery_worker
-    ports:
-      # Internal evidence API (GET /api/internal/deployments/{run_id}) consumed
-      # by incident-service; never publish outside the compose network in prod.
-      - "8030:8030"
     command:
       - sh
       - -c
@@ -100,8 +88,6 @@ services:
       context: .
       dockerfile: ./monitoring_service/Dockerfile
     container_name: devops_monitoring_service
-    ports:
-      - "8040:8040"
     depends_on:
       - postgres
 
@@ -110,8 +96,6 @@ services:
       context: .
       dockerfile: ./incident_service/Dockerfile
     container_name: devops_incident_service
-    ports:
-      - "8050:8050"
     environment:
       - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
       # Enables HMAC verification of inbound Sentry webhooks
