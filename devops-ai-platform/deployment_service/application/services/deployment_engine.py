@@ -63,9 +63,13 @@ class DeploymentEngine:
         return hashlib.sha256(json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
-    def _plan_hash(artifact_hash: str, terraform_result: Dict[str, Any], kubernetes_result: Dict[str, Any], source_revision: Dict[str, Any] | None = None) -> str:
+    def _plan_hash(artifact_hash: str, terraform_result: Dict[str, Any], kubernetes_result: Dict[str, Any], source_revision: Dict[str, Any] | None = None, repository_name: str | None = None) -> str:
         material = {
             "artifact_hash": artifact_hash,
+            # repository identity participates in plan identity: identical
+            # artifacts deployed from two different repositories must not
+            # share a plan hash.
+            "repository_name": repository_name or "",
             "source_revision": source_revision or {},
             "terraform": {"status": terraform_result.get("status"), "stdout": terraform_result.get("plan", {}).get("stdout", "")},
             "kubernetes": {"status": kubernetes_result.get("status"), "stdout": kubernetes_result.get("stdout", "")},
@@ -129,7 +133,7 @@ class DeploymentEngine:
             run.terraform_plan = self.terraform.run_plan(temp_dir, execution=False)
             run.kubernetes_dry_run = self.kubectl.dry_run(paths["kubernetes"])
             run.artifact_hash = self._artifact_hash(payload)
-            run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision)
+            run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
             if run.terraform_plan["status"] == "PASS" and run.kubernetes_dry_run["status"] == "PASS":
                 run.move(DeploymentState.DRY_RUN_PASSED)
                 run.move(DeploymentState.AWAITING_APPROVAL)

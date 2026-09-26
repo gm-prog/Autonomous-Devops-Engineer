@@ -111,3 +111,13 @@ def test_source_revision_changes_plan_hash():
     changed["source_revision"] = dict(VALID_PAYLOAD["source_revision"], head_sha="b" * 40)
     second = build_engine().create_dry_run(changed)
     assert first.plan_hash != second.plan_hash
+
+
+def test_repository_name_changes_plan_hash():
+    """Repository identity participates in plan identity: identical
+    configuration + SHA from two repositories must not share a plan hash."""
+    engine = build_engine()
+    first = engine.create_dry_run(VALID_PAYLOAD)
+    other_repo = dict(VALID_PAYLOAD, repository_name="evil/checkout")
+    second = engine.create_dry_run(other_repo)
+    assert first.plan_hash != second.plan_hash

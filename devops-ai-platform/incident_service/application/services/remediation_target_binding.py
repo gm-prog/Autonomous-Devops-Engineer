@@ -17,10 +17,19 @@ Both values must come from the **same** evidence object. Values harvested
 from different records are never combined, so two deployments cannot be
 cross-mixed (repository from deployment A + SHA from deployment B).
 
+**Deployment provenance:** only evidence from a successfully *deployed*
+run is authoritative. The deployment domain's terminal success state is
+``DeploymentState.DEPLOYED`` (``domain/value_objects/deployment_state.py``);
+records left in ``AWAITING_APPROVAL``, ``DRY_RUN_*``, ``DEPLOYMENT_*``,
+``ROLLED_BACK`` etc. - or with a missing/malformed ``state`` - never
+authorize remediation.
+
 Canonical forms:
 
 * repository identity — ``payload["repository_name"]`` in ``owner/repo``
-  form matching ``^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$``. Bare names
+  form matching ``^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`` where each
+  segment contains at least one alphanumeric character (dot-only segments
+  such as ``..`` are rejected). Bare names
   (``checkout``) are ambiguous and are **never** accepted, upgraded, or
   segment-matched.
 * source revision — ``payload["source_revision"]["head_sha"]``, a full
@@ -35,9 +44,12 @@ import re
 from typing import Any
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
-_SLUG_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_SLUG_PATTERN = re.compile(r"^(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+/(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+$")
 
 _DEPLOYMENT_EVIDENCE_KIND = "deployment_run"
+# Authoritative deployment state: only a fully deployed revision may feed
+# remediation authorization (mirrors DeploymentState.DEPLOYED).
+_AUTHORITATIVE_DEPLOYMENT_STATE = "DEPLOYED"
 
 
 class RemediationTargetBindingError(PermissionError):
@@ -50,6 +62,17 @@ def _deployment_evidence(incident: Any) -> list:
         for item in getattr(incident, "evidence", [])
         if item.kind == _DEPLOYMENT_EVIDENCE_KIND
     ]
+
+
+def _is_authoritative(payload: dict) -> bool:
+    """True only for evidence produced by a successfully deployed run.
+
+    Exact match only: the deployment service emits the domain enum value
+    verbatim, so anything else (padding, different case, non-string,
+    missing) is treated as non-authoritative.
+    """
+    state = payload.get("state")
+    return isinstance(state, str) and state == _AUTHORITATIVE_DEPLOYMENT_STATE
 
 
 def _canonical_repository(payload: dict) -> str | None:
@@ -121,8 +144,19 @@ def authorize_remediation_target(
             "refusing remediation of an unbound target"
         )
 
+    # --- deployment-state gate: only successfully deployed runs are proof ---
+    authoritative_items = [
+        item for item in evidence_items if _is_authoritative(dict(item.payload or {}))
+    ]
+    if not authoritative_items:
+        raise RemediationTargetBindingError(
+            "incident has no successfully deployed (state=DEPLOYED) deployment "
+            "evidence; dry-run, failed or awaiting-approval runs cannot "
+            "authorize remediation"
+        )
+
     # --- same-record pair match ---
-    for item in evidence_items:
+    for item in authoritative_items:
         payload = dict(item.payload or {})
         record_repository = _canonical_repository(payload)
         if record_repository is None:

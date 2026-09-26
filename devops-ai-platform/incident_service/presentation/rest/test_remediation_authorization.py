@@ -153,6 +153,12 @@ class TargetBindingUnitTests(unittest.TestCase):
         with self.assertRaises(RemediationTargetBindingError):
             authorize_remediation_target(incident, "checkout", SOURCE_SHA)
 
+    def test_path_trick_repository_slug_request_is_rejected(self):
+        incident = self._incident_with(_deployment_evidence())
+        for bad in ("../checkout", "acme/../checkout", "a/b/c", "https://github.com/a/b"):
+            with self.assertRaises(RemediationTargetBindingError, msg=bad):
+                authorize_remediation_target(incident, bad, SOURCE_SHA)
+
     def test_malformed_repository_identity_in_evidence_fails_closed(self):
         for bad in ("", "a/b/c", "acme/checkout.git?x", None, 42):
             incident = self._incident_with(
@@ -192,6 +198,82 @@ class TargetBindingUnitTests(unittest.TestCase):
                 RemediationTargetBindingError, msg=f"evidence sha={bad!r}"
             ):
                 authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+
+    def test_only_deployed_state_is_authoritative(self):
+        """A successful deployment authorizes; every lesser/failed state does
+        not (§8 deployment-provenance invariant)."""
+        for bad_state in (
+            "AWAITING_APPROVAL",
+            "DRY_RUN_PASSED",
+            "DRY_RUNNING",
+            "APPROVED",
+            "DEPLOYING",
+            "DEPLOYMENT_FAILED",
+            "ROLLED_BACK",
+            "VALIDATION_FAILED",
+        ):
+            incident = self._incident_with(
+                IncidentEvidence(
+                    id=f"deploy-state-{bad_state}",
+                    kind="deployment_run",
+                    source="deployment-service",
+                    payload={
+                        "repository_name": "acme/checkout",
+                        "source_revision": {"head_sha": SOURCE_SHA},
+                        "state": bad_state,
+                    },
+                )
+            )
+            with self.assertRaises(
+                RemediationTargetBindingError, msg=f"state={bad_state}"
+            ):
+                authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+
+    def test_missing_or_malformed_state_is_not_authoritative(self):
+        # Policy: exact match on the domain enum value only - no trimming,
+        # no case folding. Anything else is non-authoritative (fail closed).
+        for state in (None, "", "deployed", " DEPLOYED", "DEPLOYED ", 42, "DEPLOYED_FAILED"):
+            incident = self._incident_with(
+                IncidentEvidence(
+                    id=f"deploy-state-{id(state)}",
+                    kind="deployment_run",
+                    source="deployment-service",
+                    payload={
+                        "repository_name": "acme/checkout",
+                        "source_revision": {"head_sha": SOURCE_SHA},
+                        "state": state,
+                    },
+                )
+            )
+            with self.assertRaises(
+                RemediationTargetBindingError, msg=f"state={state!r}"
+            ):
+                authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+
+    def test_failed_deployment_cannot_authorize_while_deployed_run_exists(self):
+        """State gate is per record: a DEPLOYED record with a DIFFERENT pair
+        must not rescue a failed record's pair."""
+        failed = IncidentEvidence(
+            id="deploy-failed",
+            kind="deployment_run",
+            source="deployment-service",
+            payload={
+                "repository_name": "acme/checkout",
+                "source_revision": {"head_sha": SOURCE_SHA},
+                "state": "DEPLOYMENT_FAILED",
+            },
+        )
+        deployed = self._incident_with(
+            failed,
+            _deployment_evidence(
+                name="acme/checkout", head_sha=OTHER_SHA, evidence_id="deploy-ok"
+            ),
+        )
+        # the failed run's pair is unusable
+        with self.assertRaises(RemediationTargetBindingError):
+            authorize_remediation_target(deployed, "acme/checkout", SOURCE_SHA)
+        # the deployed run's pair still works
+        authorize_remediation_target(deployed, "acme/checkout", OTHER_SHA)
 
     def test_no_deployment_evidence_is_rejected(self):
         incident = IncidentAggregate("inc-none", "t", "HIGH", "gw")
@@ -350,6 +432,7 @@ class RemediationAuthorizationTests(unittest.TestCase):
                 payload={
                     "repository_name": "checkout",
                     "source_revision": {"head_sha": SOURCE_SHA},
+                    "state": "DEPLOYED",
                 },
             )
         )
@@ -376,6 +459,7 @@ class RemediationAuthorizationTests(unittest.TestCase):
                 payload={
                     "repository_name": "a/b/c",
                     "source_revision": {"head_sha": SOURCE_SHA},
+                    "state": "DEPLOYED",
                 },
             )
         )
@@ -422,6 +506,31 @@ class RemediationAuthorizationTests(unittest.TestCase):
         self.assertNotIsInstance(result, Exception)
         provider.assert_called_once()
         spy.execute.assert_called_once()
+
+    def test_non_deployed_evidence_cannot_reach_orchestrator(self):
+        from fastapi import HTTPException
+
+        incident = _incident(with_deployment=False)
+        incident.attach_evidence(
+            IncidentEvidence(
+                id="deploy-awaiting",
+                kind="deployment_run",
+                source="deployment-service",
+                payload={
+                    "repository_name": "acme/checkout",
+                    "source_revision": {"head_sha": SOURCE_SHA},
+                    "state": "AWAITING_APPROVAL",
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+
+        spy, provider, exc = self._call_with_spy("inc-bind", _request())
+
+        self.assertIsInstance(exc, HTTPException)
+        self.assertEqual(exc.status_code, 403)
+        provider.assert_not_called()
+        spy.execute.assert_not_called()
 
     def test_uppercase_requested_sha_is_normalized(self):
         incident = _incident()

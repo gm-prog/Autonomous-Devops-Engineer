@@ -1,7 +1,7 @@
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from incident_service.application.dependencies import get_incident_repository
 from incident_service.domain.repository_interface import IncidentRepositoryPort
@@ -32,12 +32,29 @@ class RemediationRequest(BaseModel):
     target_filepath: str = Field(min_length=1, max_length=256)
     patch: str = Field(min_length=1, max_length=262144)
     source_sha: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
-    repository_slug: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+    repository_slug: str
     base_branch: str = Field(default="main", min_length=1, max_length=120)
     validation_profile: str = Field(default="incident_service", min_length=1, max_length=64)
     confidence_score: float = Field(default=0.85, ge=0.0, le=1.0)
     pr_title: str | None = Field(default=None, max_length=256)
     pr_body: str | None = Field(default=None, max_length=8192)
+
+    @field_validator("repository_slug")
+    @classmethod
+    def _canonical_repository_slug(cls, value: str) -> str:
+        # pydantic's Rust regex lacks lookahead; enforce the strong canonical
+        # form (rejects bare names and dot-only segments) with Python re.
+        import re as _re
+        strong = (
+            r"(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+"
+            r"/(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+"
+        )
+        if not _re.fullmatch(strong, value):
+            raise ValueError(
+                "repository_slug must be canonical owner/repository "
+                "(alphanumeric segments; bare names and path tricks rejected)"
+            )
+        return value
 
 
 def get_remediation_orchestrator() -> RemediationOrchestrationService:
