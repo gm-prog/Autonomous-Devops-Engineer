@@ -4,15 +4,29 @@ The public remediation endpoint must not trust ``repository_slug`` /
 ``source_sha`` request fields independently: a caller could otherwise turn
 the incident API into an arbitrary GitHub write primitive. Before any
 workspace is cloned, the requested target must be proven to belong to the
-incident through persisted deployment evidence:
+incident through persisted deployment evidence.
 
-    incident
-      → known deployment run(s) (evidence kind ``deployment_run``)
-      → repository identity (``repository_slug`` / ``repository_name``)
-      → source revision (``source_revision.head_sha``)
+Security invariant (same-record pair matching)::
 
-Both gates must pass: the repository identity AND the exact 40-character
-source SHA must appear in the incident's deployment evidence.
+    authorized(request)  ⇔  ∃ one deployment_run evidence record E such that
+        canonical_repository(E) == request.repository_slug
+        AND
+        canonical_source_sha(E) == request.source_sha
+
+Both values must come from the **same** evidence object. Values harvested
+from different records are never combined, so two deployments cannot be
+cross-mixed (repository from deployment A + SHA from deployment B).
+
+Canonical forms:
+
+* repository identity — ``payload["repository_name"]`` in ``owner/repo``
+  form matching ``^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$``. Bare names
+  (``checkout``) are ambiguous and are **never** accepted, upgraded, or
+  segment-matched.
+* source revision — ``payload["source_revision"]["head_sha"]``, a full
+  40-character hex string, compared case-insensitively (normalized to
+  lowercase). Branch names, tags, short SHAs and malformed values are
+  rejected.
 """
 
 from __future__ import annotations
@@ -24,7 +38,6 @@ _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SLUG_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 _DEPLOYMENT_EVIDENCE_KIND = "deployment_run"
-_SHA_KEYS = ("head_sha", "sha", "commit_sha")
 
 
 class RemediationTargetBindingError(PermissionError):
@@ -39,31 +52,34 @@ def _deployment_evidence(incident: Any) -> list:
     ]
 
 
-def _evidence_repository_names(evidence_items: list) -> set[str]:
-    names: set[str] = set()
-    for item in evidence_items:
-        payload = dict(item.payload or {})
-        slug = str(payload.get("repository_slug") or "").strip()
-        if _SLUG_PATTERN.fullmatch(slug):
-            names.add(slug)
-        name = str(payload.get("repository_name") or "").strip()
-        if name:
-            names.add(name)
-    return names
+def _canonical_repository(payload: dict) -> str | None:
+    """Return the record's canonical ``owner/repo`` identity, or None.
+
+    Only ``repository_name`` in full slug form counts. A bare or malformed
+    value makes this record contribute no repository identity at all
+    (fail closed) — it is never segment-matched or upgraded.
+    """
+    name = payload.get("repository_name")
+    if not isinstance(name, str):
+        return None
+    name = name.strip()
+    if _SLUG_PATTERN.fullmatch(name):
+        return name
+    return None
 
 
-def _evidence_source_shas(evidence_items: list) -> set[str]:
-    shas: set[str] = set()
-    for item in evidence_items:
-        payload = dict(item.payload or {})
-        revision = payload.get("source_revision")
-        if not isinstance(revision, dict):
-            continue
-        for key in _SHA_KEYS:
-            value = str(revision.get(key) or "").strip().lower()
-            if _SHA_PATTERN.fullmatch(value):
-                shas.add(value)
-    return shas
+def _canonical_source_sha(payload: dict) -> str | None:
+    """Return the record's canonical 40-hex ``source_revision.head_sha``, or None."""
+    revision = payload.get("source_revision")
+    if not isinstance(revision, dict):
+        return None
+    value = revision.get("head_sha")
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    if _SHA_PATTERN.fullmatch(value):
+        return value
+    return None
 
 
 def authorize_remediation_target(
@@ -72,12 +88,32 @@ def authorize_remediation_target(
     source_sha: str,
 ) -> None:
     """Raise :class:`RemediationTargetBindingError` unless the requested
-    ``(repository_slug, source_sha)`` pair is bound to this incident via
-    its deployment evidence.
-    """
-    slug = (repository_slug or "").strip()
-    sha = (source_sha or "").strip().lower()
+    ``(repository_slug, source_sha)`` pair is bound to this incident.
 
+    The pair must occur together in a **single** ``deployment_run`` evidence
+    record; values from different records are never combined.
+    """
+    # --- validate the request (fail fast on malformed input) ---
+    if not isinstance(repository_slug, str):
+        raise RemediationTargetBindingError(
+            "requested repository must be a canonical owner/repository slug"
+        )
+    slug = repository_slug.strip()
+    if not _SLUG_PATTERN.fullmatch(slug):
+        raise RemediationTargetBindingError(
+            "requested repository must be a canonical owner/repository slug"
+        )
+    if not isinstance(source_sha, str):
+        raise RemediationTargetBindingError(
+            "requested source revision is not a full 40-character SHA"
+        )
+    sha = source_sha.strip().lower()
+    if not _SHA_PATTERN.fullmatch(sha):
+        raise RemediationTargetBindingError(
+            "requested source revision is not a full 40-character SHA"
+        )
+
+    # --- the incident must have deployment evidence at all ---
     evidence_items = _deployment_evidence(incident)
     if not evidence_items:
         raise RemediationTargetBindingError(
@@ -85,22 +121,19 @@ def authorize_remediation_target(
             "refusing remediation of an unbound target"
         )
 
-    known_names = _evidence_repository_names(evidence_items)
-    repo_segment = slug.split("/", 1)[-1] if slug else ""
-    repository_ok = bool(slug) and any(
-        slug == name or repo_segment == name for name in known_names
-    )
-    if not repository_ok:
-        raise RemediationTargetBindingError(
-            "requested repository is not bound to this incident's deployment evidence"
-        )
+    # --- same-record pair match ---
+    for item in evidence_items:
+        payload = dict(item.payload or {})
+        record_repository = _canonical_repository(payload)
+        if record_repository is None:
+            continue  # malformed/ambiguous identity contributes nothing
+        record_sha = _canonical_source_sha(payload)
+        if record_sha is None:
+            continue  # malformed revision contributes nothing
+        if record_repository == slug and record_sha == sha:
+            return  # exact pair found together in ONE evidence record
 
-    known_shas = _evidence_source_shas(evidence_items)
-    if not _SHA_PATTERN.fullmatch(sha):
-        raise RemediationTargetBindingError(
-            "requested source revision is not a full 40-character SHA"
-        )
-    if sha not in known_shas:
-        raise RemediationTargetBindingError(
-            "requested source revision was never deployed for this incident"
-        )
+    raise RemediationTargetBindingError(
+        "requested (repository, source SHA) pair does not occur together in any "
+        "single deployment evidence record of this incident"
+    )

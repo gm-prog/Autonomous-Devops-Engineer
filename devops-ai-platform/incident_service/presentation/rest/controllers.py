@@ -160,7 +160,6 @@ def create_remediation(
     incident_id: str,
     request: RemediationRequest,
     repository: IncidentRepositoryPort = Depends(get_incident_repository),
-    orchestrator: RemediationOrchestrationService = Depends(get_remediation_orchestrator),
 ):
     incident = repository.get_incident_by_id(incident_id.strip())
     if incident is None:
@@ -193,6 +192,11 @@ def create_remediation(
             status_code=422,
             detail={"message": "remediation patch failed safety validation", "violations": violations},
         )
+
+    # Construct the remediation pipeline only now: authorization and patch
+    # safety have passed, so an unauthorized request never instantiates the
+    # orchestrator (no workspace, no GitHub client, nothing to publish).
+    orchestrator = get_remediation_orchestrator()
 
     try:
         result = orchestrator.execute(
