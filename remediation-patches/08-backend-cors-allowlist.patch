@@ -1,0 +1,36 @@
+# Remediation patch 08 - see README.md in this directory
+# Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
+# Apply from the repository root:  git apply 08-backend-cors-allowlist.patch
+
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -25,7 +25,18 @@
+ 
+ app.add_middleware(
+     CORSMiddleware,
+-    allow_origins=["*"],
++    # Explicit origin allowlist: ["*"] together with allow_credentials is
++    # rejected by browsers and would let any site call this API with the
++    # user's cookies. Override per environment, e.g.
++    #   ALLOW_ORIGINS=https://app.example.com,http://localhost:5173
++    allow_origins=[
++        origin.strip()
++        for origin in os.getenv(
++            "ALLOW_ORIGINS",
++            "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000",
++        ).split(",")
++        if origin.strip()
++    ],
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -56,6 +56,7 @@
+       - REPO_SERVICE_URL=http://repo-service:8010
+       - AGENT_SERVICE_URL=http://agent-service:8020
+       - DEPLOYMENT_SERVICE_URL=http://deployment-service:8030
++      - ALLOW_ORIGINS=${ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
+     depends_on:
+       db:
+         condition: service_healthy

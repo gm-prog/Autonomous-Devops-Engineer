@@ -1,0 +1,4 @@
+# Test-only dependencies for the operator gateway (not shipped in the image)
+-r requirements.txt
+pytest>=8.0.0
+httpx>=0.27.0

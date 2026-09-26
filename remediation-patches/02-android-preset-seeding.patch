@@ -1,0 +1,160 @@
+# Remediation patch 02 - see README.md in this directory
+# Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
+# Apply from the repository root:  git apply 02-android-preset-seeding.patch
+
+--- a/app/src/main/java/com/example/data/DevOpsRepository.kt
++++ b/app/src/main/java/com/example/data/DevOpsRepository.kt
+@@ -27,10 +27,10 @@
+ 
+     // Prepopulate presets
+     suspend fun setupPresetsIfEmpty() {
+-        // Query to check if empty
+-        val existing = dao.getAllRepositoriesFlow()
+-        // Wait, since getAllRepositoriesFlow is a Flow, let's look up once
+-        val isDbEmpty = getRepoByPredicate { true } == null
++        // True emptiness check: presets are seeded only into a first-run database.
++        // (The previous getRepoByPredicate helper always returned null, which
++        // re-inserted the preset repos and incidents on every app launch.)
++        val isDbEmpty = dao.getRepositoryCount() == 0
+         if (isDbEmpty) {
+             val presets = listOf(
+                 RepoEntity(
+@@ -138,11 +138,6 @@
+         }
+     }
+ 
+-    private suspend fun getRepoByPredicate(p: (RepoEntity) -> Boolean): RepoEntity? {
+-        // Simple internal check
+-        return null // returns null to enforce setup if needed or let DAO handle
+-    }
+-
+     /**
+      * Executes Repository Analysis & Asset generation via live Gemini AI or remote FastAPI Gateway.
+      */
+--- a/app/src/test/java/com/example/DevOpsRepositorySeedingTest.kt
++++ b/app/src/test/java/com/example/DevOpsRepositorySeedingTest.kt
+@@ -0,0 +1,124 @@
++package com.example
++
++import com.example.data.DeploymentLogEntity
++import com.example.data.DevOpsDao
++import com.example.data.DevOpsRepository
++import com.example.data.IncidentEntity
++import com.example.data.RepoEntity
++import kotlinx.coroutines.flow.Flow
++import kotlinx.coroutines.flow.emptyFlow
++import kotlinx.coroutines.runBlocking
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++/**
++ * Regression test for the preset-duplication bug:
++ * `setupPresetsIfEmpty()` previously relied on a predicate helper that always
++ * returned null, so the 3 preset repos + 2 preset incidents were re-inserted
++ * on every app launch (unbounded growth).
++ *
++ * Pure JVM unit test - no Robolectric needed: a fake DAO records inserts and
++ * reports the repository count exactly as Room would.
++ */
++class DevOpsRepositorySeedingTest {
++
++    /** In-memory stand-in for the Room DAO. */
++    private class FakeDevOpsDao : DevOpsDao {
++        val repos = mutableListOf<RepoEntity>()
++        val incidents = mutableListOf<IncidentEntity>()
++        var nextId = 1
++
++        override fun getAllRepositoriesFlow(): Flow<List<RepoEntity>> = emptyFlow()
++
++        override suspend fun getRepositoryById(id: Int): RepoEntity? =
++            repos.firstOrNull { it.id == id }
++
++        override suspend fun getRepositoryByName(name: String): RepoEntity? =
++            repos.firstOrNull { it.name == name }
++
++        override suspend fun getRepositoryCount(): Int = repos.size
++
++        override suspend fun insertRepository(repo: RepoEntity): Long {
++            val id = repo.id.takeIf { it != 0 } ?: nextId++
++            repos.add(repo.copy(id = id))
++            return id.toLong()
++        }
++
++        override suspend fun updateRepository(repo: RepoEntity) {
++            val i = repos.indexOfFirst { it.id == repo.id }
++            if (i >= 0) repos[i] = repo
++        }
++
++        override suspend fun deleteRepository(repo: RepoEntity) {
++            repos.removeAll { it.id == repo.id }
++        }
++
++        override suspend fun deleteAllRepositories() = repos.clear()
++
++        override fun getAllIncidentsFlow(): Flow<List<IncidentEntity>> = emptyFlow()
++
++        override suspend fun getIncidentById(id: Int): IncidentEntity? =
++            incidents.firstOrNull { it.id == id }
++
++        override suspend fun insertIncident(incident: IncidentEntity): Long {
++            val id = incident.id.takeIf { it != 0 } ?: nextId++
++            incidents.add(incident.copy(id = id))
++            return id.toLong()
++        }
++
++        override suspend fun updateIncident(incident: IncidentEntity) {
++            val i = incidents.indexOfFirst { it.id == incident.id }
++            if (i >= 0) incidents[i] = incident
++        }
++
++        override suspend fun deleteIncidentId(id: Int) {
++            incidents.removeAll { it.id == id }
++        }
++
++        override fun getLogsForRepoFlow(repoId: Int): Flow<List<DeploymentLogEntity>> = emptyFlow()
++
++        override suspend fun insertLog(log: DeploymentLogEntity) {}
++
++        override suspend fun clearLogsForRepo(repoId: Int) {}
++    }
++
++    @Test
++    fun `seeding is idempotent - presets inserted exactly once`() = runBlocking {
++        val dao = FakeDevOpsDao()
++        val repository = DevOpsRepository(dao)
++
++        // Simulate two consecutive app cold starts
++        repository.setupPresetsIfEmpty()
++        repository.setupPresetsIfEmpty()
++
++        assertEquals(3, dao.repos.size)
++        assertEquals(2, dao.incidents.size)
++        assertEquals(
++            setOf("Flask Microservice", "Spring Gatekeeper", "NextJS Dashboard"),
++            dao.repos.map { it.name }.toSet()
++        )
++    }
++
++    @Test
++    fun `seeding is skipped when user data already exists`() = runBlocking {
++        val dao = FakeDevOpsDao()
++        val repository = DevOpsRepository(dao)
++
++        // User imports a repo first, then the app "re-seeds"
++        dao.insertRepository(
++            RepoEntity(
++                name = "My Custom Repo",
++                url = "github.com/me/repo",
++                framework = "FastAPI",
++                technology = "Python 3.12",
++                isCustom = true
++            )
++        )
++        repository.setupPresetsIfEmpty()
++
++        // Only the user's repo - presets must NOT be injected into a used DB
++        assertEquals(1, dao.repos.size)
++        assertEquals("My Custom Repo", dao.repos.first().name)
++        assertEquals(0, dao.incidents.size)
++    }
++}

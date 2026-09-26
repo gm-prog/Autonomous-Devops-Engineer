@@ -27,10 +27,10 @@ class DevOpsRepository(private val dao: DevOpsDao) {
 
     // Prepopulate presets
     suspend fun setupPresetsIfEmpty() {
-        // Query to check if empty
-        val existing = dao.getAllRepositoriesFlow()
-        // Wait, since getAllRepositoriesFlow is a Flow, let's look up once
-        val isDbEmpty = getRepoByPredicate { true } == null
+        // True emptiness check against the repositories table.
+        // (The previous predicate helper always returned null, which made this
+        // method re-insert the preset repos + incidents on EVERY app launch.)
+        val isDbEmpty = dao.countRepositories() == 0
         if (isDbEmpty) {
             val presets = listOf(
                 RepoEntity(
@@ -138,17 +138,12 @@ class DevOpsRepository(private val dao: DevOpsDao) {
         }
     }
 
-    private suspend fun getRepoByPredicate(p: (RepoEntity) -> Boolean): RepoEntity? {
-        // Simple internal check
-        return null // returns null to enforce setup if needed or let DAO handle
-    }
-
     /**
      * Executes Repository Analysis & Asset generation via live Gemini AI or remote FastAPI Gateway.
      */
     suspend fun analyzeRepoAsync(repoId: Int, isRemote: Boolean = false, remoteUrl: String = "") {
         val repo = dao.getRepositoryById(repoId) ?: return
-        dao.insertRepository(repo.copy(status = "Analyzing"))
+        dao.updateRepository(repo.copy(status = "Analyzing"))
 
         try {
             val result = if (isRemote && remoteUrl.isNotEmpty()) {
