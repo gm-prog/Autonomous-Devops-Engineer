@@ -24,6 +24,9 @@ class HotfixProposal:
     proposal_hash: str = ""
     status: str = "PROPOSED"
     blocked_reason: str = ""
+    approved_by: Optional[str] = None
+    approved_at: Optional[datetime] = None
+    executed_at: Optional[datetime] = None
 
     def to_dict(self) -> dict:
         """JSON-safe projection including every §12 field."""
@@ -43,6 +46,9 @@ class HotfixProposal:
             "proposal_hash": self.proposal_hash,
             "status": self.status,
             "blocked_reason": self.blocked_reason,
+            "approved_by": self.approved_by,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+            "executed_at": self.executed_at.isoformat() if self.executed_at else None,
         }
 
     def apply_verification_pass(self) -> bool:
