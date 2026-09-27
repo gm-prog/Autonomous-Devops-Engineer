@@ -24,9 +24,20 @@ class HotfixProposal:
     proposal_hash: str = ""
     status: str = "PROPOSED"
     blocked_reason: str = ""
+    # Phase 6.2: approval + controlled execution lifecycle (additive)
+    approved_by: str = ""
+    approved_at: Optional[datetime] = None
+    approval_hash: str = ""
+    execution_id: str = ""
+    executed_at: Optional[datetime] = None
+    commit_sha: str = ""
+    branch_name: str = ""
+    execution_attempts: int = 0
+    last_failure_stage: str = ""
+    last_failure_reason: str = ""
 
     def to_dict(self) -> dict:
-        """JSON-safe projection including every §12 field."""
+        """JSON-safe projection including every §12 + §6.2 field."""
         return {
             "id": self.id,
             "incident_id": self.incident_id,
@@ -43,6 +54,16 @@ class HotfixProposal:
             "proposal_hash": self.proposal_hash,
             "status": self.status,
             "blocked_reason": self.blocked_reason,
+            "approved_by": self.approved_by,
+            "approved_at": self.approved_at.isoformat() if self.approved_at else None,
+            "approval_hash": self.approval_hash,
+            "execution_id": self.execution_id,
+            "executed_at": self.executed_at.isoformat() if self.executed_at else None,
+            "commit_sha": self.commit_sha,
+            "branch_name": self.branch_name,
+            "execution_attempts": int(self.execution_attempts),
+            "last_failure_stage": self.last_failure_stage,
+            "last_failure_reason": self.last_failure_reason,
         }
 
     def apply_verification_pass(self) -> bool:

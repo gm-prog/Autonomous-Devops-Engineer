@@ -1,3 +1,4 @@
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,25 @@ from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 
 class RemediationOrchestrationError(RuntimeError):
     """Raised when a remediation cannot safely reach publication."""
+
+
+def _summarize_validation_steps(validation_result) -> list:
+    """Observer-safe step summary: never raise on odd/mock-shaped results."""
+    try:
+        steps = validation_result.steps
+    except AttributeError:
+        return []
+    summary = []
+    try:
+        iterator = iter(steps)
+    except TypeError:
+        return []
+    for step in iterator:
+        try:
+            summary.append({"name": step.name, "passed": step.passed})
+        except (AttributeError, TypeError):
+            continue
+    return summary
 
 
 @dataclass(frozen=True)
@@ -73,7 +93,27 @@ class RemediationOrchestrationService:
         pr_title: str | None = None,
         pr_body: str | None = None,
         prepared_workspace: Any | None = None,
+        stage_callback: Any | None = None,
     ) -> RemediationOrchestrationResult:
+        """Run workspace → patch → validation → commit → publish → draft PR.
+
+        ``stage_callback`` (optional, Phase 6.2) receives
+        ``(stage_name, metadata_dict)`` at each completed stage so the
+        caller can emit structured lifecycle logs/audit evidence. It is a
+        pure observer: callback errors never alter execution flow, and
+        omitting it preserves prior behaviour exactly.
+        """
+
+        def notify(stage: str, **metadata) -> None:
+            if stage_callback is None:
+                return
+            try:
+                stage_callback(stage, metadata)
+            except Exception:  # observers must not change control flow
+                logging.getLogger("RemediationOrchestration").warning(
+                    "stage observer failed for stage=%s", stage, exc_info=True
+                )
+
         if not proposal.is_verified:
             raise ValueError("remediation proposal must be verified before orchestration")
         if not proposal.source_sha:
@@ -86,14 +126,37 @@ class RemediationOrchestrationService:
             proposal_id=proposal.id,
             base_branch=base_branch,
         )
+        notify(
+            "workspace.created",
+            branch=workspace.branch_name,
+            source_sha=workspace.source_sha,
+        )
 
         try:
             patch_result = self.patch_executor.apply(workspace, proposal)
+            try:
+                changed_paths = [
+                    str(item) for item in patch_result.changed_paths
+                ]
+            except TypeError:  # observer must never break execution
+                changed_paths = []
+            notify(
+                "patch.applied",
+                target_filepath=patch_result.target_filepath,
+                changed_paths=changed_paths,
+            )
 
+            notify("validation.started", profile=validation_profile)
             validation_result = self.validation_runner.validate(
                 workspace=workspace,
                 profile=validation_profile,
                 target_filepath=proposal.target_filepath,
+            )
+            notify(
+                "validation.completed",
+                profile=validation_profile,
+                passed=bool(validation_result.passed),
+                steps=_summarize_validation_steps(validation_result),
             )
             if not validation_result.passed:
                 raise RemediationOrchestrationError(
@@ -109,6 +172,12 @@ class RemediationOrchestrationService:
                 target_filepath=proposal.target_filepath,
                 incident_id=incident_id,
                 proposal_id=proposal.id,
+            )
+            notify(
+                "commit.created",
+                commit_sha=commit_result.commit_sha,
+                parent_sha=commit_result.parent_sha,
+                branch=commit_result.branch_name,
             )
 
             if commit_result.parent_sha != proposal.source_sha.lower():
@@ -153,6 +222,12 @@ class RemediationOrchestrationService:
                 draft=True,
                 base=base_branch,
             )
+            notify(
+                "pr.created",
+                pull_request_url=pull_request_url,
+                branch=commit_result.branch_name,
+                commit_sha=commit_result.commit_sha,
+            )
 
             proposal.pull_request_url = pull_request_url
 
@@ -179,9 +254,13 @@ class RemediationOrchestrationService:
         return (
             f"Incident: {incident_id}\n"
             f"Proposal: {proposal.id}\n"
+            f"Proposal hash: {proposal.proposal_hash or 'n/a'}\n"
+            f"Risk class: {proposal.risk_class or 'n/a'}\n"
             f"Target: {proposal.target_filepath}\n"
             f"Source SHA: {proposal.source_sha}\n"
             f"Remediation Commit: {commit_result.commit_sha}\n"
             f"Branch: {commit_result.branch_name}\n\n"
-            "Generated remediation. Review CI and human approval before merge."
+            "Generated remediation awaiting human review. "
+            "Do not merge without CI review. No deployment is performed "
+            "by this automation."
         )

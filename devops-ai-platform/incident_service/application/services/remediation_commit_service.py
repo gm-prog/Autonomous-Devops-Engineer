@@ -11,6 +11,11 @@ from incident_service.application.services.remediation_workspace_service import 
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _MAX_COMMIT_MESSAGE_LENGTH = 160
+
+# Fixed, non-impersonating committer identity for remediation commits
+# (hermetic by default; os.environ overrides still win via setdefault).
+_COMMITTER_NAME = "devops-ai-remediation"
+_COMMITTER_EMAIL = "devops-ai-remediation@noreply.invalid"
 _AUTOMATION_BRANCH_PREFIX = "automation/remediation/"
 _PROTECTED_BRANCHES = frozenset({"main", "master", "production", "release"})
 
@@ -232,6 +237,14 @@ class RemediationCommitService:
             }
         }
         env["GIT_TERMINAL_PROMPT"] = "0"
+        # Deterministic platform committer identity: a cloned workspace has
+        # no user.name/user.email, and relying on ambient global git config
+        # would make commits non-hermetic (and non-reproducible). Fixed,
+        # non-impersonating values — never derived from model/request input.
+        env.setdefault("GIT_AUTHOR_NAME", _COMMITTER_NAME)
+        env.setdefault("GIT_AUTHOR_EMAIL", _COMMITTER_EMAIL)
+        env.setdefault("GIT_COMMITTER_NAME", _COMMITTER_NAME)
+        env.setdefault("GIT_COMMITTER_EMAIL", _COMMITTER_EMAIL)
 
         try:
             return subprocess.run(

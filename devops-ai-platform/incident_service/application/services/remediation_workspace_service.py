@@ -62,14 +62,21 @@ class RemediationWorkspaceService:
         self,
         git_timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS,
         workspace_prefix: str = WORKSPACE_PREFIX,
+        remote_url_factory=None,
     ):
         if git_timeout_seconds <= 0:
             raise ValueError("git_timeout_seconds must be greater than zero")
         if not workspace_prefix or not workspace_prefix.endswith("-"):
             raise ValueError("workspace_prefix must be non-empty and end with '-'")
+        if remote_url_factory is not None and not callable(remote_url_factory):
+            raise ValueError("remote_url_factory must be callable")
 
         self.git_timeout_seconds = git_timeout_seconds
         self.workspace_prefix = workspace_prefix
+        # Composition-time seam for tests (e.g. a local bare origin); the
+        # production default below is the fixed GitHub URL derived from the
+        # validated slug. Never influenced by request/model input.
+        self._remote_url_factory = remote_url_factory
         self._active_workspaces: set[Path] = set()
 
     @staticmethod
@@ -154,7 +161,10 @@ class RemediationWorkspaceService:
         workspace_path = cleanup_root / "repository"
 
         try:
-            remote_url = f"https://github.com/{repo}.git"
+            if self._remote_url_factory is not None:
+                remote_url = self._remote_url_factory(repo)
+            else:
+                remote_url = f"https://github.com/{repo}.git"
 
             self._run_git(
                 [

@@ -112,6 +112,19 @@ def _serialize_incident(incident) -> Dict[str, Any]:
                 "proposal_hash": proposal.proposal_hash,
                 "status": proposal.status,
                 "blocked_reason": proposal.blocked_reason,
+                "approved_by": proposal.approved_by,
+                "approved_at": (
+                    proposal.approved_at.isoformat()
+                    if proposal.approved_at
+                    else None
+                ),
+                "approval_hash": proposal.approval_hash,
+                "execution_id": proposal.execution_id,
+                "commit_sha": proposal.commit_sha,
+                "branch_name": proposal.branch_name,
+                "execution_attempts": int(proposal.execution_attempts or 0),
+                "last_failure_stage": proposal.last_failure_stage,
+                "last_failure_reason": proposal.last_failure_reason,
             }
             for proposal in incident.patch_proposals
         ],
@@ -345,3 +358,150 @@ def get_remediation_proposal(
         "incident_status": incident.status,
         "proposal": _serialize_proposal(proposal),
     }
+
+# --------------------------------------------------------------------------
+# Phase 6.2: proposal approval + controlled execution (draft PR boundary)
+# --------------------------------------------------------------------------
+
+
+class ProposalApprovalRequest(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=200)
+    proposal_hash: str = Field(min_length=64, max_length=64)
+    # Stamped by the gateway from the verified JWT sub; recorded for audit
+    # only — authorization happens at the gateway (operator role) and the
+    # deterministic policy checks inside the approval service.
+    approved_by: str = Field(default="", max_length=200)
+
+
+class ProposalExecutionRequest(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=200)
+    proposal_hash: str = Field(min_length=64, max_length=64)
+    requested_by: str = Field(default="", max_length=200)
+
+
+def get_proposal_approval_service() -> "ProposalApprovalService":
+    from incident_service.application.services.proposal_approval_service import (
+        ProposalApprovalService,
+    )
+
+    return ProposalApprovalService(repository=get_incident_repository())
+
+
+def get_proposal_execution_service() -> "ProposalExecutionService":
+    from incident_service.application.services.proposal_execution_service import (
+        ProposalExecutionService,
+    )
+
+    return ProposalExecutionService(
+        repository=get_incident_repository(),
+        orchestrator_factory=get_remediation_orchestrator,
+    )
+
+
+@router.post("/{incident_id}/proposal/approve", response_model=Dict[str, Any])
+def approve_proposal(
+    incident_id: str,
+    request: ProposalApprovalRequest,
+    service=Depends(get_proposal_approval_service),
+):
+    """Bind an operator approval to one exact canonical proposal hash (§6).
+
+    Deterministic policy only: state, hash integrity, bounded risk class,
+    freshness and current authoritative target eligibility. AI confidence
+    is never an authorization signal.
+    """
+    from incident_service.application.failures import (
+        ApprovalPolicyError,
+        ProposalIntegrityError,
+        ProposalNotFoundError,
+        ProposalStaleError,
+        TargetRevalidationError,
+    )
+
+    try:
+        return service.approve(
+            incident_id=incident_id,
+            proposal_id=request.proposal_id,
+            proposal_hash=request.proposal_hash,
+            approved_by=request.approved_by,
+        )
+    except ProposalNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ApprovalPolicyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except TargetRevalidationError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ProposalStaleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProposalIntegrityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/{incident_id}/proposal/execute", response_model=Dict[str, Any])
+def execute_proposal(
+    incident_id: str,
+    request: ProposalExecutionRequest,
+    service=Depends(get_proposal_execution_service),
+):
+    """Execute an approved persisted proposal up to a draft PR (§2).
+
+    Target repository/SHA always come from persisted + revalidated
+    authoritative evidence — never from the request body. Repeating the
+    call after success reconciles the existing PR instead of creating
+    another one (§21).
+    """
+    from incident_service.application.failures import (
+        ApprovalPolicyError,
+        ProposalAlreadyExecutingError,
+        ProposalExecutionFailedError,
+        ProposalIntegrityError,
+        ProposalNotApprovedError,
+        ProposalNotFoundError,
+        ProposalPatchPolicyError,
+        ProposalStaleError,
+        RemediationValidationFailedError,
+        TargetRevalidationError,
+    )
+    from incident_service.application.services.remediation_orchestration_service import (
+        RemediationOrchestrationError,
+    )
+    from incident_service.application.services.remediation_workspace_service import (
+        RemediationWorkspaceError,
+    )
+    from incident_service.infrastructure.source_provider.github_pr_client import (
+        PRCreationFailedException,
+    )
+
+    try:
+        return service.execute(
+            incident_id=incident_id,
+            proposal_id=request.proposal_id,
+            proposal_hash=request.proposal_hash,
+            requested_by=request.requested_by,
+        )
+    except ProposalNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProposalIntegrityError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProposalPatchPolicyError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except (ProposalNotApprovedError, ProposalAlreadyExecutingError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProposalStaleError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ApprovalPolicyError, TargetRevalidationError) as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except RemediationValidationFailedError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProposalExecutionFailedError as exc:
+        status = 422 if getattr(exc, "stage", "") == "patch" else 502
+        raise HTTPException(
+            status_code=status,
+            detail=f"execution failed at stage '{getattr(exc, 'stage', 'unknown')}': {exc}",
+        ) from exc
+    except (RemediationOrchestrationError, RemediationWorkspaceError,
+            PRCreationFailedException) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"remediation execution failed: {exc}",
+        ) from exc

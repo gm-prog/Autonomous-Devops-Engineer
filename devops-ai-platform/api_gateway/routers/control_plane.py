@@ -201,3 +201,47 @@ def control_plane_get_proposal(
     """
     _rate_limit_or_429(request)
     return _forward_get("incident", f"/incidents/{incident_id}/proposal")
+
+
+@router.post("/incidents/{incident_id}/proposal/approve")
+def control_plane_approve_proposal(
+    incident_id: str,
+    payload: Dict,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Bind an operator approval to one canonical proposal hash (§6).
+
+    ``approved_by`` is always the verified JWT subject — a client-supplied
+    identity string is discarded. The downstream still re-verifies hash
+    integrity, risk policy, freshness and the authoritative target before
+    recording anything.
+    """
+    _rate_limit_or_429(request)
+    forwarded = dict(payload)
+    forwarded["approved_by"] = user["sub"]
+    return _forward_post(
+        "incident", f"/incidents/{incident_id}/proposal/approve", forwarded
+    )
+
+
+@router.post("/incidents/{incident_id}/proposal/execute")
+def control_plane_execute_proposal(
+    incident_id: str,
+    payload: Dict,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Execute an approved proposal up to a draft PR (operator, §2).
+
+    ``requested_by`` is stamped from the JWT subject for audit; the
+    repository/SHA/branch/commands are never caller-provided — the
+    downstream derives them from revalidated persisted evidence.
+    Repeated calls reconcile the same persisted execution/PR.
+    """
+    _rate_limit_or_429(request)
+    forwarded = dict(payload)
+    forwarded["requested_by"] = user["sub"]
+    return _forward_post(
+        "incident", f"/incidents/{incident_id}/proposal/execute", forwarded
+    )

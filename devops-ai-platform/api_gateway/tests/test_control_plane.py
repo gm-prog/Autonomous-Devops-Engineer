@@ -260,3 +260,119 @@ class ProposalReadRouteTests(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 404)
         get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.2: proposal approval / execution control-plane routes (§6/§21)
+# ---------------------------------------------------------------------------
+
+PROPOSAL_APPROVE = "/v1/incidents/inc-42/proposal/approve"
+PROPOSAL_EXECUTE = "/v1/incidents/inc-42/proposal/execute"
+PROPOSAL_ACTION_ROUTES = (PROPOSAL_APPROVE, PROPOSAL_EXECUTE)
+
+_PROPOSAL_BODY = {
+    "proposal_id": "proposal-inc-42",
+    "proposal_hash": "a" * 64,
+    "approved_by": "mallory",
+    "requested_by": "mallory",
+}
+
+
+class ProposalExecutionRouteTests(unittest.TestCase):
+    """Proposal approve/execute require JWT + operator role at the gateway
+    and always stamp the verified identity over caller-supplied fields."""
+
+    def test_unauthenticated_requests_are_rejected_before_forwarding(self):
+        for route in PROPOSAL_ACTION_ROUTES:
+            with self.subTest(route=route), _post_mock() as post:
+                resp = client.post(route, json=_PROPOSAL_BODY)
+                self.assertIn(resp.status_code, (401, 403))
+                post.assert_not_called()
+
+    def test_ordinary_user_cannot_approve_or_execute_proposals(self):
+        ordinary = mint_token("bob-developer", roles=["Developer"])
+        for route in PROPOSAL_ACTION_ROUTES:
+            with self.subTest(route=route), _post_mock() as post:
+                resp = client.post(
+                    route, json=_PROPOSAL_BODY, headers=_authed(ordinary)
+                )
+                self.assertEqual(resp.status_code, 403, resp.text)
+                self.assertIn("operator role", resp.json()["detail"])
+                post.assert_not_called()
+
+    def test_operator_identity_is_stamped_over_request_strings(self):
+        token = mint_token("alice-operator", roles=["DevOpsLead"])
+        for route, field in (
+            (PROPOSAL_APPROVE, "approved_by"),
+            (PROPOSAL_EXECUTE, "requested_by"),
+        ):
+            with self.subTest(route=route), _post_mock() as post:
+                post.return_value = _downstream()
+                resp = client.post(
+                    route, json=_PROPOSAL_BODY, headers=_authed(token)
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                forwarded = post.call_args.kwargs["json"]
+                self.assertEqual(forwarded[field], "alice-operator")
+                self.assertNotEqual(forwarded[field], "mallory")
+                # trusted inputs preserved verbatim
+                self.assertEqual(forwarded["proposal_id"], "proposal-inc-42")
+                self.assertEqual(forwarded["proposal_hash"], "a" * 64)
+                # forwarded to the incident service proposal endpoints
+                self.assertTrue(
+                    post.call_args.args[0].endswith(
+                        f"/incidents/inc-42/proposal/{route.rsplit('/', 1)[-1]}"
+                    ),
+                    post.call_args.args[0],
+                )
+
+    def test_all_documented_operator_roles_are_accepted(self):
+        for role in ("operator", "DevOpsLead", "ClusterAdmin"):
+            for route in PROPOSAL_ACTION_ROUTES:
+                with self.subTest(role=role, route=route), _post_mock() as post:
+                    post.return_value = _downstream()
+                    token = mint_token("op", roles=[role])
+                    resp = client.post(
+                        route, json=_PROPOSAL_BODY, headers=_authed(token)
+                    )
+                    self.assertEqual(resp.status_code, 200, resp.text)
+
+    def test_downstream_statuses_are_relayed(self):
+        token = _operator()
+        for status, body in (
+            (409, {"detail": "proposal status PROPOSED cannot execute"}),
+            (422, {"detail": "supplied proposal_hash does not match"}),
+            (403, {"detail": "authoritative deployment target no longer matches"}),
+        ):
+            with self.subTest(status=status), _post_mock() as post:
+                post.return_value = _downstream(status, body)
+                resp = client.post(
+                    PROPOSAL_EXECUTE, json=_PROPOSAL_BODY, headers=_authed(token)
+                )
+                self.assertEqual(resp.status_code, status)
+                self.assertEqual(resp.json(), body)
+
+    def test_unreachable_downstream_is_502(self):
+        import requests as requests_lib
+
+        token = _operator()
+        with _post_mock() as post:
+            post.side_effect = requests_lib.ConnectionError("refused")
+            resp = client.post(
+                PROPOSAL_EXECUTE, json=_PROPOSAL_BODY, headers=_authed(token)
+            )
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("unreachable", resp.json()["detail"])
+
+    def test_internal_prefix_grants_nothing(self):
+        token = _operator()
+        for path in (
+            "/api/internal/incidents/inc-42/proposal/approve",
+            "/api/internal/incidents/inc-42/proposal/execute",
+        ):
+            with self.subTest(path=path), _post_mock() as post:
+                resp = client.post(
+                    path, json=_PROPOSAL_BODY, headers=_authed(token)
+                )
+                self.assertEqual(resp.status_code, 404)
+                post.assert_not_called()

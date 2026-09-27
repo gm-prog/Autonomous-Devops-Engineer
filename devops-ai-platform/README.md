@@ -11,12 +11,12 @@ CI):
 
 | Service | Package | Entrypoint | Exposes |
 |---|---|---|---|
-| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal` (HS256 JWT, operator roles where noted), `/health` |
+| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal`, `POST /v1/incidents/{id}/proposal/approve`, `POST /v1/incidents/{id}/proposal/execute` (HS256 JWT, operator roles where noted), `/health` |
 | Repo context | `repo_service` | `repo_service.main:app` :8010 | `POST /repositories`, `/health` |
 | Agent swarm | `agent_service` | `agent_service.main:app` :8020 | `GET /agent/streams/{task_id}` (SSE), `/health` |
 | Deployment | `deployment_service` | Celery worker | task `tasks.execute_iac_deployment` (Redis broker) |
 | Monitoring | `monitoring_service` | `monitoring_service.main:app` :8040 | `WS /ws/telemetry/socket/{client_id}`, `POST /api/internal` (observation → threshold event, dispatch target), `/health` |
-| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
+| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /incidents/{id}/proposal/approve` + `/execute` (Phase 6.2, approval → draft PR), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
 | Reporting | `reporting_service` | (library) | weekly audit-report queries + "PDF" engine |
 | Shared kernel | `shared_kernel` | (library) | domain events, value objects, event publisher, metrics |
 
@@ -274,6 +274,95 @@ never trigger execution.
   the monitoring receiver itself is exercised directly as an in-network
   caller.
 
+## Phase 6.2 — Controlled remediation execution (proposal → approval → validated patch → draft PR)
+
+```text
+POST /incidents/{id}/proposal        (Phase 6.1: persisted proposal)
+  → operator approval at the gateway (JWT sub stamped, never request text)
+  → deterministic approval policy (state/hash/TTL/risk/target — re-verified)
+  → execution pre-flight: canonical hash recompute, patch policy re-check,
+    authoritative deployment target re-resolution (same DEPLOYED record
+    + repo + SHA as the proposal — never retargeted)
+  → EXECUTING persisted (uuid5 execution id, attempt counter)
+  → existing orchestration: isolated SHA-pinned workspace → bounded patch
+    (git apply --check) → fixed validation profile → deterministic commit
+    (parent == pinned SHA) → push automation/remediation/* → remote SHA
+    verified → GitHub REST branch + DRAFT PR
+  → PR_CREATED persisted + machine-readable execution evidence
+```
+
+**The AI proposes; deterministic code authorizes; deterministic code
+executes; independent checks verify.** The request body never carries
+`repository`, `source_sha`, branch, workspace or commands — those are
+always derived from the persisted proposal and re-validated against the
+authoritative deployment evidence immediately before side effects.
+
+* **Approval policy (`POST /incidents/{id}/proposal/approve`, operator
+  only at `/v1/...` at the gateway).** Requires: incident + proposal
+  exist, status `PROPOSED` (idempotent re-approval of the same approved
+  hash is accepted), reproducible canonical hash == stored hash ==
+  caller claim, risk class inside the deliberately small
+  `LOW`/`MEDIUM` set, generation → approval within
+  `REMEDIATION_PROPOSAL_TTL_SECONDS` (default 86400), and the
+  authoritative deployment target still matching the proposal binding.
+  AI confidence is never an authorization signal. `approved_by` is the
+  verified JWT subject, never a request string.
+* **Lifecycle:** `PROPOSED → APPROVED → EXECUTING → PR_CREATED`, failure
+  → `EXECUTION_FAILED` (retryable). `BLOCKED` is never approvable.
+  Approval fields (`approved_by/approved_at/approval_hash`) and
+  execution fields (`execution_id/executed_at/commit_sha/branch_name/
+  execution_attempts/last_failure_*`) persist on the existing aggregate —
+  no new tables.
+* **Idempotency & concurrency:** execution id =
+  `uuid5(namespace, proposal_id:proposal_hash)` — same proposal, same
+  identity, same PR. After `PR_CREATED` a repeat call reconciles the
+  stored PR (no second push, no second PR). Concurrency is guarded by a
+  process-local per-proposal lock **plus** the persisted status
+  precondition; the current storage layer cannot provide distributed
+  locking (see limitations).
+* **Failure semantics (§25 HTTP map):** 404 missing incident/proposal;
+  422 integrity/patch-policy/validation-failed (and deterministic
+  patch-stage failures); 409 not-approved/executing/stale; 403
+  policy/target-revalidation; 502 GitHub/remote failure — persisted as
+  `EXECUTION_FAILED` with stage + evidence, never a fake `PR_CREATED`.
+  Validation failure stops before commit/push/PR every time.
+* **Observability:** structured `remediation.*` JSON logs for
+  `approval.accepted`, `target.revalidated`, `execution.started`,
+  `workspace.created`, `patch.applied`, `validation.started`,
+  `validation.completed`, `commit.created`, `pr.created`,
+  `execution.completed`, `execution.failed`, `execution.reconciled`
+  (ids, hashes, statuses, stage results — no secrets, no headers), plus
+  persisted `remediation_execution` evidence records
+  (`exec-{execution_id}-a{attempt}`) carrying the full stage list,
+  validation step results, commit SHA and PR URL.
+* **Command boundary:** execution runs only the fixed validation profile
+  bound at composition (`REMEDIATION_VALIDATION_PROFILE`, default
+  `incident_service`); `validation_plan` text from the proposal never
+  becomes a command. Patch/branch/commit policy from the existing
+  orchestration stack is re-applied on every attempt.
+
+### Honest limitations (Phase 6.2)
+
+* **Locks are process-local.** The per-proposal lock plus persisted
+  status precondition guarantee the single-execution domain invariant
+  within one process (tested); multiple replicas sharing this storage
+  cannot be proven to hold it — production deployment needs a
+  storage-level lock/lease. A process crash mid-`EXECUTING` leaves that
+  state behind and requires manual recovery (no auto-reconcile designed
+  in this slice).
+* **Workspace + subprocess validation is not a hardened sandbox** — no
+  container/VM isolation, seccomp or user namespace separation. Bounded
+  timeouts, resource limits, fixed argv and sanitized env are enforced,
+  but a determined local exploit surface remains.
+* **Non-fast-forward retry:** a failed attempt after a successful push
+  retries with a plain push of the same deterministic branch; if the
+  remote branch advanced unexpectedly the retry fails closed (no lease
+  force).
+* **GitHub "draft" and base-branch policy** rely on the configured
+  `GITHUB_ALLOWED_BASE_BRANCHES` and token permissions; merging,
+  approving, deploying, canary or rollback remain explicitly out of
+  scope.
+
 ## Network & authentication trust boundary
 
 * **External boundary = API gateway only.** `docker-compose.yml` publishes a
@@ -378,3 +467,12 @@ plus the live vertical slice: monitoring runtime composition →
 `POST /api/internal` → consumer envelope → incident consumer →
 proposal (duplicate-event, malformed-input, prompt-injection-as-data and
 no-side-effect cases included).
+
+Phase 6.2 execution adds: approval policy unit matrix (hash binding,
+TTL, risk bounds, target drift, injection-as-data), execution service
+gates (unapproved/tampered/stale/drift → zero side effects), failure
+matrix A–I (validation/GitHub/patch failures, redaction, retry,
+duplicate reconcile, concurrency invariant), controller HTTP mapping,
+gateway operator routes (auth/role/stamp/relay/internal-prefix), and a
+real-git integration E2E (persisted proposal → approval → execution →
+local bare-origin push → draft PR, plus no-publish failure cases).

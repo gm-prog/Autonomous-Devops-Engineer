@@ -183,11 +183,31 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 proposal_hash=str(item.get("proposal_hash") or ""),
                 status=str(item.get("status") or "PROPOSED"),
                 blocked_reason=str(item.get("blocked_reason") or ""),
+                # Phase 6.2 lifecycle (missing on older rows → defaults)
+                approved_by=str(item.get("approved_by") or ""),
+                approved_at=_parse_optional_datetime(item.get("approved_at")),
+                approval_hash=str(item.get("approval_hash") or ""),
+                execution_id=str(item.get("execution_id") or ""),
+                executed_at=_parse_optional_datetime(item.get("executed_at")),
+                commit_sha=str(item.get("commit_sha") or ""),
+                branch_name=str(item.get("branch_name") or ""),
+                execution_attempts=int(item.get("execution_attempts") or 0),
+                last_failure_stage=str(item.get("last_failure_stage") or ""),
+                last_failure_reason=str(item.get("last_failure_reason") or ""),
             )
             for item in proposals
         ]
 
         return incident
+
+
+def _parse_optional_datetime(value):
+    if isinstance(value, str) and value:
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _normalize_created_at(value: datetime) -> datetime:

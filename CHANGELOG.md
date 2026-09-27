@@ -1,5 +1,67 @@
 # CHANGELOG
 
+## 2026-09-27 — Phase 6.2: controlled remediation execution (proposal → approval → validated patch → draft PR)
+
+Completes the bounded vertical slice: an evidence-grounded, persisted
+proposal can now be approved by an authenticated operator and executed
+by deterministic code up to a **draft GitHub PR** — and nothing else.
+No merge, no approve of the PR itself, no deploy/canary/rollback, no
+authorization escalation, no multi-agent or model-supplied commands.
+
+* **Approval (`POST /incidents/{id}/proposal/approve`).** Deterministic
+  policy only: proposal exists, status approvable (`BLOCKED` never),
+  canonical hash reproducible from persisted state and equal to both the
+  stored and caller-claimed hash, risk class within the bounded
+  `LOW`/`MEDIUM` set, generation → approval inside
+  `REMEDIATION_PROPOSAL_TTL_SECONDS` (default 86400), and the
+  authoritative deployment target still matching the proposal's trusted
+  repository/SHA. `approved_by` is stamped from the verified JWT subject
+  at the gateway (`/v1/incidents/{id}/proposal/approve`, operator role);
+  AI confidence is never consulted for authorization. Approval persists
+  `APPROVED` + `approved_by/approved_at/approval_hash` on the existing
+  aggregate (idempotent for the same hash).
+* **Execution (`POST /incidents/{id}/proposal/execute`, operator).**
+  Pre-flight re-verifies integrity, approval freshness (TTL), patch
+  policy and the authoritative target (mismatch → abort, never
+  retarget), persists `EXECUTING` with a deterministic
+  `uuid5(proposal_id:proposal_hash)` execution id, then runs the
+  existing orchestration stack unchanged (SHA-pinned isolated workspace →
+  bounded `git apply --check` → fixed validation profile → deterministic
+  commit with parent == pinned SHA → push `automation/remediation/*` →
+  remote SHA verification → **draft** PR). Success persists
+  `PR_CREATED` + commit/branch/PR identity and attaches machine-readable
+  `remediation_execution` evidence (`exec-{id}-a{attempt}`); failure
+  persists `EXECUTION_FAILED` with stage + redacted reason and allows
+  retry. Repeat execution reconciles the stored PR (same identity, no
+  second push).
+* **Lifecycle fields (additive):** `approved_by`, `approved_at`,
+  `approval_hash`, `execution_id`, `executed_at`, `commit_sha`,
+  `branch_name`, `execution_attempts`, `last_failure_stage`,
+  `last_failure_reason`, plus statuses `APPROVED/EXECUTING/PR_CREATED/
+  EXECUTION_FAILED` — restored on reload through the existing
+  postgres/sqlite adapter; no schema/table changes.
+* **Typed failures + HTTP map:** 404 not found / 422 integrity, patch
+  policy, validation-failed / 409 not-approved, executing, stale /
+  403 approval-policy, target-revalidation / 502 GitHub-remote failure.
+* **Heredity fixes found while wiring the chain:** deterministic
+  committer identity for remediation commits (a cloned workspace has no
+  `user.name/user.email`; fixed non-impersonating
+  `devops-ai-remediation@noreply.invalid`, env-overridable) and a
+  composition-time remote-URL seam on the workspace service (production
+  default still the fixed GitHub URL; tests inject a local bare origin).
+* **Observability:** structured `remediation.*` logs for approval,
+  target revalidation, execution start/stage/complete/fail/reconcile.
+* **Tests:** approval policy matrix, execution gates + failure matrix
+  (unapproved, wrong hash, tampered patch/path, deployment drift, stale,
+  validation failure, GitHub failure, patch rejection, redaction, retry,
+  duplicate reconcile, concurrency invariant, injection-as-data),
+  controller mapping, gateway operator routes, and a real-git E2E
+  (persisted proposal → approval → execution → bare-origin push → draft
+  PR). CI incident job: 24 modules.
+* **Honest limitations:** process-local locks (not distributed),
+  workspace+subprocess ≠ hardened sandbox, crashed `EXECUTING` needs
+  manual recovery, non-fast-forward push retries fail closed.
+
 ## 2026-09-27 — Phase 6.1 live vertical slice: monitoring runtime wiring
 
 Closes the last runtime gap of the monitoring → proposal chain (proposal

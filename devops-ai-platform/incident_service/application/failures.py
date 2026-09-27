@@ -40,3 +40,50 @@ class ProposalValidationFailed(Phase6PipelineError):
 
 class ProposalPersistenceFailed(Phase6PipelineError):
     """The proposal could not be persisted."""
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.2: approval + controlled execution
+# ---------------------------------------------------------------------- #
+class ProposalNotFoundError(Phase6PipelineError):
+    """The referenced proposal does not exist on the incident."""
+
+
+class ProposalIntegrityError(Phase6PipelineError):
+    """Canonical hash could not be reproduced or does not match the claim."""
+
+
+class ProposalNotApprovedError(Phase6PipelineError):
+    """Execution was requested for a proposal that is not approved."""
+
+
+class ProposalAlreadyExecutingError(Phase6PipelineError):
+    """Another execution attempt holds this proposal right now."""
+
+
+class ProposalStaleError(Phase6PipelineError):
+    """The approval (or proposal) is older than the freshness contract."""
+
+
+class ApprovalPolicyError(Phase6PipelineError):
+    """Deterministic approval policy rejected the proposal."""
+
+
+class TargetRevalidationError(Phase6PipelineError):
+    """Authoritative deployment evidence no longer matches the proposal."""
+
+
+class ProposalPatchPolicyError(Phase6PipelineError):
+    """Deterministic patch policy rejected the persisted proposal."""
+
+
+class RemediationValidationFailedError(Phase6PipelineError):
+    """Workspace validation failed; commit/push/PR are forbidden."""
+
+
+class ProposalExecutionFailedError(Phase6PipelineError):
+    """A later execution stage failed; state is persisted for audit/retry."""
+
+    def __init__(self, message: str, stage: str = "unknown"):
+        super().__init__(message)
+        self.stage = stage
