@@ -162,3 +162,42 @@ def control_plane_remediation(
     return _forward_post(
         "incident", f"/incidents/{incident_id}/remediation", dict(payload)
     )
+
+
+def _forward_get(service_name: str, path: str) -> JSONResponse:
+    """GET from a private-network downstream, relayed verbatim."""
+    target_url = f"{SERVICES[service_name]}{path}"
+    try:
+        downstream = requests.get(target_url, timeout=_FORWARD_TIMEOUT_SECONDS)
+    except requests.RequestException as exc:
+        logger.warning("Control-plane forward to %s failed: %s", target_url, exc)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Downstream service '{service_name}' is unreachable "
+                f"({exc.__class__.__name__})"
+            ),
+        ) from exc
+    try:
+        body = downstream.json()
+    except ValueError:
+        body = {"raw": downstream.text[:1000]}
+    return JSONResponse(status_code=downstream.status_code, content=body)
+
+
+@router.get("/incidents/{incident_id}/proposal")
+def control_plane_get_proposal(
+    incident_id: str,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Read the incident's persisted remediation proposal (§27).
+
+    Read-only, but gated by the same operator-role authorization as the
+    remediation control plane: proposals embed patch content and trusted
+    repository/SHA identity, so they are not exposed to ordinary users.
+    Authentication happens at the gateway (JWT); knowing the internal
+    incident URL grants nothing.
+    """
+    _rate_limit_or_429(request)
+    return _forward_get("incident", f"/incidents/{incident_id}/proposal")

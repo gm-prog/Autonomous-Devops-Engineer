@@ -100,16 +100,11 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
 
     @staticmethod
     def _to_row(incident: IncidentAggregate) -> dict:
+        # to_dict() carries every §12 field (incident_id, repository,
+        # evidence_refs, validation_plan, risk_class, proposal_hash,
+        # status, blocked_reason) — all survive reload (§19).
         proposals = [
-            {
-                "id": proposal.id,
-                "target_filepath": proposal.target_filepath,
-                "diff_patch_payload": proposal.diff_patch_payload,
-                "is_verified": proposal.is_verified,
-                "generated_at": proposal.generated_at.isoformat(),
-                "pull_request_url": proposal.pull_request_url,
-                "source_sha": proposal.source_sha,
-            }
+            proposal.to_dict()
             for proposal in incident.patch_proposals
         ]
 
@@ -175,6 +170,19 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 generated_at=datetime.fromisoformat(item["generated_at"]),
                 pull_request_url=item.get("pull_request_url"),
                 source_sha=item.get("source_sha"),
+                # Phase 6.1 fields (missing on legacy rows → defaults)
+                incident_id=str(item.get("incident_id") or ""),
+                repository=str(item.get("repository") or ""),
+                evidence_refs=[
+                    str(ref) for ref in item.get("evidence_refs") or []
+                ],
+                validation_plan=[
+                    str(step) for step in item.get("validation_plan") or []
+                ],
+                risk_class=str(item.get("risk_class") or "UNSPECIFIED"),
+                proposal_hash=str(item.get("proposal_hash") or ""),
+                status=str(item.get("status") or "PROPOSED"),
+                blocked_reason=str(item.get("blocked_reason") or ""),
             )
             for item in proposals
         ]

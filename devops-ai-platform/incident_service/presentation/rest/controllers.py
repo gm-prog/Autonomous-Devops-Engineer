@@ -1,13 +1,25 @@
 from typing import Any, Dict, List
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from incident_service.application.dependencies import get_incident_repository
+from incident_service.application.failures import (
+    IncidentNotFound,
+    InvalidRcaResult,
+    ProposalPersistenceFailed,
+    RcaGenerationFailed,
+    TargetBindingFailed,
+)
 from incident_service.domain.repository_interface import IncidentRepositoryPort
 from incident_service.domain.entities.incident_evidence import IncidentEvidence
 from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 from incident_service.infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
+from incident_service.application.services.proposal_generation_service import (
+    ProposalGenerationService,
+)
 from incident_service.application.services.rca_evidence_pack import RcaEvidencePackBuilder
 from incident_service.application.services.hotfix_validation_service import HotfixValidationService
 from incident_service.application.services.remediation_commit_service import RemediationCommitService
@@ -88,9 +100,18 @@ def _serialize_incident(incident) -> Dict[str, Any]:
         "patch_proposals": [
             {
                 "id": proposal.id,
+                "incident_id": proposal.incident_id,
                 "target_filepath": proposal.target_filepath,
                 "is_verified": proposal.is_verified,
                 "generated_at": proposal.generated_at.isoformat(),
+                "repository": proposal.repository,
+                "source_sha": proposal.source_sha,
+                "evidence_refs": list(proposal.evidence_refs),
+                "validation_plan": list(proposal.validation_plan),
+                "risk_class": proposal.risk_class,
+                "proposal_hash": proposal.proposal_hash,
+                "status": proposal.status,
+                "blocked_reason": proposal.blocked_reason,
             }
             for proposal in incident.patch_proposals
         ],
@@ -249,3 +270,78 @@ def create_remediation(
         },
     }
 
+
+# --------------------------------------------------------------------------
+# Phase 6.1: incident → evidence → RCA → structured remediation proposal
+# --------------------------------------------------------------------------
+
+logger = logging.getLogger("IncidentProposalController")
+
+
+def get_proposal_generation_service() -> ProposalGenerationService:
+    """Proposal pipeline bound to the shared incident repository."""
+    return ProposalGenerationService(repository=get_incident_repository())
+
+
+def _serialize_proposal(proposal: HotfixProposal) -> Dict[str, Any]:
+    return proposal.to_dict()
+
+
+@router.post("/{incident_id}/proposal", response_model=Dict[str, Any])
+def generate_remediation_proposal(
+    incident_id: str,
+    service: ProposalGenerationService = Depends(get_proposal_generation_service),
+):
+    """Evidence-grounded proposal generation — proposal-only (§22).
+
+    Runs the full pipeline (trusted target → RCA → deterministic
+    validation → canonical hash → persistence). Never executes remediation:
+    no workspace, no git, no GitHub, no deploy. Returns HTTP 200 for both
+    a ``PROPOSED`` and a ``BLOCKED`` outcome (the pipeline itself ran);
+    blocked payloads carry a machine-readable ``blocked_reason`` and are
+    persisted, never executable (§7/§20).
+    """
+    try:
+        return service.generate(incident_id)
+    except IncidentNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidRcaResult as exc:
+        # schema-constrained AI output failed validation → fail closed (§11)
+        raise HTTPException(
+            status_code=422,
+            detail=f"RCA result failed schema validation: {exc}",
+        ) from exc
+    except RcaGenerationFailed as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="RCA provider is unavailable; try again later",
+        ) from exc
+    except TargetBindingFailed as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ProposalPersistenceFailed as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Proposal could not be persisted",
+        ) from exc
+
+
+@router.get("/{incident_id}/proposal", response_model=Dict[str, Any])
+def get_remediation_proposal(
+    incident_id: str,
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Read-only view of the incident's persisted proposal (§27)."""
+    incident = repository.get_incident_by_id(incident_id.strip())
+    if incident is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+    if not incident.patch_proposals:
+        raise HTTPException(
+            status_code=404,
+            detail="No remediation proposal exists for this incident",
+        )
+    proposal = incident.patch_proposals[-1]
+    return {
+        "incident_id": incident.id,
+        "incident_status": incident.status,
+        "proposal": _serialize_proposal(proposal),
+    }

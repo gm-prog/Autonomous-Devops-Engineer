@@ -1,5 +1,47 @@
 # CHANGELOG
 
+## 2026-09-27 — Phase 6.1: incident → evidence → RCA → structured remediation proposal
+
+Proposal-only pipeline inside `devops-ai-platform/incident_service` (no
+execution of any kind — no clone/modify/commit/push/branch/PR, no deploy,
+no remediation engine, no approval).
+
+* **Producer wiring:** `ThresholdValidator` can publish
+  `ThreatThresholdExceededEvent` via the new shared
+  `RedisStreamPublisher` (`devops:events`) — the exact type the incident
+  consumer already dispatches.
+* **Idempotent ingestion:** incident and threshold-evidence ids derive
+  from the producer `event_id` (uuid5); redeliveries return the existing
+  incident without duplicates; proposal regeneration upserts one record.
+* **Typed RCA:** `RootCauseAnalysis` domain object persisted as
+  `kind="rca_result"` evidence; `RcaAnalyzerPort` (agent-service adapter,
+  deterministic fakes in tests); `parse_rca_result` schema fail-closed
+  (bounded types/lengths, confidence in [0,1], evidence refs must exist
+  on the incident; legacy `supporting_evidence_ids` alias supported).
+* **Trusted target binding:** `resolve_authoritative_deployment_target`
+  reuses the Stage-5 gates (DEPLOYED, one-record canonical repo + 40-hex
+  SHA, valid provenance); no trustworthy target → persisted
+  `BLOCKED/MISSING_DEPLOYED_TARGET_EVIDENCE` proposal with empty identity
+  fields — nothing fabricated.
+* **Proposal generation:** AI may propose file/patch/plan/risk only;
+  target-path policy + `HotfixProposal.apply_verification_pass()` +
+  `HotfixValidationService` decide pass/fail (single-file policy kept);
+  deterministic `LOW|MEDIUM|HIGH|BLOCKED` risk classifier; SHA-256
+  canonical proposal hash over the fixed §18 field set; every §12 field
+  survives repository reload; success → incident `RemediationProposed`.
+* **API:** `POST/GET /incidents/{id}/proposal` (typed failures: 404/422/
+  503) + gateway `GET /v1/incidents/{id}/proposal` (JWT + operator role).
+* **Observability:** structured single-line JSON logs (`incident.created`,
+  `evidence.attached`, `rca.started/completed/failed`,
+  `proposal.generated/validated/blocked`) with correlation ids; no
+  secrets, tokens or full AI outputs logged.
+* **Tests:** incident suite grows 17 → 21 modules (140 tests), platform
+  `tests/` gains the producer + full pipeline E2E; gateway read-route
+  auth matrix added. Full local battery: 323 tests + 91 subtests green;
+  §22 no-side-effect spies assert GitHub client/git/branch/PR/deploy/
+  remediation-engine paths are never invoked while the proposal is still
+  produced and persisted.
+
 ## 2026-09-24 — Development round: fix & stabilize (post-forensic-audit)
 
 This round addresses the defects identified in `FORENSIC_REPORT.md`.

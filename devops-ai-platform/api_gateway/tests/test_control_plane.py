@@ -189,3 +189,74 @@ class ControlPlaneRelayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PROPOSAL_GET = "/v1/incidents/inc-42/proposal"
+
+
+def _get_mock():
+    return patch(f"{CONTROL_PLANE}.requests.get")
+
+
+class ProposalReadRouteTests(unittest.TestCase):
+    """Phase 6.1 §27: proposal read endpoint is authenticated + authorized."""
+
+    def test_unauthenticated_get_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(PROPOSAL_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_ordinary_user_cannot_read_proposals(self):
+        token = mint_token(
+            "bob", roles=["Developer"], secret=GatewaySettings.JWT_SECRET
+        )
+        with _get_mock() as get:
+            resp = client.get(PROPOSAL_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 403)
+        get.assert_not_called()
+
+    def test_operator_get_is_forwarded_and_relayed(self):
+        body = {
+            "incident_id": "inc-42",
+            "proposal": {"status": "PROPOSED", "proposal_hash": "a" * 64},
+        }
+        token = _operator()
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(PROPOSAL_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), body)
+        target = get.call_args.args[0]
+        self.assertEqual(
+            target, "http://incident-service:8050/incidents/inc-42/proposal"
+        )
+        get.assert_called_once()
+
+    def test_downstream_404_is_relayed(self):
+        token = _operator()
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                404, {"detail": "No remediation proposal exists for this incident"}
+            )
+            resp = client.get(PROPOSAL_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("No remediation proposal", resp.json()["detail"])
+
+    def test_unreachable_downstream_is_502(self):
+        import requests as _requests
+
+        token = _operator()
+        with _get_mock() as get:
+            get.side_effect = _requests.ConnectionError("refused")
+            resp = client.get(PROPOSAL_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 502)
+
+    def test_internal_prefix_still_404_at_the_gateway(self):
+        token = _operator()
+        with _get_mock() as get:
+            resp = client.get(
+                "/api/internal/incidents/inc-42/proposal", headers=_authed(token)
+            )
+        self.assertEqual(resp.status_code, 404)
+        get.assert_not_called()

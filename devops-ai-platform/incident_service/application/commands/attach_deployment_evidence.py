@@ -1,6 +1,11 @@
+import json
+import logging
+
 from incident_service.domain.entities.incident_evidence import IncidentEvidence
 from incident_service.infrastructure.deployment.deployment_evidence_collector import DeploymentEvidenceCollector
 from incident_service.domain.repository_interface import IncidentRepositoryPort
+
+logger = logging.getLogger("AttachDeploymentEvidence")
 
 
 class AttachDeploymentEvidenceCommand:
@@ -26,4 +31,16 @@ class AttachDeploymentEvidenceCommandHandler:
         evidence = self.collector.collect(command.deployment_run_id)
         incident.attach_evidence(evidence)
         self.repository.save_incident(incident)
+        logger.info(
+            json.dumps(
+                {
+                    "event": "evidence.attached",
+                    "incident_id": incident.id,
+                    "evidence_id": evidence.id,
+                    "evidence_kind": evidence.kind,
+                    "deployment_run_id": command.deployment_run_id,
+                    "correlation_id": incident.id,
+                }
+            )
+        )
         return evidence

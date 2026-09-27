@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -7,6 +8,7 @@ from incident_service.domain.entities.incident_evidence import IncidentEvidence
 from incident_service.application.commands.ingest_webhook_alert import (
     IngestWebhookAlertCommand,
     IngestWebhookAlertCommandHandler,
+    deterministic_evidence_id,
 )
 
 logger = logging.getLogger("OnMetricThresholdFailed")
@@ -43,13 +45,21 @@ class OnMetricThresholdFailedHandler:
         ).upper()
 
         observed_at = _parse_timestamp(event.get("timestamp"))
+        event_id = str(event.get("event_id", ""))
+
+        # §4 idempotency: the evidence id derives from the producer's
+        # event_id, so a redelivered event maps onto the SAME evidence
+        # entry (attach_evidence skips ids it already holds).
+        evidence_kwargs = {}
+        if event_id.strip():
+            evidence_kwargs["id"] = deterministic_evidence_id(event_id)
 
         evidence = IncidentEvidence(
             kind="threshold_breach",
             source="monitoring-service",
             observed_at=observed_at,
             payload={
-                "event_id": str(event.get("event_id", "")),
+                "event_id": event_id,
                 "event_type": str(event.get("event_type", "ThreatThresholdExceededEvent")),
                 "service": aggregate_id,
                 "metric": metric,
@@ -61,6 +71,7 @@ class OnMetricThresholdFailedHandler:
                 "breaches": breaches,
                 "metrics": payload.get("metrics") or {},
             },
+            **evidence_kwargs,
         )
 
         command = IngestWebhookAlertCommand(
@@ -82,7 +93,8 @@ class OnMetricThresholdFailedHandler:
             metric,
             severity,
         )
-        return self.triage.handle(command)
+        incident_id = self.triage.handle(command)
+        return incident_id
 
 
 def _parse_timestamp(value: Any) -> datetime:

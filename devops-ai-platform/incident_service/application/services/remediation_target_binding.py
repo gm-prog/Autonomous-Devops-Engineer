@@ -54,6 +54,7 @@ Canonical forms:
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from shared_kernel.domain.provenance import (
@@ -159,6 +160,62 @@ def _provenance_satisfies_record(payload: dict) -> bool:
         if recorded and provenance.get(field) != str(recorded):
             return False
     return True
+
+
+def resolve_authoritative_deployment_target(incident: Any) -> dict | None:
+    """Most recent trusted DEPLOYED target for this incident, or None.
+
+    Single source of truth for "trusted execution target" (Phase 6.1 §6):
+    a candidate record must pass the SAME gates as remediation binding —
+    state == DEPLOYED, canonical repository + full 40-hex SHA coexisting
+    in ONE record, and a valid platform provenance record describing that
+    same record. The winner is the most recent candidate by
+    ``(observed_at, evidence_id)`` — deterministic, and always ONE record's
+    pair, so repo-A + sha-B combinations are structurally impossible.
+    """
+    candidates = []
+    for item in _deployment_evidence(incident):
+        payload = dict(item.payload or {})
+        if not _is_authoritative(payload):
+            continue
+        if not _provenance_satisfies_record(payload):
+            continue
+        repository = _canonical_repository(payload)
+        sha = _canonical_source_sha(payload)
+        if repository is None or sha is None:
+            continue
+        candidates.append(
+            (
+                getattr(item, "observed_at", None),
+                item.id,
+                repository,
+                sha,
+                payload,
+            )
+        )
+    if not candidates:
+        return None
+
+    def _recency_key(entry: tuple) -> tuple:
+        observed = entry[0]
+        if isinstance(observed, datetime):
+            if observed.tzinfo is None:
+                observed = observed.replace(tzinfo=timezone.utc)
+            timestamp = observed.timestamp()
+        else:
+            timestamp = 0.0
+        return (timestamp, str(entry[1]))
+
+    candidates.sort(key=_recency_key, reverse=True)
+    _, evidence_id, repository, sha, payload = candidates[0]
+    return {
+        "repository_name": repository,
+        "source_sha": sha,
+        "evidence_id": evidence_id,
+        "deployment_run_id": str(payload.get("deployment_run_id") or ""),
+        "artifact_hash": str(payload.get("artifact_hash") or ""),
+        "plan_hash": str(payload.get("plan_hash") or ""),
+    }
 
 
 def authorize_remediation_target(

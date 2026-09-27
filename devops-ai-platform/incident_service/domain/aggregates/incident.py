@@ -53,6 +53,27 @@ class IncidentAggregate:
         self.patch_proposals.append(proposal)
         self.status = "RemediationProposed"
 
+    def upsert_remediation_proposal(self, proposal: HotfixProposal):
+        """Idempotent proposal attach (§4): a deterministic proposal id
+        replaces any previous instance instead of accumulating duplicates."""
+        if not proposal.is_verified:
+            raise ValueError("remediation proposal must pass deterministic patch verification")
+        self.patch_proposals = [
+            item for item in self.patch_proposals if item.id != proposal.id
+        ]
+        self.patch_proposals.append(proposal)
+        self.status = "RemediationProposed"
+
+    def attach_blocked_proposal(self, proposal: HotfixProposal):
+        """Persist a BLOCKED (non-executable) proposal without promoting
+        the incident: status must not suggest an executable proposal (§20)."""
+        if proposal.status != "BLOCKED":
+            raise ValueError("blocked proposal must carry status BLOCKED")
+        self.patch_proposals = [
+            item for item in self.patch_proposals if item.id != proposal.id
+        ]
+        self.patch_proposals.append(proposal)
+
     def attach_verified_patch(self, proposal: HotfixProposal):
         if proposal.is_verified:
             self.patch_proposals.append(proposal)

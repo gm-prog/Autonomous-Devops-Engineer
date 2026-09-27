@@ -11,12 +11,12 @@ CI):
 
 | Service | Package | Entrypoint | Exposes |
 |---|---|---|---|
-| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation` (HS256 JWT), `/health` |
+| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal` (HS256 JWT, operator roles where noted), `/health` |
 | Repo context | `repo_service` | `repo_service.main:app` :8010 | `POST /repositories`, `/health` |
 | Agent swarm | `agent_service` | `agent_service.main:app` :8020 | `GET /agent/streams/{task_id}` (SSE), `/health` |
 | Deployment | `deployment_service` | Celery worker | task `tasks.execute_iac_deployment` (Redis broker) |
 | Monitoring | `monitoring_service` | `monitoring_service.main:app` :8040 | `WS /ws/telemetry/socket/{client_id}`, `/health` |
-| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
+| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
 | Reporting | `reporting_service` | (library) | weekly audit-report queries + "PDF" engine |
 | Shared kernel | `shared_kernel` | (library) | domain events, value objects, event publisher, metrics |
 
@@ -166,6 +166,101 @@ another record, or a state mismatch all fail closed.
   detects tampering and cross-record grafting, while authenticity rests
   on the network/gateway boundary below.
 
+## Phase 6.1 — Incident → evidence → RCA → remediation proposal (proposal-only)
+
+```text
+monitoring breach → ThreatThresholdExceededEvent (devops:events)
+  → idempotent incident ingestion (ids derived from event_id, uuid5)
+  → deployment evidence (existing collector command; DEPLOYED + provenance)
+  → evidence pack (deterministic timeline, existing builder)
+  → RcaAnalyzerPort → schema-validated RootCauseAnalysis (fail-closed)
+  → trusted target resolution (Stage-5 gates, one-record pair)
+  → HotfixProposal + deterministic rules (single-file, path policy, risk)
+  → canonical proposal_hash → persisted for human review
+```
+
+* **Producer wiring:** `ThresholdValidator(publisher=RedisStreamPublisher())`
+  publishes the exact event type the existing incident consumer dispatches.
+  *Observed:* no production entrypoint currently constructs
+  `ThresholdValidator` (the monitoring app exposes `/health`); the wiring is
+  a constructor-injected library capability covered by deterministic tests,
+  not a live-Redis CI job.
+* **Idempotency (§4):** incident id = `uuid5(event_id)`; threshold evidence
+  id likewise. Redelivering the same event returns the existing incident and
+  never duplicates evidence; proposal regeneration upserts by deterministic
+  `proposal-{incident_id}` (one proposal, one RCA result, stable hash).
+* **RCA (§10/§11):** application-level `RcaAnalyzerPort.analyze` (agent-service
+  HTTP adapter in production, deterministic fakes in tests). The aggregate
+  never calls an LLM. Results are schema-constrained fail-closed: bounded
+  types/lengths, confidence within [0, 1], and **every `evidence_ref` must
+  exist on this incident** — anything else raises `InvalidRcaResult` (HTTP
+  422) and nothing is persisted. Legacy `supporting_evidence_ids` is
+  accepted as an alias.
+* **Trusted target (§6/§7):** `resolve_authoritative_deployment_target`
+  reuses the Stage-5 binding gates (state `DEPLOYED`, canonical `owner/repo`
+  + full 40-hex SHA coexisting in ONE evidence record, valid platform
+  provenance) and selects the most recent qualifying record. No candidate →
+  proposal `status=BLOCKED`,
+  `blocked_reason=MISSING_DEPLOYED_TARGET_EVIDENCE`, empty repository/SHA —
+  never a fabricated repo, SHA, run or artifact.
+* **Proposal content (§12–§15):** id, incident_id, root_cause, confidence,
+  target_repository, source_sha, `files[{path,patch}]` (single file),
+  validation_plan, risk_class, evidence_refs, proposal_hash, status,
+  blocked_reason. AI output may propose `target_file`, `patch`,
+  `validation_plan`, `risk_class` only — `repository`, `source_sha` and
+  identity fields in provider output are rejected outright. Validation
+  reuses `HotfixProposal.apply_verification_pass()` (single-file unified
+  diff) and `HotfixValidationService` (size, security-path,
+  protected-path, confidence rules).
+* **Risk + hash (§17/§18):** deterministic classifier
+  (`LOW|MEDIUM|HIGH|BLOCKED`) derived from confidence, uncertainty,
+  contributing factors, incident severity and the AI-suggested class (which
+  can only raise, never lower, the result). Hash = SHA-256 over fixed-field
+  canonical JSON (sorted keys, compact separators) of incident_id,
+  root_cause, evidence_refs, repository, source_sha, file paths, patch,
+  validation plan and risk — timestamps and dict order never matter.
+* **Persistence (§19/§20):** through the existing incident repository (no
+  separate database). Success upserts one verified proposal, moves the
+  incident to `RemediationProposed`, and every field survives reload;
+  failures persist a non-executable `BLOCKED` proposal (`is_verified=false`)
+  without promoting the incident.
+* **API:** `POST /incidents/{id}/proposal` (200 for PROPOSED **and**
+  BLOCKED outcomes — the pipeline ran; blocked bodies carry a
+  machine-readable `blocked_reason`; 404 unknown incident, 422 malformed
+  RCA, 503 provider/persistence outage) and read-only
+  `GET /incidents/{id}/proposal`. At the gateway:
+  `GET /v1/incidents/{id}/proposal` requires a valid JWT **and** an
+  operator role; the internal URL prefix grants nothing.
+* **Observability (§26):** single-line JSON logs with correlation ids —
+  `incident.created`, `evidence.attached`, `rca.started`, `rca.completed`,
+  `proposal.generated`, `proposal.validated`, `proposal.blocked` (plus
+  `rca.failed`, `incident.duplicate_ignored`). No tokens, headers or full
+  AI outputs are ever logged.
+
+**Guarantee — proposal only.** Phase 6.1 never clones, modifies, commits,
+pushes, creates branches/PRs, deploys, approves or executes remediation.
+`ApplyAutomatedFixCommandHandler`, the remediation orchestrator and the
+GitHub client are covered by no-side-effect spy tests that still require a
+fully produced + persisted proposal (§22). `risk_class` is metadata and can
+never trigger execution.
+
+### Honest limitations (Phase 6.1)
+
+* RCA confidence is **probabilistic**, not a correctness guarantee; the
+  derivation of the conclusion from the cited evidence is not formally
+  established. `evidence_refs` prove the references exist on this incident,
+  not that the causal claim is true.
+* Service-to-service authentication (incident → agent-service) relies on
+  the private compose network; a second token system and TLS between
+  services are future work (documented in the trust-boundary section).
+* Proposal validation runs the deterministic rule service in-process — the
+  same non-isolation limit as the remediation validation runner (below).
+  `git apply --check` is **not** run in Phase 6.1: a proposal-only pipeline
+  never materializes a source snapshot, so there is no tree to check
+  against (noted honestly instead of skipped silently).
+* Stream production is unit/E2E tested with deterministic fakes; CI does
+  not run a live Redis (see producer-wiring note above).
+
 ## Network & authentication trust boundary
 
 * **External boundary = API gateway only.** `docker-compose.yml` publishes a
@@ -262,4 +357,7 @@ Sentry HMAC accept/reject/unset-secret (503), provenance hash contract
 (tamper/graft/unverified/over-claim), source-verification fail-closed
 matrix, remediation binding attacks, SSE + WebSocket endpoints, repo
 import, shared-kernel VOs/events, Celery task registration,
-GitHub no-fake-PR guard.
+GitHub no-fake-PR guard, and the Phase 6.1 proposal pipeline
+(event-id idempotency, monitoring producer, schema fail-closed RCA,
+target binding, deterministic risk/hash, proposal endpoints + gateway
+read route, reload round-trip, blocked outcomes, no-side-effect spies).
