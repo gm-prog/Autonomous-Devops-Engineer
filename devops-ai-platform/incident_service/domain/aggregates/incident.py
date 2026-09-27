@@ -74,6 +74,47 @@ class IncidentAggregate:
         ]
         self.patch_proposals.append(proposal)
 
+    def approve_remediation_proposal(
+        self,
+        proposal_id: str,
+        approved_by: str,
+        expected_hash: str,
+    ):
+        """Approve exactly one persisted proposal, bound to its current hash."""
+        proposal = next(
+            (item for item in self.patch_proposals if item.id == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise ValueError("remediation proposal not found")
+        if proposal.status != "PROPOSED":
+            raise ValueError(f"proposal state {proposal.status!r} cannot be approved")
+        if not proposal.is_verified:
+            raise ValueError("only a verified proposal can be approved")
+        if proposal.proposal_hash != expected_hash:
+            raise ValueError("proposal hash does not match the persisted proposal")
+        if not approved_by.strip():
+            raise ValueError("approved_by must not be empty")
+        proposal.approved_by = approved_by.strip()
+        proposal.approved_at = datetime.now(timezone.utc)
+        proposal.status = "APPROVED"
+
+    def mark_remediation_pr_created(self, proposal_id: str, pull_request_url: str):
+        """Record successful guarded publication of a remediation PR."""
+        proposal = next(
+            (item for item in self.patch_proposals if item.id == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise ValueError("remediation proposal not found")
+        if proposal.status != "APPROVED":
+            raise ValueError("only an approved proposal can become PR_CREATED")
+        if not isinstance(pull_request_url, str) or not pull_request_url.startswith("https://github.com/"):
+            raise ValueError("pull_request_url must be a GitHub HTTPS URL")
+        proposal.pull_request_url = pull_request_url
+        proposal.status = "PR_CREATED"
+        self.status = "RemediationPRCreated"
+
     def attach_verified_patch(self, proposal: HotfixProposal):
         if proposal.is_verified:
             self.patch_proposals.append(proposal)
