@@ -99,7 +99,14 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 .order_by(incidents_table.c.created_at.desc())
             ).mappings().all()
 
-        return [self._from_row(row, self._get_evidence(row["id"])) for row in rows]
+        incidents: List[IncidentAggregate] = []
+        for row in rows:
+            incident = self._from_row(row, self._get_evidence(row["id"]))
+            # Phase 6.2.1B: list/read path projects durable claim state
+            # with the SAME per-proposal mapping as get_incident_by_id()
+            self._apply_claim_overlay(incident)
+            incidents.append(incident)
+        return incidents
 
     # ------------------------------------------------------------------ #
     # Phase 6.2.1: durable execution coordination (source of truth for
@@ -314,7 +321,11 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 claim is None
                 or str(claim["state"]) != "LEASED"
                 or str(claim["lease_owner"] or "") != owner
+                or not _lease_is_live(claim, now)
             ):
+                # an expired lease is not authoritative even when state
+                # and owner still match — never renew progress from an
+                # expired owner
                 return False
             validate_stage_transition(str(claim["stage"] or ""), stage)
             result = connection.execute(
@@ -324,6 +335,8 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                     execution_claims_table.c.proposal_id == proposal_id,
                     execution_claims_table.c.state == "LEASED",
                     execution_claims_table.c.lease_owner == owner,
+                    execution_claims_table.c.lease_expires_at.isnot(None),
+                    execution_claims_table.c.lease_expires_at > now,
                 )
                 .values(
                     stage=stage,
@@ -390,7 +403,10 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 or claim is None
                 or str(claim["state"]) != "LEASED"
                 or str(claim["lease_owner"] or "") != owner
+                or not _lease_is_live(claim, now)
             ):
+                # a stale (expired) owner must not write terminal state,
+                # release the claim, or attach evidence
                 return False
             validate_stage_transition(str(claim["stage"] or ""), stage)
 
@@ -448,6 +464,8 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                     execution_claims_table.c.proposal_id == proposal_id,
                     execution_claims_table.c.state == "LEASED",
                     execution_claims_table.c.lease_owner == owner,
+                    execution_claims_table.c.lease_expires_at.isnot(None),
+                    execution_claims_table.c.lease_expires_at > now,
                 )
                 .values(**claim_values)
             )
@@ -477,10 +495,11 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
     ) -> bool:
         """Owner-gated heartbeat: extend THIS lease only.
 
-        CAS on (state == LEASED AND lease_owner == owner): a different
-        owner, a released claim, or a completed/reclaimed claim all
-        return False — renewal never resurrects or steals a lease, and
-        never changes the durable stage.
+        CAS on (state == LEASED AND lease_owner == owner AND
+        lease_expires_at > now): a different owner, a released claim, a
+        completed/reclaimed claim, or an EXPIRED lease all return False —
+        renewal never resurrects or steals a lease, never extends an
+        expired owner's authority, and never changes the durable stage.
         """
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
@@ -493,6 +512,8 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                     execution_claims_table.c.proposal_id == proposal_id,
                     execution_claims_table.c.state == "LEASED",
                     execution_claims_table.c.lease_owner == owner,
+                    execution_claims_table.c.lease_expires_at.isnot(None),
+                    execution_claims_table.c.lease_expires_at > now,
                 )
                 .values(
                     last_heartbeat_at=now,
@@ -732,6 +753,16 @@ execution_claims_table = Table(
 
 class _CoordinationRace(Exception):
     """Concurrent writer changed coordination state between read and CAS."""
+
+
+def _lease_is_live(claim_row, now: datetime) -> bool:
+    """A lease is authoritative only while expiry is present and strictly
+    after `now` (state/owner are checked separately by callers).
+    Expired-but-LEASED is NOT live."""
+    expires = claim_row["lease_expires_at"]
+    if expires is None:
+        return False
+    return _aware_utc(expires) > _aware_utc(now)
 
 
 def _aware_utc(value):

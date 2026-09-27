@@ -610,6 +610,166 @@ class MissingCoordinationRepositoryTests(unittest.TestCase):
             service._coordination("claim_execution_lease")
 
 
+class StrictLeaseExpiryTests(unittest.TestCase):
+    """Phase 6.2.1B Goal A: an expired lease is never authoritative, even
+    while state == LEASED and lease_owner still matches."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        url = f"sqlite:///{os.path.join(self._temp.name, 'exp.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        seed, self.proposal_hash = _seed_incident()
+        self.repository.save_incident(seed)
+        self.now = datetime.now(timezone.utc)
+        reason, _ = self.repository.claim_execution_lease(
+            "inc-lease-1",
+            "proposal-inc-lease-1",
+            self.proposal_hash,
+            owner="worker-a",
+            now=self.now,
+            lease_seconds=600.0,
+        )
+        assert reason == "claimed", reason
+
+    def _expire(self):
+        """Expire worker A's lease in place (state/owner untouched)."""
+        with self.repository.engine.begin() as connection:
+            connection.execute(
+                sa_update(execution_claims_table)
+                .where(
+                    execution_claims_table.c.incident_id == "inc-lease-1"
+                )
+                .values(
+                    lease_expires_at=self.now - timedelta(seconds=1)
+                )
+            )
+
+    def _claim(self):
+        return self.repository.get_execution_claim(
+            "inc-lease-1", "proposal-inc-lease-1"
+        )
+
+    def _renew(self, owner="worker-a"):
+        return self.repository.renew_execution_lease(
+            "inc-lease-1",
+            "proposal-inc-lease-1",
+            owner,
+            now=datetime.now(timezone.utc),
+            lease_seconds=600.0,
+        )
+
+    def _progress(self, owner="worker-a", stage="WORKSPACE_CREATED"):
+        return self.repository.persist_execution_progress(
+            "inc-lease-1",
+            "proposal-inc-lease-1",
+            owner,
+            stage=stage,
+            now=datetime.now(timezone.utc),
+            lease_seconds=600.0,
+        )
+
+    def _finish(self, owner="worker-a"):
+        return self.repository.finish_execution_lease(
+            "inc-lease-1",
+            "proposal-inc-lease-1",
+            owner,
+            status="PR_CREATED",
+            stage="COMPLETED",
+            now=datetime.now(timezone.utc),
+        )
+
+    def test_expired_lease_cannot_renew(self):
+        self._expire()
+        self.assertFalse(self._renew())
+        claim = self._claim()
+        # expiry untouched — the expired owner gained nothing
+        expires = claim["lease_expires_at"]
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        self.assertLess(expires, self.now)
+        self.assertEqual(claim["lease_owner"], "worker-a")
+        self.assertEqual(claim["state"], "LEASED")
+
+    def test_expired_lease_cannot_persist_progress(self):
+        self._expire()
+        self.assertFalse(self._progress())
+        self.assertEqual(self._claim()["stage"], "CLAIMED")
+
+    def test_expired_lease_cannot_finish(self):
+        self._expire()
+        self.assertFalse(self._finish())
+        claim = self._claim()
+        self.assertEqual(claim["state"], "LEASED")  # never released
+        proposal = self.repository.get_incident_by_id(
+            "inc-lease-1"
+        ).patch_proposals[0]
+        self.assertEqual(proposal.status, "EXECUTING")  # no terminal write
+
+    def test_valid_lease_owner_can_renew_persist_finish(self):
+        # same owner, unexpired lease — all three operations succeed
+        self.assertTrue(self._renew())
+        self.assertTrue(self._progress(stage="WORKSPACE_CREATED"))
+        self.assertTrue(
+            self.repository.persist_execution_progress(
+                "inc-lease-1",
+                "proposal-inc-lease-1",
+                "worker-a",
+                stage="PATCH_APPLIED",
+                now=datetime.now(timezone.utc),
+                lease_seconds=600.0,
+            )
+        )
+        self.assertTrue(self._finish())
+        claim = self._claim()
+        self.assertEqual(claim["state"], "FREE")
+        self.assertEqual(claim["stage"], "COMPLETED")
+
+    def test_stale_owner_cannot_clobber_new_owner_after_reclaim(self):
+        # worker A expires, worker B reclaims and progresses
+        self._expire()
+        now_b = datetime.now(timezone.utc)
+        reason, _ = self.repository.claim_execution_lease(
+            "inc-lease-1",
+            "proposal-inc-lease-1",
+            self.proposal_hash,
+            owner="worker-b",
+            now=now_b,
+            lease_seconds=600.0,
+        )
+        self.assertEqual(reason, "claimed")
+        self.assertTrue(
+            self.repository.persist_execution_progress(
+                "inc-lease-1",
+                "proposal-inc-lease-1",
+                "worker-b",
+                stage="WORKSPACE_CREATED",
+                now=now_b,
+                lease_seconds=600.0,
+            )
+        )
+        state_after_b = self._claim()
+        self.assertEqual(state_after_b["lease_owner"], "worker-b")
+        self.assertEqual(state_after_b["attempt"], 2)
+
+        # stale worker A: every mutating operation is refused
+        self.assertFalse(self._renew(owner="worker-a"))
+        self.assertFalse(self._progress(owner="worker-a"))
+        self.assertFalse(self._finish(owner="worker-a"))
+
+        # worker B's durable state is byte-for-byte unchanged
+        state_final = self._claim()
+        for key in (
+            "lease_owner",
+            "state",
+            "stage",
+            "attempt",
+            "lease_expires_at",
+            "lease_acquired_at",
+        ):
+            self.assertEqual(state_final[key], state_after_b[key], key)
+
+
 class MultiProposalClaimProjectionTests(unittest.TestCase):
     """Phase 6.2.1A: one incident, many proposals — claims project
     independently by proposal_id; no proposal inherits another's state."""
@@ -676,6 +836,141 @@ class MultiProposalClaimProjectionTests(unittest.TestCase):
             )
             assert ok, (pid, final_stage)
         return reason
+
+    def _spec_seed(self):
+        """Fresh incident with p-a (attempt 2, COMMIT_CREATED, worker-a),
+        p-b (attempt 4, PR_CREATED, worker-b), p-c (no claim)."""
+        incident = IncidentAggregate("inc-active", "cpu", "HIGH", "ctx")
+        incident.move_to_triage()
+        hashes = {}
+        for pid in ("p-a", "p-b", "p-c"):
+            patch = (
+                f"--- a/app/{pid}.py\n+++ b/app/{pid}.py\n"
+                "@@ -1 +1 @@\n-old()\n+new()\n"
+            )
+            proposal = HotfixProposal(
+                id=pid,
+                incident_id="inc-active",
+                target_filepath=f"app/{pid}.py",
+                diff_patch_payload=patch,
+                source_sha="a" * 40,
+                repository="acme/checkout",
+                status="APPROVED",
+                validation_plan=["pytest -q"],
+            )
+            assert proposal.apply_verification_pass()
+            proposal.proposal_hash = (str(len(hashes) + 1) * 64)
+            hashes[pid] = proposal.proposal_hash
+            proposal.approved_by = "alice-operator"
+            proposal.approval_hash = proposal.proposal_hash
+            proposal.approved_at = datetime.now(timezone.utc)
+            incident.upsert_remediation_proposal(proposal)
+        return incident, hashes
+
+    @staticmethod
+    def _stage_chain(repository, incident_id, pid, owner, stages, commit=None):
+        for stage in stages:
+            ok = repository.persist_execution_progress(
+                incident_id,
+                pid,
+                owner,
+                stage=stage,
+                now=datetime.now(timezone.utc),
+                lease_seconds=600.0,
+                commit_sha=commit
+                if stage == "COMMIT_CREATED" and commit
+                else None,
+                branch_name=(
+                    f"automation/remediation/{incident_id}/{pid}"
+                    if stage == "COMMIT_CREATED" and commit
+                    else None
+                ),
+            )
+            assert ok, (pid, stage)
+
+    def _reclaim_to(self, repository, incident_id, pid, p_hash, owner,
+                    attempts):
+        for index in range(attempts):
+            now = datetime.now(timezone.utc)
+            reason, _ = repository.claim_execution_lease(
+                incident_id, pid, p_hash,
+                owner=owner, now=now, lease_seconds=600.0,
+            )
+            assert reason == "claimed", (pid, index, reason)
+            # expire BETWEEN claims only; the final claim stays live
+            # so subsequent stage persists are authorized
+            if index < attempts - 1:
+                with repository.engine.begin() as connection:
+                    connection.execute(
+                        sa_update(execution_claims_table)
+                        .where(
+                            execution_claims_table.c.incident_id == incident_id
+                        )
+                        .values(
+                            lease_expires_at=datetime.now(timezone.utc)
+                            - timedelta(seconds=1)
+                        )
+                    )
+
+    def test_get_active_incidents_projects_claims_per_proposal(self):
+        incident, hashes = self._spec_seed()
+        self.repository.save_incident(incident)
+
+        # p-a: attempt 2, stage COMMIT_CREATED, worker-a, durable commit
+        self._reclaim_to(
+            self.repository, "inc-active", "p-a", hashes["p-a"],
+            "worker-a", attempts=2,
+        )
+        self._stage_chain(
+            self.repository, "inc-active", "p-a", "worker-a",
+            ["WORKSPACE_CREATED", "PATCH_APPLIED", "VALIDATION_STARTED",
+             "VALIDATION_PASSED", "COMMIT_CREATED"],
+            commit="e" * 40,
+        )
+        # p-b: attempt 4, stage PR_CREATED, worker-b
+        self._reclaim_to(
+            self.repository, "inc-active", "p-b", hashes["p-b"],
+            "worker-b", attempts=4,
+        )
+        self._stage_chain(
+            self.repository, "inc-active", "p-b", "worker-b",
+            ["WORKSPACE_CREATED", "PATCH_APPLIED", "VALIDATION_STARTED",
+             "VALIDATION_PASSED", "COMMIT_CREATED", "REMOTE_PUBLISHED",
+             "REMOTE_VERIFIED", "PR_DISCOVERY", "PR_CREATED"],
+            commit="f" * 40,
+        )
+        # p-c: no claim row at all
+
+        active = [
+            item
+            for item in self.repository.get_active_incidents()
+            if item.id == "inc-active"
+        ]
+        self.assertEqual(len(active), 1)
+        by_id = {item.id: item for item in active[0].patch_proposals}
+        a, b, c = by_id["p-a"], by_id["p-b"], by_id["p-c"]
+
+        # A gets only A's claim state
+        self.assertEqual(a.execution_stage, "COMMIT_CREATED")
+        self.assertEqual(a.execution_attempts, 2)
+        self.assertEqual(a.lease_owner, "worker-a")
+        self.assertEqual(a.commit_sha, "e" * 40)
+        self.assertTrue(a.branch_name.endswith("/p-a"))
+        # B gets only B's claim state
+        self.assertEqual(b.execution_stage, "PR_CREATED")
+        self.assertEqual(b.execution_attempts, 4)
+        self.assertEqual(b.lease_owner, "worker-b")
+        self.assertEqual(b.commit_sha, "f" * 40)
+        self.assertTrue(b.branch_name.endswith("/p-b"))
+        self.assertNotEqual(a.execution_id, b.execution_id)
+        # C preserves its JSON coordination view (no claim projected)
+        self.assertEqual(c.execution_stage, "")
+        self.assertEqual(c.execution_attempts, 0)
+        self.assertFalse(c.lease_owner)
+        self.assertFalse(c.commit_sha)
+        # cross-contamination impossible
+        self.assertNotEqual(a.lease_owner, b.lease_owner)
+        self.assertNotEqual(a.commit_sha, b.commit_sha)
 
     def test_claims_project_independently_across_proposals(self):
         # p-a: active lease at COMMIT_CREATED with durable commit

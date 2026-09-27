@@ -1,5 +1,57 @@
 # CHANGELOG
 
+## 2026-09-27 — Phase 6.2.1B: lease expiry enforcement & pre-side-effect authorization (corrective hardening)
+
+- **Lease expiry is now authoritative for every durable write.** `renew_execution_lease`,
+  `persist_execution_progress` and `finish_execution_lease` require
+  `state == LEASED` **and** `lease_owner == caller` **and** a non-null
+  `lease_expires_at > now`, enforced in SQL inside the read check and the
+  final UPDATE CAS (single atomic statement, app-side filtering only as
+  defence in depth). An expired worker — even one whose `lease_owner` row
+  still matches — can no longer renew, persist progress, write evidence,
+  release the lease, or persist a terminal state after another worker has
+  re-claimed it.
+- **Pre-side-effect authorization guard.** A single reusable check,
+  `ProposalExecutionService.assert_execution_lease_live(incident_id,
+  proposal_id)`, verifies (1) this attempt's heartbeat has not detected
+  ownership loss, (2) the durable claim row still exists, (3) `state ==
+  LEASED`, (4) `lease_owner` is this worker, (5) `lease_expires_at > now`.
+  Store/network uncertainty raises the same typed guard error (fail
+  closed). The orchestration layer receives it as an injected
+  `before_side_effect(name)` callback — it never learns database details —
+  and the guard runs immediately before **every** remote side effect:
+  workspace prepare, patch apply, validation run, commit create,
+  publish, remote branch create, pull-request discovery (the control-plane
+  read that decides whether to mutate) and PR create, plus every resume
+  path (`remote.inspect` before any resume remote read). If the guard
+  refuses, the side-effecting function is never invoked; the failure
+  flows through the existing classification and owner-gated persistence.
+  A successfully guarded boundary means only that the durable control
+  plane reports live ownership at that instant — external operations are
+  **not** atomic with the database lease; heartbeats during the
+  operation, owner-gated post-stage CAS, reconciliation and fail-closed
+  sequencing remain as defence in depth. Exactly-once external execution
+  is explicitly not claimed.
+- **Active incident list projection fixed.** `get_active_incidents()`
+  now applies the same all-claims → proposal-keyed overlay used by
+  `get_incident_by_id()`, so `GET /incidents` reports each proposal's own
+  durable stage/attempt/owner/commit instead of inheriting whichever
+  claim row was read first (or nothing).
+- **Post-create PR identity verification.** After `create_pull_request`
+  succeeds, the orchestrator performs a bounded re-discovery and requires
+  the returned pull request to prove exact identity: same repository as
+  the proposal, deterministic head branch, `head_sha == executed commit`,
+  allowed `base_ref`, open and unmerged, exact URL match (body hash only
+  as corroboration, never as identity). Mismatch or malformed discovery
+  output raises a typed conflict/reconciliation failure and the operation
+  fails closed — no second create, no retarget, no force-push, no
+  merge — while the pre-existing discovery-before-create reuse policy
+  (zero second creates on lost responses) is preserved.
+- Honest limits: PostgreSQL concurrency for the expiry CAS is exercised
+  in tests through the portable SQLAlchemy statement path but concurrent
+  multi-writer races are only covered on SQLite; this is not
+  "production-safe" by assertion. No schema change (no migration needed).
+
 ## 2026-09-27 — Phase 6.2.1A: lease liveness & remote identity integrity (corrective hardening)
 
 Closes three review gaps on the completed 6.2.1 implementation; no

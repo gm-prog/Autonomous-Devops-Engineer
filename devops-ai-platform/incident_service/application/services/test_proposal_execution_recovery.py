@@ -57,7 +57,8 @@ class RecordingOrchestrator:
         self.commit_sha = commit_sha
 
     def execute(self, *, incident_id, proposal, repository_slug,
-                validation_profile, stage_callback=None):
+                validation_profile, stage_callback=None,
+                before_side_effect=None):
         self.calls.append(("execute", proposal.execution_stage))
         if stage_callback:
             stage_callback("workspace.created", {"workspace": "ws"})
@@ -344,7 +345,8 @@ class ExecutionRecoveryTests(unittest.TestCase):
 
         class StealingOrchestrator:
             def execute(orch_self, *, incident_id, proposal, repository_slug,
-                        validation_profile, stage_callback=None):
+                        validation_profile, stage_callback=None,
+                        before_side_effect=None):
                 stage_callback("workspace.created", {"workspace": "ws"})
                 if not stolen["done"]:
                     stolen["done"] = True

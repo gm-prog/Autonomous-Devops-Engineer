@@ -121,7 +121,7 @@ class RecordingOrchestrator:
         self.delay = delay
 
     def execute(self, incident_id, proposal, repository_slug, validation_profile,
-                stage_callback=None):
+                stage_callback=None, before_side_effect=None):
         self.calls.append(
             {
                 "incident_id": incident_id,

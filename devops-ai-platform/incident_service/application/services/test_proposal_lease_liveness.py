@@ -99,7 +99,8 @@ class _Orchestrator:
         self.hold_after = hold_after
 
     def execute(self, *, incident_id, proposal, repository_slug,
-                validation_profile, stage_callback=None):
+                validation_profile, stage_callback=None,
+                before_side_effect=None):
         self.stage_callback = stage_callback
         _full_sequence(
             self, self.stages,
@@ -271,7 +272,8 @@ class ActiveHeartbeatTests(unittest.TestCase):
 
         class Scenario:
             def execute(self, *, incident_id, proposal, repository_slug,
-                        validation_profile, stage_callback=None):
+                        validation_profile, stage_callback=None,
+                        before_side_effect=None):
                 stage_callback("workspace.created", {"workspace": "ws"})
                 if not stolen["done"]:
                     stolen["done"] = True
@@ -355,7 +357,8 @@ class ActiveHeartbeatTests(unittest.TestCase):
 
         class Scenario:
             def execute(self, *, incident_id, proposal, repository_slug,
-                        validation_profile, stage_callback=None):
+                        validation_profile, stage_callback=None,
+                        before_side_effect=None):
                 stage_callback("workspace.created", {"workspace": "ws"})
                 boundaries.append("workspace.created")
                 if not service._heartbeat.lost.wait(timeout=5.0):
@@ -380,7 +383,8 @@ class ActiveHeartbeatTests(unittest.TestCase):
         # failure path first (fresh APPROVED proposal)
         class Boom:
             def execute(self, *, incident_id, proposal, repository_slug,
-                        validation_profile, stage_callback=None):
+                        validation_profile, stage_callback=None,
+                        before_side_effect=None):
                 stage_callback("workspace.created", {"workspace": "ws"})
                 raise RuntimeError("boom")
 
@@ -409,6 +413,179 @@ class ActiveHeartbeatTests(unittest.TestCase):
             and t.is_alive()
         ]
         self.assertEqual(leaked, [], "heartbeat threads must not outlive runs")
+
+
+class PreSideEffectAuthorizationTests(unittest.TestCase):
+    """Phase 6.2.1B Goal B: assert_execution_lease_live semantics on a
+    real durable store + service-to-orchestrator wiring."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.db_path = os.path.join(self._temp.name, "guard.db")
+        self.repository = CountingRepository(f"sqlite:///{self.db_path}")
+        seed, self.proposal_hash = _seed_incident()
+        self.repository.save_incident(seed)
+        self.now = datetime.now(timezone.utc)
+        reason, _ = self.repository.claim_execution_lease(
+            INCIDENT_ID, PROPOSAL_ID, self.proposal_hash,
+            owner="worker-a", now=self.now, lease_seconds=600.0,
+        )
+        assert reason == "claimed", reason
+
+    def _service(self, owner="worker-a", repository=None, orchestrator=None):
+        return ProposalExecutionService(
+            repository=repository or self.repository,
+            orchestrator_factory=lambda: orchestrator or _Orchestrator(),
+            ttl_seconds=3600.0,
+            lease_seconds=600.0,
+            lease_owner=owner,
+            heartbeat_interval=0.02,
+        )
+
+    def test_live_lease_authorizes_the_next_side_effect(self):
+        service = self._service()
+        service.assert_execution_lease_live(INCIDENT_ID, PROPOSAL_ID)
+
+    def test_owner_mismatch_fails_closed(self):
+        service = self._service(owner="worker-b")
+        with self.assertRaises(RemediationStageGuardError):
+            service.assert_execution_lease_live(INCIDENT_ID, PROPOSAL_ID)
+
+    def test_expired_lease_fails_closed(self):
+        with self.repository.engine.begin() as connection:
+            connection.execute(
+                sa_update(execution_claims_table)
+                .where(execution_claims_table.c.incident_id == INCIDENT_ID)
+                .values(lease_expires_at=self.now)
+            )
+        service = self._service()
+        with self.assertRaises(RemediationStageGuardError):
+            service.assert_execution_lease_live(INCIDENT_ID, PROPOSAL_ID)
+
+    def test_released_claim_fails_closed(self):
+        self.assertTrue(
+            self.repository.finish_execution_lease(
+                INCIDENT_ID, PROPOSAL_ID, "worker-a",
+                status="EXECUTION_FAILED", stage="FAILED",
+                now=datetime.now(timezone.utc),
+            )
+        )
+        service = self._service()
+        with self.assertRaises(RemediationStageGuardError):
+            service.assert_execution_lease_live(INCIDENT_ID, PROPOSAL_ID)
+
+    def test_missing_claim_fails_closed(self):
+        service = self._service()
+        with self.assertRaises(RemediationStageGuardError):
+            service.assert_execution_lease_live(INCIDENT_ID, "proposal-ghost")
+
+    def test_heartbeat_loss_fails_closed_immediately(self):
+        import threading as _threading
+
+        service = self._service()
+        fake = type("H", (), {})()
+        fake.lost = _threading.Event()
+        fake.lost.set()
+        fake.loss_reason = "owner_lost"
+        with self.assertRaises(RemediationStageGuardError):
+            service.assert_execution_lease_live(
+                INCIDENT_ID, PROPOSAL_ID, heartbeat=fake
+            )
+
+    def test_store_uncertainty_fails_closed(self):
+        service = self._service()
+
+        class BrokenRepo:
+            def get_execution_claim(self, incident_id, proposal_id):
+                raise RuntimeError("database offline")
+
+            def get_incident_by_id(self, incident_id):
+                return self.wrapped.get_incident_by_id(incident_id)
+
+        broken = BrokenRepo()
+        broken.wrapped = self.repository
+        service = ProposalExecutionService(
+            repository=broken,
+            orchestrator_factory=lambda: _Orchestrator(),
+            ttl_seconds=3600.0,
+            lease_seconds=600.0,
+            lease_owner="worker-a",
+            heartbeat_interval=0.02,
+        )
+        with self.assertRaises(RemediationStageGuardError):
+            service.assert_execution_lease_live(INCIDENT_ID, PROPOSAL_ID)
+
+    def test_service_passes_guard_and_lost_lease_blocks_side_effect(self):
+        """End-to-end wiring: service injects before_side_effect; after a
+        steal, the guard refuses and the fake side effect never runs."""
+        # release the setUp claim so the SERVICE claims its own lease
+        # (the wiring under test starts from a normal claim)
+        self.assertTrue(
+            self.repository.finish_execution_lease(
+                INCIDENT_ID, PROPOSAL_ID, "worker-a",
+                status="EXECUTION_FAILED", stage="FAILED",
+                now=datetime.now(timezone.utc),
+            )
+        )
+        holder = {}
+        stolen = {"done": False}
+        side_effect_ran = []
+        test = self
+
+        class Scenario:
+            def execute(self, *, incident_id, proposal, repository_slug,
+                        validation_profile, stage_callback=None,
+                        before_side_effect=None):
+                assert before_side_effect is not None, (
+                    "service must inject the pre-side-effect guard"
+                )
+                stage_callback("workspace.created", {"workspace": "ws"})
+                if not stolen["done"]:
+                    stolen["done"] = True
+                    with test.repository.engine.begin() as connection:
+                        connection.execute(
+                            sa_update(execution_claims_table)
+                            .where(
+                                execution_claims_table.c.incident_id
+                                == INCIDENT_ID
+                            )
+                            .values(
+                                lease_expires_at=datetime.now(timezone.utc)
+                            )
+                        )
+                    repo_b = PostgresIncidentRepositoryAdapter(
+                        f"sqlite:///{test.db_path}"
+                    )
+                    reason, _ = repo_b.claim_execution_lease(
+                        INCIDENT_ID, PROPOSAL_ID, test.proposal_hash,
+                        owner="worker-b",
+                        now=datetime.now(timezone.utc),
+                        lease_seconds=600.0,
+                    )
+                    assert reason == "claimed", reason
+                # THE pre-side-effect boundary: must refuse now
+                before_side_effect("patch.apply")
+                side_effect_ran.append("patch.apply")  # must never run
+                raise AssertionError("side effect ran after lease loss")
+
+        service = self._service(orchestrator=Scenario())
+        holder["service"] = service
+        with self.assertRaises(
+            (RemediationStageGuardError, Exception)
+        ) as ctx:
+            service.execute(
+                incident_id=INCIDENT_ID,
+                proposal_id=PROPOSAL_ID,
+                proposal_hash=self.proposal_hash,
+                requested_by="alice-operator",
+            )
+        self.assertNotIsInstance(ctx.exception, AssertionError)
+        self.assertEqual(side_effect_ran, [], "side effect must not run")
+        claim = self.repository.get_execution_claim(
+            INCIDENT_ID, PROPOSAL_ID
+        )
+        self.assertEqual(claim["lease_owner"], "worker-b")
 
 
 if __name__ == "__main__":

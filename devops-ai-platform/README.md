@@ -588,6 +588,88 @@ controlled remediation → draft PR**.
 * Still no hardened sandbox (that is Phase 6.2.2), and no exactly-once
   transaction across DB + Git + GitHub.
 
+## Phase 6.2.1B — Lease expiry enforcement & pre-side-effect authorization (corrective hardening)
+
+Three review gaps closed on top of 6.2.1A; no architecture change, no
+new infrastructure (no distributed mutex, no advisory locks, no long
+transactions), the at-least-once + deterministic idempotency +
+reconciliation model is preserved, and the pipeline still stops at
+**approved proposal → controlled remediation → draft PR**.
+
+### 1. Expiry-authoritative lease writes (Goal A)
+
+`renew_execution_lease`, `persist_execution_progress` and
+`finish_execution_lease` now require, inside the SQL statement itself
+(both the read check and the final UPDATE CAS):
+
+```
+state = 'LEASED' AND lease_owner = :caller
+AND lease_expires_at IS NOT NULL AND lease_expires_at > :now
+```
+
+Consequences: an expired worker can no longer renew, persist progress or
+finish even though the row still names it as owner; after another worker
+re-claims, the stale worker cannot release the new owner's lease or write
+a terminal state (owner CAS and expiry CAS compose in one UPDATE — short
+transactions preserved). `get_active_incidents()` now applies the same
+all-claims overlay as `get_incident_by_id()` so the active list never
+mixes projections across proposals.
+
+### 2. Pre-side-effect authorization guard (Goal B)
+
+Stage-callback checks happen **after** a side effect would already have
+run if the lease were lost mid-stage. A single reusable check,
+`ProposalExecutionService.assert_execution_lease_live(incident_id,
+proposal_id)`, runs immediately before every remote side effect:
+
+1. this attempt's heartbeat has not observed ownership loss,
+2. the durable claim row still exists,
+3. `state == LEASED`,
+4. `lease_owner` is this worker (never caller-supplied),
+5. `lease_expires_at > now`.
+
+Store/network uncertainty raises the same typed guard error (fail
+closed — uncertainty is never authorization). The orchestration layer
+receives the check as an injected `before_side_effect(name)` callable
+and invokes it before: `workspace.prepare`, `patch.apply`,
+`validation.run`, `commit.create`, `remote.publish`, `remote.branch.create`,
+`pr.discovery` (the control-plane read that decides whether to mutate),
+`pr.create`, and every resume-path remote read (`remote.inspect` first).
+On refusal the side-effecting function is **never invoked**; the typed
+failure flows through the existing classification and owner-gated
+persistence; no silent reclaim occurs in the running worker (reclaim =
+a new attempt).
+
+**Honest semantics:** a successful guard means only that the durable
+control plane reports live ownership *at that instant*. External
+operations are not atomic with the database lease — heartbeat renewal
+during the operation, owner-gated post-stage persistence, remote
+reconciliation and fail-closed sequencing remain as defence in depth.
+Exactly-once external execution is explicitly not claimed.
+
+### 3. Post-create pull request identity (Goal D)
+
+After `create_pull_request` succeeds, a bounded re-discovery must return
+the created PR proving **exact identity**: repository == proposal
+repository, head == the deterministic branch, `head_sha` == the executed
+commit, base == the allowed base, open and unmerged, exact URL match.
+Title/body/number/URL alone never authorize; the body hash is only
+corroboration. Wrong SHA, wrong repository, wrong base, closed/merged or
+malformed results raise typed failures and the operation fails closed —
+never a second PR, retarget, force-push or auto-merge — while the
+pre-existing discovery-before-create reuse policy (zero second creates
+on lost responses) is unchanged.
+
+### Honest limitations (Phase 6.2.1B)
+
+- Concurrent multi-writer expiry CAS races are exercised on SQLite
+  through the same portable SQLAlchemy statement path; PostgreSQL
+  concurrency is **untested**.
+- The guard bounds the window; it does not make external side effects
+  atomic with lease state (no exactly-once claim).
+- Postgres must be treated as external evidence: the claims table has
+  no migration — schema remains code-defined (`metadata.create_all`).
+
 ## Network & authentication trust boundary
 
 * **External boundary = API gateway only.** `docker-compose.yml` publishes a

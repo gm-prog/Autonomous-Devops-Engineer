@@ -102,6 +102,7 @@ class RemediationE2EBoundaryTests(unittest.TestCase):
             target_filepath="src/service.py",
             diff_patch_payload=PATCH,
             source_sha=source_sha,
+            repository=REPO_SLUG,
         )
         verified = proposal.apply_verification_pass()
         assert verified, "E2E fixture patch failed deterministic verification"
@@ -139,13 +140,40 @@ class RemediationE2EBoundaryTests(unittest.TestCase):
         proposal = self._proposal(source_sha)
 
         github = MagicMock()
-        github.find_existing_pull_requests.return_value = []
         github.create_branch_from_commit.return_value = (
             f"https://github.com/{REPO_SLUG}/tree/{BRANCH}"
         )
         github.create_pull_request.return_value = (
             f"https://github.com/{REPO_SLUG}/pull/99"
         )
+
+        # [] before create; the created PR afterwards (post-create
+        # exact-identity verification, Phase 6.2.1B)
+        from incident_service.infrastructure.source_provider.github_pr_client import (
+            ExistingPullRequest,
+        )
+
+        def _discovery(**kwargs):
+            if github.create_pull_request.call_count == 0:
+                return []
+            return [
+                ExistingPullRequest(
+                    number=99,
+                    url=f"https://github.com/{REPO_SLUG}/pull/99",
+                    state="open",
+                    draft=True,
+                    merged=False,
+                    head_ref=BRANCH,
+                    base_ref="main",
+                    body="",
+                    head_sha=github.create_branch_from_commit.call_args.kwargs[
+                        "commit_sha"
+                    ],
+                    head_repository=REPO_SLUG,
+                )
+            ]
+
+        github.find_existing_pull_requests.side_effect = _discovery
         orchestrator = self._orchestrator(github)
 
         result = orchestrator.execute(

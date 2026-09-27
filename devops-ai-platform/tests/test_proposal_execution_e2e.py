@@ -174,13 +174,39 @@ class ProposalExecutionE2ETests(unittest.TestCase):
         self.proposal_hash = generated["proposal"]["proposal_hash"]
 
         self.github = MagicMock()
-        self.github.find_existing_pull_requests.return_value = []
         self.github.create_branch_from_commit.return_value = (
             f"https://github.com/{REPO_SLUG}/tree/automation/remediation"
         )
         self.github.create_pull_request.return_value = (
             f"https://github.com/{REPO_SLUG}/pull/77"
         )
+
+        # [] before create; the created PR afterwards so post-create
+        # exact-identity verification (Phase 6.2.1B) can succeed
+        from incident_service.infrastructure.source_provider.github_pr_client import (
+            ExistingPullRequest,
+        )
+
+        def _discovery(**kwargs):
+            if self.github.create_pull_request.call_count == 0:
+                return []
+            proposal = self._proposal()
+            return [
+                ExistingPullRequest(
+                    number=77,
+                    url=f"https://github.com/{REPO_SLUG}/pull/77",
+                    state="open",
+                    draft=True,
+                    merged=False,
+                    head_ref=proposal.branch_name,
+                    base_ref="main",
+                    body="",
+                    head_sha=proposal.commit_sha,
+                    head_repository=REPO_SLUG,
+                )
+            ]
+
+        self.github.find_existing_pull_requests.side_effect = _discovery
 
     # --- builders -------------------------------------------------------
     def _approval_service(self):

@@ -252,7 +252,7 @@ class FullChainWiringTests(unittest.TestCase):
 
         def orchestrator_factory():
             def execute(incident_id, proposal, repository_slug,
-                        validation_profile, stage_callback=None):
+                        validation_profile, stage_callback=None, before_side_effect=None):
                 if stage_callback:
                     stage_callback("workspace.created", {"workspace": "ws"})
                     stage_callback(

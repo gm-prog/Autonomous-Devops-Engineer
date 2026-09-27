@@ -26,7 +26,7 @@ import logging
 import os
 import re
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from incident_service.application.failures import (
@@ -258,6 +258,70 @@ class ProposalExecutionService:
             )
         return method
 
+    def assert_execution_lease_live(
+        self,
+        incident_id: str,
+        proposal_id: str,
+        *,
+        heartbeat: Optional["_LeaseHeartbeat"] = None,
+    ) -> None:
+        """Pre-side-effect authorization (Phase 6.2.1B, single source of
+        truth).
+
+        Succeeds only when, AT THIS INSTANT, the durable control plane
+        reports this worker owns a live (state LEASED, owner match,
+        unexpired) claim and the heartbeat has not flagged loss. It does
+        NOT make the subsequent external Git/GitHub operation
+        transactionally atomic with the lease — defense in depth remains
+        pre-side-effect guard + heartbeat + owner-gated stage persistence
+        + remote reconciliation + fail closed. Store uncertainty raises
+        (fail closed) — never treated as authorization.
+        """
+        active_heartbeat = heartbeat if heartbeat is not None else self._heartbeat
+        if active_heartbeat is not None and active_heartbeat.lost.is_set():
+            raise RemediationStageGuardError(
+                "execution lease lost ("
+                f"{active_heartbeat.loss_reason or 'unknown'}) before a "
+                "side effect"
+            )
+        try:
+            claim = self._coordination("get_execution_claim")(
+                incident_id, proposal_id
+            )
+        except ExecutionLeaseUnavailable:
+            raise
+        except Exception as exc:
+            raise RemediationStageGuardError(
+                "durable claim store unavailable; cannot authorize the "
+                "next side effect"
+            ) from exc
+        if not claim:
+            raise RemediationStageGuardError(
+                "execution claim missing; cannot authorize the next side effect"
+            )
+        if str(claim.get("state") or "") != "LEASED":
+            raise RemediationStageGuardError(
+                "execution claim is not leased; cannot authorize the next "
+                "side effect"
+            )
+        if str(claim.get("lease_owner") or "") != self.lease_owner:
+            raise RemediationStageGuardError(
+                "execution lease is owned by another worker; cannot "
+                "authorize the next side effect"
+            )
+        expires = claim.get("lease_expires_at")
+        if expires is None:
+            raise RemediationStageGuardError(
+                "execution lease has no expiry; cannot authorize the next "
+                "side effect"
+            )
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= self.now():
+            raise RemediationStageGuardError(
+                "execution lease expired; cannot authorize the next side effect"
+            )
+
     def execute(
         self,
         *,
@@ -461,6 +525,16 @@ class ProposalExecutionService:
                     heartbeat=heartbeat,
                 )
 
+            def before_side_effect(operation: str) -> None:
+                # runs on the execution worker thread (never the
+                # heartbeat thread): durable live-ownership check
+                # immediately before each side effect
+                self.assert_execution_lease_live(
+                    incident.id,
+                    proposal.id,
+                    heartbeat=heartbeat,
+                )
+
             try:
                 try:
                     heartbeat.start()
@@ -477,6 +551,7 @@ class ProposalExecutionService:
                             proposal=proposal,
                             repository_slug=proposal.repository,
                             stage_callback=stage_callback,
+                            before_side_effect=before_side_effect,
                         )
                         result = _ResumeResult(
                             commit_sha=proposal.commit_sha,
@@ -490,6 +565,7 @@ class ProposalExecutionService:
                             repository_slug=proposal.repository,
                             validation_profile=self.validation_profile,
                             stage_callback=stage_callback,
+                            before_side_effect=before_side_effect,
                         )
                 except Exception as exc:
                     heartbeat.stop()

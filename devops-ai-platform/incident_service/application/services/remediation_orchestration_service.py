@@ -131,6 +131,7 @@ class RemediationOrchestrationService:
         pr_body: str | None = None,
         prepared_workspace: Any | None = None,
         stage_callback: Any | None = None,
+        before_side_effect: Any | None = None,
     ) -> RemediationOrchestrationResult:
         """Run workspace → patch → validation → commit → publish → draft PR.
 
@@ -142,19 +143,27 @@ class RemediationOrchestrationService:
         """
 
         notify = _make_notifier(stage_callback)
+        # Phase 6.2.1B: durable live-ownership authorization immediately
+        # before EVERY side effect (injected by the execution service;
+        # no-op for isolated orchestration unit use)
+        guard = before_side_effect or (lambda operation: None)
 
         if not proposal.is_verified:
             raise ValueError("remediation proposal must be verified before orchestration")
         if not proposal.source_sha:
             raise ValueError("remediation proposal requires an immutable source SHA")
 
-        workspace = prepared_workspace or self.workspace_service.prepare(
-            repository_slug=repository_slug,
-            source_sha=proposal.source_sha,
-            incident_id=incident_id,
-            proposal_id=proposal.id,
-            base_branch=base_branch,
-        )
+        if prepared_workspace is None:
+            guard("workspace.prepare")
+            workspace = self.workspace_service.prepare(
+                repository_slug=repository_slug,
+                source_sha=proposal.source_sha,
+                incident_id=incident_id,
+                proposal_id=proposal.id,
+                base_branch=base_branch,
+            )
+        else:
+            workspace = prepared_workspace
         notify(
             "workspace.created",
             branch=workspace.branch_name,
@@ -162,6 +171,7 @@ class RemediationOrchestrationService:
         )
 
         try:
+            guard("patch.apply")
             patch_result = self.patch_executor.apply(workspace, proposal)
             try:
                 changed_paths = [
@@ -176,6 +186,7 @@ class RemediationOrchestrationService:
             )
 
             notify("validation.started", profile=validation_profile)
+            guard("validation.run")
             validation_result = self.validation_runner.validate(
                 workspace=workspace,
                 profile=validation_profile,
@@ -196,6 +207,7 @@ class RemediationOrchestrationService:
                     "validation source SHA does not match the proposal source SHA"
                 )
 
+            guard("commit.create")
             commit_result = self.commit_service.create(
                 workspace=workspace,
                 target_filepath=proposal.target_filepath,
@@ -223,6 +235,7 @@ class RemediationOrchestrationService:
             # it has been pushed (GitHub cannot create a ref to an object it
             # has never received).
             try:
+                guard("remote.publish")
                 self.workspace_service.publish_branch(
                     workspace=workspace,
                     oauth_token=self.github_oauth_token,
@@ -248,6 +261,7 @@ class RemediationOrchestrationService:
                 verified=True,
             )
 
+            guard("remote.branch.create")
             self.github.create_branch_from_commit(
                 repo_slug=repository_slug,
                 branch=commit_result.branch_name,
@@ -265,6 +279,7 @@ class RemediationOrchestrationService:
                 commit_sha=commit_result.commit_sha,
                 pr_title=pr_title,
                 pr_body=pr_body,
+                guard=guard,
             )
 
             proposal.pull_request_url = pull_request_url
@@ -293,6 +308,7 @@ class RemediationOrchestrationService:
         pr_title: str | None = None,
         pr_body: str | None = None,
         stage_callback: Any | None = None,
+        before_side_effect: Any | None = None,
     ) -> str:
         """Resume path (Phase 6.2.1): converge to the draft PR without
         repeating workspace/patch/validation/commit.
@@ -304,6 +320,7 @@ class RemediationOrchestrationService:
           remote != persisted commit  -> fail closed (never overwrite)
         """
         notify = _make_notifier(stage_callback)
+        guard = before_side_effect or (lambda operation: None)
         if not proposal.is_verified:
             raise ValueError("remediation proposal must be verified before orchestration")
         commit_sha = (proposal.commit_sha or "").strip().lower()
@@ -313,6 +330,7 @@ class RemediationOrchestrationService:
                 "durable execution state does not record a published commit"
             )
 
+        guard("remote.inspect")
         remote_sha = self.workspace_service.inspect_remote_branch(
             repository_slug, branch, self.github_oauth_token
         )
@@ -338,6 +356,7 @@ class RemediationOrchestrationService:
             recovered=True,
         )
 
+        guard("remote.branch.create")
         self.github.create_branch_from_commit(
             repo_slug=repository_slug,
             branch=branch,
@@ -355,6 +374,7 @@ class RemediationOrchestrationService:
             commit_sha=commit_sha,
             pr_title=pr_title,
             pr_body=pr_body,
+            guard=guard,
         )
         proposal.pull_request_url = pull_request_url
         return pull_request_url
@@ -371,8 +391,12 @@ class RemediationOrchestrationService:
         commit_sha: str,
         pr_title: str | None,
         pr_body: str | None,
+        guard: Any | None = None,
     ) -> str:
-        """Reconcile-then-create: discovery ALWAYS precedes POST /pulls."""
+        """Reconcile-then-create: discovery ALWAYS precedes POST /pulls,
+        and a newly created PR is identity-verified before success."""
+        guard = guard or (lambda operation: None)
+        guard("pr.discovery")
         try:
             matches = self.github.find_existing_pull_requests(
                 repo_slug=repository_slug,
@@ -392,6 +416,7 @@ class RemediationOrchestrationService:
             matches=len(matches) if isinstance(matches, list) else None,
         )
         if isinstance(matches, list) and not matches:
+            guard("pr.create")
             url = self.github.create_pull_request(
                 repo_slug=repository_slug,
                 branch=branch,
@@ -406,6 +431,17 @@ class RemediationOrchestrationService:
                 ),
                 draft=True,
                 base=base_branch,
+            )
+            # Phase 6.2.1B: a create response is not success until the
+            # remote PR proves exact identity (repo + branch + executed
+            # commit SHA + allowed base + open/unmerged)
+            self._verify_created_pr_identity(
+                repository_slug=repository_slug,
+                branch=branch,
+                base_branch=base_branch,
+                commit_sha=commit_sha,
+                proposal=proposal,
+                created_url=url,
             )
             notify(
                 "pr.created",
@@ -431,6 +467,74 @@ class RemediationOrchestrationService:
             commit_sha=commit_sha,
         )
         return url
+
+    def _verify_created_pr_identity(
+        self,
+        *,
+        repository_slug: str,
+        branch: str,
+        base_branch: str,
+        commit_sha: str,
+        proposal: HotfixProposal,
+        created_url: str,
+    ) -> None:
+        """Post-create exact identity check (Phase 6.2.1B).
+
+        Re-reads the PR through the same bounded discovery call and
+        requires the created PR (matched by URL) to prove: exact
+        repository head identity, exact head branch, the executed commit
+        SHA, the allowed base, and open/unmerged state. Title, body and
+        PR number alone are never identity; mismatch/malformed/missing
+        fails closed (no second create, no retarget, no force-push).
+        """
+        if not isinstance(created_url, str) or not created_url.strip():
+            raise ExistingPullRequestConflict(
+                "pull request creation returned no usable URL to verify"
+            )
+        try:
+            matches = self.github.find_existing_pull_requests(
+                repo_slug=repository_slug,
+                head=branch,
+                base=base_branch,
+            )
+        except (PullRequestLookupFailedException, RepositoryNotFoundException) as exc:
+            raise RemoteReconciliationFailed(
+                "could not verify the newly created pull request identity"
+            ) from exc
+        if not isinstance(matches, list):
+            raise RemoteReconciliationFailed(
+                "created pull request verification returned an unexpected result"
+            )
+        created = [
+            item
+            for item in matches
+            if getattr(item, "url", "") == created_url
+        ]
+        if len(created) != 1:
+            raise ExistingPullRequestConflict(
+                "newly created pull request could not be re-verified against "
+                "the remote"
+            )
+        pull = created[0]
+        expected_sha = (commit_sha or "").strip().lower()
+        expected_repo = (proposal.repository or "").strip().lower()
+        problems = []
+        if getattr(pull, "state", "") != "open" or getattr(pull, "merged", False):
+            problems.append("state")
+        if getattr(pull, "head_ref", None) != branch:
+            problems.append("head branch")
+        if getattr(pull, "base_ref", None) != base_branch:
+            problems.append("base branch")
+        if not expected_sha or (getattr(pull, "head_sha", "") or "").strip().lower() != expected_sha:
+            problems.append("head commit")
+        if not expected_repo or (getattr(pull, "head_repository", "") or "").strip().lower() != expected_repo:
+            problems.append("head repository")
+        if problems:
+            raise ExistingPullRequestConflict(
+                "newly created pull request does not prove exact identity ("
+                + ", ".join(problems)
+                + ")"
+            )
 
     @staticmethod
     def _evaluate_existing_pr(

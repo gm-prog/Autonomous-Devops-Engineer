@@ -8,6 +8,7 @@ this module pins the controller contract itself.
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 
@@ -182,6 +183,114 @@ class ProposalEndpointTests(unittest.TestCase):
             generate_remediation_proposal("inc-ep-1", self._service(repository=broken))
         self.assertEqual(ctx.exception.status_code, 503)
         self.assertIn("persisted", ctx.exception.detail)
+
+
+class ActiveIncidentListSerializationTests(unittest.TestCase):
+    """Phase 6.2.1B Goal C: GET /incidents (list endpoint) reflects
+    per-proposal durable claim state after the projection fix."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        url = f"sqlite:///{os.path.join(self._temp.name, 'list.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+
+        incident = IncidentAggregate("inc-list", "cpu", "HIGH", "ctx")
+        incident.move_to_triage()
+        from incident_service.domain.entities.hotfix_proposal import (
+            HotfixProposal,
+        )
+
+        for pid, patch_file in (("p-x", "app/x.py"), ("p-y", "app/y.py")):
+            patch = (
+                f"--- a/{patch_file}\n+++ b/{patch_file}\n"
+                "@@ -1 +1 @@\n-old()\n+new()\n"
+            )
+            proposal = HotfixProposal(
+                id=pid,
+                incident_id="inc-list",
+                target_filepath=patch_file,
+                diff_patch_payload=patch,
+                source_sha="a" * 40,
+                repository="acme/checkout",
+                status="APPROVED",
+                validation_plan=["pytest -q"],
+            )
+            assert proposal.apply_verification_pass()
+            proposal.proposal_hash = ("1" * 64) if pid == "p-x" else ("2" * 64)
+            proposal.approved_by = "alice-operator"
+            proposal.approval_hash = proposal.proposal_hash
+            proposal.approved_at = datetime.now(timezone.utc)
+            incident.upsert_remediation_proposal(proposal)
+        self.repository.save_incident(incident)
+
+        # p-x: claimed, COMMIT_CREATED + durable commit (attempt 2)
+        from sqlalchemy import update as sa_update
+
+        from incident_service.infrastructure.database.postgres_incident_repo import (
+            execution_claims_table,
+        )
+
+        for index in range(2):
+            now = datetime.now(timezone.utc)
+            reason, _ = self.repository.claim_execution_lease(
+                "inc-list", "p-x", "1" * 64,
+                owner="worker-x", now=now, lease_seconds=600.0,
+            )
+            assert reason == "claimed", reason
+            # expire between claims only; final claim stays live
+            if index < 1:
+                with self.repository.engine.begin() as connection:
+                    connection.execute(
+                        sa_update(execution_claims_table)
+                        .where(
+                            execution_claims_table.c.incident_id == "inc-list"
+                        )
+                        .values(
+                            lease_expires_at=datetime.now(timezone.utc)
+                            - timedelta(seconds=1)
+                        )
+                    )
+        for stage in (
+            "WORKSPACE_CREATED", "PATCH_APPLIED", "VALIDATION_STARTED",
+            "VALIDATION_PASSED", "COMMIT_CREATED",
+        ):
+            assert self.repository.persist_execution_progress(
+                "inc-list", "p-x", "worker-x",
+                stage=stage,
+                now=datetime.now(timezone.utc),
+                lease_seconds=600.0,
+                commit_sha="e" * 40 if stage == "COMMIT_CREATED" else None,
+                branch_name=(
+                    "automation/remediation/inc-list/p-x"
+                    if stage == "COMMIT_CREATED"
+                    else None
+                ),
+            ), stage
+        # p-y: no claim
+
+    def test_list_endpoint_serializes_durable_per_proposal_state(self):
+        from incident_service.presentation.rest.controllers import (
+            list_current_anomalies,
+        )
+
+        body = list_current_anomalies(repository=self.repository)
+        target = [item for item in body if item["id"] == "inc-list"]
+        self.assertEqual(len(target), 1)
+        proposals = {item["id"]: item for item in target[0]["patch_proposals"]}
+        self.assertEqual(set(proposals), {"p-x", "p-y"})
+
+        x, y = proposals["p-x"], proposals["p-y"]
+        # x reflects ITS claim: attempt 2, durable commit/branch
+        self.assertEqual(x["execution_attempts"], 2)
+        self.assertEqual(x["commit_sha"], "e" * 40)
+        self.assertEqual(x["branch_name"], "automation/remediation/inc-list/p-x")
+        self.assertTrue(x["execution_id"])
+        # y has no claim: JSON view preserved, nothing inherited from x
+        self.assertEqual(y["execution_attempts"], 0)
+        self.assertEqual(y["commit_sha"], "")
+        self.assertEqual(y["branch_name"], "")
+        self.assertEqual(y["execution_id"], "")
 
 
 if __name__ == "__main__":
