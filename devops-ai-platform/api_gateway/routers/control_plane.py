@@ -164,6 +164,36 @@ def control_plane_remediation(
     )
 
 
+@router.post("/incidents/{incident_id}/proposal/approve")
+def control_plane_approve_proposal(
+    incident_id: str,
+    payload: Dict,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Approve a persisted proposal; identity is always the JWT subject."""
+    _rate_limit_or_429(request)
+    forwarded = dict(payload)
+    forwarded["approved_by"] = user["sub"]
+    return _forward_post(
+        "incident", f"/incidents/{incident_id}/proposal/approve", forwarded
+    )
+
+
+@router.post("/incidents/{incident_id}/proposal/execute")
+def control_plane_execute_proposal(
+    incident_id: str,
+    payload: Dict,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Execute only an explicitly approved, hash-bound proposal."""
+    _rate_limit_or_429(request)
+    return _forward_post(
+        "incident", f"/incidents/{incident_id}/proposal/execute", dict(payload)
+    )
+
+
 def _forward_get(service_name: str, path: str) -> JSONResponse:
     """GET from a private-network downstream, relayed verbatim."""
     target_url = f"{SERVICES[service_name]}{path}"
