@@ -13,16 +13,19 @@ Covers the HTTP boundary of the trust chain:
 """
 
 import unittest
+from unittest.mock import patch
 
 from deployment_service.main import app as deployment_app
 from deployment_service.tests.test_deployment_engine import (
     VALID_PAYLOAD,
     FakeHealth,
     FakeKubectl,
+    FakeSourceVerifier,
     FakeStore,
     FakeTerraform,
     FakeValidator,
 )
+from shared_kernel.domain.provenance import verify_provenance_record
 
 from fastapi.testclient import TestClient
 
@@ -39,7 +42,7 @@ def _payload(repository_name="acme/checkout", head_sha=SHA_A, **overrides):
         source_revision=dict(VALID_PAYLOAD["source_revision"], head_sha=head_sha),
     )
     body.update(overrides)
-    # VALID_PAYLOAD carries lowercase "demo" style names; force canonical pair
+    # VALID_PAYLOAD carries a canonical acme/demo pair; force the test pair
     body["repository_id"] = overrides.get("repository_id", 1)
     return body
 
@@ -51,13 +54,22 @@ class DeploymentHttpContractTests(unittest.TestCase):
 
         self._originals = {
             name: getattr(deployment_main.engine, name)
-            for name in ("store", "validator", "terraform", "kubectl", "health_checker")
+            for name in (
+                "store",
+                "validator",
+                "terraform",
+                "kubectl",
+                "health_checker",
+                "source_verifier",
+            )
         }
         deployment_main.engine.store = self.store
         deployment_main.engine.validator = FakeValidator()
         deployment_main.engine.terraform = FakeTerraform()
         deployment_main.engine.kubectl = FakeKubectl()
         deployment_main.engine.health_checker = FakeHealth()
+        # deterministic source verification (no network in contract tests)
+        deployment_main.engine.source_verifier = FakeSourceVerifier()
         self.addCleanup(self._restore)
 
     def _restore(self):
@@ -219,6 +231,174 @@ class DeploymentHttpContractTests(unittest.TestCase):
             json=_payload(repository_name="  acme/checkout"),
         )
         self.assertEqual(resp.status_code, 422, resp.text)
+
+    # ---------------- Stage 5: source verification (§B) ----------------
+
+    def test_dry_run_records_independent_source_verification(self):
+        resp = client.post("/api/internal/deployments/dry-run", json=_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(
+            body["source_verification"]["method"], FakeSourceVerifier.METHOD
+        )
+        self.assertEqual(
+            body["source_verification"]["verified_source_sha"], SHA_A
+        )
+        provenance = body["provenance"]
+        verify_provenance_record(provenance)  # no raise
+        self.assertEqual(provenance["verification_method"], FakeSourceVerifier.METHOD)
+        self.assertEqual(provenance["state"], "AWAITING_APPROVAL")
+
+    def test_unverified_source_revision_rejected_and_no_run_persisted(self):
+        """A revision the provider does not confirm → 422 and NO run exists
+        (fail closed; nothing to approve, nothing to collect evidence from)."""
+        import deployment_service.main as deployment_main
+
+        deployment_main.engine.source_verifier = FakeSourceVerifier(
+            accepted_pairs=set()
+        )
+        resp = client.post(
+            "/api/internal/deployments/dry-run",
+            json=_payload(repository_name="acme/checkout", head_sha="f" * 40),
+        )
+        self.assertEqual(resp.status_code, 422, resp.text)
+        self.assertIn("not found", resp.json()["detail"])
+        self.assertEqual(len(self.store.data), 0)
+
+    def test_source_verification_unavailable_fails_closed_503(self):
+        import deployment_service.main as deployment_main
+        from deployment_service.application.services.source_verification import (
+            SourceVerificationError,
+        )
+
+        class _Unavailable:
+            def verify(self, repository_name, head_sha):
+                raise SourceVerificationError(
+                    "unavailable",
+                    "source verification is currently unavailable; "
+                    "deployment requests fail closed",
+                )
+
+        deployment_main.engine.source_verifier = _Unavailable()
+        resp = client.post("/api/internal/deployments/dry-run", json=_payload())
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertIn("fail closed", resp.json()["detail"])
+        self.assertEqual(len(self.store.data), 0)
+
+    # ---------------- Stage 5: no state/identity forgery (§L/§M) ----------------
+
+    def test_caller_supplied_state_is_dropped_and_never_reaches_provenance(self):
+        """`state` and `provenance` are not part of the request contract:
+        pydantic drops them and the run state/provenance come only from the
+        server-side state machine."""
+        forged_provenance = {
+            "schema": "devops.deployment-provenance/1",
+            "state": "DEPLOYED",
+            "provenance_hash": "0" * 64,
+        }
+        resp = client.post(
+            "/api/internal/deployments/dry-run",
+            json=_payload(state="DEPLOYED", provenance=forged_provenance),
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["state"], "AWAITING_APPROVAL")
+        self.assertNotEqual(body["state"], "DEPLOYED")
+        provenance = body["provenance"]
+        self.assertEqual(provenance["state"], "AWAITING_APPROVAL")
+        self.assertNotEqual(provenance, forged_provenance)
+        verify_provenance_record(provenance)  # server-derived, self-consistent
+
+    def test_caller_supplied_state_cannot_skip_approval(self):
+        dry = client.post("/api/internal/deployments/dry-run", json=_payload())
+        self.assertEqual(dry.status_code, 200, dry.text)
+        run = dry.json()
+        resp = client.post(
+            f"/api/internal/deployments/{run['id']}/approve",
+            json={
+                "approved_by": "attacker",
+                "state": "DEPLOYED",
+                "artifact_hash": run["artifact_hash"],
+                "plan_hash": run["plan_hash"],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # the state machine, not the request body, decided the transition
+        self.assertEqual(resp.json()["state"], "APPROVED")
+
+    def test_execute_with_mutated_artifact_is_rejected_409(self):
+        """Artifacts mutated after approval cannot execute under the old
+        artifact hash (execution stays bound to the approved identity)."""
+        dry = client.post("/api/internal/deployments/dry-run", json=_payload())
+        self.assertEqual(dry.status_code, 200, dry.text)
+        run = dry.json()
+        approval = client.post(
+            f"/api/internal/deployments/{run['id']}/approve",
+            json={
+                "approved_by": "human",
+                "artifact_hash": run["artifact_hash"],
+                "plan_hash": run["plan_hash"],
+            },
+        )
+        self.assertEqual(approval.status_code, 200, approval.text)
+        with patch.dict("os.environ", {"DEPLOYMENT_EXECUTION_ENABLED": "true"}):
+            resp = client.post(
+                f"/api/internal/deployments/{run['id']}/execute",
+                json={
+                    "artifact_hash": run["artifact_hash"],
+                    "plan_hash": run["plan_hash"],
+                    "dockerfile": "FROM python:3.11-slim\nUSER 0\n",  # mutated
+                    "k8s_yaml": _payload()["k8s_yaml"],
+                    "terraform_tf": _payload()["terraform_tf"],
+                    "pipeline_yaml": _payload()["pipeline_yaml"],
+                },
+            )
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertIn("immutable approved artifact hash", resp.json()["detail"])
+
+    def test_execute_with_tampered_plan_hash_is_rejected_409(self):
+        dry = client.post("/api/internal/deployments/dry-run", json=_payload())
+        self.assertEqual(dry.status_code, 200, dry.text)
+        run = dry.json()
+        approval = client.post(
+            f"/api/internal/deployments/{run['id']}/approve",
+            json={
+                "approved_by": "human",
+                "artifact_hash": run["artifact_hash"],
+                "plan_hash": run["plan_hash"],
+            },
+        )
+        self.assertEqual(approval.status_code, 200, approval.text)
+        with patch.dict("os.environ", {"DEPLOYMENT_EXECUTION_ENABLED": "true"}):
+            resp = client.post(
+                f"/api/internal/deployments/{run['id']}/execute",
+                json={
+                    "artifact_hash": run["artifact_hash"],
+                    "plan_hash": "0" * 64,  # tampered
+                    "dockerfile": _payload()["dockerfile"],
+                    "k8s_yaml": _payload()["k8s_yaml"],
+                    "terraform_tf": _payload()["terraform_tf"],
+                    "pipeline_yaml": _payload()["pipeline_yaml"],
+                },
+            )
+        self.assertEqual(resp.status_code, 409, resp.text)
+        self.assertIn("approval record", resp.json()["detail"])
+
+    def test_evidence_endpoint_carries_verifiable_provenance(self):
+        """GET evidence (the surface the incident collector reads) exposes
+        the run's source verification and a provenance record that validates."""
+        resp = client.post("/api/internal/deployments/dry-run", json=_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        run_id = resp.json()["id"]
+        fetched = client.get(f"/api/internal/deployments/{run_id}")
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        evidence = fetched.json()
+        self.assertEqual(
+            evidence["source_verification"]["method"], FakeSourceVerifier.METHOD
+        )
+        verify_provenance_record(evidence["provenance"])  # no raise
+        self.assertEqual(evidence["provenance"]["repository_name"], "acme/checkout")
+        self.assertEqual(evidence["provenance"]["source_sha"], SHA_A)
 
 
 if __name__ == "__main__":

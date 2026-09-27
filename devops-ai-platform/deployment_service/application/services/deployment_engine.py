@@ -13,6 +13,9 @@ import yaml
 from deployment_service.application.services.health_check_service import HealthCheckService
 from deployment_service.application.services.iac_validator import IaCValidator
 from deployment_service.application.services.kubectl_runner import KubectlRunnerService
+from deployment_service.application.services.source_verification import (
+    GitHubSourceVerifier,
+)
 from deployment_service.application.services.terraform_runner import TerraformRunnerService
 from deployment_service.domain.entities.deployment_run import DeploymentRun
 from deployment_service.domain.value_objects.deployment_state import DeploymentState
@@ -24,12 +27,15 @@ class DeploymentActionError(RuntimeError):
 
 
 class DeploymentEngine:
-    def __init__(self, store=None, validator=None, terraform=None, kubectl=None, health_checker=None):
+    def __init__(self, store=None, validator=None, terraform=None, kubectl=None, health_checker=None, source_verifier=None):
         self.store = store or RedisPipelineStore()
         self.validator = validator or IaCValidator()
         self.terraform = terraform or TerraformRunnerService()
         self.kubectl = kubectl or KubectlRunnerService()
         self.health_checker = health_checker or HealthCheckService()
+        # Independent source-revision verification (Stage 5): the default is
+        # the real GitHub-backed verifier; tests inject deterministic fakes.
+        self.source_verifier = source_verifier or GitHubSourceVerifier()
 
     @staticmethod
     def _validated_source_revision(value: Any) -> Dict[str, Any]:
@@ -106,13 +112,22 @@ class DeploymentEngine:
         return paths
 
     def create_dry_run(self, payload: Dict[str, Any]) -> DeploymentRun:
+        source_revision = self._validated_source_revision(payload.get("source_revision"))
+        # Independent source verification happens FIRST: if the exact
+        # requested revision cannot be confirmed against the canonical
+        # repository, SourceVerificationError propagates and NO run is ever
+        # persisted (fail closed; see main.py for the HTTP mapping).
+        source_verification = self.source_verifier.verify(
+            payload["repository_name"], source_revision.get("head_sha", "")
+        )
         run = DeploymentRun(
             id=f"run_{uuid.uuid4().hex[:12]}",
             repository_id=int(payload["repository_id"]),
             repository_name=payload["repository_name"],
             requested_by=payload.get("requested_by"),
-            source_revision=self._validated_source_revision(payload.get("source_revision")),
+            source_revision=source_revision,
         )
+        run.source_verification = dict(source_verification)
         run.move(DeploymentState.VALIDATING)
         run.add_log("VALIDATING: static IaC safety and syntax checks started.")
         run.validation = self.validator.validate(payload.get("dockerfile", ""), payload.get("k8s_yaml", ""), payload.get("terraform_tf", ""), payload.get("pipeline_yaml", ""))

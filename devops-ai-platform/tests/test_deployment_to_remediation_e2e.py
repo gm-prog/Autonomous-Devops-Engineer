@@ -32,6 +32,7 @@ from deployment_service.tests.test_deployment_engine import (
     VALID_PAYLOAD,
     FakeHealth,
     FakeKubectl,
+    FakeSourceVerifier,
     FakeStore,
     FakeTerraform,
     FakeValidator,
@@ -114,13 +115,23 @@ class DeploymentToRemediationEndToEndTests(unittest.TestCase):
         self.store = FakeStore()
         self._originals = {
             name: getattr(deployment_main.engine, name)
-            for name in ("store", "validator", "terraform", "kubectl", "health_checker")
+            for name in (
+                "store",
+                "validator",
+                "terraform",
+                "kubectl",
+                "health_checker",
+                "source_verifier",
+            )
         }
         deployment_main.engine.store = self.store
         deployment_main.engine.validator = FakeValidator()
         deployment_main.engine.terraform = FakeTerraform()
         deployment_main.engine.kubectl = FakeKubectl()
         deployment_main.engine.health_checker = FakeHealth()
+        # deterministic source verification: the E2E proves the chain, not
+        # GitHub's availability (the real verifier has its own unit tests)
+        deployment_main.engine.source_verifier = FakeSourceVerifier()
         self.addCleanup(self._restore)
 
         self._tmp = tempfile.TemporaryDirectory()

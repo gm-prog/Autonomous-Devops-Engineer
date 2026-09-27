@@ -80,6 +80,9 @@ services:
       - REDIS_HOST=redis
       # Cluster execution stays disabled unless explicitly enabled.
       - DEPLOYMENT_EXECUTION_ENABLED=${DEPLOYMENT_EXECUTION_ENABLED:-false}
+      # Server-side source-revision verification (optional but recommended;
+      # unauthenticated GitHub allows public repos at a low rate limit).
+      - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
     depends_on:
       - redis
 

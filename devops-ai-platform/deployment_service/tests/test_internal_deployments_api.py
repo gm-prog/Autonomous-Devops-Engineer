@@ -77,6 +77,7 @@ class InternalDeploymentApiTests(unittest.TestCase):
             "repository_id": 7,
             "repository_name": "acme/checkout",
             "source_revision": {"head_sha": "b" * 40, "commits": []},
+            "source_verification": {"method": "github-commit-lookup"},
             "state": "DEPLOYED",
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:05:00Z",
@@ -86,6 +87,7 @@ class InternalDeploymentApiTests(unittest.TestCase):
             "health_check": {"status": "PASS"},
             "rollback": {"status": "NOT_REQUIRED"},
             "error": None,
+            "provenance": {"schema": "devops.deployment-provenance/1"},
         }
 
         response = MagicMock()
@@ -107,6 +109,12 @@ class InternalDeploymentApiTests(unittest.TestCase):
         self.assertEqual(evidence.kind, "deployment_run")
         self.assertEqual(evidence.payload["repository_name"], "acme/checkout")
         self.assertEqual(evidence.payload["source_revision"]["head_sha"], "b" * 40)
+        # the provenance record is passed through verbatim for remediation
+        # binding to verify (Stage 5)
+        self.assertEqual(
+            evidence.payload["provenance"],
+            {"schema": "devops.deployment-provenance/1"},
+        )
         requested_url = urlopen.call_args[0][0].full_url
         self.assertEqual(
             requested_url,

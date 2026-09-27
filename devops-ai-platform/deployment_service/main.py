@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from deployment_service.application.services.deployment_engine import DeploymentActionError, DeploymentEngine
+from deployment_service.application.services.source_verification import SourceVerificationError
 
 app = FastAPI(title="DevOps.AI Deployment Engine", version="2.0.0")
 engine = DeploymentEngine()
@@ -98,7 +99,16 @@ def dry_run(request: DryRunRequest):
     payload = request.model_dump()
     assert _SHA_PATTERN.fullmatch(payload["source_revision"]["head_sha"])
     assert _SLUG_PATTERN.fullmatch(payload["repository_name"])
-    return engine.create_dry_run(payload).to_dict()
+    try:
+        # The engine independently verifies the requested revision against
+        # the authoritative repository before any run record exists.
+        return engine.create_dry_run(payload).to_dict()
+    except SourceVerificationError as exc:
+        # not_found → 422 (the input cannot be confirmed), anything the
+        # provider could not answer → 503. Both fail closed: no run, no
+        # plan, no provenance.
+        status = 422 if exc.reason == "not_found" else 503
+        raise HTTPException(status_code=status, detail=exc.public_message) from exc
 
 
 @app.get("/api/internal/deployments/{run_id}")

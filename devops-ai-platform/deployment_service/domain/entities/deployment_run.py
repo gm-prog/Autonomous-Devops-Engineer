@@ -4,6 +4,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from deployment_service.domain.value_objects.deployment_state import DeploymentState, transition
+from shared_kernel.domain.provenance import (
+    VERIFICATION_METHOD_UNVERIFIED,
+    build_provenance_record,
+)
 
 
 def _parse_datetime(value: Optional[str], fallback: datetime) -> datetime:
@@ -20,6 +24,9 @@ class DeploymentRun:
     repository_name: str
     requested_by: Optional[str] = None
     source_revision: Dict[str, Any] = field(default_factory=dict)
+    # Independent source-revision attestation recorded by the engine's
+    # source verifier before any run state is persisted (Stage 5).
+    source_verification: Dict[str, Any] = field(default_factory=dict)
     state: DeploymentState = DeploymentState.CREATED
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -52,6 +59,7 @@ class DeploymentRun:
             "repository_name": self.repository_name,
             "requested_by": self.requested_by,
             "source_revision": self.source_revision,
+            "source_verification": self.source_verification,
             "state": self.state.value,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -66,10 +74,40 @@ class DeploymentRun:
             "rollback": self.rollback,
             "logs": self.logs,
             "error": self.error,
+            # Provenance is DERIVED on every serialization from this run's own
+            # persisted identity — it is never read back from storage or any
+            # caller-supplied payload, so unrelated HTTP fields cannot rewrite
+            # it (Stage 5: platform-owned provenance).
+            "provenance": self.derive_provenance(),
         }
+
+    def derive_provenance(self) -> Dict[str, Any]:
+        """Current provenance record for this run (see shared_kernel)."""
+        method = VERIFICATION_METHOD_UNVERIFIED
+        if isinstance(self.source_verification, dict):
+            recorded = self.source_verification.get("method")
+            if isinstance(recorded, str) and recorded.strip():
+                method = recorded.strip()
+        head_sha = ""
+        if isinstance(self.source_revision, dict):
+            recorded_sha = self.source_revision.get("head_sha")
+            if isinstance(recorded_sha, str):
+                head_sha = recorded_sha
+        return build_provenance_record(
+            repository_name=self.repository_name,
+            source_sha=head_sha,
+            artifact_hash=self.artifact_hash,
+            plan_hash=self.plan_hash,
+            deployment_run_id=self.id,
+            state=self.state.value,
+            verification_method=method,
+        )
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "DeploymentRun":
+        # NOTE: a "provenance" key in ``payload`` is deliberately ignored —
+        # provenance is re-derived from authoritative fields on the next
+        # to_dict(); stored copies are never trusted as input.
         now = datetime.now(timezone.utc)
         return cls(
             id=str(payload["id"]),
@@ -77,6 +115,7 @@ class DeploymentRun:
             repository_name=str(payload["repository_name"]),
             requested_by=payload.get("requested_by"),
             source_revision=payload.get("source_revision") or {},
+            source_verification=payload.get("source_verification") or {},
             state=DeploymentState(payload.get("state", DeploymentState.CREATED.value)),
             created_at=_parse_datetime(payload.get("created_at"), now),
             updated_at=_parse_datetime(payload.get("updated_at"), now),

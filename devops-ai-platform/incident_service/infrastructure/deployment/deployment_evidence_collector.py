@@ -84,6 +84,10 @@ class DeploymentEvidenceCollector:
                 "updated_at": payload.get("updated_at"),
                 "artifact_hash": payload.get("artifact_hash"),
                 "plan_hash": payload.get("plan_hash"),
+                # Platform provenance record (Stage 5): passed through
+                # verbatim; remediation binding verifies its hash and
+                # identity before this evidence can authorize a target.
+                "provenance": payload.get("provenance"),
                 "approval": {
                     "approved_by": (payload.get("approval") or {}).get("approved_by"),
                     "approved_at": (payload.get("approval") or {}).get("approved_at"),

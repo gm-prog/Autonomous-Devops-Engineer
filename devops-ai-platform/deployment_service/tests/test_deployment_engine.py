@@ -2,7 +2,55 @@
 import pytest
 
 from deployment_service.application.services.deployment_engine import DeploymentActionError, DeploymentEngine
+from deployment_service.application.services.source_verification import SourceVerificationError
 from deployment_service.domain.value_objects.deployment_state import DeploymentState
+from shared_kernel.domain.provenance import verify_provenance_record
+
+
+class FakeSourceVerifier:
+    """Deterministic source-verification double (no network).
+
+    Permissive by default (accepts any canonical pair) for tests that are
+    about other properties; pass ``accepted_pairs`` to model a strict
+    provider that only confirms explicitly registered ``(repo, sha)``
+    combinations — everything else raises like the real fail-closed
+    verifier.
+    """
+
+    METHOD = "test-source-verifier"
+
+    def __init__(self, accepted_pairs=None):
+        self.accepted_pairs = accepted_pairs
+        self.calls = []
+
+    def verify(self, repository_name, head_sha):
+        sha = head_sha.strip().lower() if isinstance(head_sha, str) else ""
+        self.calls.append((repository_name, sha))
+        is_slug = (
+            isinstance(repository_name, str)
+            and repository_name.count("/") == 1
+            and not repository_name.startswith("/")
+            and not repository_name.endswith("/")
+        )
+        if not is_slug or len(sha) != 40 or any(c not in "0123456789abcdef" for c in sha):
+            # mirrors the real verifier's canonical-input gate (no network)
+            raise SourceVerificationError(
+                "not_found",
+                "requested source revision was not confirmed for a "
+                "canonical owner/repository identity",
+            )
+        if self.accepted_pairs is not None and (repository_name, sha) not in self.accepted_pairs:
+            raise SourceVerificationError(
+                "not_found",
+                "requested source revision was not found in this repository",
+            )
+        return {
+            "method": self.METHOD,
+            "verified_at": "2026-09-27T00:00:00+00:00",
+            "verified_repository": repository_name,
+            "verified_source_sha": sha,
+            "verified_remote_commit": sha,
+        }
 
 
 class FakeStore:
@@ -38,7 +86,7 @@ class FakeValidator:
 
 
 VALID_PAYLOAD = {
-    "repository_id": 1, "repository_name": "demo", "requested_by": "developer",
+    "repository_id": 1, "repository_name": "acme/demo", "requested_by": "developer",
     "dockerfile": "FROM python:3.11-slim\nUSER 10001\n",
     "k8s_yaml": "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: demo\nspec:\n  template:\n    spec:\n      containers:\n        - name: demo\n          image: demo:latest\n",
     "terraform_tf": 'terraform { required_version = ">= 1.5.0" }\n',
@@ -51,8 +99,8 @@ VALID_PAYLOAD = {
 }
 
 
-def build_engine():
-    return DeploymentEngine(store=FakeStore(), validator=FakeValidator(), terraform=FakeTerraform(), kubectl=FakeKubectl(), health_checker=FakeHealth())
+def build_engine(source_verifier=None):
+    return DeploymentEngine(store=FakeStore(), validator=FakeValidator(), terraform=FakeTerraform(), kubectl=FakeKubectl(), health_checker=FakeHealth(), source_verifier=source_verifier or FakeSourceVerifier())
 
 
 def test_dry_run_waits_for_human_approval():
@@ -121,3 +169,116 @@ def test_repository_name_changes_plan_hash():
     other_repo = dict(VALID_PAYLOAD, repository_name="evil/checkout")
     second = engine.create_dry_run(other_repo)
     assert first.plan_hash != second.plan_hash
+
+
+# ---------------- Stage 5: source verification + provenance ----------------
+
+
+def test_source_verification_failure_persists_no_run():
+    """Fail closed: if the exact revision cannot be confirmed against the
+    canonical repository, no run record exists at all (no state, no plan,
+    no evidence surface)."""
+    engine = build_engine(source_verifier=FakeSourceVerifier(accepted_pairs=set()))
+    with pytest.raises(SourceVerificationError) as excinfo:
+        engine.create_dry_run(VALID_PAYLOAD)
+    assert excinfo.value.reason == "not_found"
+    assert engine.store.data == {}
+
+
+def test_source_verification_unavailable_also_persists_no_run():
+    class _Unavailable:
+        def verify(self, repository_name, head_sha):
+            raise SourceVerificationError(
+                "unavailable", "source verification is currently unavailable"
+            )
+
+    engine = build_engine(source_verifier=_Unavailable())
+    with pytest.raises(SourceVerificationError) as excinfo:
+        engine.create_dry_run(VALID_PAYLOAD)
+    assert excinfo.value.reason == "unavailable"
+    assert engine.store.data == {}
+
+
+def test_source_verification_is_recorded_on_the_run():
+    verifier = FakeSourceVerifier()
+    engine = build_engine(source_verifier=verifier)
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    assert verifier.calls == [("acme/demo", "a" * 40)]
+    assert run.source_verification["method"] == FakeSourceVerifier.METHOD
+    assert run.to_dict()["source_verification"]["method"] == FakeSourceVerifier.METHOD
+    # the attestation never contains credentials or provider URLs
+    assert "token" not in str(run.to_dict()["source_verification"]).lower()
+
+
+def test_provenance_is_derived_and_verifiable():
+    """to_dict() carries a provenance record that validates against the
+    shared contract and reflects the run's own identity."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    provenance = run.to_dict()["provenance"]
+    verify_provenance_record(provenance)  # no raise
+    assert provenance["repository_name"] == "acme/demo"
+    assert provenance["source_sha"] == "a" * 40
+    assert provenance["artifact_hash"] == run.artifact_hash
+    assert provenance["plan_hash"] == run.plan_hash
+    assert provenance["deployment_run_id"] == run.id
+    assert provenance["state"] == "AWAITING_APPROVAL"
+    assert provenance["verification_method"] == FakeSourceVerifier.METHOD
+
+
+def test_state_change_changes_provenance_identity(monkeypatch):
+    """DEPLOYED provenance differs from AWAITING_APPROVAL provenance for the
+    same run (state participates in the hashed identity), and both verify."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    before = run.to_dict()["provenance"]
+    approved_run = engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    approved = approved_run.to_dict()["provenance"]
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    deployed_run = engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash)
+    after = deployed_run.to_dict()["provenance"]
+    verify_provenance_record(before)
+    verify_provenance_record(after)
+    assert before["state"] == "AWAITING_APPROVAL"
+    assert approved["state"] == "APPROVED"
+    assert after["state"] == "DEPLOYED"
+    assert before["provenance_hash"] != approved["provenance_hash"] != after["provenance_hash"]
+    assert before["provenance_hash"] != after["provenance_hash"]
+
+
+def test_provenance_is_rederived_and_never_trusted_from_storage():
+    """A provenance value smuggled into a stored payload is ignored: from_dict
+    does not read it and the next serialization re-derives it from the
+    authoritative fields."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    stored = run.to_dict()
+    genuine = dict(stored["provenance"])
+    forged = dict(stored["provenance"])
+    forged["repository_name"] = "evil/checkout"
+    forged["provenance_hash"] = "0" * 64
+    stored["provenance"] = forged
+    roundtrip = type(run).from_dict(stored).to_dict()
+    assert roundtrip["provenance"] == genuine
+    verify_provenance_record(roundtrip["provenance"])
+
+
+def test_execute_rejects_artifact_mutation_after_approval(monkeypatch):
+    """Execution is bound to the approved artifact: changing the Dockerfile
+    after approval can never execute under the old artifact hash."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    mutated = dict(VALID_PAYLOAD, dockerfile="FROM python:3.11-slim\nUSER 0\n")
+    with pytest.raises(DeploymentActionError, match="do not match"):
+        engine.execute(run.id, mutated, run.artifact_hash, run.plan_hash)
+
+
+def test_execute_rejects_tampered_plan_hash(monkeypatch):
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    with pytest.raises(DeploymentActionError, match="approval record"):
+        engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, "0" * 64)
