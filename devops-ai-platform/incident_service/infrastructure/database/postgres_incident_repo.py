@@ -183,6 +183,9 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 proposal_hash=str(item.get("proposal_hash") or ""),
                 status=str(item.get("status") or "PROPOSED"),
                 blocked_reason=str(item.get("blocked_reason") or ""),
+                approved_by=item.get("approved_by"),
+                approved_at=_parse_optional_datetime(item.get("approved_at")),
+                executed_at=_parse_optional_datetime(item.get("executed_at")),
             )
             for item in proposals
         ]
@@ -194,3 +197,17 @@ def _normalize_created_at(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def _parse_optional_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
