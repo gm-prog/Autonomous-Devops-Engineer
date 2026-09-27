@@ -35,6 +35,9 @@ from incident_service.application.services.remediation_target_binding import (
     authorize_remediation_target,
 )
 from incident_service.infrastructure.source_provider.github_pr_client import GitHubPRClient
+from incident_service.infrastructure.sandbox.container_validation_sandbox import (
+    ContainerValidationSandbox,
+)
 
 
 
@@ -73,7 +76,11 @@ def get_remediation_orchestrator() -> RemediationOrchestrationService:
     return RemediationOrchestrationService(
         workspace_service=RemediationWorkspaceService(),
         patch_executor=RemediationPatchExecutor(),
-        validation_runner=RemediationValidationRunner(),
+        # Phase 6.2.2: validation workloads execute ONLY inside the
+        # container sandbox; there is no host-execution fallback.
+        validation_runner=RemediationValidationRunner(
+            sandbox=ContainerValidationSandbox.from_environment(),
+        ),
         commit_service=RemediationCommitService(),
         github_client=GitHubPRClient(),
     )

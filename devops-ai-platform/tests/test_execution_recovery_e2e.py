@@ -29,6 +29,9 @@ from incident_service.application.failures import (
     ProposalExecutionFailedError,
     RemoteBranchConflict,
 )
+from incident_service.application.services.local_validation_executor import (
+    LocalProcessValidationExecutor,
+)
 from incident_service.application.services.proposal_approval_service import (
     ProposalApprovalService,
 )
@@ -353,7 +356,10 @@ class ExecutionRecoveryE2ETests(unittest.TestCase):
                 remote_url_factory=lambda slug: f"file://{self.bare}"
             ),
             patch_executor=RemediationPatchExecutor(),
-            validation_runner=RemediationValidationRunner(profiles=profiles),
+            validation_runner=RemediationValidationRunner(
+                sandbox=LocalProcessValidationExecutor(),
+                profiles=profiles,
+            ),
             commit_service=RemediationCommitService(),
             github_client=GitHubPRClient(oauth_token="e2e-token"),
             github_oauth_token="e2e-token",

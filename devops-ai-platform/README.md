@@ -690,6 +690,67 @@ Two correctness gaps from the 6.2.1B review, no architecture change:
 Known limit: deterministic interleavings are proven on SQLite; concurrent
 PostgreSQL writers remain untested in CI.
 
+## Phase 6.2.2 — Hardened remediation execution sandbox
+
+The remediation pipeline previously executed validation (repository
+test/build workloads) on the incident-service host trust boundary. As of
+Phase 6.2.2 that workload runs only inside a short-lived constrained
+container:
+
+```
+verified proposal → before_side_effect("validation.run") lease guard
+  → build sandbox run plan (pure policy) → docker run (pinned image,
+  network=none, non-root, read-only, cap-drop ALL, no-new-privileges,
+  seccomp, pids/memory/cpu bounds, single workspace bind)
+  → bounded result → container destroyed → existing owner-gated
+  durable progress → existing orchestration continues
+```
+
+Key invariants:
+
+- **No unsandboxed fallback.** `RemediationValidationRunner` requires
+  an injected `ValidationSandboxPort`; construction without one raises.
+  Production wiring uses `ContainerValidationSandbox.from_environment()`.
+  Failures are typed (`ValidationSandboxUnavailableError` /
+  `ValidationSandboxConfigurationError` / `ValidationSandboxResultError`)
+  and fail closed. `LocalProcessValidationExecutor` exists only as an
+  explicit test seam.
+- **No host secrets in the sandbox.** Environment = constant
+  `SANDBOX_ENV_ALLOWLIST` only; tokens/DB/Redis/JWT/cloud credentials
+  are never passed via env, mounts or default locations.
+- **Filesystem bounded.** Exactly one bind mount: the ephemeral
+  per-attempt workspace at `/workspace`. No host root, home, `.ssh`,
+  docker socket, `/proc`, `/sys`.
+- **Network disabled by default** (`--network none` is the only mode
+  the policy accepts; exceptions require an explicit change in
+  `validation_sandbox.py`).
+- **Privilege reduced:** non-root, read-only rootfs, all capabilities
+  dropped, no-new-privileges, seccomp (runtime default or validated
+  profile; `unconfined` forbidden), never privileged/host-network/
+  host-PID.
+- **Bounds:** step timeout ≤ 180s (+10s wall grace), 768 MiB memory,
+  2 CPUs, 256 pids, 128 KiB output — enforced by policy validation that
+  profile construction and plan generation both re-check.
+- **Cleanup:** `--rm` plus unconditional best-effort
+  `docker rm -f <name>` on success, timeout, command failure and
+  startup failure.
+- **Image:** digest-pinned (`name@sha256:...`, `--pull never`);
+  floating tags are rejected. Configure via `REMEDIATION_SANDBOX_IMAGE`
+  (resolve with `docker pull <tag> && docker image inspect --format
+  '{{index .RepoDigests 0}}' <tag>`); unset configuration fails closed
+  at execution time. Optional `REMEDIATION_SANDBOX_SECCOMP_PROFILE`.
+
+Honest limitations: configuration unit tests prove the generated
+runtime plan, not kernel enforcement; the single real-container
+integration test runs only where a docker runtime is available
+(GitHub-hosted runners) and is skipped otherwise. The sandbox covers
+the validation workload — workspace preparation, patch application and
+commit remain host-side fixed-argv git operations (no repository code
+execution; repository content is data, never command policy). Not
+"production-safe", not "escape-proof", not exactly-once. The lease,
+heartbeat, stale-writer CAS, reconciliation and draft-PR semantics from
+Phases 6.2.1A/B/C are unchanged.
+
 ## Network & authentication trust boundary
 
 * **External boundary = API gateway only.** `docker-compose.yml` publishes a

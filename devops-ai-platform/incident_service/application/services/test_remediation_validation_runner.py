@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from incident_service.application.services.local_validation_executor import (
+    LocalProcessValidationExecutor,
+)
 from incident_service.application.services.remediation_validation_runner import (
     RemediationValidationRunner,
     UnknownValidationProfileError,
@@ -46,7 +49,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
         root, workspace = make_workspace()
         try:
             with self.assertRaises(UnknownValidationProfileError):
-                RemediationValidationRunner(profile("print('ok')")).validate(workspace, "unknown", "service.py")
+                RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles=profile("print('ok')")).validate(workspace, "unknown", "service.py")
         finally:
             import shutil
             shutil.rmtree(root, ignore_errors=True)
@@ -54,7 +57,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
     def test_fixed_profile_passes_when_command_succeeds(self):
         root, workspace = make_workspace()
         try:
-            result = RemediationValidationRunner(profile("print('ok')")).validate(workspace, "test", "service.py")
+            result = RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles=profile("print('ok')")).validate(workspace, "test", "service.py")
             self.assertTrue(result.passed)
             self.assertEqual(result.steps[0].exit_code, 0)
             self.assertFalse(result.steps[0].timed_out)
@@ -65,7 +68,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
     def test_nonzero_command_fails_validation(self):
         root, workspace = make_workspace()
         try:
-            result = RemediationValidationRunner(profile("raise SystemExit(3)")).validate(workspace, "test", "service.py")
+            result = RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles=profile("raise SystemExit(3)")).validate(workspace, "test", "service.py")
             self.assertFalse(result.passed)
             self.assertEqual(result.steps[0].exit_code, 3)
         finally:
@@ -76,7 +79,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
         root, workspace = make_workspace()
         try:
             with self.assertRaises(ValidationWorkspaceMutationError):
-                RemediationValidationRunner(profile(
+                RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles=profile(
                     "from pathlib import Path; Path('unexpected.txt').write_text('mutation')"
                 )).validate(workspace, "test", "service.py")
         finally:
@@ -86,7 +89,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
     def test_timeout_is_reported_and_process_does_not_pass(self):
         root, workspace = make_workspace()
         try:
-            result = RemediationValidationRunner({
+            result = RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles={
                 "test": (ValidationStep(
                     name="timeout", working_directory=".",
                     argv=("python", "-c", "import time; time.sleep(10)"),
@@ -103,7 +106,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
         root, workspace = make_workspace()
         try:
             os.environ["UNIT_TEST_SECRET_TOKEN"] = "should-not-forward"
-            result = RemediationValidationRunner(profile(
+            result = RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles=profile(
                 "import os; print(os.getenv('UNIT_TEST_SECRET_TOKEN', 'missing'))"
             )).validate(workspace, "test", "service.py")
             self.assertTrue(result.passed)
@@ -116,7 +119,7 @@ class RemediationValidationRunnerTests(unittest.TestCase):
 
     def test_profile_rejects_non_python_executable(self):
         with self.assertRaises(ValueError):
-            RemediationValidationRunner({"bad": (ValidationStep(
+            RemediationValidationRunner(sandbox=LocalProcessValidationExecutor(), profiles={"bad": (ValidationStep(
                 name="bad", working_directory=".",
                 argv=("sh", "-c", "echo unsafe"),
             ),)})

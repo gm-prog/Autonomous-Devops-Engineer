@@ -1,25 +1,41 @@
-import logging
+"""Bounded remediation validation behind an explicit sandbox boundary.
+
+Phase 6.2.2: profile policy, workspace-state checks and result mapping
+stay host-owned; the actual workload execution is delegated to an
+explicitly injected ``ValidationSandboxPort``. Production wiring uses the
+container sandbox (``infrastructure.sandbox.container_validation_sandbox``);
+there is deliberately NO default sandbox and NO host-execution fallback —
+``sandbox`` is a required constructor argument and every sandbox failure
+is typed and fail-closed.
+"""
+
 import os
 import re
-import signal
 import subprocess
-import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
-from incident_service.application.services.remediation_patch_executor import (
-    PatchPostconditionError,
+from incident_service.application.services.remediation_workspace_service import (
+    RemediationWorkspace,
 )
-from incident_service.application.services.remediation_workspace_service import RemediationWorkspace
+from incident_service.application.services.validation_sandbox import (
+    SANDBOX_MAX_OUTPUT_BYTES,
+    SANDBOX_MAX_RUNTIME_SECONDS,
+    SandboxStepSpec,
+    is_safe_working_directory,
+)
 
-logger = logging.getLogger("RemediationValidationRunner")
+if TYPE_CHECKING:
+    from incident_service.application.services.validation_sandbox import (
+        ValidationSandboxPort,
+    )
 
-MAX_RUNTIME_SECONDS = 180.0
-MAX_OUTPUT_BYTES = 128 * 1024
-MAX_CPU_SECONDS = 120
-MAX_ADDRESS_SPACE_BYTES = 768 * 1024 * 1024
-MAX_OPEN_FILES = 256
+logger = __import__("logging").getLogger("RemediationValidationRunner")
+
+# Single source of truth lives in validation_sandbox policy module.
+MAX_RUNTIME_SECONDS = SANDBOX_MAX_RUNTIME_SECONDS
+MAX_OUTPUT_BYTES = SANDBOX_MAX_OUTPUT_BYTES
 
 _SECRET_ENV_PATTERN = re.compile(
     r"(TOKEN|PASSWORD|SECRET|PRIVATE_KEY|API_KEY|CREDENTIAL)",
@@ -37,6 +53,18 @@ class UnknownValidationProfileError(ValidationRunnerError):
 
 class ValidationWorkspaceMutationError(ValidationRunnerError):
     """Validation changed files outside the expected remediation target."""
+
+
+class ValidationSandboxUnavailableError(ValidationRunnerError):
+    """The sandbox runtime could not be reached; workload never ran."""
+
+
+class ValidationSandboxConfigurationError(ValidationRunnerError):
+    """Sandbox runtime configuration violated policy; workload never ran."""
+
+
+class ValidationSandboxResultError(ValidationRunnerError):
+    """Sandbox result could not be trusted; treated as a failure."""
 
 
 @dataclass(frozen=True)
@@ -70,7 +98,7 @@ class RemediationValidationResult:
     target_filepath: str
 
 
-_DEFAULT_PROFILES: Dict[str, tuple[ValidationStep, ...]] = {
+_DEFAULT_PROFILES: Mapping[str, tuple[ValidationStep, ...]] = {
     "incident_service": (
         ValidationStep(
             name="incident-service-unit-tests",
@@ -97,6 +125,7 @@ _DEFAULT_PROFILES: Dict[str, tuple[ValidationStep, ...]] = {
                 "incident_service.application.services.test_remediation_commit_service",
                 "incident_service.application.services.test_remediation_orchestration_service",
                 "incident_service.infrastructure.messaging.test_redis_incident_consumer",
+                "incident_service.presentation.rest.test_remediation_authorization",
                 "incident_service.application.services.test_proposal_approval_service",
                 "incident_service.application.services.test_proposal_execution_service",
                 "incident_service.presentation.rest.test_proposal_execution_endpoints",
@@ -109,12 +138,33 @@ _DEFAULT_PROFILES: Dict[str, tuple[ValidationStep, ...]] = {
 
 
 class RemediationValidationRunner:
-    """Runs only fixed platform validation profiles inside an isolated workspace."""
+    """Runs only fixed platform validation profiles inside a sandbox.
+
+    The runner never executes the workload itself: every step is handed
+    to the injected ``ValidationSandboxPort``. There is no fallback —
+    construction without a sandbox raises, and sandbox failures surface
+    as typed ``ValidationSandbox*`` errors instead of host execution.
+    """
 
     def __init__(
         self,
+        *,
+        sandbox: "ValidationSandboxPort",
         profiles: Mapping[str, Sequence[ValidationStep]] | None = None,
     ):
+        if sandbox is None:
+            raise ValueError(
+                "validation sandbox is required; host execution fallback is "
+                "forbidden (Phase 6.2.2)"
+            )
+        if not hasattr(sandbox, "execute") or not callable(
+            getattr(sandbox, "execute")
+        ):
+            raise ValueError(
+                "validation sandbox must provide execute(step, workspace_path)"
+            )
+        self._sandbox = sandbox
+
         selected = profiles or _DEFAULT_PROFILES
         if not selected:
             raise ValueError("at least one validation profile is required")
@@ -128,6 +178,11 @@ class RemediationValidationRunner:
             if not profile_name or not steps:
                 raise ValueError("validation profiles must have non-empty names and steps")
             self._validate_steps(steps)
+
+    @property
+    def sandbox(self) -> "ValidationSandboxPort":
+        """The injected execution boundary (never the host implicitly)."""
+        return self._sandbox
 
     def validate(
         self,
@@ -210,80 +265,32 @@ class RemediationValidationRunner:
         workspace: RemediationWorkspace,
         step: ValidationStep,
     ) -> ValidationStepResult:
-        cwd = self._resolve_working_directory(workspace, step.working_directory)
+        # Host-side safety validation happens BEFORE any sandbox launch.
+        relative = self._safe_working_directory(workspace, step)
+        workspace_path = Path(workspace.path).resolve()
 
-        try:
-            process = subprocess.Popen(
-                list(step.argv),
-                cwd=str(cwd),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
-                env=self._sanitized_environment(),
-                start_new_session=True,
-                preexec_fn=self._resource_limiter,
-            )
-        except OSError as exc:
-            raise ValidationRunnerError(
-                f"could not start validation step {step.name}"
-            ) from exc
-
-        stdout_buffer = bytearray()
-        stderr_buffer = bytearray()
-        stdout_truncated = [False]
-        stderr_truncated = [False]
-
-        readers = [
-            threading.Thread(
-                target=self._drain_stream,
-                args=(process.stdout, stdout_buffer, stdout_truncated, step.max_output_bytes),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=self._drain_stream,
-                args=(process.stderr, stderr_buffer, stderr_truncated, step.max_output_bytes),
-                daemon=True,
-            ),
-        ]
-
-        for reader in readers:
-            reader.start()
-
-        timed_out = False
-        try:
-            process.wait(timeout=step.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            self._terminate_process_group(process)
-
-        for reader in readers:
-            reader.join(timeout=2.0)
-
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
-
-        exit_code = process.returncode if process.returncode is not None else -signal.SIGKILL
-        output_truncated = stdout_truncated[0] or stderr_truncated[0]
-
-        stdout = bytes(stdout_buffer).decode("utf-8", errors="replace")
-        stderr = bytes(stderr_buffer).decode("utf-8", errors="replace")
+        spec = SandboxStepSpec(
+            name=step.name,
+            argv=tuple(step.argv),
+            working_directory=relative,
+            timeout_seconds=float(step.timeout_seconds),
+            max_output_bytes=int(step.max_output_bytes),
+        )
+        outcome = self._sandbox.execute(spec, workspace_path)
 
         passed = (
-            not timed_out
-            and exit_code == 0
-            and not output_truncated
+            not outcome.timed_out
+            and outcome.exit_code == 0
+            and not outcome.output_truncated
         )
 
-        if output_truncated:
+        stderr = outcome.stderr
+        if outcome.output_truncated:
             stderr = (
                 f"{stderr}\n[validation rejected: output exceeded "
                 f"{step.max_output_bytes} bytes]"
             )
-
-        if timed_out:
+        if outcome.timed_out:
             stderr = (
                 f"{stderr}\n[validation rejected: step exceeded "
                 f"{step.timeout_seconds:.1f}s timeout]"
@@ -292,28 +299,27 @@ class RemediationValidationRunner:
         return ValidationStepResult(
             name=step.name,
             passed=passed,
-            exit_code=exit_code,
-            stdout=stdout,
+            exit_code=outcome.exit_code,
+            stdout=outcome.stdout,
             stderr=stderr,
-            timed_out=timed_out,
-            output_truncated=output_truncated,
+            timed_out=outcome.timed_out,
+            output_truncated=outcome.output_truncated,
         )
 
-    @staticmethod
-    def _resolve_working_directory(
+    @classmethod
+    def _safe_working_directory(
+        cls,
         workspace: RemediationWorkspace,
-        relative_directory: str,
-    ) -> Path:
-        relative = Path(relative_directory)
-        if relative.is_absolute() or any(
-            part in {"", ".", ".."} for part in relative.parts
-        ):
+        step: ValidationStep,
+    ) -> str:
+        relative = str(step.working_directory).replace("\\", "/").strip()
+        if not is_safe_working_directory(relative):
             raise ValidationRunnerError(
                 "validation working directory must be a safe workspace-relative path"
             )
 
         root = Path(workspace.path).resolve()
-        resolved = (root / relative).resolve()
+        resolved = (root / (relative or ".")).resolve()
 
         try:
             resolved.relative_to(root)
@@ -324,9 +330,9 @@ class RemediationValidationRunner:
 
         if not resolved.is_dir():
             raise ValidationRunnerError(
-                f"validation working directory does not exist: {relative_directory}"
+                f"validation working directory does not exist: {step.working_directory}"
             )
-        return resolved
+        return relative if relative else "."
 
     @staticmethod
     def _sanitized_environment() -> dict[str, str]:
@@ -357,79 +363,6 @@ class RemediationValidationRunner:
         return sanitized
 
     @staticmethod
-    def _resource_limiter() -> None:
-        try:
-            import resource
-
-            resource.setrlimit(
-                resource.RLIMIT_CPU,
-                (MAX_CPU_SECONDS, MAX_CPU_SECONDS + 1),
-            )
-            resource.setrlimit(
-                resource.RLIMIT_AS,
-                (MAX_ADDRESS_SPACE_BYTES, MAX_ADDRESS_SPACE_BYTES),
-            )
-            resource.setrlimit(
-                resource.RLIMIT_NOFILE,
-                (MAX_OPEN_FILES, MAX_OPEN_FILES),
-            )
-        except (ImportError, OSError, ValueError):
-            logger.warning("OS resource limits are unavailable on this platform")
-
-    @staticmethod
-    def _terminate_process_group(process: subprocess.Popen) -> None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-        finally:
-            if process.poll() is None:
-                process.kill()
-
-    @staticmethod
-    def _drain_stream(
-        stream: Iterable[bytes] | None,
-        buffer: bytearray,
-        truncated: list[bool],
-        limit: int,
-    ) -> None:
-        if stream is None:
-            return
-
-        while True:
-            chunk = stream.read(8192)
-            if not chunk:
-                break
-
-            remaining = limit - len(buffer)
-            if remaining > 0:
-                buffer.extend(chunk[:remaining])
-            if len(chunk) > max(remaining, 0):
-                truncated[0] = True
-
-    @staticmethod
-    def _validate_steps(steps: Sequence[ValidationStep]) -> None:
-        for step in steps:
-            if not step.name.strip():
-                raise ValueError("validation step name must not be empty")
-            if not step.argv or step.argv[0] != "python":
-                raise ValueError(
-                    "validation steps may only use the policy-owned Python executable"
-                )
-            if step.timeout_seconds <= 0 or step.timeout_seconds > MAX_RUNTIME_SECONDS:
-                raise ValueError(
-                    f"validation step timeout must be in (0, {MAX_RUNTIME_SECONDS}]"
-                )
-            if step.max_output_bytes <= 0 or step.max_output_bytes > MAX_OUTPUT_BYTES:
-                raise ValueError(
-                    f"validation output limit must be in (0, {MAX_OUTPUT_BYTES}]"
-                )
-
-    @staticmethod
     def _run_fixed_git(
         args: list[str],
         cwd: Path,
@@ -445,3 +378,25 @@ class RemediationValidationRunner:
             env=RemediationValidationRunner._sanitized_environment(),
             timeout=10,
         )
+
+    @staticmethod
+    def _validate_steps(steps: Sequence[ValidationStep]) -> None:
+        for step in steps:
+            if not step.name.strip():
+                raise ValueError("validation step name must not be empty")
+            if not step.argv or step.argv[0] != "python":
+                raise ValueError(
+                    "validation steps may only use the policy-owned Python executable"
+                )
+            if step.timeout_seconds <= 0 or step.timeout_seconds > MAX_RUNTIME_SECONDS:
+                raise ValueError(
+                    f"validation step timeout must be in (0, {MAX_RUNTIME_SECONDS}]"
+                )
+            if (
+                step.max_output_bytes <= 0
+                or step.max_output_bytes > MAX_OUTPUT_BYTES
+            ):
+                raise ValueError(
+                    "validation output limit must be in "
+                    f"(0, {MAX_OUTPUT_BYTES}]"
+                )

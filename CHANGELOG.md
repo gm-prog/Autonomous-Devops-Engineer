@@ -1,5 +1,47 @@
 # CHANGELOG
 
+## 2026-09-28 — Phase 6.2.2: hardened remediation execution sandbox
+
+- **Validation workloads now execute ONLY inside a dedicated container
+  sandbox** (`ValidationSandboxPort` → `ContainerValidationSandbox`).
+  The remediation runner requires an explicitly injected sandbox; there
+  is no default and NO host-execution fallback — sandbox runtime,
+  image, configuration, timeout or result failures raise typed
+  `ValidationSandbox*` errors and the workload never runs on the host.
+  The legacy in-process executor survives only as
+  `LocalProcessValidationExecutor`, an explicit unit-test/dev seam that
+  production wiring (`controllers.get_remediation_orchestrator`) cannot
+  reach.
+- **Isolation configuration (generated per step, unit-tested):**
+  digest-pinned image with `--pull never` (floating tags rejected),
+  `--network none` (the only network mode the policy accepts), non-root
+  `--user`, `--read-only` rootfs + tmpfs `/tmp`, `--cap-drop ALL`,
+  `no-new-privileges`, seccomp (runtime default; configured profiles
+  validated, `unconfined` forbidden), `--pids-limit`/`--memory`/`--cpus`
+  bounds, wall-clock timeout with grace, unique per-attempt container
+  name, exactly ONE bind mount (the ephemeral workspace at
+  `/workspace`), `--rm` + unconditional best-effort `docker rm -f`
+  cleanup on every exit path.
+- **Credential isolation:** sandbox environment is built exclusively
+  from a constant allowlist (`SANDBOX_ENV_ALLOWLIST`); host variables —
+  `GITHUB_OAUTH_TOKEN`, `JWT_SECRET`, database/Redis URLs, cloud keys,
+  SSH config — are never forwarded via env, mounts or defaults.
+- **Untrusted repository content** (patched files, test/build scripts,
+  filenames) can only influence its own test inputs: argv, executable,
+  limits, mounts, network mode and credentials remain host policy;
+  hostile filenames fail the pre-execution workspace-state check and
+  never reach the sandbox.
+- Lease semantics unchanged: `before_side_effect` still guards
+  `validation.run` before any sandbox creation, heartbeats continue
+  during execution, and stage/finish writes remain owner/expiry/CAS
+  gated. Phase 6.2.1A/B/C reconciliation semantics untouched.
+- Honest limits: one real-container integration test runs only where a
+  docker runtime exists (GitHub-hosted runners provide one; it skips
+  otherwise) — without a runtime, the proof surface is configuration
+  generation, not kernel enforcement. Not "production-safe",
+  "escape-proof" or exactly-once. Concurrent PostgreSQL behavior
+  unchanged from previous phases.
+
 ## 2026-09-28 — Phase 6.2.1C: finish CAS atomicity & post-create PR uniqueness (corrective hardening)
 
 - **Finish transaction atomicity.** `finish_execution_lease()` now raises

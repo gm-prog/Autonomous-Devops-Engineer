@@ -25,6 +25,7 @@ from .remediation_orchestration_service import (
     RemediationOrchestrationService,
 )
 from .remediation_patch_executor import RemediationPatchExecutor
+from .local_validation_executor import LocalProcessValidationExecutor
 from .remediation_validation_runner import (
     RemediationValidationRunner,
     ValidationStep,
@@ -129,7 +130,10 @@ class RemediationE2EBoundaryTests(unittest.TestCase):
         return RemediationOrchestrationService(
             workspace_service=RemediationWorkspaceService(),
             patch_executor=RemediationPatchExecutor(),
-            validation_runner=RemediationValidationRunner(profiles=profiles),
+            validation_runner=RemediationValidationRunner(
+                sandbox=LocalProcessValidationExecutor(),
+                profiles=profiles,
+            ),
             commit_service=RemediationCommitService(),
             github_client=github,
             github_oauth_token=token,
