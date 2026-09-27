@@ -740,10 +740,27 @@ Key invariants:
   '{{index .RepoDigests 0}}' <tag>`); unset configuration fails closed
   at execution time. Optional `REMEDIATION_SANDBOX_SECCOMP_PROFILE`.
 
+**Corrective pass (writable-workspace gap):** the workspace bind is
+`:ro` — validation observes the real Git workspace (including `.git`,
+inside the same read-only mount) but cannot write the working tree,
+the approved target, or Git metadata; the only writable path is tmpfs
+`/tmp`. In addition, the host snapshots approved-target SHA-256, HEAD,
+staged/worktree state and `.git/HEAD|index|config` digests immediately
+before and after every sandboxed step and requires exact equality
+(before-sandbox == after-sandbox), so a zero exit code alone never
+authorizes a changed workspace. All validation-time Git reads use
+`--no-optional-locks` (validation itself never rewrites `.git/index`).
+
 Honest limitations: configuration unit tests prove the generated
-runtime plan, not kernel enforcement; the single real-container
-integration test runs only where a docker runtime is available
-(GitHub-hosted runners) and is skipped otherwise. The sandbox covers
+runtime plan, not kernel enforcement; the real-container integration
+tests (read-only denial of target rewrites and `.git` writes, plus the
+isolation suite) run only where a docker runtime is available
+(GitHub-hosted runners) and are honestly skipped otherwise. The claim
+is deliberately narrow: the untrusted validation workload receives a
+read-only view of the remediation workspace and cannot write the host
+repository or Git metadata through the mounted workspace — the host
+still performs controlled Git patch/commit/publish operations outside
+the sandbox with the existing fixed-argv and SHA checks. The sandbox covers
 the validation workload — workspace preparation, patch application and
 commit remain host-side fixed-argv git operations (no repository code
 execution; repository content is data, never command policy). Not

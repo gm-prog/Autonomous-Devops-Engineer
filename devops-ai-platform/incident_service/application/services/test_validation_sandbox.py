@@ -264,13 +264,41 @@ class SecretIsolationTests(unittest.TestCase):
 
 
 class FilesystemIsolationTests(unittest.TestCase):
-    """C. Only the intended workspace is mounted."""
+    """C. Only the intended workspace is mounted, READ-ONLY."""
 
-    def test_only_workspace_mount_present(self):
+    def test_workspace_mount_is_read_only(self):
+        """Corrective Test 1: /workspace bind is :ro, never :rw."""
         plan = _plan()
         self.assertEqual(
-            plan.mounts, (f"{WORKSPACE}:/workspace:rw",)
+            plan.mounts, (f"{WORKSPACE}:/workspace:ro",)
         )
+        self.assertTrue(plan.mounts[0].endswith(":ro"))
+        # the -v argument in the generated argv carries the same :ro bind
+        volumes = [
+            plan.cli_argv[i + 1]
+            for i, a in enumerate(plan.cli_argv)
+            if a == "-v"
+        ]
+        self.assertEqual(volumes, [f"{WORKSPACE}:/workspace:ro"])
+        for volume in volumes:
+            self.assertFalse(volume.endswith(":rw"), volume)
+
+    def test_only_one_bind_and_no_writable_git_mount(self):
+        """Corrective Test 2: exactly one bind; no mount whose source or
+        destination exposes .git; no separate Git metadata mount; no
+        host-path RW mount of any kind."""
+        plan = _plan()
+        self.assertEqual(len(plan.mounts), 1)
+        source, destination, mode = plan.mounts[0].rsplit(":", 2)
+        self.assertEqual(mode, "ro")
+        self.assertEqual(destination, "/workspace")
+        self.assertFalse(source.endswith("/.git"), source)
+        self.assertFalse(destination.endswith("/.git"), destination)
+        # no other -v mounts exist at all (tmpfs /tmp is --tmpfs, not a bind)
+        volume_flags = plan.cli_argv.count("-v")
+        self.assertEqual(volume_flags, 1)
+        # .git is reachable only inside the RO /workspace mount
+        self.assertNotIn(".git", " ".join(plan.cli_argv))
 
     def test_no_sensitive_host_paths_mounted(self):
         plan = _plan()
@@ -639,6 +667,104 @@ class MockCommit:
     target_filepath = "src/service.py"
 
 
+class TargetIntegrityDefenseInDepthTests(unittest.TestCase):
+    """Corrective Tests 5-7: before/after integrity around every step."""
+
+    @staticmethod
+    def _profiles():
+        return {
+            "test": (
+                ValidationStep(
+                    name="s",
+                    working_directory=".",
+                    argv=("python", "-c", "print('ok')"),
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                ),
+            )
+        }
+
+    def test_mutating_sandbox_fails_validation_closed(self):
+        """Corrective Test 5 (no docker): a sandbox that rewrites the
+        approved target between the before/after snapshots must raise
+        ValidationWorkspaceMutationError even though its command exits 0
+        — and even though git status still shows the same single ' M'
+        entry (the old check could not see this)."""
+        root, workspace = make_git_workspace()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        target = Path(workspace.path) / "service.py"
+        approved_bytes = target.read_bytes()
+
+        class MutatingSandbox:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, step, workspace_path):
+                self.calls += 1
+                # rewrites the ALREADY-APPROVED target with different bytes
+                target.write_text(
+                    "print('malicious replacement')\n", encoding="utf-8"
+                )
+                from incident_service.application.services.validation_sandbox import (
+                    SandboxStepOutcome,
+                )
+
+                return SandboxStepOutcome(
+                    exit_code=0,
+                    stdout="ok\n",
+                    stderr="",
+                    timed_out=False,
+                    output_truncated=False,
+                )
+
+        sandbox = MutatingSandbox()
+        runner = RemediationValidationRunner(
+            sandbox=sandbox, profiles=self._profiles()
+        )
+        with self.assertRaises(ValidationWorkspaceMutationError):
+            runner.validate(workspace, "test", "service.py")
+        self.assertEqual(sandbox.calls, 1)
+        # the host target itself was altered by the fake — the check must
+        # have FIRED (fail closed), it must never silently authorize it
+        self.assertNotEqual(target.read_bytes(), approved_bytes)
+
+    def test_unchanged_mutation_free_sandbox_passes_integrity(self):
+        """Corrective Test 6: an already-patched (approved) target is
+        accepted — the check compares before-vs-after sandbox state,
+        never source-vs-after."""
+        root, workspace = make_git_workspace()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        target = Path(workspace.path) / "service.py"
+        approved_bytes = target.read_bytes()
+        self.assertNotEqual(
+            approved_bytes, b"print('old')\n"
+        )  # fixture target already carries the approved remediation
+
+        runner = RemediationValidationRunner(
+            sandbox=_SpySandbox(outcome=_ok_outcome()),
+            profiles=self._profiles(),
+        )
+        result = runner.validate(workspace, "test", "service.py")
+        self.assertTrue(result.passed)
+        self.assertEqual(target.read_bytes(), approved_bytes)
+
+    def test_git_metadata_unchanged_across_validation(self):
+        """Corrective Test 7 (unit): .git/HEAD, .git/index and .git/config
+        are byte-identical across a successful validation."""
+        root, workspace = make_git_workspace()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        repo = Path(workspace.path)
+        before = _git_metadata_digests(repo)
+
+        runner = RemediationValidationRunner(
+            sandbox=_SpySandbox(outcome=_ok_outcome()),
+            profiles=self._profiles(),
+        )
+        result = runner.validate(workspace, "test", "service.py")
+        self.assertTrue(result.passed)
+        self.assertEqual(_git_metadata_digests(repo), before)
+
+
 class MaliciousRepositoryContentTests(unittest.TestCase):
     """I. Hostile repository content stays untrusted data."""
 
@@ -717,6 +843,19 @@ class MaliciousRepositoryContentTests(unittest.TestCase):
         self.assertEqual(
             spy.calls, [], "hostile workspace must never execute"
         )
+
+
+def _git_metadata_digests(repo: Path) -> dict:
+    """sha256 of .git/HEAD, .git/index, .git/config (None if absent)."""
+    import hashlib
+
+    out = {}
+    for name in ("HEAD", "index", "config"):
+        f = repo / ".git" / name
+        out[name] = (
+            hashlib.sha256(f.read_bytes()).hexdigest() if f.is_file() else None
+        )
+    return out
 
 
 def _docker_reachable() -> bool:
@@ -828,6 +967,23 @@ class RealContainerIntegrationTests(unittest.TestCase):
             branch_name="automation/remediation/inc-1/proposal-1",
         )
 
+        # bytes/state captured for before/after integrity evidence
+        self.target_bytes = (repo / "service.py").read_bytes()
+        self.git_metadata_before = _git_metadata_digests(repo)
+        self.porcelain_before = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
         self.steps = (
             ("uid", "import os,sys; sys.stdout.write(str(os.getuid()))"),
             (
@@ -854,6 +1010,112 @@ class RealContainerIntegrationTests(unittest.TestCase):
                 "except OSError:\n"
                 "    sys.stdout.write('OUTSIDE-ABSENT')\n",
             ),
+        )
+
+    def _single_step_result(self, code: str):
+        profiles = {
+            "probe": (
+                ValidationStep(
+                    name="probe",
+                    working_directory=".",
+                    argv=("python", "-c", code),
+                    timeout_seconds=60,
+                    max_output_bytes=4096,
+                ),
+            )
+        }
+        runner = RemediationValidationRunner(
+            sandbox=ContainerValidationSandbox(image=self.image_digest),
+            profiles=profiles,
+        )
+        with patch.dict(os.environ, _SECRET_ENV):
+            return runner, runner.validate(
+                self.workspace, "probe", "service.py"
+            )
+
+    def test_workspace_read_only_blocks_target_rewrite(self):
+        """Corrective Test 3 (real container): the validation command
+        attempts to rewrite the approved target; the :ro mount denies
+        it, validation does not pass, and the host target/Git state are
+        byte-for-byte identical afterwards."""
+        repo = Path(self.workspace.path)
+        runner, result = self._single_step_result(
+            "from pathlib import Path\n"
+            "Path('service.py').write_text('malicious replacement')\n"
+        )
+        self.assertFalse(
+            result.passed,
+            "a workspace-rewriting validation command must never pass",
+        )
+        self.assertNotEqual(result.steps[0].exit_code, 0)
+        # host target unchanged byte-for-byte
+        self.assertEqual(
+            (repo / "service.py").read_bytes(), self.target_bytes
+        )
+        # host Git state unchanged
+        self.assertEqual(
+            _git_metadata_digests(repo), self.git_metadata_before
+        )
+        porcelain = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertEqual(porcelain, self.porcelain_before)
+
+    def test_git_metadata_writes_denied_in_container(self):
+        """Corrective Test 4 (real container): harmless append attempts
+        to .git/HEAD, .git/index and .git/config are each denied by the
+        read-only mount; host metadata is unchanged; the fact that the
+        probe exits 0 never substitutes for the host integrity check."""
+        repo = Path(self.workspace.path)
+        probe = (
+            "import sys\n"
+            "results = []\n"
+            "for path in ('.git/HEAD', '.git/index', '.git/config'):\n"
+            "    try:\n"
+            "        with open(path, 'a') as fh:\n"
+            "            fh.write('\\n# sandbox probe')\n"
+            "        results.append(path + '=WRITTEN')\n"
+            "    except OSError:\n"
+            "        results.append(path + '=DENIED')\n"
+            "sys.stdout.write('|'.join(results))\n"
+        )
+        runner, result = self._single_step_result(probe)
+        self.assertTrue(result.passed, result)
+        output = result.steps[0].stdout
+        self.assertEqual(output.count("=DENIED"), 3, output)
+        self.assertNotIn("=WRITTEN", output)
+        # host Git metadata identical — the probe's exit code did not
+        # substitute for host-side integrity verification
+        self.assertEqual(
+            _git_metadata_digests(repo), self.git_metadata_before
+        )
+        porcelain = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertEqual(porcelain, self.porcelain_before)
+        # target untouched too
+        self.assertEqual(
+            (repo / "service.py").read_bytes(), self.target_bytes
         )
 
     def test_sandboxed_execution_isolation_and_cleanup(self):
@@ -891,6 +1153,29 @@ class RealContainerIntegrationTests(unittest.TestCase):
         self.assertIn("print('new')", outputs["visible"])
         # file outside the mount unavailable
         self.assertEqual(outputs["outside"], "OUTSIDE-ABSENT")
+        # host target bytes + .git metadata + Git state identical across
+        # the entire sandboxed validation (before == after)
+        repo = Path(self.workspace.path)
+        self.assertEqual(
+            (repo / "service.py").read_bytes(), self.target_bytes
+        )
+        self.assertEqual(
+            _git_metadata_digests(repo), self.git_metadata_before
+        )
+        porcelain_after = subprocess.run(
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        self.assertEqual(porcelain_after, self.porcelain_before)
         # sandbox containers removed afterwards
         listing = subprocess.run(
             [

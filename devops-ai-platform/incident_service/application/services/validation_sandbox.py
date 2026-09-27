@@ -5,7 +5,10 @@ filenames) is UNTRUSTED: it may influence its own test inputs only. It can
 never redefine the executable, argv, resource limits, network mode, mounts,
 environment, credentials, or any other property of the execution sandbox.
 Those are host-owned policy, expressed here as pure, unit-testable
-configuration builders.
+configuration builders. The real remediation workspace is bound
+READ-ONLY at /workspace (the writable area is tmpfs /tmp only); the
+host additionally verifies before/after target and Git-state integrity
+around every sandboxed step.
 
 Critical invariant: there is NO host/in-process fallback behind this
 module. Every failure to build or run a sandboxed step is a typed,
@@ -106,7 +109,7 @@ class SandboxRunPlan:
     container_name: str
     cli_argv: tuple[str, ...]
     env: Mapping[str, str]
-    mounts: tuple[str, ...]
+    mounts: tuple[str, ...]  # exactly one bind, always ":ro" (workspace)
     working_directory: str  # container path
     wall_timeout_seconds: float
 
@@ -222,10 +225,14 @@ def build_run_plan(
             "sandbox workspace mount source must be an absolute path"
         )
 
-    # Exactly one host bind: the ephemeral per-attempt workspace. No host
-    # root, home, credential directories, docker socket, /proc, /sys, or
-    # any other sensitive path is ever mounted.
-    mounts = (f"{workspace}:{SANDBOX_WORKSPACE_MOUNT}:rw",)
+    # Exactly one host bind: the ephemeral per-attempt workspace, and it
+    # is READ-ONLY — the untrusted validation workload may observe the
+    # real remediation Git workspace (including .git, which lives inside
+    # the same mount) but can never write the working tree or Git
+    # metadata through it. No host root, home, credential directories,
+    # docker socket, /proc, /sys, or any other sensitive path is ever
+    # mounted, and no separate Git-metadata mount exists.
+    mounts = (f"{workspace}:{SANDBOX_WORKSPACE_MOUNT}:ro",)
 
     env = dict(SANDBOX_ENV_ALLOWLIST)
 

@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## 2026-09-28 — Phase 6.2.2 corrective pass: read-only validation workspace & target integrity
+
+- **The real remediation Git workspace is now bound READ-ONLY into the
+  validation sandbox** (`<workspace>:/workspace:ro`; the only writable
+  area remains the bounded tmpfs `/tmp`). The untrusted validation
+  workload can observe the working tree and `.git` (inside the same
+  RO mount) but can never write the host repository, the approved
+  target, or Git metadata through it. No alternate RW host-repository
+  mount exists (exactly one bind, always `:ro`).
+- **Before/after integrity around every sandboxed step:** the host
+  snapshots the approved target's SHA-256, HEAD, the target's staged
+  and working-tree diff state, and `.git/HEAD`/`.git/index`/`.git/config`
+  digests immediately before and after each step and requires exact
+  equality — a zero exit code alone never authorizes a changed
+  workspace. The comparison is before-sandbox == after-sandbox (the
+  target already carries the approved remediation patch), and all
+  validation-time Git reads use `--no-optional-locks` so validation is
+  observationally side-effect-free on `.git/index`.
+- Focused regressions: `:ro` plan assertions, no-writable-`.git` mount
+  checks, a non-Docker mutating-sandbox test
+  (`ValidationWorkspaceMutationError` fail-closed), unchanged-approved-
+  target acceptance, and real-container probes that attempt (and have
+  denied) target rewrites and harmless `.git/HEAD|index|config` writes
+  with byte-identical host state afterwards.
+- Honest scope: this narrows the claim to "the validation workload gets
+  a read-only view of the remediation workspace and cannot write the
+  host repository or Git metadata through the mount" — the host still
+  performs controlled Git patch/commit/publish operations outside the
+  sandbox. Not "escape-proof", not "production-safe", not exactly-once.
+  Phase 6.2.1A/B/C lease/CAS/heartbeat/reconciliation/PR-identity
+  semantics unchanged.
+
 ## 2026-09-28 — Phase 6.2.2: hardened remediation execution sandbox
 
 - **Validation workloads now execute ONLY inside a dedicated container

@@ -9,6 +9,7 @@ there is deliberately NO default sandbox and NO host-execution fallback —
 is typed and fail-closed.
 """
 
+import hashlib
 import os
 import re
 import subprocess
@@ -201,7 +202,21 @@ class RemediationValidationRunner:
 
         results = []
         for step in steps:
+            # Defense in depth (6.2.2 corrective pass): capture the
+            # approved target's exact bytes and the Git state around
+            # THIS sandbox execution, and require byte-for-byte
+            # equality afterwards — a zero exit code alone never
+            # authorizes a changed workspace. The comparison is
+            # before-sandbox == after-sandbox (the target already
+            # contains the approved remediation patch at this point).
+            integrity_before = self._integrity_snapshot(workspace, target)
             result = self._run_step(workspace, step)
+            integrity_after = self._integrity_snapshot(workspace, target)
+            if integrity_after != integrity_before:
+                raise ValidationWorkspaceMutationError(
+                    "sandbox validation modified the approved target or "
+                    "Git state around the validation step"
+                )
             results.append(result)
 
             if not result.passed:
@@ -223,6 +238,89 @@ class RemediationValidationRunner:
             target_filepath=target,
         )
 
+    def _integrity_snapshot(
+        self,
+        workspace: RemediationWorkspace,
+        target: str,
+    ) -> dict:
+        """Deterministic integrity snapshot taken immediately before and
+        after each sandboxed step.
+
+        Captures: the approved target's SHA-256 over its exact bytes,
+        HEAD, the target's staged and working-tree diff state, and the
+        digests of .git/HEAD, .git/index and .git/config. Any difference
+        between the before/after snapshots fails validation closed.
+        All Git reads use --no-optional-locks so the snapshot itself
+        never rewrites .git/index (self-observation must be stable).
+        """
+        root = Path(workspace.path).resolve()
+        target_path = (root / target).resolve()
+        try:
+            target_path.relative_to(root)
+        except ValueError as exc:
+            raise ValidationRunnerError(
+                "approved target escaped the remediation workspace"
+            ) from exc
+        if not target_path.is_file():
+            raise ValidationRunnerError(
+                "approved target is missing around sandbox execution"
+            )
+
+        snapshot = {
+            "target_sha256": hashlib.sha256(
+                target_path.read_bytes()
+            ).hexdigest(),
+        }
+        try:
+            snapshot["head"] = self._run_fixed_git(
+                ["git", "rev-parse", "HEAD"], root, read_only=True
+            ).stdout.strip()
+            snapshot["target_staged"] = self._run_fixed_git(
+                ["git", "diff", "--cached", "--binary", "--", target],
+                root,
+                read_only=True,
+            ).stdout
+            snapshot["target_worktree"] = self._run_fixed_git(
+                ["git", "diff", "--binary", "--", target],
+                root,
+                read_only=True,
+            ).stdout
+        except subprocess.CalledProcessError as exc:
+            raise ValidationRunnerError(
+                "could not capture Git integrity state around sandbox execution"
+            ) from exc
+
+        for name, key in (
+            ("HEAD", "git_head"),
+            ("index", "git_index"),
+            ("config", "git_config"),
+        ):
+            snapshot[key] = self._file_digest(self._git_metadata_path(root, name))
+        return snapshot
+
+    @staticmethod
+    def _git_metadata_path(root: Path, name: str) -> Path | None:
+        git_dir = root / ".git"
+        if git_dir.is_dir():
+            candidate = git_dir / name
+            return candidate if candidate.is_file() else None
+        if git_dir.is_file():
+            # gitfile pointer ("gitdir: <path>") — resolve the real dir
+            pointer = git_dir.read_text(encoding="utf-8", errors="replace")
+            if pointer.startswith("gitdir:"):
+                real = Path(pointer.split(":", 1)[1].strip())
+                if not real.is_absolute():
+                    real = (root / real).resolve()
+                candidate = real / name
+                return candidate if candidate.is_file() else None
+        return None
+
+    @staticmethod
+    def _file_digest(path: Path | None):
+        if path is None or not path.is_file():
+            return None
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
     @staticmethod
     def _normalize_target(target_filepath: str) -> str:
         target = target_filepath.replace("\\", "/").strip()
@@ -243,9 +341,13 @@ class RemediationValidationRunner:
         if not workspace_path.is_dir():
             raise ValidationRunnerError("validation workspace does not exist")
 
+        # read-only observation: --no-optional-locks so the CHECK itself
+        # never writes .git/index (validation must be observationally
+        # side-effect-free on Git metadata)
         status = self._run_fixed_git(
             ["git", "status", "--porcelain=v1", "--untracked-files=all"],
             workspace_path,
+            read_only=True,
         )
         entries = [line for line in status.stdout.splitlines() if line.strip()]
 
@@ -366,9 +468,15 @@ class RemediationValidationRunner:
     def _run_fixed_git(
         args: list[str],
         cwd: Path,
+        *,
+        read_only: bool = False,
     ) -> subprocess.CompletedProcess[str]:
+        command = list(args)
+        if read_only and command and command[0] == "git":
+            # never refresh/write the index while observing it
+            command = [command[0], "--no-optional-locks", *command[1:]]
         return subprocess.run(
-            args,
+            command,
             cwd=str(cwd),
             stdin=subprocess.DEVNULL,
             capture_output=True,
