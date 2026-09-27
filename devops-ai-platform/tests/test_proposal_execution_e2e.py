@@ -174,6 +174,7 @@ class ProposalExecutionE2ETests(unittest.TestCase):
         self.proposal_hash = generated["proposal"]["proposal_hash"]
 
         self.github = MagicMock()
+        self.github.find_existing_pull_requests.return_value = []
         self.github.create_branch_from_commit.return_value = (
             f"https://github.com/{REPO_SLUG}/tree/automation/remediation"
         )

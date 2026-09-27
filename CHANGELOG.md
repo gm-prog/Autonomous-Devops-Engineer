@@ -1,5 +1,82 @@
 # CHANGELOG
 
+## 2026-09-27 — Phase 6.2.1: durable execution coordination & remote reconciliation
+
+Hardens the Phase 6.2 executor (same architecture, no new stack): one
+logical proposal execution now converges to one logical remediation
+result under duplicate, interrupted and ambiguous requests.
+
+* **Durable execution lease** — new `devops_execution_claims` table
+  (same database, explicit schema, reload round-trip tested) holding
+  `execution_id, attempt, lease_owner, lease_acquired_at,
+  lease_expires_at, current_stage, state, commit/branch/pr mirrors`.
+  Atomic claim guarantees at most one live lease per
+  `(incident_id, proposal_id, proposal_hash)` **across independent
+  service instances** (verified with two adapters over real SQLite,
+  including a threaded CAS race). TTL from
+  `REMEDIATION_EXECUTION_LEASE_SECONDS` (default 600.0, positive,
+  fail-fast, tz-aware); fresh leases can never be stolen; progress
+  writes renew expiry; `attempt` increments only on a real ownership
+  claim. Lease owner is process-derived — the execute API still accepts
+  only `{proposal_id, proposal_hash}` (+ authenticated operator),
+  never owner/repository/target.
+* **Bounded durable stage vocabulary** — `CLAIMED → WORKSPACE_CREATED →
+  PATCH_APPLIED → VALIDATION_STARTED → VALIDATION_PASSED → COMMIT_CREATED
+  → REMOTE_PUBLISHED → REMOTE_VERIFIED → PR_DISCOVERY → PR_CREATED →
+  COMPLETED|FAILED`, each transition a short owner-gated transaction
+  (never held across external ops). Losing the lease mid-run aborts the
+  orchestrator (`RemediationStageGuardError`) without clobbering the
+  new owner's state.
+* **Crash recovery reconciles reality first** — expired lease reclaim
+  re-runs integrity/freshness/patch/target gates, then inspects durable
+  cursor + `ls-remote` SHA before choosing RESUME (remote == persisted
+  commit → skip workspace, converge PR) or a deterministic FULL
+  restart; missing/vanished or mismatched remotes fail closed with
+  durable `RECONCILIATION_CONFLICT` evidence — never retarget, never
+  force-push.
+* **Mandatory PR reconciliation** — new
+  `GitHubPRClient.find_existing_pull_request(s)` (auth, slug/base
+  validation, bounded timeouts, distinct 401/403/404/429/5xx typed
+  outcomes, no token leakage, typed `ExistingPullRequest` results) runs
+  before every create: 0 → create, 1 open exact-identity match → reuse,
+  merged/closed/multiple/mismatched-corroboration →
+  `ExistingPullRequestConflict` fail closed. head/base/repository are
+  the identity; PR body metadata is corroboration only — remote state
+  is never authorization. Branch publication reconciles the same way
+  (absent → push, equal → idempotent, unequal → conflict).
+* **Failure/HTTP map:** new typed `ExecutionLeaseUnavailable`,
+  `RemoteBranchConflict`, `ExistingPullRequestConflict` → 409;
+  `RemoteReconciliationFailed` → 502 (`ExecutionLeaseExpired`,
+  `ExecutionRecoveryConflict` remain reserved vocabulary). Active
+  lease → 409 (no parallel execution); retry-after-success returns the
+  existing result without incrementing attempts; unrecoverable
+  conflicts stay `EXECUTION_FAILED` until operator action.
+* **Observability:** `remediation.lease.acquired|rejected|expired`,
+  `recovery.started|reconciled`, `remote.branch.reconciled`,
+  `pr.discovery|reconciled|created`, `execution.completed|failed` —
+  observer failures never change semantics. Per-attempt evidence
+  (`exec-{id}-a{attempt}`) carries stage, status, repo, SHAs, lease
+  owner and redacted reason; conflict evidence
+  (`exec-{id}-recon-a{n}`) persists pre-lease reconciliation failures.
+* **Tests (all green locally):** durable lease coordination (19 —
+  two-instance claims, expiry reclaim, owner-gated finish, thread CAS
+  race, stage guard, vocabulary, fail-closed store), service recovery
+  (11 — crash/RESUME/FULL/vanished/wrong-SHA, stale/tampered/drift
+  gates, lease theft mid-run), discovery client (21 — typed status
+  matrix, filters, token-free messages), orchestration reconciliation
+  (16 — reuse/merged/multiple/body-hash, resume re-inspect), §44
+  recovery E2E with bare git + deterministic fake GitHub HTTP
+  (worker A push → crash → worker B converges to exactly 1 commit /
+  1 branch / 1 PR; PR-response timeout retry; wrong-SHA fail-closed;
+  merged-PR no-second-PR), plus the full proposal battery —
+  156 passed / 29 subtests. CI incident job: 26 modules (+2).
+* **Honest limitations:** TTL lease ≠ distributed consensus (no
+  exactly-once claim across DB+Git+GitHub — at-least-once +
+  deterministic idempotency + fail-closed reconciliation only);
+  PostgreSQL DDL mirrors SQLite but is not exercised in CI; hostile
+  remote history beyond branch SHA/PR identity fails closed to an
+  operator; workspace+subprocess still not a hardened sandbox.
+
 ## 2026-09-27 — Phase 6.2: controlled remediation execution (proposal → approval → validated patch → draft PR)
 
 Completes the bounded vertical slice: an evidence-grounded, persisted

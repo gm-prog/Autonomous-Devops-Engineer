@@ -55,6 +55,12 @@ class RemediationWorkspace:
     branch_name: str
 
 
+from incident_service.application.failures import (
+    RemoteBranchConflict,
+    RemoteReconciliationFailed,
+)
+
+
 class RemediationWorkspaceService:
     """Creates a clean, SHA-pinned Git workspace without allowing model-supplied shell commands."""
 
@@ -259,6 +265,32 @@ class RemediationWorkspaceService:
             "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {oauth_token.strip()}",
         }
 
+        # Phase 6.2.1: reconcile the remote branch BEFORE any push.
+        #  absent          -> publish normally
+        #  at this commit  -> idempotently published (no second push)
+        #  at any other    -> fail closed (never force, never overwrite)
+        pre_listing = self._run_git(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=cwd,
+            extra_env=credential_env,
+        ).stdout.strip()
+        existing_sha = ""
+        if pre_listing:
+            existing_sha = pre_listing.split()[0].strip().lower()
+        if existing_sha:
+            if existing_sha == head_sha:
+                logger.info(
+                    "Remote branch refs/heads/%s already at verified commit %s "
+                    "(idempotent publication)",
+                    branch,
+                    head_sha[:12],
+                )
+                return head_sha
+            raise RemoteBranchConflict(
+                "remediation branch already exists at an unexpected commit; "
+                "publication refuses to move or overwrite it"
+            )
+
         try:
             self._run_git(
                 ["git", "push", "--no-tags", "origin", f"HEAD:refs/heads/{branch}"],
@@ -286,6 +318,52 @@ class RemediationWorkspaceService:
             "Published remediation commit %s to refs/heads/%s", head_sha[:12], branch
         )
         return head_sha
+
+    def inspect_remote_branch(
+        self,
+        repository_slug: str,
+        branch_name: str,
+        oauth_token: str = "",
+    ) -> "str | None":
+        """Read-only reconciliation: current remote SHA of the controlled
+        remediation branch, or None when the branch is absent.
+
+        Failure to reach the remote raises (fail closed) — an error is
+        never reported as "branch absent".
+        """
+        repo = self.validate_repository_slug(repository_slug)
+        self.validate_head_branch(branch_name, "main")
+
+        if self._remote_url_factory is not None:
+            remote_url = self._remote_url_factory(repo)
+        else:
+            remote_url = f"https://github.com/{repo}.git"
+
+        credential_env = {}
+        if oauth_token and oauth_token.strip():
+            credential_env = {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {oauth_token.strip()}",
+            }
+
+        try:
+            listing = self._run_git(
+                ["git", "ls-remote", remote_url, f"refs/heads/{branch_name}"],
+                extra_env=credential_env,
+            ).stdout.strip()
+        except subprocess.CalledProcessError as exc:
+            raise RemoteReconciliationFailed(
+                "remote branch state could not be inspected"
+            ) from exc
+        if not listing.strip():
+            return None
+        sha = listing.split()[0].strip().lower()
+        if not _GIT_SHA_PATTERN.fullmatch(sha):
+            raise RemoteReconciliationFailed(
+                "remote branch inspection returned an unexpected ref shape"
+            )
+        return sha
 
     def cleanup(self, workspace: RemediationWorkspace) -> None:
         cleanup_root = Path(workspace.cleanup_path).resolve()

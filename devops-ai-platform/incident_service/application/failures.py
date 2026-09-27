@@ -87,3 +87,30 @@ class ProposalExecutionFailedError(Phase6PipelineError):
     def __init__(self, message: str, stage: str = "unknown"):
         super().__init__(message)
         self.stage = stage
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.2.1: durable execution coordination + remote reconciliation
+# ---------------------------------------------------------------------- #
+class ExecutionLeaseUnavailable(Phase6PipelineError):
+    """Another live owner currently holds the durable execution lease."""
+
+
+class ExecutionLeaseExpired(Phase6PipelineError):
+    """The execution lease expired and recovery conditions were not met."""
+
+
+class ExecutionRecoveryConflict(Phase6PipelineError):
+    """Recovery found durable/remote state that cannot be reconciled safely."""
+
+
+class RemoteBranchConflict(Phase6PipelineError):
+    """The deterministic remediation branch exists at an unexpected commit."""
+
+
+class ExistingPullRequestConflict(Phase6PipelineError):
+    """An existing PR for the remediation identity cannot be safely reused."""
+
+
+class RemoteReconciliationFailed(Phase6PipelineError):
+    """Remote state could not be inspected or is missing when expected."""

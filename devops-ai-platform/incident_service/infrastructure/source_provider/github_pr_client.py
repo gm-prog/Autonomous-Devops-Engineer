@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import re
@@ -333,6 +334,113 @@ class GitHubPRClient:
 
         return f"https://github.com/{repo}/tree/{normalized_branch}"
 
+    def find_existing_pull_requests(
+        self,
+        repo_slug: str,
+        head: str,
+        base: str,
+    ) -> list["ExistingPullRequest"]:
+        """Find PRs for the exact deterministic head/base pair (section 40).
+
+        Returns every match for callers to apply explicit policy (none ->
+        create, one -> reuse/conflict, many -> fail closed). Never creates,
+        never mutates; bounded timeouts; distinct 401/403/404/429/5xx
+        handling; malformed payloads fail closed.
+        """
+        self._require_token()
+        repo = self._validate_repo_slug(repo_slug)
+        normalized_head, normalized_base = self._validate_pr_target(head, base)
+        owner = repo.split("/", 1)[0]
+
+        try:
+            response = requests.get(
+                f"{self.api_base_url}/repos/{repo}/pulls",
+                params={
+                    "head": f"{owner}:{normalized_head}",
+                    "base": normalized_base,
+                    "state": "all",
+                    "per_page": 20,
+                },
+                headers=self._headers,
+                timeout=self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise PullRequestLookupFailedException(
+                "network failure while querying existing pull requests"
+            ) from exc
+
+        if response.status_code == 401:
+            raise InvalidGitHubTokenException(
+                "The provided GitHub OAuth token is invalid or expired "
+                "(GitHub HTTP 401 during pull request discovery)."
+            )
+        if response.status_code == 404:
+            raise RepositoryNotFoundException(
+                f"Target repository {repo} was not found on GitHub."
+            )
+        if response.status_code == 403:
+            raise PullRequestLookupFailedException(
+                "GitHub refused pull request discovery (HTTP 403 forbidden)"
+            )
+        if response.status_code == 429:
+            raise PullRequestLookupFailedException(
+                "GitHub rate limit exceeded during pull request discovery"
+            )
+        if response.status_code != 200:
+            raise PullRequestLookupFailedException(
+                "GitHub rejected pull request discovery with HTTP "
+                f"{response.status_code}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PullRequestLookupFailedException(
+                "GitHub returned invalid JSON during pull request discovery"
+            ) from exc
+        if not isinstance(payload, list):
+            raise PullRequestLookupFailedException(
+                "GitHub returned an unexpected pull request discovery payload"
+            )
+
+        matches: list[ExistingPullRequest] = []
+        for item in payload:
+            try:
+                head_ref = item["head"]["ref"]
+                base_ref = item["base"]["ref"]
+                number = int(item["number"])
+                url = str(item["html_url"])
+                state = str(item["state"])
+                draft = bool(item.get("draft", False))
+                merged = (
+                    item.get("merged") is True
+                    or item.get("merged_at") is not None
+                )
+                body = str(item.get("body") or "")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PullRequestLookupFailedException(
+                    "GitHub returned a malformed pull request entry"
+                ) from exc
+            if head_ref != normalized_head or base_ref != normalized_base:
+                continue  # API filters are hints; verify exact identity here
+            if not url.startswith("https://github.com/"):
+                raise PullRequestLookupFailedException(
+                    "GitHub returned a pull request with an unexpected URL"
+                )
+            matches.append(
+                ExistingPullRequest(
+                    number=number,
+                    url=url,
+                    state=state,
+                    draft=draft,
+                    merged=merged,
+                    head_ref=head_ref,
+                    base_ref=base_ref,
+                    body=body,
+                )
+            )
+        return matches
+
     def mark_pr_ready_for_review(self, repo_slug: str, pr_number: int) -> bool:
         """Transition a draft PR to ready only when explicitly enabled."""
         self._require_token()
@@ -369,3 +477,21 @@ class GitHubPRClient:
                 f"GitHub rejected ready-for-review transition with HTTP {response.status_code}"
             )
         return True
+
+
+class PullRequestLookupFailedException(Exception):
+    """GitHub could not return a trustworthy answer for PR discovery."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ExistingPullRequest:
+    """Typed, minimal view of a remote PR used for reconciliation."""
+
+    number: int
+    url: str
+    state: str  # "open" | "closed"
+    draft: bool
+    merged: bool
+    head_ref: str
+    base_ref: str
+    body: str

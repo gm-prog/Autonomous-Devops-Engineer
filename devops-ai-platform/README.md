@@ -317,9 +317,9 @@ authoritative deployment evidence immediately before side effects.
   `uuid5(namespace, proposal_id:proposal_hash)` — same proposal, same
   identity, same PR. After `PR_CREATED` a repeat call reconciles the
   stored PR (no second push, no second PR). Concurrency is guarded by a
-  process-local per-proposal lock **plus** the persisted status
-  precondition; the current storage layer cannot provide distributed
-  locking (see limitations).
+  process-local per-proposal lock (an optimization only) **plus** the
+  durable storage-backed execution lease introduced in Phase 6.2.1
+  below — the lease row, not the process lock, is the source of truth.
 * **Failure semantics (§25 HTTP map):** 404 missing incident/proposal;
   422 integrity/patch-policy/validation-failed (and deterministic
   patch-stage failures); 409 not-approved/executing/stale; 403
@@ -343,13 +343,12 @@ authoritative deployment evidence immediately before side effects.
 
 ### Honest limitations (Phase 6.2)
 
-* **Locks are process-local.** The per-proposal lock plus persisted
-  status precondition guarantee the single-execution domain invariant
-  within one process (tested); multiple replicas sharing this storage
-  cannot be proven to hold it — production deployment needs a
-  storage-level lock/lease. A process crash mid-`EXECUTING` leaves that
-  state behind and requires manual recovery (no auto-reconcile designed
-  in this slice).
+* **Process-local locking superseded by Phase 6.2.1.** The 6.2
+  process-local lock alone could not hold the single-execution
+  invariant across replicas, and a crash mid-`EXECUTING` stranded the
+  state — both addressed by the durable execution lease and
+  crash-recovery reconciliation documented in Phase 6.2.1 below (with
+  that phase's remaining honest limitations).
 * **Workspace + subprocess validation is not a hardened sandbox** — no
   container/VM isolation, seccomp or user namespace separation. Bounded
   timeouts, resource limits, fixed argv and sanitized env are enforced,
@@ -362,6 +361,150 @@ authoritative deployment evidence immediately before side effects.
   `GITHUB_ALLOWED_BASE_BRANCHES` and token permissions; merging,
   approving, deploying, canary or rollback remain explicitly out of
   scope.
+
+## Phase 6.2.1 — Durable execution coordination & remote reconciliation
+
+One logical proposal execution converges to **one logical remediation
+result** under duplicate, interrupted or ambiguous requests.
+
+```text
+POST /incidents/{id}/proposal/execute   body: {proposal_id, proposal_hash} ONLY
+  → integrity (canonical hash == approval == claim) + freshness + target gates
+  → durable claim: atomic INSERT/UPDATE on devops_execution_claims
+       at most one live lease for (incident_id, proposal_id, proposal_hash)
+  → recovery inspects reality BEFORE any side effect:
+       durable cursor + local HEAD/parent + `git ls-remote` branch SHA
+       + GitHub PR discovery (`find_existing_pull_requests`)
+  → RESUME (remote == persisted commit) or FULL restart (no remote evidence)
+  → existing orchestration with durable stage transitions
+  → owner-gated finish: PR_CREATED/COMPLETED or EXECUTION_FAILED + evidence
+```
+
+### Execution lease (durable, storage-backed)
+
+* **Table `devops_execution_claims`** (same database as incidents):
+  `incident_id, proposal_id, proposal_hash, execution_id, attempt,
+  lease_owner, lease_acquired_at, lease_expires_at, current_stage, state`
+  (`FREE|LEASED`) plus `heartbeat_at, completed_at, failure_*,
+  commit_sha, branch_name, pull_request_url`. The claim row is
+  authoritative; proposal JSON carries mirrored fields projected on read.
+* **Atomic claim invariant:** at most one live lease per
+  `(incident_id, proposal_id, proposal_hash)` — enforced by insert-or-CAS
+  update inside one short transaction, verified between **independent
+  service instances** (two adapters over one SQLite file), not merely
+  between threads. A fresh lease can never be stolen; an expired lease is
+  reclaimable only via the same atomic CAS (previous owner included).
+* **TTL:** `REMEDIATION_EXECUTION_LEASE_SECONDS` (default `600.0`,
+  must be a positive finite number — invalid values fail fast at
+  construction). Every progress write renews expiry; expiry is computed
+  with tz-aware UTC instants.
+* **Owner identity is process-derived** (`new_lease_owner()` embeds pid
+  + monotonic time); the `execute()` interface accepts **no** owner,
+  repository, branch or target parameters — callers cannot choose lease
+  identity or execution targets.
+* **Attempt semantics:** `attempt` increments only on a successful
+  claim (a real ownership acquisition). Duplicate polls or
+  `PR_CREATED`-state reconciliations never increment it.
+* **Reclamation policy:** active lease → reject
+  (`ExecutionLeaseUnavailable`/409); expired + no remote evidence →
+  safe restart from a verified stage; expired + remote evidence →
+  reconcile first (RESUME); inconsistent → fail closed with a durable
+  reconciliation conflict — never retarget or force-push.
+
+### State machine (documented, enforced)
+
+```text
+PROPOSED → APPROVED → EXECUTING → PR_CREATED
+                        ⇅
+               EXECUTION_FAILED   (retryable — fresh claim, revalidated)
+EXECUTION_FAILED → PR_CREATED ONLY via remote provenance (discovery of the
+                    already-created PR), never by direct status assignment.
+```
+
+Durable stage vocabulary (bounded, persisted one short transaction at a
+time, never while an external op is in flight):
+`CLAIMED → WORKSPACE_CREATED → PATCH_APPLIED → VALIDATION_STARTED →
+VALIDATION_PASSED → COMMIT_CREATED → REMOTE_PUBLISHED → REMOTE_VERIFIED →
+PR_DISCOVERY → PR_CREATED → COMPLETED | FAILED`.
+A stage never claims a mutation before it is verified, and `PR_CREATED`
+is written only after a validated PR response with a known PR identity.
+If the lease is lost mid-run (owner CAS fails at any stage write) the
+orchestrator aborts via `RemediationStageGuardError` and the failure is
+persisted only if ownership still holds — otherwise the new owner's
+state is never clobbered.
+
+### Recovery semantics (crash-safe)
+
+* Crash after `EXECUTING`, after commit, after push, after branch
+  before PR, or on a PR-response timeout: the next claim sees the
+  durable cursor and inspects reality —
+  * remote branch absent + durable commit not published → full
+    deterministic restart (same branch, same parent, new attempt);
+  * remote branch == persisted commit → **resume**: skip workspace,
+    re-inspect, reconcile PR (idempotent);
+  * remote branch ≠ persisted commit → `RemoteBranchConflict` (409),
+    durable `RECONCILIATION_CONFLICT` evidence, no force-push;
+  * remote unreachable/ambiguous → `RemoteReconciliationFailed` (502)
+    with a durable conflict record — never a guessed outcome.
+* Every recovery re-runs the full gate stack first: canonical
+  hash == approval == claim, patch policy, authoritative deployment
+  target (no retarget), proposal TTL, and lease TTL. Stale/tampered/
+  drifted state stops before any inspection or side effect.
+
+### Remote reconciliation (mandatory before create)
+
+* **Branch:** deterministic identity
+  `automation/remediation/{incident}/{proposal}` derived only from
+  persisted values. Pre-push: absent → normal push + SHA verify;
+  equal → idempotent (no push); different → fail closed. GitHub ref
+  creation mirrors the same rules (never update an existing ref).
+* **PR:** `find_existing_pull_request(s)` on the same GitHub client runs
+  before every `POST /pulls` — auth required, slug/base allowlist
+  validated, bounded timeouts, distinct 401/403/404/429/5xx typed
+  outcomes, no token in any message. **head/base/repository are the
+  identity**; body metadata (`Incident:`, `Proposal:`, `Proposal hash:`,
+  `Source SHA:`, `Remediation Commit:`) is corroborating evidence only —
+  remote state is never authorization. Policy: 0 → create; 1 open
+  matching → reuse; merged/closed → `ExistingPullRequestConflict` (409)
+  no second PR; >1 matches or unexpected content → fail closed; title is
+  never a search key.
+* **HTTP map additions:** 409 adds `ExecutionLeaseUnavailable`,
+  `RemoteBranchConflict`, `ExistingPullRequestConflict`; 502 adds
+  `RemoteReconciliationFailed`. Active lease → 409 (no parallel
+  execution); retry after success → the existing result; an
+  unrecoverable conflict stays `EXECUTION_FAILED` until operator action.
+
+### Delivery model & structured events
+
+* **At-least-once execution with deterministic idempotency** — this
+  system does **not** claim exactly-once or exact atomicity across
+  database + Git + GitHub. Convergence comes from deterministic inputs,
+  durable stage records and fail-closed reconciliation; recovery is
+  deterministic (no randomness, memory, model output or request
+  identity dependence).
+* Events (redaction-safe): `remediation.lease.acquired|rejected|expired`,
+  `recovery.started|reconciled`, `remote.branch.reconciled`,
+  `pr.discovery|reconciled|created`, `execution.started|completed|
+  failed|reconciled`. Observer failures never change semantics (only
+  the stage-guard ownership signal aborts).
+
+### Honest limitations (Phase 6.2.1)
+
+* **Not distributed consensus.** The lease is a TTL-guarded CAS row —
+  strong within one storage engine, not a k8s lease/Temporal/consensus
+  protocol. Clock skew beyond the TTL window can extend an expired
+  lease's apparent validity for observers until the next CAS; a
+  partitioned worker whose writes fail simply aborts (fail closed).
+* **Storage gap:** the claim/lease contract is exercised against the
+  real SQLite persistence layer (two independent adapters, threaded CAS
+  race included). The PostgreSQL DDL mirrors it one-to-one, but Postgres
+  is not exercised in CI — run the §43 matrix against Postgres before
+  claiming parity.
+* **Remote evidence is shallow by design:** `ls-remote` + PR discovery
+  see branch SHA and PR identity, not the full history of a hostile
+  remote; anything unexpected fails closed to an operator.
+* **PR body corroboration can be forged by a repo admin** — it only
+  corroborates; authorization still comes from persisted approval state.
 
 ## Network & authentication trust boundary
 

@@ -10,7 +10,44 @@ from incident_service.application.services.remediation_workspace_service import 
     RemediationWorkspaceError,
     RemediationWorkspaceService,
 )
+from incident_service.application.failures import (
+    ExistingPullRequestConflict,
+    RemoteBranchConflict,
+    RemoteReconciliationFailed,
+)
+from incident_service.infrastructure.source_provider.github_pr_client import (
+    PullRequestLookupFailedException,
+    RepositoryNotFoundException,
+)
 from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+
+
+class RemediationStageGuardError(RuntimeError):
+    """Execution lease/stage guard tripped — abort the running orchestration.
+
+    Unlike ordinary observers (whose failures never change control flow),
+    this signal means the caller lost durable ownership and must stop
+    performing side effects.
+    """
+
+
+def _make_notifier(stage_callback):
+    """Build an observer that swallows ordinary errors but propagates the
+    stage guard (ownership) exception."""
+
+    def notify(stage: str, **metadata) -> None:
+        if stage_callback is None:
+            return
+        try:
+            stage_callback(stage, metadata)
+        except RemediationStageGuardError:
+            raise
+        except Exception:  # observers must not change control flow
+            logging.getLogger("RemediationOrchestration").warning(
+                "stage observer failed for stage=%s", stage, exc_info=True
+            )
+
+    return notify
 
 
 class RemediationOrchestrationError(RuntimeError):
@@ -104,15 +141,7 @@ class RemediationOrchestrationService:
         omitting it preserves prior behaviour exactly.
         """
 
-        def notify(stage: str, **metadata) -> None:
-            if stage_callback is None:
-                return
-            try:
-                stage_callback(stage, metadata)
-            except Exception:  # observers must not change control flow
-                logging.getLogger("RemediationOrchestration").warning(
-                    "stage observer failed for stage=%s", stage, exc_info=True
-                )
+        notify = _make_notifier(stage_callback)
 
         if not proposal.is_verified:
             raise ValueError("remediation proposal must be verified before orchestration")
@@ -198,10 +227,26 @@ class RemediationOrchestrationService:
                     workspace=workspace,
                     oauth_token=self.github_oauth_token,
                 )
+            except (RemoteBranchConflict, RemoteReconciliationFailed):
+                raise
             except RemediationWorkspaceError as exc:
                 raise RemediationOrchestrationError(
                     "remediation commit could not be published to the remote repository"
                 ) from exc
+
+            # publish_branch pushes AND verifies the remote ref at the
+            # verified commit before this point (§12 ordering).
+            notify(
+                "remote.published",
+                branch=commit_result.branch_name,
+                commit_sha=commit_result.commit_sha,
+            )
+            notify(
+                "remote.verified",
+                branch=commit_result.branch_name,
+                commit_sha=commit_result.commit_sha,
+                verified=True,
+            )
 
             self.github.create_branch_from_commit(
                 repo_slug=repository_slug,
@@ -210,23 +255,16 @@ class RemediationOrchestrationService:
                 expected_parent_sha=commit_result.parent_sha,
             )
 
-            pull_request_url = self.github.create_pull_request(
-                repo_slug=repository_slug,
+            pull_request_url = self._resolve_draft_pr(
+                notify=notify,
+                repository_slug=repository_slug,
                 branch=commit_result.branch_name,
-                title=pr_title or f"Automated remediation for incident {incident_id}",
-                body=pr_body or self._default_pr_body(
-                    incident_id=incident_id,
-                    proposal=proposal,
-                    commit_result=commit_result,
-                ),
-                draft=True,
-                base=base_branch,
-            )
-            notify(
-                "pr.created",
-                pull_request_url=pull_request_url,
-                branch=commit_result.branch_name,
+                base_branch=base_branch,
+                incident_id=incident_id,
+                proposal=proposal,
                 commit_sha=commit_result.commit_sha,
+                pr_title=pr_title,
+                pr_body=pr_body,
             )
 
             proposal.pull_request_url = pull_request_url
@@ -245,11 +283,209 @@ class RemediationOrchestrationService:
         finally:
             self.workspace_service.cleanup(workspace)
 
+    def reconcile_and_create_pr(
+        self,
+        *,
+        incident_id: str,
+        proposal: HotfixProposal,
+        repository_slug: str,
+        base_branch: str = "main",
+        pr_title: str | None = None,
+        pr_body: str | None = None,
+        stage_callback: Any | None = None,
+    ) -> str:
+        """Resume path (Phase 6.2.1): converge to the draft PR without
+        repeating workspace/patch/validation/commit.
+
+        Preconditions are durable state (persisted commit + branch cursor).
+        The method re-inspects the real remote before trusting it:
+          remote == persisted commit  -> resume PR reconciliation
+          remote absent               -> fail closed (state vanished)
+          remote != persisted commit  -> fail closed (never overwrite)
+        """
+        notify = _make_notifier(stage_callback)
+        if not proposal.is_verified:
+            raise ValueError("remediation proposal must be verified before orchestration")
+        commit_sha = (proposal.commit_sha or "").strip().lower()
+        branch = (proposal.branch_name or "").strip()
+        if not commit_sha or not branch:
+            raise RemoteReconciliationFailed(
+                "durable execution state does not record a published commit"
+            )
+
+        remote_sha = self.workspace_service.inspect_remote_branch(
+            repository_slug, branch, self.github_oauth_token
+        )
+        if remote_sha is None:
+            raise RemoteReconciliationFailed(
+                "expected remediation branch is missing on the remote"
+            )
+        if remote_sha != commit_sha:
+            raise RemoteBranchConflict(
+                "remote remediation branch moved away from the persisted commit"
+            )
+        notify(
+            "remote.published",
+            branch=branch,
+            commit_sha=commit_sha,
+            recovered=True,
+        )
+        notify(
+            "remote.verified",
+            branch=branch,
+            commit_sha=commit_sha,
+            verified=True,
+            recovered=True,
+        )
+
+        self.github.create_branch_from_commit(
+            repo_slug=repository_slug,
+            branch=branch,
+            commit_sha=commit_sha,
+            expected_parent_sha=proposal.source_sha.lower(),
+        )
+
+        pull_request_url = self._resolve_draft_pr(
+            notify=notify,
+            repository_slug=repository_slug,
+            branch=branch,
+            base_branch=base_branch,
+            incident_id=incident_id,
+            proposal=proposal,
+            commit_sha=commit_sha,
+            pr_title=pr_title,
+            pr_body=pr_body,
+        )
+        proposal.pull_request_url = pull_request_url
+        return pull_request_url
+
+    def _resolve_draft_pr(
+        self,
+        *,
+        notify,
+        repository_slug: str,
+        branch: str,
+        base_branch: str,
+        incident_id: str,
+        proposal: HotfixProposal,
+        commit_sha: str,
+        pr_title: str | None,
+        pr_body: str | None,
+    ) -> str:
+        """Reconcile-then-create: discovery ALWAYS precedes POST /pulls."""
+        try:
+            matches = self.github.find_existing_pull_requests(
+                repo_slug=repository_slug,
+                head=branch,
+                base=base_branch,
+            )
+        except (PullRequestLookupFailedException, RepositoryNotFoundException) as exc:
+            # discovery infrastructure failures are reconciliation failures
+            # (typed -> 502), never authorization to create blindly
+            raise RemoteReconciliationFailed(
+                "could not reconcile existing pull requests before creation"
+            ) from exc
+        notify(
+            "pr.discovery",
+            branch=branch,
+            base=base_branch,
+            matches=len(matches) if isinstance(matches, list) else None,
+        )
+        if isinstance(matches, list) and not matches:
+            url = self.github.create_pull_request(
+                repo_slug=repository_slug,
+                branch=branch,
+                title=pr_title
+                or f"Automated remediation for incident {incident_id}",
+                body=pr_body
+                or self._default_pr_body(
+                    incident_id=incident_id,
+                    proposal=proposal,
+                    commit_sha=commit_sha,
+                    branch=branch,
+                ),
+                draft=True,
+                base=base_branch,
+            )
+            notify(
+                "pr.created",
+                pull_request_url=url,
+                branch=branch,
+                commit_sha=commit_sha,
+            )
+            return url
+
+        url = self._evaluate_existing_pr(
+            matches,
+            proposal=proposal,
+            incident_id=incident_id,
+            branch=branch,
+            base=base_branch,
+        )
+        notify(
+            "pr.reconciled",
+            pull_request_url=url,
+            branch=branch,
+            base=base_branch,
+            commit_sha=commit_sha,
+        )
+        return url
+
+    @staticmethod
+    def _evaluate_existing_pr(
+        matches,
+        *,
+        proposal: HotfixProposal,
+        incident_id: str,
+        branch: str,
+        base: str,
+    ) -> str:
+        """Explicit policy for discovered PRs (§16/§40). Fail closed on
+        anything that is not exactly one open PR corroborating this
+        proposal identity. PR body text is untrusted data — corroboration
+        only; authorization comes from persisted approval state."""
+        if not isinstance(matches, list):
+            raise RemoteReconciliationFailed(
+                "PR discovery returned an unexpected result"
+            )
+        if len(matches) > 1:
+            raise ExistingPullRequestConflict(
+                "multiple pull requests match the deterministic remediation "
+                "head/base pair"
+            )
+        pull = matches[0]
+        if getattr(pull, "merged", False) or getattr(pull, "state", "") != "open":
+            raise ExistingPullRequestConflict(
+                "an existing pull request for the remediation branch is "
+                "merged or closed; refusing to open another"
+            )
+        if getattr(pull, "head_ref", None) != branch or getattr(
+            pull, "base_ref", None
+        ) != base:
+            raise ExistingPullRequestConflict(
+                "existing pull request does not match the deterministic "
+                "remediation identity"
+            )
+        body = getattr(pull, "body", "") or ""
+        expected_hash = (proposal.proposal_hash or "n/a").strip()
+        found_hash = None
+        for line in body.splitlines():
+            if line.strip().lower().startswith("proposal hash:"):
+                found_hash = line.split(":", 1)[1].strip()
+                break
+        if found_hash is None or found_hash != expected_hash:
+            raise ExistingPullRequestConflict(
+                "existing pull request does not corroborate the persisted "
+                "proposal hash"
+            )
+        return getattr(pull, "url", "") or ""
+
     @staticmethod
     def _default_pr_body(
         incident_id: str,
         proposal: HotfixProposal,
-        commit_result: RemediationCommitResult,
+        commit_sha: str,
+        branch: str,
     ) -> str:
         return (
             f"Incident: {incident_id}\n"
@@ -258,8 +494,8 @@ class RemediationOrchestrationService:
             f"Risk class: {proposal.risk_class or 'n/a'}\n"
             f"Target: {proposal.target_filepath}\n"
             f"Source SHA: {proposal.source_sha}\n"
-            f"Remediation Commit: {commit_result.commit_sha}\n"
-            f"Branch: {commit_result.branch_name}\n\n"
+            f"Remediation Commit: {commit_sha}\n"
+            f"Branch: {branch}\n\n"
             "Generated remediation awaiting human review. "
             "Do not merge without CI review. No deployment is performed "
             "by this automation."

@@ -61,7 +61,7 @@ jobs:
           cache-dependency-path: devops-ai-platform/requirements.txt
       - run: pip install -r requirements.txt
       - run: python -m compileall -q incident_service
-      - name: Run incident, RCA and remediation tests (24 modules)
+      - name: Run incident, RCA and remediation tests (26 modules)
         env:
           PYTHONPATH: .
         run: >-
@@ -90,6 +90,8 @@ jobs:
           incident_service.application.services.test_proposal_approval_service
           incident_service.application.services.test_proposal_execution_service
           incident_service.presentation.rest.test_proposal_execution_endpoints
+          incident_service.application.services.test_proposal_lease_coordination
+          incident_service.application.services.test_proposal_execution_recovery
           -v
 
   compose:

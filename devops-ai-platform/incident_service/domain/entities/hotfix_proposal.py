@@ -35,6 +35,13 @@ class HotfixProposal:
     execution_attempts: int = 0
     last_failure_stage: str = ""
     last_failure_reason: str = ""
+    # Phase 6.2.1: durable execution coordination (lease is source-of-truth
+    # for ownership; execution_stage is the persisted recovery cursor).
+    lease_owner: str = ""
+    lease_acquired_at: Optional[datetime] = None
+    lease_expires_at: Optional[datetime] = None
+    last_heartbeat_at: Optional[datetime] = None
+    execution_stage: str = ""
 
     def to_dict(self) -> dict:
         """JSON-safe projection including every §12 + §6.2 field."""
@@ -64,6 +71,23 @@ class HotfixProposal:
             "execution_attempts": int(self.execution_attempts),
             "last_failure_stage": self.last_failure_stage,
             "last_failure_reason": self.last_failure_reason,
+            "lease_owner": self.lease_owner,
+            "lease_acquired_at": (
+                self.lease_acquired_at.isoformat()
+                if self.lease_acquired_at
+                else None
+            ),
+            "lease_expires_at": (
+                self.lease_expires_at.isoformat()
+                if self.lease_expires_at
+                else None
+            ),
+            "last_heartbeat_at": (
+                self.last_heartbeat_at.isoformat()
+                if self.last_heartbeat_at
+                else None
+            ),
+            "execution_stage": self.execution_stage,
         }
 
     def apply_verification_pass(self) -> bool:

@@ -35,6 +35,11 @@ class FakeRepository:
 class FakeGitHub:
     def __init__(self):
         self.calls = []
+        self.discovery_calls = []
+
+    def find_existing_pull_requests(self, **kwargs):
+        self.discovery_calls.append(kwargs)
+        return []
 
     def create_pull_request(self, **kwargs):
         self.calls.append(kwargs)

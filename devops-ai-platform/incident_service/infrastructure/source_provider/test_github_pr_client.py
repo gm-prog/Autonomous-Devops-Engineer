@@ -5,6 +5,8 @@ from incident_service.infrastructure.source_provider.github_pr_client import (
     GitHubPRClient,
     InvalidGitHubTokenException,
     PRCreationFailedException,
+    PullRequestLookupFailedException,
+    RepositoryNotFoundException,
     UnsafePullRequestTargetException,
 )
 
@@ -176,6 +178,162 @@ class GitHubPRClientTests(unittest.TestCase):
                 "Fix incident",
                 "Automated remediation",
             )
+
+
+class FindExistingPullRequestsTests(unittest.TestCase):
+    HEAD = "automation/remediation/inc-1/proposal-1"
+
+    def _client(self, token="secret"):
+        return GitHubPRClient(oauth_token=token)
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_requires_token(self, get):
+        with self.assertRaises(
+            (InvalidGitHubTokenException, PullRequestLookupFailedException)
+        ):
+            self._client(token="").find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+        get.assert_not_called()
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_404_is_typed_fail_closed(self, get):
+        get.return_value = Mock(status_code=404)
+        with self.assertRaises(RepositoryNotFoundException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_401_and_403_are_typed_and_token_free(self, get):
+        for status in (401, 403):
+            with self.subTest(status=status):
+                get.return_value = Mock(
+                    status_code=status,
+                    text="authentication failed for token secret",
+                )
+                with self.assertRaises(
+                    (InvalidGitHubTokenException, PullRequestLookupFailedException)
+                ) as ctx:
+                    self._client(token="secret").find_existing_pull_requests(
+                        "owner/repo", self.HEAD, "main"
+                    )
+                message = str(ctx.exception)
+                self.assertIn(str(status), message)
+                self.assertNotIn("secret", message)
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_429_is_typed(self, get):
+        get.return_value = Mock(status_code=429, text="rate limited")
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_5xx_is_typed(self, get):
+        get.return_value = Mock(status_code=503, text="unavailable")
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_bad_json_is_typed(self, get):
+        response = Mock(status_code=200)
+        response.json.side_effect = ValueError("no json")
+        get.return_value = response
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_non_list_payload_is_typed(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = {"message": "unexpected"}
+        get.return_value = response
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_timeout_is_typed(self, get):
+        import requests as _requests
+
+        get.side_effect = _requests.Timeout("too slow")
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_filters_by_exact_head_and_base(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = [
+            {
+                "number": 1,
+                "html_url": "https://github.com/owner/repo/pull/1",
+                "state": "open",
+                "title": "other work",
+                "head": {"ref": "someone-else", "sha": "a" * 40},
+                "base": {"ref": "main"},
+                "body": "",
+            },
+            {
+                "number": 7,
+                "html_url": "https://github.com/owner/repo/pull/7",
+                "state": "open",
+                "title": "Automation PR",
+                "head": {"ref": "automation/remediation/inc-1/proposal-1",
+                          "sha": "b" * 40},
+                "base": {"ref": "release"},
+                "body": "",
+            },
+            {
+                "number": 8,
+                "html_url": "https://github.com/owner/repo/pull/8",
+                "state": "open",
+                "title": "Automation PR",
+                "head": {"ref": "automation/remediation/inc-1/proposal-1",
+                          "sha": "b" * 40},
+                "base": {"ref": "main"},
+                "body": "",
+            },
+        ]
+        get.return_value = response
+
+        result = self._client().find_existing_pull_requests(
+            "owner/repo", self.HEAD, "main"
+        )
+        self.assertEqual([item.number for item in result], [8])
+
+        # query is bounded and addressed to the validated slug only
+        url = get.call_args.args[0]
+        self.assertIn("/repos/owner/repo/pulls", url)
+        params = get.call_args.kwargs["params"]
+        self.assertEqual(params["head"], f"owner:{self.HEAD}")
+        self.assertEqual(params["base"], "main")
+        self.assertEqual(params["state"], "all")  # detect merged/closed too
+        self.assertEqual(params["per_page"], 20)
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_never_queries_protected_head(self, get):
+        with self.assertRaises(UnsafePullRequestTargetException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", "main", "main"
+            )
+        get.assert_not_called()
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_rejects_malformed_slug(self, get):
+        with self.assertRaises(RepositoryNotFoundException):
+            self._client().find_existing_pull_requests(
+                "not-a-slug", self.HEAD, "main"
+            )
+        get.assert_not_called()
+
 
 
 if __name__ == "__main__":

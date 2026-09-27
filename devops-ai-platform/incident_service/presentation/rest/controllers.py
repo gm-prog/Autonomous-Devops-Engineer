@@ -452,6 +452,8 @@ def execute_proposal(
     """
     from incident_service.application.failures import (
         ApprovalPolicyError,
+        ExecutionLeaseUnavailable,
+        ExistingPullRequestConflict,
         ProposalAlreadyExecutingError,
         ProposalExecutionFailedError,
         ProposalIntegrityError,
@@ -459,6 +461,8 @@ def execute_proposal(
         ProposalNotFoundError,
         ProposalPatchPolicyError,
         ProposalStaleError,
+        RemoteBranchConflict,
+        RemoteReconciliationFailed,
         RemediationValidationFailedError,
         TargetRevalidationError,
     )
@@ -487,6 +491,17 @@ def execute_proposal(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (ProposalNotApprovedError, ProposalAlreadyExecutingError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (
+        ExecutionLeaseUnavailable,
+        RemoteBranchConflict,
+        ExistingPullRequestConflict,
+    ) as exc:
+        # lease contention + remote reconciliation conflicts: operator
+        # must resolve/retry — never silently proceed (6.2.1 §19)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RemoteReconciliationFailed as exc:
+        # cannot establish remote truth → upstream/remote problem
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except ProposalStaleError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except (ApprovalPolicyError, TargetRevalidationError) as exc:

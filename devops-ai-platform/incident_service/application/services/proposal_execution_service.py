@@ -1,23 +1,23 @@
-"""Controlled remediation execution of an approved proposal (Phase 6.2 §2).
+"""Controlled remediation execution with durable coordination (Phase 6.2/6.2.1).
 
-Chain enforced here, in order, ALL before any repository side effect:
+Pre-side-effect gates (every attempt, including recovery):
 
-    load persisted proposal → canonical hash re-verified (stored + claim)
-    → status/precondition gate → approval freshness (TTL)
-    → deterministic patch policy re-validated against persisted content
-    → authoritative target re-resolution (still DEPLOYED, same repo+SHA —
-      never retarget to a newer deployment)
-    → EXECUTING transition persisted (idempotent execution id)
-    → existing RemediationOrchestrationService
-        (isolated workspace → bounded patch → fixed validation profile →
-         deterministic commit → remote verification → draft PR)
-    → PR_CREATED persisted + execution evidence attached
+    load persisted proposal → canonical hash re-verified (stored + claim +
+    approval binding) → status/lease gate → approval freshness (TTL)
+    → deterministic patch policy re-check → authoritative target
+    re-resolution (never retarget) → remote inspection when a durable
+    resume cursor exists → ATOMIC durable lease claim (storage CAS —
+    the process-local lock is only a performance optimization)
+    → bounded side effects through RemediationOrchestrationService with
+    durable stage persistence at every verified boundary
+    → PR_CREATED persisted atomically with lease release + evidence.
 
-Failure at any stage persists EXECUTION_FAILED + evidence for audit and
-allows retry; PR_CREATED returns/reconciles the stored PR instead of
-creating a second one. Concurrency is guarded by a process-local lock
-PLUS the persisted status precondition — this storage layer does not
-provide distributed locking (documented limitation, not claimed).
+Recovery never blindly repeats external mutations: a resumable durable
+cursor (commit_sha + stage >= COMMIT_CREATED) is reconciled against the
+real remote before deciding resume-vs-restart, and draft PR creation is
+always preceded by PR discovery. Model: at-least-once attempts +
+deterministic idempotency + reconciliation + fail-closed conflicts —
+never claimed as exactly-once.
 """
 
 from __future__ import annotations
@@ -31,6 +31,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from incident_service.application.failures import (
     ApprovalPolicyError,
+    ExecutionLeaseUnavailable,
+    ExistingPullRequestConflict,
     ProposalAlreadyExecutingError,
     ProposalExecutionFailedError,
     ProposalIntegrityError,
@@ -38,6 +40,8 @@ from incident_service.application.failures import (
     ProposalNotFoundError,
     ProposalPatchPolicyError,
     ProposalStaleError,
+    RemoteBranchConflict,
+    RemoteReconciliationFailed,
     RemediationValidationFailedError,
     TargetRevalidationError,
 )
@@ -47,20 +51,28 @@ from incident_service.application.services.hotfix_validation_service import (
     HotfixValidationService,
 )
 from incident_service.application.services.proposal_execution_policy import (
+    RESUMABLE_STAGES,
     execution_id_for,
     find_proposal,
     is_fresh,
+    load_lease_seconds,
     load_proposal_ttl_seconds,
     log_stage,
+    new_lease_owner,
     rca_root_cause,
+    stage_for_notify,
     utcnow,
     verify_proposal_integrity,
 )
 from incident_service.application.services.remediation_orchestration_service import (
     RemediationOrchestrationError,
+    RemediationStageGuardError,
 )
 from incident_service.application.services.remediation_target_binding import (
     resolve_authoritative_deployment_target,
+)
+from incident_service.application.services.remediation_workspace_service import (
+    RemediationWorkspaceService,
 )
 
 logger = logging.getLogger("ProposalExecution")
@@ -69,21 +81,25 @@ EXECUTION_EVIDENCE_KIND = "remediation_execution"
 VALIDATION_PROFILE_ENV = "REMEDIATION_VALIDATION_PROFILE"
 DEFAULT_VALIDATION_PROFILE = "incident_service"
 
-_LOCKS: Dict[str, threading.Lock] = {}
-_LOCKS_GUARD = threading.Lock()
-
 _SENSITIVE_PATTERNS = (
     re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
     re.compile(r"ghp_[A-Za-z0-9]+"),
     re.compile(r"github_pat_[A-Za-z0-9_]+"),
 )
 
-
-def _proposal_lock(key: str) -> threading.Lock:
-    with _LOCKS_GUARD:
-        if key not in _LOCKS:
-            _LOCKS[key] = threading.Lock()
-        return _LOCKS[key]
+#: typed failures that must pass through classification unchanged
+_PASSTHROUGH_FAILURES = (
+    ApprovalPolicyError,
+    ExecutionLeaseUnavailable,
+    ExistingPullRequestConflict,
+    ProposalIntegrityError,
+    ProposalNotApprovedError,
+    ProposalPatchPolicyError,
+    ProposalStaleError,
+    RemoteBranchConflict,
+    RemoteReconciliationFailed,
+    TargetRevalidationError,
+)
 
 
 def _safe_reason(exc: BaseException) -> str:
@@ -109,11 +125,17 @@ class ProposalExecutionService:
         now: Callable[[], datetime] = utcnow,
         validation_profile: Optional[str] = None,
         validation_service: Optional[HotfixValidationService] = None,
+        lease_seconds: Optional[float] = None,
+        lease_owner: Optional[str] = None,
+        remote_inspector: Optional[Any] = None,
     ):
         self.repository = repository
         self.orchestrator_factory = orchestrator_factory
         self.ttl_seconds = (
             load_proposal_ttl_seconds() if ttl_seconds is None else ttl_seconds
+        )
+        self.lease_seconds = (
+            load_lease_seconds() if lease_seconds is None else lease_seconds
         )
         self.now = now
         self.validation_profile = (
@@ -122,8 +144,27 @@ class ProposalExecutionService:
             else load_validation_profile()
         )
         self.validation = validation_service or HotfixValidationService()
+        # never caller-supplied: process-derived identity (§9)
+        self.lease_owner = lease_owner or new_lease_owner()
+        self.remote_inspector = remote_inspector or RemediationWorkspaceService()
+        # performance optimization ONLY — the durable claim is the
+        # source of truth for ownership (§7)
+        self._locks: Dict[str, threading.Lock] = {}
 
     # ------------------------------------------------------------------ #
+    def _proposal_lock(self, key: str) -> threading.Lock:
+        if key not in self._locks:
+            self._locks[key] = threading.Lock()
+        return self._locks[key]
+
+    def _coordination(self, method_name: str) -> Callable[..., Any]:
+        method = getattr(self.repository, method_name, None)
+        if method is None:
+            raise ExecutionLeaseUnavailable(
+                "incident repository lacks durable execution coordination"
+            )
+        return method
+
     def execute(
         self,
         *,
@@ -136,21 +177,12 @@ class ProposalExecutionService:
         if incident is None:
             raise ProposalNotFoundError(f"Incident '{incident_id}' not found")
 
-        lock = _proposal_lock(f"{incident.id}:{proposal_id}")
+        lock = self._proposal_lock(f"{incident.id}:{proposal_id}")
         with lock:
-            # Re-read under the lock: state may have advanced while waiting.
             incident = self.repository.get_incident_by_id(incident.id)
             if incident is None:
                 raise ProposalNotFoundError(f"Incident '{incident_id}' not found")
             proposal = find_proposal(incident, proposal_id)
-
-            # Never-approved states fail fast on authorization (§5/§15):
-            # nothing to verify a claim against yet, nothing may execute.
-            if proposal.status in {"PROPOSED", "BLOCKED"}:
-                raise ProposalNotApprovedError(
-                    f"proposal status {proposal.status} cannot execute without "
-                    "a valid approval"
-                )
 
             # §5 hash binding — stored == reproducible == caller claim.
             verify_proposal_integrity(incident, proposal, proposal_hash)
@@ -158,50 +190,130 @@ class ProposalExecutionService:
             if proposal.status == "PR_CREATED":
                 return self._reconcile(incident, proposal)
 
+            if proposal.status in {"PROPOSED", "BLOCKED"}:
+                raise ProposalNotApprovedError(
+                    f"proposal status {proposal.status} cannot execute without "
+                    "a valid approval"
+                )
+
             self._assert_execution_preconditions(proposal)
-
-            # §12 deterministic patch policy re-validated on persisted
-            # content (a persisted proposal is trusted only as far as the
-            # validator says it is valid).
             self._revalidate_patch_policy(incident, proposal)
+            self._revalidate_target(incident, proposal)
 
-            # §8 mandatory target revalidation immediately before side
-            # effects — fail closed, never retarget.
-            target = resolve_authoritative_deployment_target(incident)
-            if target is None:
-                raise TargetRevalidationError(
-                    "no authoritative deployment evidence remains for this incident"
+            claim = self._coordination("get_execution_claim")(
+                incident.id, proposal.id
+            ) or {}
+            recovery = bool(
+                claim
+                and (
+                    proposal.status == "EXECUTING"
+                    or proposal.execution_stage in RESUMABLE_STAGES
                 )
-            if (
-                target["repository_name"] != proposal.repository
-                or target["source_sha"] != (proposal.source_sha or "").lower()
-            ):
-                raise TargetRevalidationError(
-                    "authoritative deployment target no longer matches the "
-                    "approved proposal; execution aborted (no retargeting)"
+            )
+            if recovery:
+                log_stage(
+                    "recovery.started",
+                    incident_id=incident.id,
+                    proposal_id=proposal.id,
+                    proposal_hash=proposal.proposal_hash,
+                    attempt=int(claim.get("attempt") or 0),
+                    durable_stage=str(
+                        proposal.execution_stage
+                        or claim.get("stage")
+                        or "unknown"
+                    ),
                 )
+
+            try:
+                mode, resume_stage = self._decide_mode(proposal, claim)
+            except (RemoteBranchConflict, RemoteReconciliationFailed) as exc:
+                # durable reconciliation failure (§10): record it before
+                # propagating; never retarget, never silently continue.
+                self._record_reconciliation_conflict(
+                    incident, proposal, claim, exc
+                )
+                raise
+
+            reason, claimed_incident = self._coordination(
+                "claim_execution_lease"
+            )(
+                incident.id,
+                proposal.id,
+                proposal.proposal_hash,
+                owner=self.lease_owner,
+                now=self.now(),
+                lease_seconds=self.lease_seconds,
+            )
+            if reason == "lease_active":
+                log_stage(
+                    "lease.rejected",
+                    incident_id=incident.id,
+                    proposal_id=proposal.id,
+                    proposal_hash=proposal.proposal_hash,
+                    owner=self.lease_owner,
+                )
+                raise ExecutionLeaseUnavailable(
+                    "another live owner holds the execution lease for this proposal"
+                )
+            if reason == "raced":
+                raise ExecutionLeaseUnavailable(
+                    "execution claim lost a concurrent write race; retry"
+                )
+            if reason in {"no_incident", "proposal_missing"}:
+                raise ProposalNotFoundError(
+                    f"Proposal '{proposal_id}' does not exist on incident "
+                    f"'{incident_id}'"
+                )
+            if reason == "hash_mismatch":
+                raise ProposalIntegrityError(
+                    "execution claim rejected: proposal hash does not match"
+                )
+            if reason == "status_not_executable":
+                fresh = self.repository.get_incident_by_id(incident.id)
+                fresh_proposal = (
+                    find_proposal(fresh, proposal_id) if fresh else None
+                )
+                if fresh_proposal is not None and (
+                    fresh_proposal.status == "PR_CREATED"
+                ):
+                    verify_proposal_integrity(fresh, fresh_proposal, proposal_hash)
+                    return self._reconcile(fresh, fresh_proposal)
+                raise ProposalNotApprovedError(
+                    "proposal state changed before the execution lease "
+                    "could be acquired"
+                )
+            if reason != "claimed" or claimed_incident is None:
+                raise ExecutionLeaseUnavailable(
+                    f"execution lease could not be acquired ({reason})"
+                )
+
+            proposal = find_proposal(claimed_incident, proposal_id)
+            attempt = int(proposal.execution_attempts or 0)
             log_stage(
-                "target.revalidated",
+                "lease.acquired",
                 incident_id=incident.id,
                 proposal_id=proposal.id,
                 proposal_hash=proposal.proposal_hash,
-                target_repository=target["repository_name"],
-                source_sha=target["source_sha"],
-                evidence_id=target["evidence_id"],
+                execution_id=proposal.execution_id
+                or execution_id_for(proposal.id, proposal.proposal_hash),
+                attempt=attempt,
+                owner=self.lease_owner,
+                mode=mode,
+                durable_stage=proposal.execution_stage,
+                requested_by=requested_by or None,
             )
-
-            # EXECUTING transition persisted BEFORE side effects.
-            proposal.execution_id = (
-                proposal.execution_id
-                or execution_id_for(proposal.id, proposal.proposal_hash)
-            )
-            proposal.execution_attempts = int(proposal.execution_attempts or 0) + 1
-            proposal.status = "EXECUTING"
-            proposal.executed_at = self.now()
-            proposal.last_failure_stage = ""
-            proposal.last_failure_reason = ""
-            self.repository.save_incident(incident)
-            attempt = proposal.execution_attempts
+            if mode == "FULL" and proposal.execution_stage not in {"CLAIMED"}:
+                # durable cursor cannot resume (e.g. remote absent) —
+                # restart from a clean CLAIMED state before side effects.
+                self._coordination("persist_execution_progress")(
+                    incident.id,
+                    proposal.id,
+                    self.lease_owner,
+                    stage="CLAIMED",
+                    now=self.now(),
+                    lease_seconds=self.lease_seconds,
+                )
+                proposal.execution_stage = "CLAIMED"
             log_stage(
                 "execution.started",
                 incident_id=incident.id,
@@ -209,6 +321,7 @@ class ProposalExecutionService:
                 proposal_hash=proposal.proposal_hash,
                 execution_id=proposal.execution_id,
                 attempt=attempt,
+                mode=mode,
                 requested_by=requested_by or None,
                 target_repository=proposal.repository,
                 source_sha=proposal.source_sha,
@@ -216,58 +329,222 @@ class ProposalExecutionService:
 
             stages: List[Tuple[str, Dict[str, Any]]] = []
 
-            def stage_callback(stage: str, metadata: Dict[str, Any]) -> None:
-                stages.append((stage, dict(metadata)))
-                log_stage(
-                    stage,
-                    incident_id=incident.id,
-                    proposal_id=proposal.id,
-                    proposal_hash=proposal.proposal_hash,
-                    execution_id=proposal.execution_id,
-                    **{
-                        key: value
-                        for key, value in metadata.items()
-                        if key != "stdout"
-                    },
+            def stage_callback(stage_name: str, metadata: Dict[str, Any]) -> None:
+                self._persist_stage(
+                    incident=incident,
+                    proposal=proposal,
+                    stage_name=stage_name,
+                    metadata=metadata,
+                    stages=stages,
                 )
 
             orchestrator = self.orchestrator_factory()
             try:
-                result = orchestrator.execute(
-                    incident_id=incident.id,
-                    proposal=proposal,
-                    repository_slug=proposal.repository,
-                    validation_profile=self.validation_profile,
-                    stage_callback=stage_callback,
-                )
+                if mode == "RESUME":
+                    url = orchestrator.reconcile_and_create_pr(
+                        incident_id=incident.id,
+                        proposal=proposal,
+                        repository_slug=proposal.repository,
+                        stage_callback=stage_callback,
+                    )
+                    result = _ResumeResult(
+                        commit_sha=proposal.commit_sha,
+                        branch_name=proposal.branch_name,
+                        pull_request_url=url,
+                    )
+                else:
+                    result = orchestrator.execute(
+                        incident_id=incident.id,
+                        proposal=proposal,
+                        repository_slug=proposal.repository,
+                        validation_profile=self.validation_profile,
+                        stage_callback=stage_callback,
+                    )
             except Exception as exc:
                 typed = self._classify_failure(exc, stages)
-                # §15/§23: failure stops here AND is persisted as audit
-                # evidence — no commit/PR is claimed, retry stays possible.
                 self._execution_failure(
-                    incident, proposal, typed, stages, attempt,
-                    requested_by, cause=exc,
+                    incident, proposal, typed, stages, attempt, requested_by,
+                    cause=exc,
                 )
                 raise typed from exc
 
             return self._persist_success(
-                incident, proposal, result, stages, requested_by, attempt
+                incident, proposal, result, stages, requested_by, attempt, mode
             )
 
+    def _record_reconciliation_conflict(
+        self, incident, proposal, claim, exc
+    ) -> None:
+        """Persist a pre-lease reconciliation failure on the aggregate.
+
+        Only used when no live owner exists (the lease is absent/expired
+        — checked before this point), so the aggregate write cannot clobber
+        a live execution.
+        """
+        attempt = int(claim.get("attempt") or proposal.execution_attempts or 0)
+        execution_id = proposal.execution_id or execution_id_for(
+            proposal.id, proposal.proposal_hash
+        )
+        reason = _safe_reason(exc)
+        proposal.status = "EXECUTION_FAILED"
+        proposal.last_failure_stage = "reconciliation"
+        proposal.last_failure_reason = reason
+        evidence = IncidentEvidence(
+            id=f"exec-{execution_id}-recon-a{attempt}",
+            kind=EXECUTION_EVIDENCE_KIND,
+            source="remediation-control-plane",
+            payload={
+                "schema": "devops.remediation.execution/2",
+                "execution_id": execution_id,
+                "attempt": attempt,
+                "status": "RECONCILIATION_CONFLICT",
+                "incident_id": incident.id,
+                "proposal_id": proposal.id,
+                "proposal_hash": proposal.proposal_hash,
+                "repository": proposal.repository,
+                "source_sha": proposal.source_sha,
+                "durable_stage": proposal.execution_stage,
+                "failure_type": exc.__class__.__name__,
+                "failure_reason": reason,
+            },
+        )
+        incident.attach_evidence(evidence)
+        self.repository.save_incident(incident)
+        log_stage(
+            "execution.failed",
+            incident_id=incident.id,
+            proposal_id=proposal.id,
+            proposal_hash=proposal.proposal_hash,
+            execution_id=execution_id,
+            failed_stage="reconciliation",
+            failure_type=exc.__class__.__name__,
+            attempt=attempt,
+        )
+
     # ------------------------------------------------------------------ #
+    def _decide_mode(self, proposal, claim: Dict[str, Any]) -> Tuple[str, str]:
+        """Resume only when durable cursor AND real remote agree (§13/§15)."""
+        stage = str(claim.get("stage") or proposal.execution_stage or "")
+        commit_sha = str(claim.get("commit_sha") or "").strip().lower()
+        branch = str(
+            claim.get("branch_name") or proposal.branch_name or ""
+        ).strip()
+        if stage not in RESUMABLE_STAGES or not commit_sha or not branch:
+            return ("FULL", stage)
+
+        remote_sha = self.remote_inspector.inspect_remote_branch(
+            proposal.repository, branch, os.getenv("GITHUB_OAUTH_TOKEN", "")
+        )
+        if remote_sha == commit_sha:
+            log_stage(
+                "recovery.reconciled",
+                incident_id=proposal.incident_id,
+                proposal_id=proposal.id,
+                proposal_hash=proposal.proposal_hash,
+                durable_stage=stage,
+                commit_sha=commit_sha,
+                branch=branch,
+                remote_sha=remote_sha,
+            )
+            log_stage(
+                "remote.branch.reconciled",
+                incident_id=proposal.incident_id,
+                proposal_id=proposal.id,
+                branch=branch,
+                remote_sha=remote_sha,
+                outcome="expected_commit",
+            )
+            return ("RESUME", stage)
+        if remote_sha is None and stage == "COMMIT_CREATED":
+            # commit was never published — safe to rebuild from source
+            return ("FULL", stage)
+        if remote_sha is None:
+            raise RemoteReconciliationFailed(
+                "persisted execution state expects a published remediation "
+                "branch, but the remote branch is missing"
+            )
+        raise RemoteBranchConflict(
+            "remote remediation branch exists at an unexpected commit; "
+            "recovery refuses to overwrite or retarget it"
+        )
+
+    def _persist_stage(
+        self, *, incident, proposal, stage_name, metadata, stages
+    ) -> None:
+        stages.append((stage_name, dict(metadata)))
+        log_stage(
+            stage_name,
+            incident_id=incident.id,
+            proposal_id=proposal.id,
+            proposal_hash=proposal.proposal_hash,
+            execution_id=proposal.execution_id,
+            **{k: v for k, v in metadata.items() if k != "stdout"},
+        )
+        stage = stage_for_notify(stage_name)
+        if stage is None:
+            return
+        if stage_name == "validation.completed" and not metadata.get("passed"):
+            return  # failure path persists FAILED; never claim VALIDATION_PASSED
+        updates: Dict[str, Any] = {}
+        if stage_name == "commit.created":
+            commit_sha = str(metadata.get("commit_sha") or "").strip()
+            branch = str(metadata.get("branch") or "").strip()
+            if commit_sha:
+                updates["commit_sha"] = commit_sha
+            if branch:
+                updates["branch_name"] = branch
+        if stage_name in {"pr.created", "pr.reconciled"}:
+            url = str(metadata.get("pull_request_url") or "")
+            if url:
+                updates["pull_request_url"] = url
+        ok = self._coordination("persist_execution_progress")(
+            incident.id,
+            proposal.id,
+            self.lease_owner,
+            stage=stage,
+            now=self.now(),
+            lease_seconds=self.lease_seconds,
+            commit_sha=updates.get("commit_sha"),
+            branch_name=updates.get("branch_name"),
+        )
+        if not ok:
+            raise RemediationStageGuardError(
+                "execution lease lost while persisting stage progress"
+            )
+        proposal.execution_stage = stage
+        if "commit_sha" in updates and updates["commit_sha"]:
+            proposal.commit_sha = updates["commit_sha"]
+        if "branch_name" in updates and updates["branch_name"]:
+            proposal.branch_name = updates["branch_name"]
+
     def _assert_execution_preconditions(self, proposal) -> None:
-        if proposal.status == "APPROVED" or proposal.status == "EXECUTION_FAILED":
+        if proposal.status in {"APPROVED", "EXECUTION_FAILED"}:
             pass  # retryable / executable
         elif proposal.status == "EXECUTING":
-            raise ProposalAlreadyExecutingError(
-                "proposal execution is already in flight or was interrupted; "
-                "reconcile before retrying"
+            claim = self._coordination("get_execution_claim")(
+                proposal.incident_id, proposal.id
             )
-        elif proposal.status in {"PROPOSED", "BLOCKED"}:
-            raise ProposalNotApprovedError(
-                f"proposal status {proposal.status} cannot execute without "
-                "a valid approval"
-            )
+            owner = str((claim or {}).get("lease_owner") or "")
+            expires = (claim or {}).get("lease_expires_at")
+            now = self.now()
+            if claim and str(claim.get("state")) == "LEASED" and owner:
+                observed = expires if expires is not None else now
+                if observed.tzinfo is None:
+                    from datetime import timezone as _tz
+
+                    observed = observed.replace(tzinfo=_tz.utc)
+                if observed > now:
+                    raise ProposalAlreadyExecutingError(
+                        "proposal execution is already in flight under an "
+                        "active durable lease"
+                    )
+                log_stage(
+                    "lease.expired",
+                    proposal_id=proposal.id,
+                    proposal_hash=proposal.proposal_hash,
+                    previous_owner=owner,
+                    expired_at=observed.isoformat(),
+                )
         else:
             raise ProposalNotApprovedError(
                 f"proposal status {proposal.status} is not executable"
@@ -287,11 +564,7 @@ class ProposalExecutionService:
             raise ProposalPatchPolicyError(
                 "persisted patch failed single-file unified-diff verification"
             )
-        # Confidence is re-read from persisted RCA evidence (fail closed
-        # when unavailable); it gates validation rules only — it is never
-        # an authorization signal.
-        root_cause = rca_root_cause(incident)
-        if root_cause is None:
+        if rca_root_cause(incident) is None:
             raise ProposalPatchPolicyError(
                 "persisted RCA evidence is unavailable for revalidation"
             )
@@ -320,24 +593,43 @@ class ProposalExecutionService:
                 return None
         return None
 
-    @staticmethod
+    def _revalidate_target(self, incident, proposal) -> None:
+        target = resolve_authoritative_deployment_target(incident)
+        if target is None:
+            raise TargetRevalidationError(
+                "no authoritative deployment evidence remains for this incident"
+            )
+        if (
+            target["repository_name"] != proposal.repository
+            or target["source_sha"] != (proposal.source_sha or "").lower()
+        ):
+            raise TargetRevalidationError(
+                "authoritative deployment target no longer matches the "
+                "approved proposal; execution aborted (no retargeting)"
+            )
+        log_stage(
+            "target.revalidated",
+            incident_id=incident.id,
+            proposal_id=proposal.id,
+            proposal_hash=proposal.proposal_hash,
+            target_repository=target["repository_name"],
+            source_sha=target["source_sha"],
+            evidence_id=target["evidence_id"],
+        )
+
     def _classify_failure(
+        self,
         exc: BaseException,
         stages: List[Tuple[str, Dict[str, Any]]],
     ) -> BaseException:
         """Map an orchestration failure onto a typed, auditable error."""
-        if isinstance(
-            exc,
-            (
-                ProposalPatchPolicyError,
-                ProposalStaleError,
-                TargetRevalidationError,
-                ProposalIntegrityError,
-                ProposalNotApprovedError,
-                ApprovalPolicyError,
-            ),
-        ):
+        if isinstance(exc, _PASSTHROUGH_FAILURES):
             return exc
+        if isinstance(exc, RemediationStageGuardError):
+            return ProposalExecutionFailedError(
+                str(exc),
+                stage=stages[-1][0] if stages else "workspace",
+            )
         if isinstance(exc, RemediationOrchestrationError) and (
             "validation failed" in str(exc) or "source SHA" in str(exc)
         ):
@@ -359,27 +651,24 @@ class ProposalExecutionService:
 
         if isinstance(exc, (RemediationOrchestrationError, ValueError)):
             return ProposalExecutionFailedError(str(exc), stage=stage)
-        # foreign/unexpected errors: redacted message, class recorded too
         return ProposalExecutionFailedError(_safe_reason(exc), stage=stage)
 
     # persistence helpers ------------------------------------------------ #
     def _persist_success(
-        self, incident, proposal, result, stages, requested_by, attempt
+        self, incident, proposal, result, stages, requested_by, attempt, mode
     ) -> Dict[str, Any]:
-        proposal.status = "PR_CREATED"
-        proposal.commit_sha = result.commit_sha
-        proposal.branch_name = result.branch_name
-        proposal.pull_request_url = result.pull_request_url
-        proposal.last_failure_stage = ""
-        proposal.last_failure_reason = ""
-
-        validation_meta = {
-            "profile": self.validation_profile,
-            "passed": bool(result.validation_result.passed),
-            "steps": [
-                {"name": step.name, "passed": step.passed}
-                for step in result.validation_result.steps
-            ],
+        execution_id = proposal.execution_id or execution_id_for(
+            proposal.id, proposal.proposal_hash
+        )
+        payload_extra = {
+            "commit_sha": result.commit_sha,
+            "branch_name": result.branch_name,
+            "pull_request_url": result.pull_request_url,
+            "mode": mode,
+            "validation": {
+                **self._validation_summary(result),
+                "profile": self.validation_profile,
+            },
         }
         evidence = self._execution_evidence(
             incident=incident,
@@ -388,42 +677,77 @@ class ProposalExecutionService:
             status="PR_CREATED",
             stages=stages,
             requested_by=requested_by,
-            extra={
-                "commit_sha": result.commit_sha,
-                "branch_name": result.branch_name,
-                "pull_request_url": result.pull_request_url,
-                "validation": validation_meta,
-            },
+            extra=payload_extra,
+            execution_id=execution_id,
         )
-        incident.attach_evidence(evidence)
-        self.repository.save_incident(incident)
+        updates = {
+            "commit_sha": result.commit_sha,
+            "branch_name": result.branch_name,
+            "pull_request_url": result.pull_request_url,
+        }
+        finished = self._coordination("finish_execution_lease")(
+            incident.id,
+            proposal.id,
+            self.lease_owner,
+            status="PR_CREATED",
+            stage="COMPLETED",
+            now=self.now(),
+            updates=updates,
+            evidence=evidence,
+        )
+        if not finished:
+            raise ExecutionLeaseUnavailable(
+                "execution lease was lost before completion could be persisted; "
+                "reconcile by retrying the execution request"
+            )
+        proposal.status = "PR_CREATED"
+        proposal.execution_stage = "COMPLETED"
+        proposal.commit_sha = result.commit_sha
+        proposal.branch_name = result.branch_name
+        proposal.pull_request_url = result.pull_request_url
+        proposal.lease_owner = ""
+        proposal.lease_acquired_at = None
+        proposal.lease_expires_at = None
+        proposal.last_heartbeat_at = None
         log_stage(
             "execution.completed",
             incident_id=incident.id,
             proposal_id=proposal.id,
             proposal_hash=proposal.proposal_hash,
-            execution_id=proposal.execution_id,
+            execution_id=execution_id,
+            attempt=attempt,
             commit_sha=result.commit_sha,
             pull_request_url=result.pull_request_url,
         )
         return {
             "incident_id": incident.id,
             "proposal": proposal.to_dict(),
-            "execution_id": proposal.execution_id,
+            "execution_id": execution_id,
             "status": "PR_CREATED",
             "idempotent": False,
         }
 
     def _execution_failure(
-        self, incident, proposal, exc, stages, attempt, requested_by, cause=None
+        self, incident, proposal, exc, stages, attempt, requested_by,
+        cause=None,
     ) -> None:
         stage = getattr(exc, "stage", None) or (
             stages[-1][0] if stages else "workspace"
         )
         original = cause if cause is not None else exc
-        proposal.status = "EXECUTION_FAILED"
-        proposal.last_failure_stage = str(stage)
-        proposal.last_failure_reason = _safe_reason(exc)
+        reason = _safe_reason(exc)
+        execution_id = proposal.execution_id or execution_id_for(
+            proposal.id, proposal.proposal_hash
+        )
+
+        # durable cursor: keep a resumable stage so recovery can reconcile
+        # remote state; otherwise mark the attempt FAILED.
+        claim = self._coordination("get_execution_claim")(
+            incident.id, proposal.id
+        ) or {}
+        cursor = str(claim.get("stage") or proposal.execution_stage or "")
+        durable_stage = cursor if cursor in RESUMABLE_STAGES else "FAILED"
+
         evidence = self._execution_evidence(
             incident=incident,
             proposal=proposal,
@@ -434,29 +758,82 @@ class ProposalExecutionService:
             extra={
                 "failed_stage": str(stage),
                 "failure_type": original.__class__.__name__,
-                "failure_reason": proposal.last_failure_reason,
+                "failure_reason": reason,
+                "durable_stage": durable_stage,
+                "lease_owner": self.lease_owner,
             },
+            execution_id=execution_id,
         )
-        incident.attach_evidence(evidence)
-        self.repository.save_incident(incident)
+        finished = self._coordination("finish_execution_lease")(
+            incident.id,
+            proposal.id,
+            self.lease_owner,
+            status="EXECUTION_FAILED",
+            stage=durable_stage,
+            now=self.now(),
+            updates={
+                "last_failure_stage": str(stage),
+                "last_failure_reason": reason,
+            },
+            evidence=evidence,
+        )
+        if not finished:
+            # ownership is gone — never clobber the new owner's state
+            log_stage(
+                "lease.rejected",
+                incident_id=incident.id,
+                proposal_id=proposal.id,
+                proposal_hash=proposal.proposal_hash,
+                reason="finish_rejected_owner_lost",
+            )
+            raise ExecutionLeaseUnavailable(
+                "execution lease was lost during the failed attempt; the "
+                "failure could not be persisted under this owner"
+            ) from exc
+        proposal.status = "EXECUTION_FAILED"
+        proposal.execution_stage = durable_stage
+        proposal.last_failure_stage = str(stage)
+        proposal.last_failure_reason = reason
+        proposal.lease_owner = ""
+        proposal.lease_acquired_at = None
+        proposal.lease_expires_at = None
+        proposal.last_heartbeat_at = None
         log_stage(
             "execution.failed",
             incident_id=incident.id,
             proposal_id=proposal.id,
             proposal_hash=proposal.proposal_hash,
-            execution_id=proposal.execution_id,
+            execution_id=execution_id,
             failed_stage=str(stage),
             failure_type=exc.__class__.__name__,
             attempt=attempt,
         )
 
     @staticmethod
+    def _validation_summary(result) -> Dict[str, Any]:
+        validation_result = getattr(result, "validation_result", None)
+        if validation_result is None:
+            return {"recovered": True}
+        try:
+            steps = [
+                {"name": step.name, "passed": step.passed}
+                for step in validation_result.steps
+            ]
+        except (AttributeError, TypeError):
+            steps = []
+        return {
+            "passed": bool(getattr(validation_result, "passed", False)),
+            "steps": steps,
+        }
+
+    @staticmethod
     def _execution_evidence(
-        *, incident, proposal, attempt, status, stages, requested_by, extra
+        *, incident, proposal, attempt, status, stages, requested_by, extra,
+        execution_id,
     ) -> IncidentEvidence:
         payload = {
-            "schema": "devops.remediation.execution/1",
-            "execution_id": proposal.execution_id,
+            "schema": "devops.remediation.execution/2",
+            "execution_id": execution_id,
             "attempt": attempt,
             "status": status,
             "incident_id": incident.id,
@@ -470,6 +847,8 @@ class ProposalExecutionService:
                 proposal.approved_at.isoformat() if proposal.approved_at else None
             ),
             "requested_by": requested_by or None,
+            "durable_stage": proposal.execution_stage,
+            "lease_owner": proposal.lease_owner or None,
             "stages": [
                 {"stage": stage, "metadata": metadata}
                 for stage, metadata in stages
@@ -477,25 +856,38 @@ class ProposalExecutionService:
             **extra,
         }
         return IncidentEvidence(
-            id=f"exec-{proposal.execution_id}-a{attempt}",
+            id=f"exec-{execution_id}-a{attempt}",
             kind=EXECUTION_EVIDENCE_KIND,
             source="remediation-control-plane",
             payload=payload,
         )
 
     def _reconcile(self, incident, proposal) -> Dict[str, Any]:
+        execution_id = proposal.execution_id or execution_id_for(
+            proposal.id, proposal.proposal_hash
+        )
         log_stage(
             "execution.reconciled",
             incident_id=incident.id,
             proposal_id=proposal.id,
             proposal_hash=proposal.proposal_hash,
-            execution_id=proposal.execution_id,
+            execution_id=execution_id,
             pull_request_url=proposal.pull_request_url,
         )
         return {
             "incident_id": incident.id,
             "proposal": proposal.to_dict(),
-            "execution_id": proposal.execution_id,
+            "execution_id": execution_id,
             "status": "PR_CREATED",
             "idempotent": True,
         }
+
+
+class _ResumeResult:
+    """Result shim for the resume path (no patch/validation this attempt)."""
+
+    def __init__(self, *, commit_sha, branch_name, pull_request_url):
+        self.commit_sha = commit_sha
+        self.branch_name = branch_name
+        self.pull_request_url = pull_request_url
+        self.validation_result = None

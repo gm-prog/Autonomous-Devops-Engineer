@@ -164,3 +164,112 @@ def _log(event: str, **fields) -> None:
 def log_stage(stage: str, **fields) -> None:
     """Structured execution lifecycle event (§29): ids/hashes/status only."""
     _log(f"remediation.{stage}", **fields)
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.2.1: durable lease coordination + persisted stage vocabulary
+# ---------------------------------------------------------------------- #
+
+#: Durable lease contract: how long one owner may hold an execution
+#: before another worker may reclaim it. Config (not hardcoded) because
+#: the value is operationally dangerous to guess.
+LEASE_SECONDS_ENV = "REMEDIATION_EXECUTION_LEASE_SECONDS"
+DEFAULT_LEASE_SECONDS = 600.0  # 10 minutes
+
+#: Bounded, externally-meaningful persisted stage vocabulary. A stage is
+#: only persisted AFTER the boundary it names has actually been verified.
+EXECUTION_STAGES: tuple = (
+    "CLAIMED",
+    "WORKSPACE_CREATED",
+    "PATCH_APPLIED",
+    "VALIDATION_STARTED",
+    "VALIDATION_PASSED",
+    "COMMIT_CREATED",
+    "REMOTE_PUBLISHED",
+    "REMOTE_VERIFIED",
+    "PR_DISCOVERY",
+    "PR_CREATED",
+    "COMPLETED",
+    "FAILED",
+)
+
+_STAGE_INDEX = {name: index for index, name in enumerate(EXECUTION_STAGES)}
+
+#: Durable cursor stages from which recovery may resume by reconciling
+#: remote state instead of redoing workspace/patch/validation/commit.
+RESUMABLE_STAGES = frozenset(
+    {"COMMIT_CREATED", "REMOTE_PUBLISHED", "REMOTE_VERIFIED", "PR_DISCOVERY"}
+)
+
+#: orchestrator notify name → persisted stage
+_NOTIFY_TO_STAGE = {
+    "workspace.created": "WORKSPACE_CREATED",
+    "patch.applied": "PATCH_APPLIED",
+    "validation.started": "VALIDATION_STARTED",
+    "validation.completed": "VALIDATION_PASSED",
+    "commit.created": "COMMIT_CREATED",
+    "remote.published": "REMOTE_PUBLISHED",
+    "remote.verified": "REMOTE_VERIFIED",
+    "pr.discovery": "PR_DISCOVERY",
+    "pr.created": "PR_CREATED",
+    "pr.reconciled": "PR_CREATED",
+}
+
+
+def load_lease_seconds() -> float:
+    """Fail fast on malformed lease configuration (repo env convention)."""
+    raw = os.getenv(LEASE_SECONDS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_LEASE_SECONDS
+    lease = float(raw)
+    if lease <= 0:
+        raise ValueError(f"{LEASE_SECONDS_ENV} must be a positive number")
+    return lease
+
+
+def new_lease_owner() -> str:
+    """Process-derived owner identity — never caller-supplied."""
+    import socket
+    import uuid as _uuid
+
+    host = socket.gethostname() or "unknown-host"
+    return f"{host}:{os.getpid()}:{_uuid.uuid4().hex[:12]}"
+
+
+def stage_for_notify(notify_stage: str) -> Optional[str]:
+    """Map an orchestrator stage callback name to the durable vocabulary.
+
+    Callers must still gate on result metadata (e.g. a FAILED validation
+    must not persist VALIDATION_PASSED — the failure path persists FAILED).
+    """
+    return _NOTIFY_TO_STAGE.get(notify_stage)
+
+
+def validate_stage_transition(current: str, new: str) -> None:
+    """Enforce the bounded forward-only stage machine (§36).
+
+    Allowed: forward movement inside EXECUTION_STAGES, and FAILED from
+    any executed state. Backward/jumping transitions raise — recovery
+    resets go through the atomic claim, never through progress writes.
+    """
+    if new == "FAILED":
+        if current not in {"", "FAILED"} and current not in _STAGE_INDEX:
+            raise ValueError(f"unknown current stage: {current!r}")
+        return
+    if new == "CLAIMED":
+        # claim-time (re)start: always allowed via the claim path
+        return
+    if new not in _STAGE_INDEX:
+        raise ValueError(f"unknown execution stage: {new!r}")
+    if current == "FAILED":
+        raise ValueError("failed execution must be re-claimed, not progressed")
+    if current and current != new:
+        current_index = _STAGE_INDEX.get(current)
+        if current_index is None:
+            raise ValueError(f"unknown current stage: {current!r}")
+        if _STAGE_INDEX[new] <= current_index:
+            raise ValueError(
+                f"stage transition {current} -> {new} violates ordering"
+            )
+    if current == "COMPLETED":
+        raise ValueError("completed execution cannot progress further")

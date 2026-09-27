@@ -1,8 +1,9 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, MetaData, String, Table, Text, create_engine, delete, select, update
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, MetaData, String, Table, Text, create_engine, delete, select, update
+from sqlalchemy.exc import IntegrityError
 
 from incident_service.domain.aggregates.incident import IncidentAggregate
 from incident_service.domain.entities.hotfix_proposal import HotfixProposal
@@ -86,7 +87,9 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             return None
 
         evidence = self._get_evidence(id)
-        return self._from_row(row, evidence)
+        incident = self._from_row(row, evidence)
+        self._apply_claim_overlay(incident)
+        return incident
 
     def get_active_incidents(self) -> List[IncidentAggregate]:
         with self.engine.connect() as connection:
@@ -97,6 +100,431 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             ).mappings().all()
 
         return [self._from_row(row, self._get_evidence(row["id"])) for row in rows]
+
+    # ------------------------------------------------------------------ #
+    # Phase 6.2.1: durable execution coordination (source of truth for
+    # lease ownership + persisted stage cursor; short transactions only —
+    # never held across external Git/GitHub operations).
+    # ------------------------------------------------------------------ #
+    def claim_execution_lease(
+        self,
+        incident_id: str,
+        proposal_id: str,
+        proposal_hash: str,
+        *,
+        owner: str,
+        now: datetime,
+        lease_seconds: float,
+    ) -> tuple[str, Optional[IncidentAggregate]]:
+        """Atomically acquire (or reclaim an expired) execution lease.
+
+        Returns ``(reason, incident)`` where reason is one of
+        ``claimed | no_incident | proposal_missing | hash_mismatch |
+        status_not_executable | lease_active | raced``. On ``claimed`` the
+        returned incident reflects the EXECUTING transition written in the
+        same transaction as the claim row.
+        """
+        from incident_service.application.services.proposal_execution_policy import (
+            RESUMABLE_STAGES,
+            execution_id_for,
+        )
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = _aware_utc(now)
+        expires = now + timedelta(seconds=lease_seconds)
+        observed_json = None
+
+        for _ in range(3):
+            try:
+                with self.engine.begin() as connection:
+                    row = connection.execute(
+                        select(incidents_table).where(
+                            incidents_table.c.id == incident_id
+                        )
+                    ).mappings().first()
+                    if row is None:
+                        return ("no_incident", None)
+                    observed_json = row["patch_proposals"]
+                    incident = self._from_row(
+                        row,
+                        self._evidence_rows(connection, incident_id),
+                    )
+                    proposal = next(
+                        (
+                            item
+                            for item in incident.patch_proposals
+                            if item.id == proposal_id
+                        ),
+                        None,
+                    )
+                    if proposal is None:
+                        return ("proposal_missing", None)
+                    if not proposal_hash or (
+                        (proposal.proposal_hash or "").strip().lower()
+                        != proposal_hash.strip().lower()
+                    ):
+                        return ("hash_mismatch", None)
+                    if proposal.status not in {
+                        "APPROVED",
+                        "EXECUTION_FAILED",
+                        "EXECUTING",
+                    }:
+                        return ("status_not_executable", None)
+
+                    claim = connection.execute(
+                        select(execution_claims_table).where(
+                            execution_claims_table.c.incident_id == incident_id,
+                            execution_claims_table.c.proposal_id == proposal_id,
+                        )
+                    ).mappings().first()
+
+                    if claim is not None:
+                        state = str(claim["state"])
+                        lease_expires = _aware_utc(claim["lease_expires_at"])
+                        if state == "LEASED" and lease_expires and lease_expires > now:
+                            return ("lease_active", None)
+                        prev_attempt = int(claim["attempt"] or 0)
+                        prev_stage = str(claim["stage"] or "")
+                        prev_commit = claim["commit_sha"] or None
+                        prev_branch = claim["branch_name"] or None
+                    else:
+                        prev_attempt = 0
+                        prev_stage = ""
+                        prev_commit = None
+                        prev_branch = None
+
+                    resume = (
+                        prev_stage in RESUMABLE_STAGES
+                        and bool(prev_commit)
+                        and proposal.status in {"EXECUTING", "EXECUTION_FAILED"}
+                    )
+                    new_stage = prev_stage if resume else "CLAIMED"
+                    new_attempt = prev_attempt + 1
+
+                    proposal.status = "EXECUTING"
+                    proposal.execution_attempts = new_attempt
+                    proposal.execution_stage = new_stage
+                    proposal.lease_owner = owner
+                    proposal.lease_acquired_at = now
+                    proposal.lease_expires_at = expires
+                    proposal.last_heartbeat_at = now
+                    proposal.last_failure_stage = ""
+                    proposal.last_failure_reason = ""
+                    execution_id = execution_id_for(proposal_id, proposal_hash)
+
+                    if claim is None:
+                        connection.execute(
+                            execution_claims_table.insert().values(
+                                incident_id=incident_id,
+                                proposal_id=proposal_id,
+                                proposal_hash=proposal_hash,
+                                execution_id=execution_id,
+                                attempt=new_attempt,
+                                state="LEASED",
+                                lease_owner=owner,
+                                lease_acquired_at=now,
+                                lease_expires_at=expires,
+                                last_heartbeat_at=now,
+                                stage=new_stage,
+                                commit_sha=prev_commit,
+                                branch_name=prev_branch,
+                            )
+                        )
+                    else:
+                        result = connection.execute(
+                            update(execution_claims_table)
+                            .where(
+                                execution_claims_table.c.incident_id
+                                == incident_id,
+                                execution_claims_table.c.proposal_id
+                                == proposal_id,
+                                execution_claims_table.c.state
+                                == str(claim["state"]),
+                                execution_claims_table.c.lease_owner
+                                == claim["lease_owner"],
+                                execution_claims_table.c.attempt
+                                == int(claim["attempt"] or 0),
+                            )
+                            .values(
+                                proposal_hash=proposal_hash,
+                                execution_id=execution_id,
+                                attempt=new_attempt,
+                                state="LEASED",
+                                lease_owner=owner,
+                                lease_acquired_at=now,
+                                lease_expires_at=expires,
+                                last_heartbeat_at=now,
+                                completed_at=None,
+                                stage=new_stage,
+                                last_failure_stage=None,
+                                last_failure_reason=None,
+                            )
+                        )
+                        if result.rowcount != 1:
+                            raise _CoordinationRace("claim row changed")
+
+                    proposals_update = connection.execute(
+                        update(incidents_table)
+                        .where(
+                            incidents_table.c.id == incident_id,
+                            incidents_table.c.patch_proposals == observed_json,
+                        )
+                        .values(patch_proposals=self._to_row(incident)["patch_proposals"])
+                    )
+                    if proposals_update.rowcount != 1:
+                        raise _CoordinationRace("proposals changed during claim")
+
+                return ("claimed", self.get_incident_by_id(incident_id))
+            except IntegrityError:
+                # concurrent first-claim insert → re-read and re-evaluate
+                continue
+            except _CoordinationRace:
+                continue
+        return ("raced", None)
+
+    def persist_execution_progress(
+        self,
+        incident_id: str,
+        proposal_id: str,
+        owner: str,
+        *,
+        stage: str,
+        now: datetime,
+        lease_seconds: float,
+        commit_sha: Optional[str] = None,
+        branch_name: Optional[str] = None,
+    ) -> bool:
+        """Owner-gated durable stage write + lease renewal (heartbeat)."""
+        from incident_service.application.services.proposal_execution_policy import (
+            validate_stage_transition,
+        )
+
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = _aware_utc(now)
+        with self.engine.begin() as connection:
+            claim = connection.execute(
+                select(execution_claims_table).where(
+                    execution_claims_table.c.incident_id == incident_id,
+                    execution_claims_table.c.proposal_id == proposal_id,
+                )
+            ).mappings().first()
+            if (
+                claim is None
+                or str(claim["state"]) != "LEASED"
+                or str(claim["lease_owner"] or "") != owner
+            ):
+                return False
+            validate_stage_transition(str(claim["stage"] or ""), stage)
+            result = connection.execute(
+                update(execution_claims_table)
+                .where(
+                    execution_claims_table.c.incident_id == incident_id,
+                    execution_claims_table.c.proposal_id == proposal_id,
+                    execution_claims_table.c.state == "LEASED",
+                    execution_claims_table.c.lease_owner == owner,
+                )
+                .values(
+                    stage=stage,
+                    commit_sha=commit_sha
+                    if commit_sha is not None
+                    else claim["commit_sha"],
+                    branch_name=branch_name
+                    if branch_name is not None
+                    else claim["branch_name"],
+                    last_heartbeat_at=now,
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                )
+            )
+            return result.rowcount == 1
+
+    def finish_execution_lease(
+        self,
+        incident_id: str,
+        proposal_id: str,
+        owner: str,
+        *,
+        status: str,
+        stage: str,
+        now: datetime,
+        updates: Optional[dict] = None,
+        evidence: Optional[IncidentEvidence] = None,
+    ) -> bool:
+        """Atomically release the lease and persist the attempt outcome
+        (proposal status + claim cursor + evidence) in one transaction."""
+        from incident_service.application.services.proposal_execution_policy import (
+            validate_stage_transition,
+        )
+
+        now = _aware_utc(now)
+        updates = dict(updates or {})
+        with self.engine.begin() as connection:
+            row = connection.execute(
+                select(incidents_table).where(
+                    incidents_table.c.id == incident_id
+                )
+            ).mappings().first()
+            if row is None:
+                return False
+            observed_json = row["patch_proposals"]
+            incident = self._from_row(
+                row, self._evidence_rows(connection, incident_id)
+            )
+            proposal = next(
+                (
+                    item
+                    for item in incident.patch_proposals
+                    if item.id == proposal_id
+                ),
+                None,
+            )
+            claim = connection.execute(
+                select(execution_claims_table).where(
+                    execution_claims_table.c.incident_id == incident_id,
+                    execution_claims_table.c.proposal_id == proposal_id,
+                )
+            ).mappings().first()
+            if (
+                proposal is None
+                or claim is None
+                or str(claim["state"]) != "LEASED"
+                or str(claim["lease_owner"] or "") != owner
+            ):
+                return False
+            validate_stage_transition(str(claim["stage"] or ""), stage)
+
+            proposal.status = status
+            proposal.execution_stage = stage
+            proposal.lease_owner = ""
+            proposal.lease_acquired_at = None
+            proposal.lease_expires_at = None
+            proposal.last_heartbeat_at = None
+            for key in (
+                "commit_sha",
+                "branch_name",
+                "pull_request_url",
+                "last_failure_stage",
+                "last_failure_reason",
+                "executed_at",
+            ):
+                if key in updates:
+                    setattr(proposal, key, updates[key])
+
+            proposals_update = connection.execute(
+                update(incidents_table)
+                .where(
+                    incidents_table.c.id == incident_id,
+                    incidents_table.c.patch_proposals == observed_json,
+                )
+                .values(
+                    patch_proposals=self._to_row(incident)["patch_proposals"]
+                )
+            )
+            if proposals_update.rowcount != 1:
+                return False
+
+            claim_values = {
+                "state": "FREE",
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "last_heartbeat_at": None,
+                "completed_at": now,
+                "stage": stage,
+                "pull_request_url": updates.get(
+                    "pull_request_url", claim["pull_request_url"]
+                ),
+                "commit_sha": updates.get("commit_sha", claim["commit_sha"]),
+                "branch_name": updates.get(
+                    "branch_name", claim["branch_name"]
+                ),
+                "last_failure_stage": updates.get("last_failure_stage"),
+                "last_failure_reason": updates.get("last_failure_reason"),
+            }
+            claim_update = connection.execute(
+                update(execution_claims_table)
+                .where(
+                    execution_claims_table.c.incident_id == incident_id,
+                    execution_claims_table.c.proposal_id == proposal_id,
+                    execution_claims_table.c.state == "LEASED",
+                    execution_claims_table.c.lease_owner == owner,
+                )
+                .values(**claim_values)
+            )
+            if claim_update.rowcount != 1:
+                return False
+
+            if evidence is not None:
+                connection.execute(
+                    delete(evidence_table).where(
+                        evidence_table.c.id == evidence.id
+                    )
+                )
+                connection.execute(
+                    evidence_table.insert(),
+                    [self._evidence_row(incident_id, evidence)],
+                )
+        return True
+
+    def get_execution_claim(
+        self, incident_id: str, proposal_id: str
+    ) -> Optional[dict]:
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(execution_claims_table).where(
+                    execution_claims_table.c.incident_id == incident_id,
+                    execution_claims_table.c.proposal_id == proposal_id,
+                )
+            ).mappings().first()
+        return dict(row) if row else None
+
+    def _apply_claim_overlay(self, incident) -> None:
+        """Project authoritative claim-row state onto the proposal view."""
+        if not incident.patch_proposals:
+            return
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(execution_claims_table).where(
+                    execution_claims_table.c.incident_id == incident.id
+                )
+            ).mappings().first()
+        if row is None:
+            return
+        for proposal in incident.patch_proposals:
+            if proposal.id != row["proposal_id"]:
+                continue
+            proposal.execution_stage = str(row["stage"] or "")
+            proposal.execution_attempts = int(row["attempt"] or 0)
+            proposal.execution_id = str(row["execution_id"] or "")
+            proposal.lease_owner = str(row["lease_owner"] or "")
+            proposal.lease_acquired_at = _aware_utc(row["lease_acquired_at"])
+            proposal.lease_expires_at = _aware_utc(row["lease_expires_at"])
+            proposal.last_heartbeat_at = _aware_utc(row["last_heartbeat_at"])
+            # claim row is authoritative for the durable remote identity
+            if row["commit_sha"]:
+                proposal.commit_sha = str(row["commit_sha"])
+            if row["branch_name"]:
+                proposal.branch_name = str(row["branch_name"])
+            if row["pull_request_url"]:
+                proposal.pull_request_url = str(row["pull_request_url"])
+
+    @staticmethod
+    def _evidence_rows(connection, incident_id: str) -> List[IncidentEvidence]:
+        rows = connection.execute(
+            select(evidence_table)
+            .where(evidence_table.c.incident_id == incident_id)
+            .order_by(evidence_table.c.observed_at.asc(), evidence_table.c.id.asc())
+        ).mappings().all()
+        return [
+            IncidentEvidence(
+                id=item["id"],
+                kind=item["kind"],
+                source=item["source"],
+                observed_at=item["observed_at"],
+                payload=json.loads(item["payload"]),
+            )
+            for item in rows
+        ]
 
     @staticmethod
     def _to_row(incident: IncidentAggregate) -> dict:
@@ -211,6 +639,50 @@ def _parse_optional_datetime(value):
 
 
 def _normalize_created_at(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.2.1: durable execution claims (lease + persisted stage cursor)
+# ---------------------------------------------------------------------- #
+# One row per (incident, proposal). This table is the AUTHORITATIVE home of
+# execution ownership and stage progress; save_incident() never touches it,
+# so unrelated aggregate writes can never clobber a live lease. Proposal
+# lifecycle (status/attempt mirrors) is updated in the SAME transaction as
+# the claim/finish CAS so JSON and claim row never diverge within a
+# completed transaction.
+execution_claims_table = Table(
+    "devops_execution_claims",
+    metadata,
+    Column("incident_id", String(64), primary_key=True),
+    Column("proposal_id", String(200), primary_key=True),
+    Column("proposal_hash", String(64), nullable=False),
+    Column("execution_id", String(64), nullable=False),
+    Column("attempt", Integer, nullable=False, default=0),
+    Column("state", String(16), nullable=False, default="FREE"),
+    Column("lease_owner", String(160)),
+    Column("lease_acquired_at", DateTime(timezone=True)),
+    Column("lease_expires_at", DateTime(timezone=True)),
+    Column("last_heartbeat_at", DateTime(timezone=True)),
+    Column("completed_at", DateTime(timezone=True)),
+    Column("stage", String(32), nullable=False, default=""),
+    Column("commit_sha", String(40)),
+    Column("branch_name", String(255)),
+    Column("pull_request_url", Text),
+    Column("last_failure_stage", String(32)),
+    Column("last_failure_reason", Text),
+)
+
+
+class _CoordinationRace(Exception):
+    """Concurrent writer changed coordination state between read and CAS."""
+
+
+def _aware_utc(value):
+    if value is None:
+        return None
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value

@@ -139,6 +139,7 @@ class RemediationE2EBoundaryTests(unittest.TestCase):
         proposal = self._proposal(source_sha)
 
         github = MagicMock()
+        github.find_existing_pull_requests.return_value = []
         github.create_branch_from_commit.return_value = (
             f"https://github.com/{REPO_SLUG}/tree/{BRANCH}"
         )
@@ -194,6 +195,7 @@ class RemediationE2EBoundaryTests(unittest.TestCase):
         proposal = self._proposal(source_sha)
 
         github = MagicMock()
+        github.find_existing_pull_requests.return_value = []
         orchestrator = self._orchestrator(github, token="")
 
         with self.assertRaises(RemediationOrchestrationError) as ctx:
