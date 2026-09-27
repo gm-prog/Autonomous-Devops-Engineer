@@ -30,7 +30,7 @@ from incident_service.application.services.remediation_orchestration_service imp
 from incident_service.application.services.remediation_patch_executor import RemediationPatchExecutor
 from incident_service.application.services.remediation_validation_runner import RemediationValidationRunner
 from incident_service.application.services.remediation_workspace_service import RemediationWorkspaceService
-from incident_service.application.services.remediation_target_binding import (
+from incident_service.application.services.proposal_execution_service import (\n    ProposalApprovalError,\n    ProposalExecutionError,\n    ProposalExecutionService,\n)\nfrom incident_service.application.services.remediation_target_binding import (
     RemediationTargetBindingError,
     authorize_remediation_target,
 )
@@ -278,6 +278,24 @@ def create_remediation(
 logger = logging.getLogger("IncidentProposalController")
 
 
+class ProposalApprovalRequest(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=128)
+    proposal_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    approved_by: str = Field(min_length=1, max_length=256)
+
+
+class ProposalExecutionRequest(BaseModel):
+    proposal_id: str = Field(min_length=1, max_length=128)
+    proposal_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+
+
+def get_proposal_execution_service() -> ProposalExecutionService:
+    return ProposalExecutionService(
+        repository=get_incident_repository(),
+        orchestrator_factory=get_remediation_orchestrator,
+    )
+
+
 def get_proposal_generation_service() -> ProposalGenerationService:
     """Proposal pipeline bound to the shared incident repository."""
     return ProposalGenerationService(repository=get_incident_repository())
@@ -344,4 +362,58 @@ def get_remediation_proposal(
         "incident_id": incident.id,
         "incident_status": incident.status,
         "proposal": _serialize_proposal(proposal),
+    }
+
+
+@router.post("/{incident_id}/proposal/approve", response_model=Dict[str, Any])
+def approve_remediation_proposal(
+    incident_id: str,
+    request: ProposalApprovalRequest,
+    service: ProposalExecutionService = Depends(get_proposal_execution_service),
+):
+    """Explicitly approve one persisted proposal by its canonical hash.
+
+    The gateway stamps the operator identity in the production control plane;
+    the incident service still validates the field and never accepts target
+    identity, patch, repository or source SHA from this request.
+    """
+    try:
+        result = service.approve(
+            incident_id=incident_id,
+            proposal_id=request.proposal_id,
+            proposal_hash=request.proposal_hash,
+            approved_by=request.approved_by,
+        )
+    except ProposalApprovalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ProposalExecutionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "incident_id": result.incident_id,
+        "proposal": _serialize_proposal(result.proposal),
+    }
+
+
+@router.post("/{incident_id}/proposal/execute", response_model=Dict[str, Any])
+def execute_approved_remediation_proposal(
+    incident_id: str,
+    request: ProposalExecutionRequest,
+    service: ProposalExecutionService = Depends(get_proposal_execution_service),
+):
+    """Execute only a persisted, hash-integrity-checked approved proposal."""
+    try:
+        result = service.execute(
+            incident_id=incident_id,
+            proposal_id=request.proposal_id,
+            proposal_hash=request.proposal_hash,
+        )
+    except ProposalExecutionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {
+        "incident_id": result.incident_id,
+        "proposal": _serialize_proposal(result.proposal),
+        "pull_request_url": result.proposal.pull_request_url,
+        "reused_existing_pr": result.reused_existing_pr,
+        "status": result.proposal.status,
     }
