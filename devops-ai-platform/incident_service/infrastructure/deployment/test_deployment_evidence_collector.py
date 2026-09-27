@@ -59,6 +59,55 @@ class DeploymentEvidenceCollectorTests(unittest.TestCase):
         self.assertEqual(mock_urlopen.call_args.kwargs["timeout"], 5.0)
 
     @patch("incident_service.infrastructure.deployment.deployment_evidence_collector.urlopen")
+    def test_provenance_record_is_passed_through_verbatim(self, mock_urlopen):
+        """Stage 5: the platform provenance record must reach incident
+        evidence untouched — remediation binding verifies it there."""
+        provenance = {
+            "schema": "devops.deployment-provenance/1",
+            "repository_name": "acme/checkout",
+            "source_sha": "a" * 40,
+            "artifact_hash": "c" * 64,
+            "plan_hash": "d" * 64,
+            "deployment_run_id": "run_abc123",
+            "state": "DEPLOYED",
+            "verification_method": "github-commit-lookup",
+            "artifact_source_derivation": "not-established",
+            "provenance_hash": "e" * 64,
+        }
+        mock_urlopen.return_value = FakeResponse({
+            "id": "run_abc123",
+            "repository_name": "acme/checkout",
+            "source_revision": {"head_sha": "a" * 40, "commits": []},
+            "state": "DEPLOYED",
+            "artifact_hash": "c" * 64,
+            "plan_hash": "d" * 64,
+            "provenance": provenance,
+        })
+
+        evidence = DeploymentEvidenceCollector(
+            "http://deployment-service:8030"
+        ).collect("run_abc123")
+
+        self.assertEqual(evidence.payload["provenance"], provenance)
+
+    @patch("incident_service.infrastructure.deployment.deployment_evidence_collector.urlopen")
+    def test_missing_provenance_lands_as_none(self, mock_urlopen):
+        """Legacy/tampered runs without a provenance record surface as None
+        (the binding layer then fails closed)."""
+        mock_urlopen.return_value = FakeResponse({
+            "id": "run_old",
+            "repository_name": "acme/checkout",
+            "source_revision": {"head_sha": "a" * 40, "commits": []},
+            "state": "DEPLOYED",
+        })
+
+        evidence = DeploymentEvidenceCollector(
+            "http://deployment-service:8030"
+        ).collect("run_old")
+
+        self.assertIsNone(evidence.payload["provenance"])
+
+    @patch("incident_service.infrastructure.deployment.deployment_evidence_collector.urlopen")
     def test_not_found_is_normalized(self, mock_urlopen):
         from urllib.error import HTTPError
         mock_urlopen.side_effect = HTTPError(

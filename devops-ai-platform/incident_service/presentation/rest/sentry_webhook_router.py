@@ -4,6 +4,12 @@ The recovery transplant had replaced the green line's signature check with
 the dev-line permissive receiver (any JSON accepted). This merged router
 keeps the transplant's real repository injection and restores raw-body
 HMAC-SHA256 verification from the green baseline.
+
+Fail-closed configuration contract (Stage 5): if ``SENTRY_WEBHOOK_SECRET``
+is unset the receiver does NOT accept anything — every request is rejected
+with HTTP 503 until the secret is configured. `verify_sentry_signature`
+also returns False when the secret is missing, so no code path can drift
+back into permissive mode.
 """
 
 import hashlib
@@ -26,21 +32,23 @@ logger = logging.getLogger("SentryWebhookReceiver")
 router = APIRouter(prefix="/alerts/webhooks", tags=["Webhook Alerting Receiver"])
 
 # Shared secret for HMAC-SHA256 verification of inbound Sentry alerts.
-# When unset the receiver runs in permissive dev mode (with a loud warning)
-# so local demos keep working; production MUST set this.
+# When unset the receiver FAILS CLOSED: requests are rejected with 503
+# (service unavailable until configured) — unverified payloads are never
+# accepted, not even in development.
 SENTRY_WEBHOOK_SECRET = os.getenv("SENTRY_WEBHOOK_SECRET", "")
 
 if not SENTRY_WEBHOOK_SECRET:
     logger.warning(
-        "SENTRY_WEBHOOK_SECRET is not set - inbound Sentry webhooks are accepted "
-        "UNVERIFIED (permissive dev mode). Set it to enable HMAC verification."
+        "SENTRY_WEBHOOK_SECRET is not set - inbound Sentry webhooks are "
+        "REJECTED with HTTP 503 (fail closed). Set the secret to enable "
+        "HMAC verification."
     )
 
 
 def verify_sentry_signature(body: bytes, signature: str | None) -> bool:
     """Verify the HMAC-SHA256 hex digest of the raw request body."""
     if not SENTRY_WEBHOOK_SECRET:
-        return True  # permissive dev mode (warned at import time)
+        return False  # fail closed: no configured secret, no accepted webhook
     if not signature:
         return False
     expected = hmac.new(
@@ -64,7 +72,16 @@ async def receive_sentry_webhook(
 
     Signature contract: header ``X-Sentry-Signature`` = hex digest of
     HMAC-SHA256(raw_body, SENTRY_WEBHOOK_SECRET).
+
+    Configuration contract: with no secret configured the endpoint is
+    disabled (503) rather than permissive — fail closed, loudly.
     """
+    if not SENTRY_WEBHOOK_SECRET:
+        logger.warning("Sentry webhook rejected: SENTRY_WEBHOOK_SECRET is not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Webhook processing is disabled: SENTRY_WEBHOOK_SECRET is not configured.",
+        )
     body = await request.body()
     signature = request.headers.get("x-sentry-signature")
 

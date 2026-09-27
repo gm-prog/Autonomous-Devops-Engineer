@@ -24,6 +24,19 @@ records left in ``AWAITING_APPROVAL``, ``DRY_RUN_*``, ``DEPLOYMENT_*``,
 ``ROLLED_BACK`` etc. - or with a missing/malformed ``state`` - never
 authorize remediation.
 
+**Platform provenance record (Stage 5):** a ``DEPLOYED`` record is only
+authoritative when it also carries the platform's provenance object
+(``shared_kernel.domain.provenance``): the record must exist, its
+``provenance_hash`` must recompute over the canonical payload, its
+identity fields must match *this* evidence record (repository, SHA, run
+id, state, artifact/plan hashes), and it must record an *independent*
+source verification (method ``unverified`` never verifies).  Missing,
+tampered, grafted or unverified provenance fails closed with a
+provenance-specific error - a plausible repository name plus SHA is never
+enough on its own.  The hash is unkeyed integrity, not authenticity: the
+authenticity root for evidence remains the private network + gateway
+boundary (README trust model).
+
 Canonical forms:
 
 * repository identity — ``payload["repository_name"]`` in ``owner/repo``
@@ -42,6 +55,11 @@ from __future__ import annotations
 
 import re
 from typing import Any
+
+from shared_kernel.domain.provenance import (
+    ProvenanceError,
+    verify_provenance_record,
+)
 
 _SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 _SLUG_PATTERN = re.compile(r"^(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+/(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+$")
@@ -105,6 +123,44 @@ def _canonical_source_sha(payload: dict) -> str | None:
     return None
 
 
+def _provenance_satisfies_record(payload: dict) -> bool:
+    """True only when the payload carries a *valid* provenance record that
+    describes THIS record (Stage 5).
+
+    Checks, in order: presence, full structural + hash verification via the
+    shared contract (rejects unknown/missing fields, malformed hex,
+    ``unverified`` source method, over-claimed artifact derivation, and any
+    tampering), then identity cross-checks against the surrounding evidence
+    payload so provenance grafted from a different record (or a different
+    state) never matches.
+    """
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+    try:
+        verify_provenance_record(provenance)
+    except ProvenanceError:
+        return False
+    # the provenance must describe the deployment state actually recorded
+    if provenance.get("state") != _AUTHORITATIVE_DEPLOYMENT_STATE:
+        return False
+    if provenance.get("repository_name") != payload.get("repository_name"):
+        return False
+    record_sha = _canonical_source_sha(payload)
+    if record_sha is None or provenance.get("source_sha") != record_sha:
+        return False
+    if provenance.get("deployment_run_id") != str(
+        payload.get("deployment_run_id")
+    ):
+        return False
+    # when the evidence record carries artifact/plan identity, it must agree
+    for field in ("artifact_hash", "plan_hash"):
+        recorded = payload.get(field)
+        if recorded and provenance.get(field) != str(recorded):
+            return False
+    return True
+
+
 def authorize_remediation_target(
     incident: Any,
     repository_slug: str,
@@ -114,7 +170,9 @@ def authorize_remediation_target(
     ``(repository_slug, source_sha)`` pair is bound to this incident.
 
     The pair must occur together in a **single** ``deployment_run`` evidence
-    record; values from different records are never combined.
+    record whose state is ``DEPLOYED`` *and* whose platform provenance
+    record verifies (Stage 5); values from different records are never
+    combined.
     """
     # --- validate the request (fail fast on malformed input) ---
     if not isinstance(repository_slug, str):
@@ -155,7 +213,10 @@ def authorize_remediation_target(
             "authorize remediation"
         )
 
-    # --- same-record pair match ---
+    # --- same-record pair match + provenance gate (Stage 5) ---
+    # Authorization requires ONE record where the exact requested pair
+    # co-occurs AND that record carries a valid platform provenance record.
+    pair_present_without_provenance = False
     for item in authoritative_items:
         payload = dict(item.payload or {})
         record_repository = _canonical_repository(payload)
@@ -164,8 +225,22 @@ def authorize_remediation_target(
         record_sha = _canonical_source_sha(payload)
         if record_sha is None:
             continue  # malformed revision contributes nothing
-        if record_repository == slug and record_sha == sha:
-            return  # exact pair found together in ONE evidence record
+        if record_repository != slug or record_sha != sha:
+            continue  # this record proves a different target
+        if _provenance_satisfies_record(payload):
+            return  # exact pair + verified provenance in ONE evidence record
+        # The requested pair exists in this record but cannot be
+        # corroborated by platform provenance → fail closed, never
+        # downgrade to "plausible repository + SHA is enough".
+        pair_present_without_provenance = True
+
+    if pair_present_without_provenance:
+        raise RemediationTargetBindingError(
+            "requested deployment evidence lacks a valid platform provenance "
+            "record (missing, tampered, unverified source, or mismatched "
+            "with its deployment record); refusing remediation on "
+            "unverifiable deployment evidence"
+        )
 
     raise RemediationTargetBindingError(
         "requested (repository, source SHA) pair does not occur together in any "

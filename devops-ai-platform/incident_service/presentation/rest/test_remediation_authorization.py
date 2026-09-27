@@ -28,6 +28,11 @@ from ...infrastructure.database.postgres_incident_repo import (
 )
 from . import controllers as controllers_module
 from .controllers import RemediationRequest, create_remediation
+from shared_kernel.domain.provenance import (
+    ProvenanceError,
+    build_provenance_record,
+    compute_provenance_hash,
+)
 
 SOURCE_SHA = "a" * 40
 OTHER_SHA = "b" * 40
@@ -41,17 +46,38 @@ PATCH = """--- a/src/service.py
 
 
 def _deployment_evidence(
-    name="acme/checkout", head_sha=SOURCE_SHA, evidence_id="deploy-1", kind_extra=None
+    name="acme/checkout",
+    head_sha=SOURCE_SHA,
+    evidence_id="deploy-1",
+    kind_extra=None,
+    run_id="run-1",
 ):
     payload = {
-        "deployment_run_id": "run-1",
+        "deployment_run_id": run_id,
         "repository_id": 42,
         "repository_name": name,
         "source_revision": {"head_sha": head_sha, "commits": []},
         "state": "DEPLOYED",
+        "artifact_hash": "c" * 64,
+        "plan_hash": "d" * 64,
     }
     if kind_extra:
         payload.update(kind_extra)
+    try:
+        # fixtures carry genuine platform provenance (Stage 5) so that tests
+        # keep proving the property they claim; malformed-identity fixtures
+        # cannot build one and stay unprovenanced (fail closed, as in prod).
+        payload["provenance"] = build_provenance_record(
+            repository_name=payload["repository_name"],
+            source_sha=str(payload["source_revision"].get("head_sha") or ""),
+            artifact_hash=str(payload.get("artifact_hash") or ""),
+            plan_hash=str(payload.get("plan_hash") or ""),
+            deployment_run_id=str(payload["deployment_run_id"]),
+            state=str(payload["state"]),
+            verification_method="test-source-verifier",
+        )
+    except ProvenanceError:
+        pass
     return IncidentEvidence(
         id=evidence_id,
         kind="deployment_run",
@@ -292,6 +318,109 @@ class TargetBindingUnitTests(unittest.TestCase):
         incident = self._incident_with(_deployment_evidence(name="acme/Checkout"))
         with self.assertRaises(RemediationTargetBindingError):
             authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+
+    # ---------------- Stage 5: provenance gate ----------------
+
+    def test_deployed_record_without_provenance_is_rejected(self):
+        """A DEPLOYED record lacking the platform provenance record fails
+        closed: plausible repository + SHA alone never authorizes."""
+        payload = {
+            "deployment_run_id": "run-noprov",
+            "repository_name": "acme/checkout",
+            "source_revision": {"head_sha": SOURCE_SHA},
+            "state": "DEPLOYED",
+        }
+        incident = self._incident_with(
+            IncidentEvidence(
+                id="deploy-no-provenance",
+                kind="deployment_run",
+                source="deployment-service",
+                payload=payload,
+            )
+        )
+        with self.assertRaises(RemediationTargetBindingError) as ctx:
+            authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+        self.assertIn("provenance", str(ctx.exception))
+
+    def test_tampered_provenance_is_rejected(self):
+        evidence = _deployment_evidence()
+        # alter an identity field without being able to hide it: the
+        # provenance_hash no longer recomputes
+        evidence.payload["provenance"]["artifact_hash"] = "e" * 64
+        incident = self._incident_with(evidence)
+        with self.assertRaises(RemediationTargetBindingError) as ctx:
+            authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+        self.assertIn("provenance", str(ctx.exception))
+
+    def test_provenance_grafted_from_another_record_is_rejected(self):
+        """Provenance from deployment B grafted onto record A (hash intact!)
+        is caught by the identity cross-check: it describes another run."""
+        record_a = _deployment_evidence(
+            name="acme/checkout",
+            head_sha=SOURCE_SHA,
+            evidence_id="deploy-a",
+            run_id="run-a",
+        )
+        record_b = _deployment_evidence(
+            name="acme/checkout",
+            head_sha=SOURCE_SHA,
+            evidence_id="deploy-b",
+            run_id="run-b",
+        )
+        # both records prove the same pair, but B's provenance carries B's
+        # run id: it must not corroborate record A.
+        record_a.payload["provenance"] = record_b.payload["provenance"]
+        incident = self._incident_with(record_a)
+        with self.assertRaises(RemediationTargetBindingError) as ctx:
+            authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+        self.assertIn("provenance", str(ctx.exception))
+
+    def test_provenance_state_mismatch_is_rejected(self):
+        """Valid-hash provenance recorded for AWAITING_APPROVAL never
+        corroborates a payload claiming DEPLOYED (state participates in the
+        hashed identity and is cross-checked against the record)."""
+        evidence = _deployment_evidence()
+        stale = build_provenance_record(
+            repository_name="acme/checkout",
+            source_sha=SOURCE_SHA,
+            artifact_hash="c" * 64,
+            plan_hash="d" * 64,
+            deployment_run_id="run-1",
+            state="AWAITING_APPROVAL",
+            verification_method="test-source-verifier",
+        )
+        evidence.payload["provenance"] = stale
+        incident = self._incident_with(evidence)
+        with self.assertRaises(RemediationTargetBindingError) as ctx:
+            authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+        self.assertIn("provenance", str(ctx.exception))
+
+    def test_unverified_source_method_never_authorizes(self):
+        """Even a perfectly re-hashed record with verification_method
+        'unverified' is rejected: provenance must record an independent
+        source verification."""
+        evidence = _deployment_evidence()
+        unverified = dict(evidence.payload["provenance"])
+        unverified["verification_method"] = "unverified"
+        unverified["provenance_hash"] = compute_provenance_hash(unverified)
+        evidence.payload["provenance"] = unverified
+        incident = self._incident_with(evidence)
+        with self.assertRaises(RemediationTargetBindingError) as ctx:
+            authorize_remediation_target(incident, "acme/checkout", SOURCE_SHA)
+        self.assertIn("provenance", str(ctx.exception))
+
+    def test_provenance_from_a_different_pair_does_not_authorize(self):
+        """Cross-evidence attack extended to provenance: the incident holds
+        B's (repoB, shaB) record whose provenance is valid, but a request
+        for (repoB, shaA) still never authorizes — provenance cannot bridge
+        different records."""
+        incident = self._incident_with(
+            _deployment_evidence(
+                name="evil/checkout", head_sha=OTHER_SHA, evidence_id="deploy-b"
+            )
+        )
+        with self.assertRaises(RemediationTargetBindingError):
+            authorize_remediation_target(incident, "evil/checkout", SOURCE_SHA)
 
 
 class FakeRepository:
@@ -543,6 +672,39 @@ class RemediationAuthorizationTests(unittest.TestCase):
         self.assertNotIsInstance(result, Exception)
         provider.assert_called_once()
         spy.execute.assert_called_once()
+
+    def test_deployed_evidence_without_provenance_never_reaches_orchestrator(
+        self,
+    ):
+        """Controller-level Stage 5 gate: correct pair + DEPLOYED state but
+        no platform provenance record → 403, orchestrator never constructed."""
+        from fastapi import HTTPException
+
+        incident = _incident(with_deployment=False)
+        incident.attach_evidence(
+            IncidentEvidence(
+                id="deploy-no-provenance",
+                kind="deployment_run",
+                source="deployment-service",
+                payload={
+                    "deployment_run_id": "run-x",
+                    "repository_name": "acme/checkout",
+                    "source_revision": {"head_sha": SOURCE_SHA},
+                    "state": "DEPLOYED",
+                    "artifact_hash": "c" * 64,
+                    "plan_hash": "d" * 64,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+
+        spy, provider, exc = self._call_with_spy("inc-bind", _request())
+
+        self.assertIsInstance(exc, HTTPException)
+        self.assertEqual(exc.status_code, 403)
+        self.assertIn("provenance", str(exc.detail))
+        provider.assert_not_called()
+        spy.execute.assert_not_called()
 
 
 if __name__ == "__main__":
