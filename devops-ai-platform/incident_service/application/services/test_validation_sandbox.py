@@ -752,31 +752,43 @@ class RealContainerIntegrationTests(unittest.TestCase):
         cls.image_tag = os.environ.get(
             "REMEDIATION_SANDBOX_TEST_IMAGE", "python:3.11-slim"
         )
-        pull = subprocess.run(
-            ["docker", "pull", cls.image_tag],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=300,
-            check=False,
-        )
-        if pull.returncode != 0:
-            raise unittest.SkipTest(
-                f"could not provision test image {cls.image_tag!r}"
+        try:
+            pull = subprocess.run(
+                ["docker", "pull", cls.image_tag],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=300,
+                check=False,
             )
-        inspect_result = subprocess.run(
-            [
-                "docker",
-                "image",
-                "inspect",
-                "--format",
-                "{{index .RepoDigests 0}}",
-                cls.image_tag,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-        )
+            if pull.returncode != 0:
+                raise RuntimeError(
+                    f"pull exit {pull.returncode}: {pull.stderr[-200:]!r}"
+                )
+            inspect_result = subprocess.run(
+                [
+                    "docker",
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{index .RepoDigests 0}}",
+                    cls.image_tag,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=True,
+            )
+        except (
+            OSError,
+            subprocess.TimeoutExpired,
+            subprocess.CalledProcessError,
+            RuntimeError,
+        ) as exc:
+            # Runtime/image provisioning unavailable -> honest skip, never
+            # a fake kernel-isolation claim and never a silent host run.
+            raise unittest.SkipTest(
+                f"could not provision sandbox test image: {exc}"
+            )
         cls.image_digest = inspect_result.stdout.strip()
         if "@sha256:" not in cls.image_digest:
             raise unittest.SkipTest("image has no resolvable content digest")
@@ -821,7 +833,7 @@ class RealContainerIntegrationTests(unittest.TestCase):
             (
                 "net",
                 "import socket,sys; sys.stdout.write("
-                "repr([n for n, _ in socket.if_nameindex()]))",
+                "repr([name for _, name in socket.if_nameindex()]))",
             ),
             (
                 "secret",
@@ -848,7 +860,7 @@ class RealContainerIntegrationTests(unittest.TestCase):
         profiles = {
             "integration": tuple(
                 ValidationStep(
-                    name=f"step-{name}",
+                    name=name,
                     working_directory=".",
                     argv=("python", "-c", code),
                     timeout_seconds=60,
