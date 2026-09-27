@@ -481,11 +481,14 @@ class RemediationOrchestrationService:
         """Post-create exact identity check (Phase 6.2.1B).
 
         Re-reads the PR through the same bounded discovery call and
-        requires the created PR (matched by URL) to prove: exact
-        repository head identity, exact head branch, the executed commit
-        SHA, the allowed base, and open/unmerged state. Title, body and
-        PR number alone are never identity; mismatch/malformed/missing
-        fails closed (no second create, no retarget, no force-push).
+        requires that discovery returns EXACTLY ONE PR for the
+        deterministic head/base pair (uniqueness, Phase 6.2.1C) and that
+        this sole PR — matched by exact URL — proves: exact repository
+        head identity, exact head branch, the executed commit SHA, the
+        allowed base, open/unmerged, and draft. Title, body and PR
+        number alone are never identity; mismatch/malformed/missing/
+        duplicate fails closed (no second create, no retarget, no
+        force-push).
         """
         if not isinstance(created_url, str) or not created_url.strip():
             raise ExistingPullRequestConflict(
@@ -505,17 +508,22 @@ class RemediationOrchestrationService:
             raise RemoteReconciliationFailed(
                 "created pull request verification returned an unexpected result"
             )
-        created = [
-            item
-            for item in matches
-            if getattr(item, "url", "") == created_url
-        ]
-        if len(created) != 1:
+        # Uniqueness invariant (Phase 6.2.1C): the deterministic
+        # head/base pair must resolve to exactly ONE discovered PR —
+        # finding the created URL among several matches would let a
+        # duplicate remediation PR masquerade as verified.
+        if len(matches) != 1:
+            raise ExistingPullRequestConflict(
+                "post-create verification requires exactly one discovered "
+                "pull request for the deterministic head/base pair; found "
+                f"{len(matches)}"
+            )
+        pull = matches[0]
+        if getattr(pull, "url", "") != created_url:
             raise ExistingPullRequestConflict(
                 "newly created pull request could not be re-verified against "
                 "the remote"
             )
-        pull = created[0]
         expected_sha = (commit_sha or "").strip().lower()
         expected_repo = (proposal.repository or "").strip().lower()
         problems = []
@@ -529,6 +537,10 @@ class RemediationOrchestrationService:
             problems.append("head commit")
         if not expected_repo or (getattr(pull, "head_repository", "") or "").strip().lower() != expected_repo:
             problems.append("head repository")
+        if not getattr(pull, "draft", False):
+            # this phase stops at a draft PR — a published (non-draft)
+            # created PR is not the authorized artifact
+            problems.append("draft")
         if problems:
             raise ExistingPullRequestConflict(
                 "newly created pull request does not prove exact identity ("

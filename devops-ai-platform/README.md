@@ -670,6 +670,26 @@ on lost responses) is unchanged.
 - Postgres must be treated as external evidence: the claims table has
   no migration — schema remains code-defined (`metadata.create_all`).
 
+## Phase 6.2.1C — Finish CAS atomicity & post-create PR uniqueness
+
+Two correctness gaps from the 6.2.1B review, no architecture change:
+
+- `finish_execution_lease()` raises the coordination-race error when the
+  final claim CAS affects zero rows so the whole transaction (proposal
+  terminal state, mirrors, failure fields, evidence) rolls back — a
+  stale worker whose lease was replaced can never commit through that
+  path. Existing typed failure handling and owner-gated semantics are
+  unchanged; this is stale-writer isolation, **not** exactly-once.
+- Post-create PR verification requires **exactly one** discovered PR for
+  the deterministic head/base pair, then verifies that sole PR's exact
+  URL, head repository, head branch, executed SHA, allowed base,
+  open/unmerged state, and draft status. Duplicates, non-draft results,
+  mismatches or malformed discovery all fail closed with at most one
+  create ever issued; discovery-before-create reuse is untouched.
+
+Known limit: deterministic interleavings are proven on SQLite; concurrent
+PostgreSQL writers remain untested in CI.
+
 ## Network & authentication trust boundary
 
 * **External boundary = API gateway only.** `docker-compose.yml` publishes a

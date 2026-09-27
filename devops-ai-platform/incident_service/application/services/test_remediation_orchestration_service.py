@@ -684,6 +684,30 @@ class PullRequestReconciliationTests(unittest.TestCase):
             self._run()
         self.github.create_pull_request.assert_called_once()
 
+    def test_multiple_discovered_matching_prs_rejected(self):
+        """Phase 6.2.1C: the deterministic head/base pair must resolve
+        to exactly ONE PR — a duplicate masquerading next to the created
+        URL never authorizes."""
+        created = self._verification_payload()  # url .../pull/42
+        duplicate = self._verification_payload(
+            number=43, url="https://github.com/owner/repo/pull/43"
+        )
+        self.github.find_existing_pull_requests.side_effect = [
+            [],
+            [created, duplicate],
+        ]
+        with self.assertRaises(ExistingPullRequestConflict):
+            self._run()
+        self.github.create_pull_request.assert_called_once()
+
+    def test_created_pr_not_draft_rejected(self):
+        payload = self._verification_payload(draft=False)
+        self._run_with_verification_payload(payload)
+        with self.assertRaises(ExistingPullRequestConflict) as ctx:
+            self._run()
+        self.assertIn("draft", str(ctx.exception))
+        self.github.create_pull_request.assert_called_once()
+
     def test_new_pr_created_url_not_discoverable_rejected(self):
         self.github.find_existing_pull_requests.side_effect = [
             [],

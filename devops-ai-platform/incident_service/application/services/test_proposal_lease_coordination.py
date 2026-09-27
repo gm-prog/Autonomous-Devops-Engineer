@@ -770,6 +770,254 @@ class StrictLeaseExpiryTests(unittest.TestCase):
             self.assertEqual(state_final[key], state_after_b[key], key)
 
 
+class FinishStaleWriterAtomicityTests(unittest.TestCase):
+    """Phase 6.2.1C Goal A: when finish's final claim CAS affects 0
+    rows, the ENTIRE finish transaction must roll back — a stale worker
+    must never commit terminal proposal state (status/stage/commit/
+    branch/PR URL/failure fields/evidence) after its lease was replaced.
+
+    Deterministic interleaving (event barriers, no timing sleeps):
+
+        A claim read (live, passes read-check)
+            ↓
+        PAUSE A at its proposals UPDATE (before any write lock)
+            ↓
+        B replaces the lease + B persists its own durable state
+            ↓
+        RESUME A → A proposals CAS matches → A claim CAS = 0 rows
+            ↓
+        finish raises _CoordinationRace → transaction ROLLS BACK
+            ↓
+        B's claim + proposal + evidence state byte-identical
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        url = f"sqlite:///{os.path.join(self._temp.name, 'finish.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        self.engine = self.repository.engine
+        seed, self.proposal_hash = _seed_incident()
+        self.repository.save_incident(seed)
+        self.now = datetime.now(timezone.utc)
+        reason, _ = self.repository.claim_execution_lease(
+            "inc-lease-1",
+            "proposal-inc-lease-1",
+            self.proposal_hash,
+            owner="worker-a",
+            now=self.now,
+            lease_seconds=600.0,
+        )
+        assert reason == "claimed", reason
+
+    @staticmethod
+    def _proposal_state(repository, incident_id, proposal_id):
+        incident = repository.get_incident_by_id(incident_id)
+        proposal = next(
+            item for item in incident.patch_proposals
+            if item.id == proposal_id
+        )
+        return {
+            "status": proposal.status,
+            "execution_stage": proposal.execution_stage,
+            "execution_attempts": proposal.execution_attempts,
+            "commit_sha": proposal.commit_sha,
+            "branch_name": proposal.branch_name,
+            "pull_request_url": proposal.pull_request_url,
+            "last_failure_stage": proposal.last_failure_stage,
+            "last_failure_reason": proposal.last_failure_reason,
+        }
+
+    def test_stale_finish_rolls_back_terminal_and_evidence_writes(self):
+        from sqlalchemy import event, select as sa_select
+
+        from incident_service.domain.entities.incident_evidence import (
+            IncidentEvidence,
+        )
+        from incident_service.infrastructure.database.postgres_incident_repo import (
+            _CoordinationRace,
+            evidence_table,
+        )
+
+        a_ident = [None]
+        paused = threading.Event()
+        release = threading.Event()
+        pause_hits = [0]
+
+        def _pause_before_a_proposals(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            # only A's finish touches incidents; A's thread is the only
+            # thread inside finish, and pause exactly once
+            if (
+                a_ident[0] is not None
+                and threading.get_ident() == a_ident[0]
+                and statement.lstrip().upper().startswith("UPDATE")
+                and "incidents" in statement
+                and pause_hits[0] == 0
+            ):
+                pause_hits[0] += 1
+                paused.set()
+                if not release.wait(timeout=10):
+                    raise RuntimeError("test never released paused finish")
+
+        event.listen(
+            self.engine, "before_cursor_execute", _pause_before_a_proposals
+        )
+        self.addCleanup(
+            event.remove,
+            self.engine,
+            "before_cursor_execute",
+            _pause_before_a_proposals,
+        )
+
+        evidence = IncidentEvidence(
+            id="ev-stale-finish",
+            kind="execution_log",
+            source="stale-worker-a",
+            observed_at=datetime.now(timezone.utc),
+            payload={"attempt": 1},
+        )
+        outcome = {}
+
+        def _run_stale_finish():
+            a_ident[0] = threading.get_ident()
+            try:
+                outcome["ret"] = self.repository.finish_execution_lease(
+                    "inc-lease-1",
+                    "proposal-inc-lease-1",
+                    "worker-a",
+                    status="EXECUTION_FAILED",
+                    stage="WORKSPACE_CREATED",
+                    now=datetime.now(timezone.utc),
+                    updates={
+                        "commit_sha": "a" * 40,
+                        "branch_name": "automation/remediation/stale-a",
+                        "pull_request_url":
+                            "https://github.com/owner/repo/pull/999",
+                        "last_failure_stage": "workspace.created",
+                        "last_failure_reason": "boom",
+                    },
+                    evidence=evidence,
+                )
+            except BaseException as exc:  # noqa: BLE001 — record anything
+                outcome["exc"] = exc
+
+        worker_a = threading.Thread(target=_run_stale_finish)
+        worker_a.start()
+        self.assertTrue(
+            paused.wait(timeout=10),
+            "worker A never reached the finish write window",
+        )
+        # A has read its OWN live claim (read-check passed). B now
+        # replaces the lease and persists its own durable state.
+        now_b = datetime.now(timezone.utc)
+        with self.engine.begin() as connection:
+            connection.execute(
+                sa_update(execution_claims_table)
+                .where(
+                    execution_claims_table.c.incident_id == "inc-lease-1"
+                )
+                .values(
+                    state="LEASED",
+                    lease_owner="worker-b",
+                    lease_acquired_at=now_b,
+                    lease_expires_at=now_b + timedelta(seconds=600),
+                    last_heartbeat_at=now_b,
+                    completed_at=None,
+                    attempt=2,
+                    stage="CLAIMED",
+                )
+            )
+        self.assertTrue(
+            self.repository.persist_execution_progress(
+                "inc-lease-1",
+                "proposal-inc-lease-1",
+                "worker-b",
+                stage="WORKSPACE_CREATED",
+                now=datetime.now(timezone.utc),
+                lease_seconds=600.0,
+                commit_sha="b" * 40,
+                branch_name="automation/remediation/inc-lease-1/proposal-1",
+            ),
+            "worker B must be able to persist while A is paused",
+        )
+        # snapshots AFTER B's state — A must leave every one intact
+        claim_before = self.repository.get_execution_claim(
+            "inc-lease-1", "proposal-inc-lease-1"
+        )
+        proposal_before = self._proposal_state(
+            self.repository, "inc-lease-1", "proposal-inc-lease-1"
+        )
+        with self.engine.connect() as connection:
+            evidence_ids_before = sorted(
+                row[0]
+                for row in connection.execute(
+                    sa_select(evidence_table.c.id).where(
+                        evidence_table.c.incident_id == "inc-lease-1"
+                    )
+                )
+            )
+
+        release.set()
+        worker_a.join(timeout=10)
+        self.assertFalse(worker_a.is_alive(), "stale finish deadlocked")
+
+        # (1) A never finished successfully: it raised, not returned
+        self.assertNotIn("ret", outcome)
+        self.assertIn("exc", outcome)
+        self.assertIsInstance(outcome["exc"], _CoordinationRace)
+
+        # (2) A cannot release B's lease; B's claim state byte-identical
+        claim_after = self.repository.get_execution_claim(
+            "inc-lease-1", "proposal-inc-lease-1"
+        )
+        for key in (
+            "lease_owner",
+            "state",
+            "attempt",
+            "stage",
+            "lease_expires_at",
+            "lease_acquired_at",
+            "last_heartbeat_at",
+            "completed_at",
+            "commit_sha",
+            "branch_name",
+            "last_failure_stage",
+            "last_failure_reason",
+        ):
+            self.assertEqual(claim_after[key], claim_before[key], key)
+
+        # (3) terminal proposal state was NOT written by A (rollback)
+        proposal_after = self._proposal_state(
+            self.repository, "inc-lease-1", "proposal-inc-lease-1"
+        )
+        self.assertEqual(proposal_after, proposal_before)
+        self.assertEqual(proposal_after["status"], "EXECUTING")
+        # commit/branch shown are B's (claim overlay), never A's stale
+        # mirrors or terminal failure fields
+        self.assertEqual(proposal_after["commit_sha"], "b" * 40)
+        self.assertEqual(
+            proposal_after["branch_name"],
+            "automation/remediation/inc-lease-1/proposal-1",
+        )
+        self.assertFalse(proposal_after["pull_request_url"])
+        self.assertFalse(proposal_after["last_failure_stage"])
+
+        # (4) A's evidence was never attached (rollback demonstrable)
+        with self.engine.connect() as connection:
+            evidence_ids_after = sorted(
+                row[0]
+                for row in connection.execute(
+                    sa_select(evidence_table.c.id).where(
+                        evidence_table.c.incident_id == "inc-lease-1"
+                    )
+                )
+            )
+        self.assertEqual(evidence_ids_after, evidence_ids_before)
+        self.assertNotIn("ev-stale-finish", evidence_ids_after)
+
+
 class MultiProposalClaimProjectionTests(unittest.TestCase):
     """Phase 6.2.1A: one incident, many proposals — claims project
     independently by proposal_id; no proposal inherits another's state."""

@@ -470,7 +470,16 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 .values(**claim_values)
             )
             if claim_update.rowcount != 1:
-                return False
+                # The proposals mutation above is already staged in THIS
+                # transaction. Returning normally here would commit stale
+                # terminal state (status/stage/commit/branch/PR/failure)
+                # after another worker replaced the lease — raise so the
+                # whole transaction rolls back (stale-writer isolation;
+                # not exactly-once: external effects are unchanged).
+                raise _CoordinationRace(
+                    "claim row changed during finish; rolling back "
+                    "terminal write"
+                )
 
             if evidence is not None:
                 connection.execute(

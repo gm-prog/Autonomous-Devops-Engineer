@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 2026-09-28 — Phase 6.2.1C: finish CAS atomicity & post-create PR uniqueness (corrective hardening)
+
+- **Finish transaction atomicity.** `finish_execution_lease()` now raises
+  the existing `_CoordinationRace` when its final claim CAS affects zero
+  rows, instead of returning normally. The proposal/status/stage/commit/
+  branch/PR-URL/failure-field mutations staged earlier in the same
+  transaction are thereby rolled back wholesale: a stale worker whose
+  lease was replaced can never commit terminal proposal state or attach
+  evidence through that path. Callers keep the existing typed failure
+  behavior (`ExecutionLeaseUnavailable`, fail closed). Transactional
+  stale-writer isolation only — not exactly-once semantics.
+- **Post-create pull request uniqueness.** `_verify_created_pr_identity()`
+  now requires the deterministic head/base pair to resolve to exactly
+  ONE discovered PR (`len(matches) == 1`) before verifying that sole PR's
+  exact URL, repository, head branch, executed head SHA, allowed base,
+  open/unmerged state — and that it is still a draft (this phase stops at
+  a draft PR). A duplicate PR discovered next to the created URL is a
+  conflict; no second create, no retarget, no force-push. Existing
+  discovery-before-create reuse rules are unchanged.
+- Honest limit: concurrency exercised on SQLite through the portable
+  SQLAlchemy path; PostgreSQL concurrent-writer behavior remains a known
+  CI limitation. Not "production-safe" by assertion.
+
 ## 2026-09-27 — Phase 6.2.1B: lease expiry enforcement & pre-side-effect authorization (corrective hardening)
 
 - **Lease expiry is now authoritative for every durable write.** `renew_execution_lease`,
