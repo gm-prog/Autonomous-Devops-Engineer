@@ -11,7 +11,7 @@ CI):
 
 | Service | Package | Entrypoint | Exposes |
 |---|---|---|---|
-| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal` (HS256 JWT, operator roles where noted), `/health` |
+| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal`, `/v1/incidents/{id}/proposal/approve`, `/v1/incidents/{id}/proposal/execute` (HS256 JWT, operator roles where noted), `/health` |
 | Repo context | `repo_service` | `repo_service.main:app` :8010 | `POST /repositories`, `/health` |
 | Agent swarm | `agent_service` | `agent_service.main:app` :8020 | `GET /agent/streams/{task_id}` (SSE), `/health` |
 | Deployment | `deployment_service` | Celery worker | task `tasks.execute_iac_deployment` (Redis broker) |
@@ -361,3 +361,28 @@ GitHub no-fake-PR guard, and the Phase 6.1 proposal pipeline
 (event-id idempotency, monitoring producer, schema fail-closed RCA,
 target binding, deterministic risk/hash, proposal endpoints + gateway
 read route, reload round-trip, blocked outcomes, no-side-effect spies).
+
+
+## Phase 7 — Approval-bound autonomous remediation execution
+
+Phase 6.1 proposals are now executable through a separate, authenticated control-plane transition. The execution contract is deliberately narrow:
+
+```text
+POST /v1/incidents/{id}/proposal/approve
+  -> operator JWT
+  -> persisted proposal id + exact proposal_hash
+  -> domain transition PROPOSED -> APPROVED
+
+POST /v1/incidents/{id}/proposal/execute
+  -> operator JWT
+  -> persisted proposal id + exact proposal_hash
+  -> integrity re-hash + RCA/evidence verification
+  -> re-authorize DEPLOYED repository/SHA provenance
+  -> deterministic patch validation
+  -> existing remediation workspace/commit/push/PR pipeline
+  -> persisted PR_CREATED state
+```
+
+The execute request intentionally contains **no repository, source SHA, target path, patch, branch or arbitrary command**. Those values are taken only from the persisted proposal and the incident's authoritative deployment evidence. Approval is bound to the proposal's SHA-256 canonical hash. Execution retries after a successful PR publication are idempotent and return the existing PR without invoking the remediation orchestrator again. If the proposal is modified after approval, the canonical hash check blocks execution.
+
+The Phase 7 service is an execution adapter around the already-hardened RemediationOrchestrationService; it does not introduce a second Git/GitHub implementation. The existing orchestrator remains responsible for the SHA-pinned workspace, single-file patch, fixed validation profile, deterministic commit, remote SHA verification, and draft GitHub PR.
