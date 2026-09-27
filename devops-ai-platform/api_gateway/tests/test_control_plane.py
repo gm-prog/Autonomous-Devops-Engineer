@@ -1,0 +1,191 @@
+"""Control-plane authorization tests (Stage 5 §E/§F/§N).
+
+Proves, at the gateway boundary and before any downstream call:
+
+* no/invalid/expired/wrong-key JWT → 401 on every control-plane route;
+* ordinary (non-operator) roles → 403 on approve/execute/remediation, and
+  the downstream is NEVER contacted (no existence probing);
+* dry-run is open to any authenticated user (requests are inert until an
+  operator approves);
+* ``requested_by`` / ``approved_by`` are overwritten with the JWT ``sub`` —
+  caller-supplied identity strings are discarded;
+* downstream status/body are relayed faithfully (404 for unknown ids,
+  409 for state-machine rejections) and an unreachable downstream → 502.
+"""
+
+import unittest
+from unittest.mock import MagicMock, patch
+
+from fastapi.testclient import TestClient
+
+from api_gateway.core.auth import GatewaySettings, mint_token
+from api_gateway.main import app
+
+client = TestClient(app)
+
+DRY_RUN = "/v1/deployments/dry-run"
+APPROVE = "/v1/deployments/run-42/approve"
+EXECUTE = "/v1/deployments/run-42/execute"
+REMEDIATION = "/v1/incidents/inc-42/remediation"
+CONTROL_PLANE_ROUTES = (DRY_RUN, APPROVE, EXECUTE, REMEDIATION)
+MUTATING_ROUTES = (APPROVE, EXECUTE, REMEDIATION)
+
+CONTROL_PLANE = "api_gateway.routers.control_plane"
+
+
+def _authed(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _operator(subject="alice-operator"):
+    return mint_token(subject, roles=["DevOpsLead"], secret=GatewaySettings.JWT_SECRET)
+
+
+def _downstream(status_code=200, body=None):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = body if body is not None else {"ok": True}
+    resp.text = "..."
+    return resp
+
+
+def _post_mock():
+    return patch(f"{CONTROL_PLANE}.requests.post")
+
+
+class ControlPlaneAuthenticationTests(unittest.TestCase):
+    def test_unauthenticated_requests_are_rejected_before_forwarding(self):
+        for route in CONTROL_PLANE_ROUTES:
+            with self.subTest(route=route), _post_mock() as post:
+                resp = client.post(route, json={})
+                self.assertIn(resp.status_code, (401, 403))
+                post.assert_not_called()
+
+    def test_malformed_token_rejected_before_forwarding(self):
+        for route in CONTROL_PLANE_ROUTES:
+            with self.subTest(route=route), _post_mock() as post:
+                resp = client.post(
+                    route,
+                    json={},
+                    headers=_authed("not-a-jwt"),
+                )
+                self.assertIn(resp.status_code, (401, 403))
+                post.assert_not_called()
+
+    def test_wrong_key_and_expired_tokens_rejected(self):
+        wrong_key = mint_token("mallory", secret="some-other-key")
+        expired = mint_token(
+            "mallory", secret=GatewaySettings.JWT_SECRET, ttl_seconds=-1
+        )
+        for token, why in ((wrong_key, "wrong-key"), (expired, "expired")):
+            with self.subTest(why=why), _post_mock() as post:
+                resp = client.post(APPROVE, json={}, headers=_authed(token))
+                self.assertIn(resp.status_code, (401, 403))
+                post.assert_not_called()
+
+
+class ControlPlaneRoleAuthorizationTests(unittest.TestCase):
+    def test_ordinary_user_cannot_approve_execute_or_remediate(self):
+        ordinary = mint_token("bob-developer", roles=["Developer"])
+        for route in MUTATING_ROUTES:
+            with self.subTest(route=route), _post_mock() as post:
+                resp = client.post(route, json={}, headers=_authed(ordinary))
+                self.assertEqual(resp.status_code, 403, resp.text)
+                self.assertIn("operator role", resp.json()["detail"])
+                post.assert_not_called()  # nothing even reaches the network
+
+    def test_roleless_token_is_not_an_operator(self):
+        roleless = mint_token("nobody", roles=[])
+        with _post_mock() as post:
+            resp = client.post(APPROVE, json={}, headers=_authed(roleless))
+        self.assertEqual(resp.status_code, 403)
+        post.assert_not_called()
+
+    def test_every_documented_operator_role_is_accepted(self):
+        for role in ("operator", "DevOpsLead", "ClusterAdmin"):
+            with self.subTest(role=role), _post_mock() as post:
+                post.return_value = _downstream()
+                token = mint_token("op", roles=[role])
+                resp = client.post(APPROVE, json={}, headers=_authed(token))
+                self.assertEqual(resp.status_code, 200, resp.text)
+                post.assert_called_once()
+
+    def test_dry_run_is_open_to_any_authenticated_user(self):
+        ordinary = mint_token("bob-developer", roles=["Developer"])
+        with _post_mock() as post:
+            post.return_value = _downstream()
+            resp = client.post(
+                DRY_RUN,
+                json={"repository_name": "acme/checkout"},
+                headers=_authed(ordinary),
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        post.assert_called_once()
+
+
+class ControlPlaneIdentityTests(unittest.TestCase):
+    def test_requested_by_is_stamped_from_the_jwt_subject(self):
+        token = mint_token("alice-operator", roles=["DevOpsLead"])
+        with _post_mock() as post:
+            post.return_value = _downstream()
+            resp = client.post(
+                DRY_RUN,
+                json={"repository_name": "acme/checkout", "requested_by": "mallory"},
+                headers=_authed(token),
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        forwarded = post.call_args.kwargs["json"]
+        self.assertEqual(forwarded["requested_by"], "alice-operator")
+        self.assertEqual(forwarded["repository_name"], "acme/checkout")
+
+    def test_approved_by_is_stamped_from_the_jwt_subject(self):
+        token = mint_token("alice-operator", roles=["DevOpsLead"])
+        with _post_mock() as post:
+            post.return_value = _downstream()
+            resp = client.post(
+                APPROVE,
+                json={"approved_by": "mallory", "artifact_hash": "a" * 64},
+                headers=_authed(token),
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        forwarded = post.call_args.kwargs["json"]
+        self.assertEqual(forwarded["approved_by"], "alice-operator")
+        self.assertNotEqual(forwarded["approved_by"], "mallory")
+
+
+class ControlPlaneRelayTests(unittest.TestCase):
+    def test_downstream_statuses_are_relayed_faithfully(self):
+        token = _operator()
+        for status, body in (
+            (404, {"detail": "Deployment run not found"}),
+            (409, {"detail": "Only an APPROVED deployment can execute."}),
+            (422, {"detail": "requested source revision was not found"}),
+        ):
+            with self.subTest(status=status), _post_mock() as post:
+                post.return_value = _downstream(status, body)
+                resp = client.post(EXECUTE, json={}, headers=_authed(token))
+                self.assertEqual(resp.status_code, status)
+                self.assertEqual(resp.json(), body)
+
+    def test_unreachable_downstream_is_502(self):
+        import requests as requests_lib
+
+        token = _operator()
+        with _post_mock() as post:
+            post.side_effect = requests_lib.ConnectionError("refused")
+            resp = client.post(REMEDIATION, json={}, headers=_authed(token))
+        self.assertEqual(resp.status_code, 502)
+        self.assertIn("unreachable", resp.json()["detail"])
+
+    def test_internal_prefix_still_404_at_the_gateway(self):
+        """Knowing /api/internal/* grants nothing: control-plane auth is on
+        named /v1 routes, not on path prefixes."""
+        token = _operator()
+        resp = client.post(
+            "/api/internal/deployments/dry-run", json={}, headers=_authed(token)
+        )
+        self.assertEqual(resp.status_code, 404)
+
+
+if __name__ == "__main__":
+    unittest.main()
