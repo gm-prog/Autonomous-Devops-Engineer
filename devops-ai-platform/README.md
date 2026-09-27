@@ -15,7 +15,7 @@ CI):
 | Repo context | `repo_service` | `repo_service.main:app` :8010 | `POST /repositories`, `/health` |
 | Agent swarm | `agent_service` | `agent_service.main:app` :8020 | `GET /agent/streams/{task_id}` (SSE), `/health` |
 | Deployment | `deployment_service` | Celery worker | task `tasks.execute_iac_deployment` (Redis broker) |
-| Monitoring | `monitoring_service` | `monitoring_service.main:app` :8040 | `WS /ws/telemetry/socket/{client_id}`, `/health` |
+| Monitoring | `monitoring_service` | `monitoring_service.main:app` :8040 | `WS /ws/telemetry/socket/{client_id}`, `POST /api/internal` (observation → threshold event, dispatch target), `/health` |
 | Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
 | Reporting | `reporting_service` | (library) | weekly audit-report queries + "PDF" engine |
 | Shared kernel | `shared_kernel` | (library) | domain events, value objects, event publisher, metrics |
@@ -179,12 +179,22 @@ monitoring breach → ThreatThresholdExceededEvent (devops:events)
   → canonical proposal_hash → persisted for human review
 ```
 
-* **Producer wiring:** `ThresholdValidator(publisher=RedisStreamPublisher())`
-  publishes the exact event type the existing incident consumer dispatches.
-  *Observed:* no production entrypoint currently constructs
-  `ThresholdValidator` (the monitoring app exposes `/health`); the wiring is
-  a constructor-injected library capability covered by deterministic tests,
-  not a live-Redis CI job.
+* **Producer wiring (live vertical slice):** the monitoring runtime now
+  composes the real chain — `monitoring_service.main` wires
+  `application/dependencies.build_threshold_monitor()` (env config
+  `MONITORING_DANGER_LIMIT`, default 90.0) → `RedisStreamPublisher`
+  (env `EVENT_BUS_REDIS_URL` / `EVENT_BUS_STREAM`, default
+  `devops:events`) → existing `ThresholdValidator`. Input arrives at
+  `POST /api/internal` (the target of the gateway's generic
+  `dispatch/monitoring` proxy; envelope `{"payload": <observation>,
+  "forwarded_by": <jwt sub>}`); a breach publishes
+  `ThreatThresholdExceededEvent` using the exact stream-field envelope
+  `RedisIncidentEventConsumer` deserializes
+  (`event_id`/`event_type`/`aggregate_id`/`timestamp`/`payload`). The
+  incident-event-worker consumes it with the existing idempotent handler.
+  Compose provisions monitoring with the event bus env + redis dependency
+  (still no host ports). Fakes sit only at adapter boundaries (Redis
+  client, RCA port) — the composition path itself is the production one.
 * **Idempotency (§4):** incident id = `uuid5(event_id)`; threshold evidence
   id likewise. Redelivering the same event returns the existing incident and
   never duplicates evidence; proposal regeneration upserts by deterministic
@@ -258,8 +268,11 @@ never trigger execution.
   `git apply --check` is **not** run in Phase 6.1: a proposal-only pipeline
   never materializes a source snapshot, so there is no tree to check
   against (noted honestly instead of skipped silently).
-* Stream production is unit/E2E tested with deterministic fakes; CI does
-  not run a live Redis (see producer-wiring note above).
+* Stream production runs through the real composed publisher; CI fakes
+  only the Redis client (adapter boundary) and does not run a live Redis.
+  The gateway→`/api/internal` hop is covered by the dispatch proxy tests;
+  the monitoring receiver itself is exercised directly as an in-network
+  caller.
 
 ## Network & authentication trust boundary
 
@@ -360,4 +373,8 @@ import, shared-kernel VOs/events, Celery task registration,
 GitHub no-fake-PR guard, and the Phase 6.1 proposal pipeline
 (event-id idempotency, monitoring producer, schema fail-closed RCA,
 target binding, deterministic risk/hash, proposal endpoints + gateway
-read route, reload round-trip, blocked outcomes, no-side-effect spies).
+read route, reload round-trip, blocked outcomes, no-side-effect spies),
+plus the live vertical slice: monitoring runtime composition →
+`POST /api/internal` → consumer envelope → incident consumer →
+proposal (duplicate-event, malformed-input, prompt-injection-as-data and
+no-side-effect cases included).

@@ -91,8 +91,15 @@ services:
       context: .
       dockerfile: ./monitoring_service/Dockerfile
     container_name: devops_monitoring_service
+    environment:
+      # Phase 6.1: breach evaluation + event publication (same bus the
+      # incident-event-worker consumes)
+      - MONITORING_DANGER_LIMIT=${MONITORING_DANGER_LIMIT:-90.0}
+      - EVENT_BUS_REDIS_URL=redis://redis:6379/0
+      - EVENT_BUS_STREAM=devops:events
     depends_on:
       - postgres
+      - redis
 
   incident-service:
     build:

@@ -50,13 +50,27 @@ class RedisStreamPublisher:
         return self._client
 
     def publish(self, event: Any) -> str:
-        """XADD the event's ``to_dict()`` payload; returns the stream id."""
+        """XADD the event using the consumer's field envelope.
+
+        ``RedisIncidentEventConsumer._deserialize`` reads the stream
+        fields ``event_id`` / ``event_type`` / ``aggregate_id`` /
+        ``timestamp`` / ``payload`` (payload as a JSON string) — the
+        producer must speak exactly that convention or messages are
+        acknowledged without ever reaching a handler.
+        """
         body = event.to_dict()
-        stream_id = self.client.xadd(self.stream_name, {"data": json.dumps(body)})
+        fields = {
+            "event_id": str(body.get("event_id") or ""),
+            "event_type": str(body.get("event_type") or ""),
+            "aggregate_id": str(body.get("aggregate_id") or ""),
+            "timestamp": str(body.get("timestamp") or ""),
+            "payload": json.dumps(body.get("payload") or {}),
+        }
+        stream_id = self.client.xadd(self.stream_name, fields)
         logger.info(
             "Published event_type=%s event_id=%s stream_id=%s",
-            body.get("event_type"),
-            body.get("event_id"),
+            fields["event_type"],
+            fields["event_id"],
             stream_id,
         )
         return stream_id

@@ -80,7 +80,7 @@ class ThresholdValidatorPublisherTests(unittest.TestCase):
 
 
 class RedisStreamPublisherTests(unittest.TestCase):
-    def test_publish_xadds_json_payload_on_configured_stream(self):
+    def test_publish_xadds_consumer_field_envelope(self):
         client = FakeRedisClient()
         publisher = RedisStreamPublisher(
             redis_url="redis://unused:6379/0",
@@ -97,10 +97,25 @@ class RedisStreamPublisherTests(unittest.TestCase):
         self.assertEqual(len(client.added), 1)
         stream_name, fields = client.added[0]
         self.assertEqual(stream_name, "devops:events")
-        decoded = json.loads(fields["data"])
-        self.assertEqual(decoded["event_id"], event.event_id)
+        # exact envelope RedisIncidentEventConsumer._deserialize reads
+        self.assertEqual(
+            sorted(fields),
+            ["aggregate_id", "event_id", "event_type", "payload", "timestamp"],
+        )
+        self.assertEqual(fields["event_id"], event.event_id)
+        self.assertEqual(fields["event_type"], "ThreatThresholdExceededEvent")
+        self.assertEqual(fields["aggregate_id"], "gateway")
+        payload = json.loads(fields["payload"])
+        self.assertEqual(payload, {"average": 97.0})
+        # round-trip through the real consumer deserializer
+        from incident_service.infrastructure.messaging.redis_incident_consumer import (
+            RedisIncidentEventConsumer,
+        )
+
+        decoded = RedisIncidentEventConsumer._deserialize(fields)
         self.assertEqual(decoded["event_type"], "ThreatThresholdExceededEvent")
-        self.assertEqual(decoded["payload"], {"average": 97.0})
+        self.assertEqual(decoded["payload"]["average"], 97.0)
+        self.assertEqual(decoded["event_id"], event.event_id)
 
     def test_env_overrides_default_stream(self):
         import os

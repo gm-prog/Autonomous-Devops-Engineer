@@ -1,5 +1,42 @@
 # CHANGELOG
 
+## 2026-09-27 — Phase 6.1 live vertical slice: monitoring runtime wiring
+
+Closes the last runtime gap of the monitoring → proposal chain (proposal
+remains proposal-only; nothing executes).
+
+* **Monitoring composition root** — `monitoring_service` now composes the
+  real producer at runtime: `application/dependencies.build_threshold_monitor()`
+  (env `MONITORING_DANGER_LIMIT`, fail-fast config) → `RedisStreamPublisher`
+  (`EVENT_BUS_REDIS_URL` / `EVENT_BUS_STREAM`) → existing
+  `ThresholdValidator`; the entrypoint only wires routers/delegates.
+* **Runtime input** — `POST /api/internal` on the monitoring app (the
+  gateway `dispatch/monitoring` target, envelope
+  `{"payload": <observation>, "forwarded_by": <jwt sub>}`) validates
+  observations (bounded fields, finite floats — malformed → 422 with a
+  sanitized error body) and delegates to the composed monitor; breaches
+  publish `ThreatThresholdExceededEvent`, non-breaches publish nothing;
+  event-bus failure → explicit 503 (never silent).
+* **Producer/consumer envelope fix** — `RedisStreamPublisher` now XADDs
+  the field set `RedisIncidentEventConsumer._deserialize` actually reads
+  (`event_id`, `event_type`, `aggregate_id`, `timestamp`, `payload` as
+  JSON string). Previously the single `data` field would have been
+  acknowledged and dropped — the live chain could never connect.
+* **Observability** — structured `monitoring.threshold_exceeded` marker
+  (event_id/service/metric/value/threshold/correlation id; ids+numbers
+  only). Optional observation `metrics` context passes through the
+  pre-existing `payload.metrics` envelope key the incident handler
+  already reads — no new schema fields.
+* **Compose** — monitoring-service gains event-bus env + `depends_on:
+  redis` (still no host ports; gateway-only publication preserved).
+* **Tests** — producer test updated to the consumer envelope + real
+  deserializer round-trip; new `tests/test_monitoring_runtime_slice.py`:
+  composition/config unit tests, ingestion contract (publish, no-breach,
+  malformed 422, bus 503, prompt-injection-as-data), and the vertical
+  slice `monitoring input → event → consumer → incident (duplicate-event
+  idempotent) → deployment evidence → RCA → persisted proposal` with
+  no-side-effect spies across the whole chain.
+
 ## 2026-09-27 — Phase 6.1: incident → evidence → RCA → structured remediation proposal
 
 Proposal-only pipeline inside `devops-ai-platform/incident_service` (no
