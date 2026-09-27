@@ -171,6 +171,38 @@ class DeterministicFakeGitHub:
                     import requests as _requests
 
                     raise _requests.Timeout("pr response timed out")
+                if self.fail_pull_create == "lose_response":
+                    # PR exists remotely but the client never sees the
+                    # response (network failure after server commit)
+                    payload_lost = kwargs.get("json") or {}
+                    number = 100 + len(self.prs) + 1
+                    self.prs.append(
+                        {
+                            "number": number,
+                            "html_url": (
+                                f"https://github.com/{REPO_SLUG}/pull/{number}"
+                            ),
+                            "state": "open",
+                            "draft": True,
+                            "merged": False,
+                            "merged_at": None,
+                            "title": payload_lost.get("title", ""),
+                            "body": payload_lost.get("body", ""),
+                            "head": {
+                                "ref": payload_lost.get("head", ""),
+                                "sha": self.refs.get(
+                                    payload_lost.get("head", ""), ""
+                                ),
+                                "repo": {"full_name": REPO_SLUG},
+                            },
+                            "base": {"ref": payload_lost.get("base", "")},
+                        }
+                    )
+                    import requests as _requests
+
+                    raise _requests.Timeout(
+                        "connection lost after PR creation"
+                    )
                 return _Resp(500, {"message": "server exploded"})
             payload = kwargs.get("json") or {}
             number = 100 + len(self.prs) + 1
@@ -183,7 +215,11 @@ class DeterministicFakeGitHub:
                 "merged_at": None,
                 "title": payload.get("title", ""),
                 "body": payload.get("body", ""),
-                "head": {"ref": payload.get("head", ""), "sha": ""},
+                "head": {
+                    "ref": payload.get("head", ""),
+                    "sha": self.refs.get(payload.get("head", ""), ""),
+                    "repo": {"full_name": REPO_SLUG},
+                },
                 "base": {"ref": payload.get("base", ""), "sha": ""},
             }
             self.prs.append(pr)
@@ -516,6 +552,44 @@ class ExecutionRecoveryE2ETests(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertEqual(conflicts[0].payload["attempt"], 1)
 
+    def test_pr_created_remotely_but_response_lost_is_reused_by_worker_b(self):
+        """§29-D: A discovers/creates, completion is interrupted; B finds
+        the SAME exact PR (repository + branch + head SHA + base) and
+        reuses it — no second PR, no second push."""
+        self.fake_github.fail_pull_create = "lose_response"
+        self.fake_github.fail_pull_create_times = 1
+
+        worker_a, _ = self._worker("worker-a")
+        with self.assertRaises(ProposalExecutionFailedError) as ctx:
+            self._execute(worker_a)
+        self.assertIsInstance(ctx.exception.__cause__, PRCreationFailedException)
+        # remote truth after the lost response: PR exists, branch pushed
+        self.assertEqual(len(self.fake_github.prs), 1)
+        remote_pr = self.fake_github.prs[0]
+        _, pushed_sha = self._branch_on_bare()
+        self.assertEqual(
+            remote_pr["head"]["sha"], pushed_sha, "PR points at our commit"
+        )
+        self.assertEqual(self._proposal().status, "EXECUTION_FAILED")
+
+        worker_b, _ = self._worker("worker-b")
+        body = self._execute(worker_b)
+
+        self.assertEqual(body["status"], "PR_CREATED")
+        proposal = self._proposal()
+        self.assertEqual(proposal.status, "PR_CREATED")
+        self.assertEqual(proposal.execution_attempts, 2)
+        # exactly one PR, reused — B never posted a create
+        self.assertEqual(len(self.fake_github.prs), 1)
+        self.assertEqual(self.fake_github.pull_create_attempts, 1)
+        self.assertEqual(
+            proposal.pull_request_url, remote_pr["html_url"],
+            "worker B reused the existing exact-identity PR",
+        )
+        # one commit, one branch — nothing re-pushed
+        self.assertEqual(self._commits_above_main(), "1")
+        self.assertEqual(self.fake_github.ref_post_count, 1)
+
     def test_merged_remote_pr_blocks_second_pr(self):
         # a merged PR already exists for the deterministic head/base pair
         self.fake_github.prs.append(
@@ -529,7 +603,11 @@ class ExecutionRecoveryE2ETests(unittest.TestCase):
                 "title": "Automated remediation for incident " + INCIDENT_ID,
                 "body": f"Incident: {INCIDENT_ID}\nProposal hash: "
                 f"{self.proposal_hash}\n",
-                "head": {"ref": self._branch_name(), "sha": ""},
+                "head": {
+                    "ref": self._branch_name(),
+                    "sha": "f" * 40,
+                    "repo": {"full_name": REPO_SLUG},
+                },
                 "base": {"ref": "main", "sha": ""},
             }
         )

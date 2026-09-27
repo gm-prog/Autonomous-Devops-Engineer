@@ -319,6 +319,95 @@ class FindExistingPullRequestsTests(unittest.TestCase):
         self.assertEqual(params["per_page"], 20)
 
     @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_exposes_exact_head_identity(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = [
+            {
+                "number": 8,
+                "html_url": "https://github.com/owner/repo/pull/8",
+                "state": "open",
+                "draft": True,
+                "merged": False,
+                "title": "Automation PR",
+                "head": {
+                    "ref": "automation/remediation/inc-1/proposal-1",
+                    "sha": "B" * 40,  # normalization to lowercase
+                    "repo": {"full_name": "Owner/Repo"},
+                },
+                "base": {"ref": "main", "sha": "d" * 40},
+                "body": "",
+            },
+            {
+                "number": 9,
+                "html_url": "https://github.com/owner/repo/pull/9",
+                "state": "open",
+                "head": {
+                    "ref": "someone-else",
+                    "sha": "a" * 40,
+                    "repo": {"full_name": "owner/repo"},
+                },
+                "base": {"ref": "main"},
+                "body": "",
+                "merged": False,
+                "draft": False,
+                "title": "other",
+            },
+        ]
+        get.return_value = response
+
+        result = self._client().find_existing_pull_requests(
+            "owner/repo", self.HEAD, "main"
+        )
+        self.assertEqual(len(result), 1)
+        item = result[0]
+        self.assertEqual(item.head_sha, "b" * 40)
+        self.assertEqual(item.head_repository, "owner/repo")
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_missing_head_sha_is_typed_failure(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = [
+            {
+                "number": 8,
+                "html_url": "https://github.com/owner/repo/pull/8",
+                "state": "open",
+                "head": {"ref": self.HEAD},  # no sha -> malformed
+                "base": {"ref": "main"},
+                "body": "",
+                "merged": False,
+                "draft": True,
+                "title": "x",
+            },
+        ]
+        get.return_value = response
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
+    def test_discovery_empty_head_sha_is_typed_failure(self, get):
+        response = Mock(status_code=200)
+        response.json.return_value = [
+            {
+                "number": 8,
+                "html_url": "https://github.com/owner/repo/pull/8",
+                "state": "open",
+                "head": {"ref": self.HEAD, "sha": ""},
+                "base": {"ref": "main"},
+                "body": "",
+                "merged": False,
+                "draft": True,
+                "title": "x",
+            },
+        ]
+        get.return_value = response
+        with self.assertRaises(PullRequestLookupFailedException):
+            self._client().find_existing_pull_requests(
+                "owner/repo", self.HEAD, "main"
+            )
+
+    @patch("incident_service.infrastructure.source_provider.github_pr_client.requests.get")
     def test_discovery_never_queries_protected_head(self, get):
         with self.assertRaises(UnsafePullRequestTargetException):
             self._client().find_existing_pull_requests(

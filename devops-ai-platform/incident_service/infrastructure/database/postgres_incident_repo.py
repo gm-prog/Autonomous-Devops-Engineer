@@ -466,6 +466,41 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 )
         return True
 
+    def renew_execution_lease(
+        self,
+        incident_id: str,
+        proposal_id: str,
+        owner: str,
+        *,
+        now: datetime,
+        lease_seconds: float,
+    ) -> bool:
+        """Owner-gated heartbeat: extend THIS lease only.
+
+        CAS on (state == LEASED AND lease_owner == owner): a different
+        owner, a released claim, or a completed/reclaimed claim all
+        return False — renewal never resurrects or steals a lease, and
+        never changes the durable stage.
+        """
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        now = _aware_utc(now)
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                update(execution_claims_table)
+                .where(
+                    execution_claims_table.c.incident_id == incident_id,
+                    execution_claims_table.c.proposal_id == proposal_id,
+                    execution_claims_table.c.state == "LEASED",
+                    execution_claims_table.c.lease_owner == owner,
+                )
+                .values(
+                    last_heartbeat_at=now,
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                )
+            )
+            return result.rowcount == 1
+
     def get_execution_claim(
         self, incident_id: str, proposal_id: str
     ) -> Optional[dict]:
@@ -478,20 +513,39 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             ).mappings().first()
         return dict(row) if row else None
 
+    def get_execution_claims_for_incident(self, incident_id: str) -> List[dict]:
+        """All claim rows for an incident (one per proposal, ordered)."""
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(execution_claims_table)
+                .where(execution_claims_table.c.incident_id == incident_id)
+                .order_by(execution_claims_table.c.proposal_id.asc())
+            ).mappings().all()
+        return [dict(row) for row in rows]
+
     def _apply_claim_overlay(self, incident) -> None:
-        """Project authoritative claim-row state onto the proposal view."""
+        """Project authoritative claim-row state onto each proposal view.
+
+        The claim primary key is (incident_id, proposal_id): an incident
+        may carry several independent proposal claims, so every row for
+        the incident is fetched and mapped BY PROPOSAL ID — a proposal
+        never inherits another proposal's coordination state, and a
+        proposal without a claim row keeps its persisted JSON view.
+        """
         if not incident.patch_proposals:
             return
         with self.engine.connect() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 select(execution_claims_table).where(
                     execution_claims_table.c.incident_id == incident.id
                 )
-            ).mappings().first()
-        if row is None:
+            ).mappings().all()
+        if not rows:
             return
+        claims_by_proposal = {str(row["proposal_id"]): row for row in rows}
         for proposal in incident.patch_proposals:
-            if proposal.id != row["proposal_id"]:
+            row = claims_by_proposal.get(proposal.id)
+            if row is None:
                 continue
             proposal.execution_stage = str(row["stage"] or "")
             proposal.execution_attempts = int(row["attempt"] or 0)

@@ -184,6 +184,7 @@ class PullRequestReconciliationTests(unittest.TestCase):
         self.proposal.proposal_hash = self.HASH
         self.proposal.commit_sha = "b" * 40
         self.proposal.branch_name = self.BRANCH
+        self.proposal.repository = "owner/repo"
 
     def _run(self, stage_callback=None):
         return self.service.execute(
@@ -202,6 +203,8 @@ class PullRequestReconciliationTests(unittest.TestCase):
         base_ref="main",
         body="Proposal hash: " + "c" * 64,
         number=7,
+        head_sha="b" * 40,          # == proposal.commit_sha
+        head_repository="owner/repo",  # == proposal.repository
     ):
         return ExistingPullRequest(
             number=number,
@@ -212,6 +215,8 @@ class PullRequestReconciliationTests(unittest.TestCase):
             head_ref=head_ref,
             base_ref=base_ref,
             body=body,
+            head_sha=head_sha,
+            head_repository=head_repository,
         )
 
     # --- reuse / conflict matrix -----------------------------------------
@@ -249,6 +254,64 @@ class PullRequestReconciliationTests(unittest.TestCase):
     def test_body_hash_mismatch_fails_closed_corroboration_only(self):
         self.github.find_existing_pull_requests.return_value = [
             self._pull(body="Proposal hash: deadbeef")
+        ]
+        with self.assertRaises(ExistingPullRequestConflict):
+            self._run()
+        self.github.create_pull_request.assert_not_called()
+
+    def test_exact_repository_branch_sha_base_reuses_pr(self):
+        self.github.find_existing_pull_requests.return_value = [
+            self._pull(
+                head_sha="b" * 40,
+                head_repository="owner/repo",
+                base_ref="main",
+            )
+        ]
+        result = self._run()
+        self.assertEqual(
+            result.pull_request_url, "https://github.com/owner/repo/pull/7"
+        )
+        self.github.create_pull_request.assert_not_called()
+
+    def test_wrong_head_sha_fails_closed_no_second_pr(self):
+        # persisted/executed commit = b*40, remote PR head = f*40
+        self.github.find_existing_pull_requests.return_value = [
+            self._pull(head_sha="f" * 40)
+        ]
+        with self.assertRaises(ExistingPullRequestConflict):
+            self._run()
+        self.github.create_pull_request.assert_not_called()
+
+    def test_wrong_head_repository_fails_closed(self):
+        # same branch name + body, but the PR head lives in another repo
+        self.github.find_existing_pull_requests.return_value = [
+            self._pull(head_repository="attacker/fork")
+        ]
+        with self.assertRaises(ExistingPullRequestConflict):
+            self._run()
+        self.github.create_pull_request.assert_not_called()
+
+    def test_missing_head_repository_fails_closed(self):
+        # deleted fork / absent head repository identity
+        self.github.find_existing_pull_requests.return_value = [
+            self._pull(head_repository="")
+        ]
+        with self.assertRaises(ExistingPullRequestConflict):
+            self._run()
+        self.github.create_pull_request.assert_not_called()
+
+    def test_wrong_base_fails_closed(self):
+        self.github.find_existing_pull_requests.return_value = [
+            self._pull(base_ref="production")
+        ]
+        with self.assertRaises(ExistingPullRequestConflict):
+            self._run()
+        self.github.create_pull_request.assert_not_called()
+
+    def test_body_hash_alone_never_authorizes_reuse(self):
+        # perfect proposal-hash body but wrong commit identity -> conflict
+        self.github.find_existing_pull_requests.return_value = [
+            self._pull(body=f"Proposal hash: {self.HASH}", head_sha="f" * 40)
         ]
         with self.assertRaises(ExistingPullRequestConflict):
             self._run()

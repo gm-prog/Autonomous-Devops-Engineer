@@ -610,5 +610,147 @@ class MissingCoordinationRepositoryTests(unittest.TestCase):
             service._coordination("claim_execution_lease")
 
 
+class MultiProposalClaimProjectionTests(unittest.TestCase):
+    """Phase 6.2.1A: one incident, many proposals — claims project
+    independently by proposal_id; no proposal inherits another's state."""
+
+    PROPOSALS = ("p-a", "p-b", "p-c", "p-d", "p-e")
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        url = f"sqlite:///{os.path.join(self._temp.name, 'multi.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        self.now = datetime.now(timezone.utc)
+
+        incident = IncidentAggregate("inc-multi", "cpu", "HIGH", "ctx")
+        incident.move_to_triage()
+        for pid in self.PROPOSALS:
+            per_proposal_patch = (
+                f"--- a/app/{pid}.py\n"
+                f"+++ b/app/{pid}.py\n"
+                "@@ -1 +1 @@\n"
+                "-old()\n"
+                "+new()\n"
+            )
+            proposal = HotfixProposal(
+                id=pid,
+                incident_id="inc-multi",
+                target_filepath=f"app/{pid}.py",
+                diff_patch_payload=per_proposal_patch,
+                source_sha="a" * 40,
+                repository="acme/checkout",
+                status="APPROVED",
+                validation_plan=["pytest -q"],
+            )
+            assert proposal.apply_verification_pass()
+            proposal.proposal_hash = (hashes := {p: (str(i) * 64) for i, p
+                                                 in enumerate(self.PROPOSALS)})[pid]
+            proposal.approved_by = "alice-operator"
+            proposal.approval_hash = proposal.proposal_hash
+            proposal.approved_at = datetime.now(timezone.utc)
+            incident.upsert_remediation_proposal(proposal)
+        self.hashes = hashes
+        self.repository.save_incident(incident)
+
+    def _claim(self, pid, owner, stage, *, commit=None, finish=None):
+        """claim -> progress(stage) -> optional finish; return reason."""
+        p_hash = self.hashes[pid]
+        reason, _ = self.repository.claim_execution_lease(
+            "inc-multi", pid, p_hash,
+            owner=owner, now=self.now, lease_seconds=600.0,
+        )
+        assert reason == "claimed", (pid, reason)
+        self.repository.persist_execution_progress(
+            "inc-multi", pid, owner,
+            stage=stage, now=self.now, lease_seconds=600.0,
+            commit_sha=commit,
+            branch_name=f"automation/remediation/inc-multi/{pid}" if commit else None,
+        )
+        if finish is not None:
+            status, final_stage, updates = finish
+            ok = self.repository.finish_execution_lease(
+                "inc-multi", pid, owner,
+                status=status, stage=final_stage, now=self.now,
+                updates=updates,
+            )
+            assert ok, (pid, final_stage)
+        return reason
+
+    def test_claims_project_independently_across_proposals(self):
+        # p-a: active lease at COMMIT_CREATED with durable commit
+        self._claim("p-a", "worker-1", "COMMIT_CREATED", commit="e" * 40)
+        # p-b: active lease at VALIDATION_PASSED (different owner)
+        self._claim("p-b", "worker-2", "VALIDATION_PASSED")
+        # p-c: no claim at all
+        # p-d: completed claim (FREE, PR_CREATED)
+        self._claim(
+            "p-d", "worker-3", "PR_DISCOVERY",
+            commit="f" * 40,
+            finish=(
+                "PR_CREATED", "COMPLETED",
+                {"pull_request_url": "https://github.example/pull/9"},
+            ),
+        )
+        # p-e: failed recoverable claim (FREE, FAILED cursor)
+        self._claim(
+            "p-e", "worker-4", "CLAIMED",
+            finish=(
+                "EXECUTION_FAILED", "FAILED",
+                {"last_failure_stage": "validation"},
+            ),
+        )
+
+        incident = self.repository.get_incident_by_id("inc-multi")
+        by_id = {item.id: item for item in incident.patch_proposals}
+        self.assertEqual(set(by_id), set(self.PROPOSALS))
+
+        a, b, c, d, e = (by_id[p] for p in self.PROPOSALS)
+
+        # active independent leases
+        self.assertEqual(a.execution_stage, "COMMIT_CREATED")
+        self.assertEqual(a.execution_attempts, 1)
+        self.assertEqual(a.lease_owner, "worker-1")
+        self.assertEqual(a.commit_sha, "e" * 40)
+        self.assertTrue(a.branch_name.endswith("/p-a"))
+
+        self.assertEqual(b.execution_stage, "VALIDATION_PASSED")
+        self.assertEqual(b.execution_attempts, 1)
+        self.assertEqual(b.lease_owner, "worker-2")
+        self.assertFalse(b.commit_sha)  # did NOT inherit p-a's commit
+        self.assertNotEqual(a.execution_id, b.execution_id)
+
+        # no claim -> untouched JSON view
+        self.assertEqual(c.execution_stage, "")
+        self.assertEqual(c.execution_attempts, 0)
+        self.assertFalse(c.lease_owner)
+
+        # completed claim -> its own PR identity, lease released
+        self.assertEqual(d.status, "PR_CREATED")
+        self.assertEqual(d.execution_stage, "COMPLETED")
+        self.assertEqual(d.lease_owner, "")
+        self.assertEqual(d.commit_sha, "f" * 40)
+        self.assertTrue(d.pull_request_url.endswith("/pull/9"))
+
+        # failed claim -> recoverable, its own failure fields
+        self.assertEqual(e.status, "EXECUTION_FAILED")
+        self.assertEqual(e.execution_stage, "FAILED")
+        self.assertEqual(e.last_failure_stage, "validation")
+        self.assertEqual(e.lease_owner, "")
+
+        # durable rows survive reload as stored (5 rows, keyed correctly)
+        rows = {
+            row["proposal_id"]: row
+            for row in self.repository.get_execution_claims_for_incident(
+                "inc-multi"
+            )
+        }
+        self.assertEqual(set(rows), {"p-a", "p-b", "p-d", "p-e"})
+        self.assertEqual(rows["p-a"]["stage"], "COMMIT_CREATED")
+        self.assertEqual(rows["p-b"]["stage"], "VALIDATION_PASSED")
+        self.assertEqual(rows["p-d"]["state"], "FREE")
+        self.assertEqual(rows["p-e"]["last_failure_stage"], "validation")
+
+
 if __name__ == "__main__":
     unittest.main()

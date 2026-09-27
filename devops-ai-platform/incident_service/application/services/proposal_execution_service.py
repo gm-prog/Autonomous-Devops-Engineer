@@ -55,6 +55,7 @@ from incident_service.application.services.proposal_execution_policy import (
     execution_id_for,
     find_proposal,
     is_fresh,
+    load_heartbeat_seconds,
     load_lease_seconds,
     load_proposal_ttl_seconds,
     log_stage,
@@ -110,6 +111,81 @@ def _safe_reason(exc: BaseException) -> str:
     return reason[:300]
 
 
+class _LeaseHeartbeat:
+    """Worker-owned liveness for one active execution attempt (§6.2.1A).
+
+    While a bounded external operation runs (clone/push/validation/REST),
+    the heartbeat periodically renews the durable lease through the
+    owner-CAS primitive. Outcomes are explicit:
+
+    * renewal succeeds -> execution continues;
+    * renewal reports the owner no longer holds the claim -> ownership
+      is marked lost, the loop stops, and the next stage persist is
+      refused (RemediationStageGuardError) BEFORE any further side
+      effect;
+    * the claim store is unreachable -> same fail-closed treatment —
+      uncertainty never grants new authority.
+
+    This is NOT distributed cancellation: an already-running git/HTTP
+    operation finishes; only the *next* destructive stage is blocked.
+    The thread is daemon, joined deterministically by stop(), and never
+    outlives the execution attempt it serves.
+    """
+
+    def __init__(self, *, renew, interval, fields, name):
+        self._renew = renew
+        self.interval = interval
+        self._fields = fields
+        self._stop = threading.Event()
+        self.lost = threading.Event()
+        self.loss_reason = ""
+        self.renewals = 0
+        self._thread: Optional[threading.Thread] = None
+        self._name = name
+
+    def start(self) -> None:
+        thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+        self._thread = thread
+        thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                renewed = self._renew()
+            except Exception as exc:  # store unavailable -> fail closed
+                self._mark_lost("store_unavailable", exc)
+                return
+            if not renewed:
+                # CAS miss: another owner, released, or completed claim
+                self._mark_lost("owner_lost", None)
+                return
+            self.renewals += 1
+            log_stage(
+                "lease.renewed",
+                renewals=self.renewals,
+                **self._fields,
+            )
+
+    def _mark_lost(self, reason: str, exc: Optional[BaseException]) -> None:
+        self.loss_reason = reason
+        self.lost.set()
+        log_stage(
+            "lease.rejected",
+            reason=f"heartbeat_{reason}",
+            error=exc.__class__.__name__ if exc is not None else None,
+            **self._fields,
+        )
+
+
 def load_validation_profile() -> str:
     return os.getenv(VALIDATION_PROFILE_ENV, "").strip() or (
         DEFAULT_VALIDATION_PROFILE
@@ -128,6 +204,7 @@ class ProposalExecutionService:
         lease_seconds: Optional[float] = None,
         lease_owner: Optional[str] = None,
         remote_inspector: Optional[Any] = None,
+        heartbeat_interval: Optional[float] = None,
     ):
         self.repository = repository
         self.orchestrator_factory = orchestrator_factory
@@ -137,6 +214,20 @@ class ProposalExecutionService:
         self.lease_seconds = (
             load_lease_seconds() if lease_seconds is None else lease_seconds
         )
+        # active-lease liveness policy: env/derived interval, or an
+        # explicit value (tests/composition) — always positive and
+        # strictly below lease/2, fail fast otherwise
+        if heartbeat_interval is None:
+            self.heartbeat_interval = load_heartbeat_seconds(self.lease_seconds)
+        else:
+            explicit = float(heartbeat_interval)
+            if explicit <= 0 or explicit != explicit or explicit == float("inf"):
+                raise ValueError("heartbeat_interval must be a positive number")
+            if explicit >= self.lease_seconds / 2.0:
+                raise ValueError(
+                    "heartbeat_interval must be less than half the lease duration"
+                )
+            self.heartbeat_interval = explicit
         self.now = now
         self.validation_profile = (
             validation_profile
@@ -150,6 +241,8 @@ class ProposalExecutionService:
         # performance optimization ONLY — the durable claim is the
         # source of truth for ownership (§7)
         self._locks: Dict[str, threading.Lock] = {}
+        # active heartbeat for the in-flight attempt (diagnostics/tests)
+        self._heartbeat: Optional[_LeaseHeartbeat] = None
 
     # ------------------------------------------------------------------ #
     def _proposal_lock(self, key: str) -> threading.Lock:
@@ -329,6 +422,35 @@ class ProposalExecutionService:
 
             stages: List[Tuple[str, Dict[str, Any]]] = []
 
+            orchestrator = self.orchestrator_factory()
+
+            # §6.2.1A active lease liveness: renew the durable lease while
+            # bounded external work runs; stop deterministically on every
+            # exit path (no orphan threads).
+            heartbeat = _LeaseHeartbeat(
+                renew=lambda: self._coordination("renew_execution_lease")(
+                    incident.id,
+                    proposal.id,
+                    self.lease_owner,
+                    now=self.now(),
+                    lease_seconds=self.lease_seconds,
+                ),
+                interval=self.heartbeat_interval,
+                fields={
+                    "incident_id": incident.id,
+                    "proposal_id": proposal.id,
+                    "proposal_hash": proposal.proposal_hash,
+                    "execution_id": proposal.execution_id,
+                    "attempt": attempt,
+                    "owner": self.lease_owner,
+                    "interval_seconds": self.heartbeat_interval,
+                },
+                name=(
+                    f"remediation-heartbeat:{incident.id}:{proposal.id}"
+                ),
+            )
+            self._heartbeat = heartbeat
+
             def stage_callback(stage_name: str, metadata: Dict[str, Any]) -> None:
                 self._persist_stage(
                     incident=incident,
@@ -336,41 +458,58 @@ class ProposalExecutionService:
                     stage_name=stage_name,
                     metadata=metadata,
                     stages=stages,
+                    heartbeat=heartbeat,
                 )
 
-            orchestrator = self.orchestrator_factory()
             try:
-                if mode == "RESUME":
-                    url = orchestrator.reconcile_and_create_pr(
-                        incident_id=incident.id,
-                        proposal=proposal,
-                        repository_slug=proposal.repository,
-                        stage_callback=stage_callback,
+                try:
+                    heartbeat.start()
+                except Exception as exc:
+                    # no side effects yet: surface typed; the durable
+                    # lease expires by TTL and recovery reconciles.
+                    raise ExecutionLeaseUnavailable(
+                        "execution lease heartbeat could not be started"
+                    ) from exc
+                try:
+                    if mode == "RESUME":
+                        url = orchestrator.reconcile_and_create_pr(
+                            incident_id=incident.id,
+                            proposal=proposal,
+                            repository_slug=proposal.repository,
+                            stage_callback=stage_callback,
+                        )
+                        result = _ResumeResult(
+                            commit_sha=proposal.commit_sha,
+                            branch_name=proposal.branch_name,
+                            pull_request_url=url,
+                        )
+                    else:
+                        result = orchestrator.execute(
+                            incident_id=incident.id,
+                            proposal=proposal,
+                            repository_slug=proposal.repository,
+                            validation_profile=self.validation_profile,
+                            stage_callback=stage_callback,
+                        )
+                except Exception as exc:
+                    heartbeat.stop()
+                    typed = self._classify_failure(exc, stages)
+                    self._execution_failure(
+                        incident, proposal, typed, stages, attempt,
+                        requested_by, cause=exc,
                     )
-                    result = _ResumeResult(
-                        commit_sha=proposal.commit_sha,
-                        branch_name=proposal.branch_name,
-                        pull_request_url=url,
-                    )
-                else:
-                    result = orchestrator.execute(
-                        incident_id=incident.id,
-                        proposal=proposal,
-                        repository_slug=proposal.repository,
-                        validation_profile=self.validation_profile,
-                        stage_callback=stage_callback,
-                    )
-            except Exception as exc:
-                typed = self._classify_failure(exc, stages)
-                self._execution_failure(
-                    incident, proposal, typed, stages, attempt, requested_by,
-                    cause=exc,
+                    raise typed from exc
+                # stop BEFORE finishing so renewal can never race the
+                # owner-gated release transaction
+                heartbeat.stop()
+                return self._persist_success(
+                    incident, proposal, result, stages, requested_by,
+                    attempt, mode
                 )
-                raise typed from exc
-
-            return self._persist_success(
-                incident, proposal, result, stages, requested_by, attempt, mode
-            )
+            finally:
+                heartbeat.stop()
+                if self._heartbeat is heartbeat:
+                    self._heartbeat = None
 
     def _record_reconciliation_conflict(
         self, incident, proposal, claim, exc
@@ -469,9 +608,19 @@ class ProposalExecutionService:
         )
 
     def _persist_stage(
-        self, *, incident, proposal, stage_name, metadata, stages
+        self, *, incident, proposal, stage_name, metadata, stages,
+        heartbeat: Optional[_LeaseHeartbeat] = None,
     ) -> None:
         stages.append((stage_name, dict(metadata)))
+        # §6.2.1A lease-expiry safety rule: a worker that has already
+        # observed lease loss (owner CAS miss or store uncertainty) must
+        # not begin the next side-effecting stage.
+        if heartbeat is not None and heartbeat.lost.is_set():
+            raise RemediationStageGuardError(
+                "execution lease lost ("
+                f"{heartbeat.loss_reason or 'unknown'}) before persisting "
+                f"stage {stage_name}"
+            )
         log_stage(
             stage_name,
             incident_id=incident.id,
@@ -497,16 +646,26 @@ class ProposalExecutionService:
             url = str(metadata.get("pull_request_url") or "")
             if url:
                 updates["pull_request_url"] = url
-        ok = self._coordination("persist_execution_progress")(
-            incident.id,
-            proposal.id,
-            self.lease_owner,
-            stage=stage,
-            now=self.now(),
-            lease_seconds=self.lease_seconds,
-            commit_sha=updates.get("commit_sha"),
-            branch_name=updates.get("branch_name"),
-        )
+        try:
+            ok = self._coordination("persist_execution_progress")(
+                incident.id,
+                proposal.id,
+                self.lease_owner,
+                stage=stage,
+                now=self.now(),
+                lease_seconds=self.lease_seconds,
+                commit_sha=updates.get("commit_sha"),
+                branch_name=updates.get("branch_name"),
+            )
+        except ValueError:
+            raise  # stage-order contract violation — surface honestly
+        except Exception as exc:
+            # §6.2.1A: if the claim store is unreachable we cannot prove
+            # ownership — fail closed, never continue on uncertainty.
+            raise RemediationStageGuardError(
+                "durable claim store unavailable while verifying execution "
+                "ownership"
+            ) from exc
         if not ok:
             raise RemediationStageGuardError(
                 "execution lease lost while persisting stage progress"
@@ -685,16 +844,24 @@ class ProposalExecutionService:
             "branch_name": result.branch_name,
             "pull_request_url": result.pull_request_url,
         }
-        finished = self._coordination("finish_execution_lease")(
-            incident.id,
-            proposal.id,
-            self.lease_owner,
-            status="PR_CREATED",
-            stage="COMPLETED",
-            now=self.now(),
-            updates=updates,
-            evidence=evidence,
-        )
+        try:
+            finished = self._coordination("finish_execution_lease")(
+                incident.id,
+                proposal.id,
+                self.lease_owner,
+                status="PR_CREATED",
+                stage="COMPLETED",
+                now=self.now(),
+                updates=updates,
+                evidence=evidence,
+            )
+        except ExecutionLeaseUnavailable:
+            raise
+        except Exception as exc:
+            raise ExecutionLeaseUnavailable(
+                "durable claim store unavailable; the completed execution "
+                "could not be persisted"
+            ) from exc
         if not finished:
             raise ExecutionLeaseUnavailable(
                 "execution lease was lost before completion could be persisted; "
@@ -764,19 +931,30 @@ class ProposalExecutionService:
             },
             execution_id=execution_id,
         )
-        finished = self._coordination("finish_execution_lease")(
-            incident.id,
-            proposal.id,
-            self.lease_owner,
-            status="EXECUTION_FAILED",
-            stage=durable_stage,
-            now=self.now(),
-            updates={
-                "last_failure_stage": str(stage),
-                "last_failure_reason": reason,
-            },
-            evidence=evidence,
-        )
+        try:
+            finished = self._coordination("finish_execution_lease")(
+                incident.id,
+                proposal.id,
+                self.lease_owner,
+                status="EXECUTION_FAILED",
+                stage=durable_stage,
+                now=self.now(),
+                updates={
+                    "last_failure_stage": str(stage),
+                    "last_failure_reason": reason,
+                },
+                evidence=evidence,
+            )
+        except ExecutionLeaseUnavailable:
+            raise
+        except Exception as exc:
+            # store unavailable: outcome unknown locally — fail closed
+            # with a typed error; the durable lease expires and recovery
+            # reconciles through the normal path.
+            raise ExecutionLeaseUnavailable(
+                "durable claim store unavailable; the execution failure "
+                "could not be persisted"
+            ) from exc
         if not finished:
             # ownership is gone — never clobber the new owner's state
             log_stage(

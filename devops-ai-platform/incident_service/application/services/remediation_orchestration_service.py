@@ -421,6 +421,7 @@ class RemediationOrchestrationService:
             incident_id=incident_id,
             branch=branch,
             base=base_branch,
+            commit_sha=commit_sha,
         )
         notify(
             "pr.reconciled",
@@ -439,11 +440,22 @@ class RemediationOrchestrationService:
         incident_id: str,
         branch: str,
         base: str,
+        commit_sha: str,
     ) -> str:
-        """Explicit policy for discovered PRs (§16/§40). Fail closed on
-        anything that is not exactly one open PR corroborating this
-        proposal identity. PR body text is untrusted data — corroboration
-        only; authorization comes from persisted approval state."""
+        """Explicit policy for discovered PRs (§16/§40/§6.2.1A). Fail
+        closed on anything that is not exactly one open PR whose head
+        points at THE commit this execution produced:
+
+            head repository == proposal.repository (exact, not branch name)
+            head ref       == deterministic branch
+            head SHA       == persisted/executed commit SHA
+            base ref       == allowed base branch
+            open + not merged
+            body proposal-hash corroboration
+
+        PR body text is untrusted data — corroboration only;
+        authorization comes from persisted approval state. Body content
+        is never used to derive commit identity."""
         if not isinstance(matches, list):
             raise RemoteReconciliationFailed(
                 "PR discovery returned an unexpected result"
@@ -465,6 +477,23 @@ class RemediationOrchestrationService:
             raise ExistingPullRequestConflict(
                 "existing pull request does not match the deterministic "
                 "remediation identity"
+            )
+        # exact remote head identity: repository + executed commit SHA
+        expected_sha = (commit_sha or "").strip().lower()
+        actual_sha = (getattr(pull, "head_sha", "") or "").strip().lower()
+        if not expected_sha or actual_sha != expected_sha:
+            raise ExistingPullRequestConflict(
+                "existing pull request head commit does not match the "
+                "executed remediation commit"
+            )
+        expected_repo = (proposal.repository or "").strip().lower()
+        actual_head_repo = (
+            getattr(pull, "head_repository", "") or ""
+        ).strip().lower()
+        if not expected_repo or actual_head_repo != expected_repo:
+            raise ExistingPullRequestConflict(
+                "existing pull request head repository does not match the "
+                "proposal repository"
             )
         body = getattr(pull, "body", "") or ""
         expected_hash = (proposal.proposal_hash or "n/a").strip()

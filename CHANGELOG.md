@@ -1,5 +1,54 @@
 # CHANGELOG
 
+## 2026-09-27 — Phase 6.2.1A: lease liveness & remote identity integrity (corrective hardening)
+
+Closes three review gaps on the completed 6.2.1 implementation; no
+architecture change, pipeline unchanged (approved proposal → controlled
+remediation → draft PR).
+
+* **Active lease liveness** — new owner-CAS renewal primitive
+  `renew_execution_lease` (stage-neutral, exact claim, never resurrects
+  or extends foreign leases; no schema change) plus a worker-owned
+  heartbeat thread active for exactly one execution attempt. Interval =
+  `REMEDIATION_EXECUTION_HEARTBEAT_SECONDS` or derived `lease/3`
+  (always positive and `< lease/2`, fail-fast validation). Lease loss
+  or claim-store uncertainty is detected immediately and the next
+  side-effecting stage is refused (stage guard); persistence/finish
+  paths convert store unavailability to typed fail-closed errors. A
+  worker that lost its lease cannot clobber the new owner's state; an
+  in-flight external operation is never "cancelled" — only the next
+  stage is blocked, recovery runs through the existing reconciliation
+  path. Heartbeats are stopped and joined on every exit path (no thread
+  leaks).
+* **Exact PR identity** — `ExistingPullRequest` exposes `head_sha` +
+  `head_repository`; reuse now requires exact repository + head branch +
+  head commit SHA + allowed base + open/unmerged, with the proposal
+  hash in the body remaining corroboration only. Wrong head SHA, wrong
+  or absent head repository, wrong base, merged/closed, multiple
+  matches, or body-only agreement → `ExistingPullRequestConflict`,
+  fail closed (no second PR / overwrite / force-push / retarget).
+  Malformed head identity in API payloads → typed discovery failure.
+* **Multi-proposal claim projection** — incident reload fetches ALL
+  claim rows per incident and maps them by `proposal_id`; proposals with
+  no claim keep their JSON view; independent stage/attempt/lease/
+  commit/branch/PR per proposal proven on real SQLite (active, completed,
+  failed and claim-less proposals side by side). Added read helper
+  `get_execution_claims_for_incident`.
+* **Tests:** new `test_proposal_lease_liveness` (13 — interval policy
+  fail-fast, renewal CAS semantics, long-operation/long-validation
+  renewal on real store, owner-loss stops next stage + cannot finish,
+  store-outage fails closed, no heartbeat-thread leaks); multi-proposal
+  projection (1); client exact-identity + malformed-head tests (+3);
+  orchestration wrong-SHA/wrong-repo/wrong-base/body-only-never-reuses
+  tests (+6); §29-D recovery E2E — PR created remotely with lost
+  response, worker B reuses the exact PR with zero second creates (+1).
+  Full battery: backend 38, platform 137+78 subtests, gateway 34+36
+  subtests, incident **27 modules Ran 255 OK**.
+* **Honest limitations:** PostgreSQL CAS still not exercised in CI
+  (SQLite real-persistence only); in-flight operations cannot be
+  cancelled after lease loss; no hardened sandbox (Phase 6.2.2); no
+  exactly-once across DB+Git+GitHub.
+
 ## 2026-09-27 — Phase 6.2.1: durable execution coordination & remote reconciliation
 
 Hardens the Phase 6.2 executor (same architecture, no new stack): one

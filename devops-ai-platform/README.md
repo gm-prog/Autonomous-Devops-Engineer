@@ -506,6 +506,88 @@ state is never clobbered.
 * **PR body corroboration can be forged by a repo admin** — it only
   corroborates; authorization still comes from persisted approval state.
 
+## Phase 6.2.1A — Lease liveness & remote identity integrity (corrective hardening)
+
+Three review gaps closed on top of 6.2.1; no architecture change, the
+at-least-once + deterministic-idempotency + reconciliation model is
+preserved, and the pipeline still stops at **approved proposal →
+controlled remediation → draft PR**.
+
+### Active lease liveness (heartbeat)
+
+* A worker-owned `_LeaseHeartbeat` thread starts immediately after the
+  durable claim and stops (deterministically joined) on every exit path
+  — success, typed failure, or unexpected error — before the owner-gated
+  finish transaction, so renewal can never race the release.
+* **Interval policy:** `REMEDIATION_EXECUTION_HEARTBEAT_SECONDS`
+  (optional) or the derived default `lease / 3` — always positive,
+  finite and strictly `< lease / 2`; anything else fails fast at
+  construction (§4 policy, no hardcoded production value).
+* **Renewal is durable and CAS-owned:** `renew_execution_lease`
+  extends only `state == LEASED AND lease_owner == this owner` for the
+  exact `(incident_id, proposal_id)` — it can never extend another
+  worker's lease, resurrect a completed/reclaimed claim, or change the
+  stage (no schema change: reuses `last_heartbeat_at` +
+  `lease_expires_at`).
+* **Lease-expiry safety rule (documented, tested):** an already-running
+  git/HTTP operation is NOT cancelled. Instead —
+  renewal success → continue; owner CAS miss or claim-store
+  uncertainty → the worker is marked unauthorized **immediately**, and
+  the stage guard refuses the *next* side-effecting boundary
+  (`RemediationStageGuardError`) before workspace/patch/validation/
+  commit/push/verify/discovery/create can begin. Failure persistence is
+  still owner-gated; a worker that lost the lease cannot clobber the
+  new owner's durable state. Database-uncertainty in persistence or
+  finish paths is converted to typed fail-closed errors
+  (`RemediationStageGuardError`/`ExecutionLeaseUnavailable`) —
+  "store unavailable" never grants authority. Recovery proceeds through
+  the existing expired-lease reclaim + reconciliation path.
+* Thread hygiene: at most one daemon heartbeat per active attempt,
+  bounded join in `stop()`, tests assert no thread accumulation across
+  repeated success/failure runs.
+
+### Exact PR identity (repository + branch + head SHA + base)
+
+* `ExistingPullRequest` now exposes `head_sha` and `head_repository`
+  (parsed from `head.sha` + `head.repo.full_name`; a missing/empty head
+  SHA is a typed discovery failure — malformed payload).
+* Reuse of an existing PR now requires ALL of:
+  `head_repository == proposal.repository` AND
+  `head ref == deterministic branch` AND
+  `head_sha == the commit this execution produced` AND
+  `base == allowed base` AND open AND not merged AND body
+  proposal-hash corroboration. Wrong SHA, wrong/absent head repository,
+  wrong base, merged/closed, multiple matches, or body-hash mismatch →
+  `ExistingPullRequestConflict` (409): no second PR, no branch
+  overwrite, no force-push, no retarget. The PR body remains untrusted
+  corroboration only — never a source of commit identity, never parsed
+  for instructions, title never searched.
+
+### Multi-proposal claim projection
+
+* The claim primary key is `(incident_id, proposal_id)`; the incident
+  reload overlay now fetches **all** claim rows for the incident, indexes
+  them by `proposal_id`, and projects each row only onto its own
+  proposal. A proposal without a claim keeps its persisted JSON view;
+  no proposal can inherit another's stage/attempt/lease/commit/branch/PR.
+* **Authority model:** proposal JSON is authoritative for proposal
+  contents, canonical hash, approval binding, target and RCA-derived
+  data; the claim row is authoritative for ownership, lease state and
+  timestamps, current stage, attempt, execution id, and the
+  commit/branch/PR mirrors used for recovery. The overlay only projects
+  coordination state — no dual authority.
+
+### Honest limitations (Phase 6.2.1A)
+
+* Renewal/stage CAS style is SQLAlchemy-portable, but **PostgreSQL
+  concurrency is still not exercised in CI** (SQLite real-persistence
+  tests only) — do not claim production-verified PG behavior.
+* An operation already in flight cannot be cancelled after lease loss;
+  only the next stage is blocked (bounded side effects + reconciliation,
+  not distributed cancellation).
+* Still no hardened sandbox (that is Phase 6.2.2), and no exactly-once
+  transaction across DB + Git + GitHub.
+
 ## Network & authentication trust boundary
 
 * **External boundary = API gateway only.** `docker-compose.yml` publishes a

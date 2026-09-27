@@ -407,6 +407,11 @@ class GitHubPRClient:
         for item in payload:
             try:
                 head_ref = item["head"]["ref"]
+                # exact head commit identity — required, malformed if absent
+                raw_head_sha = item["head"]["sha"]
+                if not isinstance(raw_head_sha, str) or not raw_head_sha.strip():
+                    raise ValueError("head sha missing")
+                head_sha = raw_head_sha.strip().lower()
                 base_ref = item["base"]["ref"]
                 number = int(item["number"])
                 url = str(item["html_url"])
@@ -417,7 +422,11 @@ class GitHubPRClient:
                     or item.get("merged_at") is not None
                 )
                 body = str(item.get("body") or "")
-            except (KeyError, TypeError, ValueError) as exc:
+                head_repo = item["head"].get("repo") or {}
+                head_repository = str(
+                    head_repo.get("full_name") or ""
+                ).lower()
+            except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 raise PullRequestLookupFailedException(
                     "GitHub returned a malformed pull request entry"
                 ) from exc
@@ -437,6 +446,8 @@ class GitHubPRClient:
                     head_ref=head_ref,
                     base_ref=base_ref,
                     body=body,
+                    head_sha=head_sha,
+                    head_repository=head_repository,
                 )
             )
         return matches
@@ -485,7 +496,12 @@ class PullRequestLookupFailedException(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class ExistingPullRequest:
-    """Typed, minimal view of a remote PR used for reconciliation."""
+    """Typed, minimal view of a remote PR used for reconciliation.
+
+    Carries exactly the fields required to prove exact identity:
+    repository + head ref + head commit SHA + base ref (body remains
+    untrusted corroboration only).
+    """
 
     number: int
     url: str
@@ -495,3 +511,5 @@ class ExistingPullRequest:
     head_ref: str
     base_ref: str
     body: str
+    head_sha: str = ""
+    head_repository: str = ""  # head.repo.full_name ("" = absent/deleted fork)

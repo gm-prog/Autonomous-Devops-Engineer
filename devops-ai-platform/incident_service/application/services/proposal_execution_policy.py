@@ -227,6 +227,38 @@ def load_lease_seconds() -> float:
     return lease
 
 
+#: Optional heartbeat interval override (Phase 6.2.1A). When unset the
+#: interval is derived from the lease duration so that renewals happen
+#: well before expiry (interval < lease/2 by construction).
+HEARTBEAT_SECONDS_ENV = "REMEDIATION_EXECUTION_HEARTBEAT_SECONDS"
+
+
+def load_heartbeat_seconds(lease_seconds: float) -> float:
+    """Resolve the active-lease heartbeat interval for one execution.
+
+    Derived default: ``lease_seconds / 3`` — strictly below the required
+    ``lease / 2`` ceiling, leaving at least two renewal opportunities
+    inside one lease window. An explicit override must be a positive
+    finite number strictly below ``lease / 2``; anything else fails
+    fast (never silently coerced).
+    """
+    if lease_seconds <= 0:
+        raise ValueError("lease duration must be positive")
+    ceiling = lease_seconds / 2.0
+    raw = os.getenv(HEARTBEAT_SECONDS_ENV, "").strip()
+    if not raw:
+        return lease_seconds / 3.0
+    interval = float(raw)
+    if interval <= 0 or interval != interval or interval == float("inf"):
+        raise ValueError(f"{HEARTBEAT_SECONDS_ENV} must be a positive number")
+    if interval >= ceiling:
+        raise ValueError(
+            f"{HEARTBEAT_SECONDS_ENV} must be less than half the lease "
+            f"duration ({ceiling})"
+        )
+    return interval
+
+
 def new_lease_owner() -> str:
     """Process-derived owner identity — never caller-supplied."""
     import socket
