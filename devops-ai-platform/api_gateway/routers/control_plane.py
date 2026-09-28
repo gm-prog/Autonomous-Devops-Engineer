@@ -35,6 +35,7 @@ second token system — is documented in the platform README.
 
 import logging
 from typing import Dict
+from urllib.parse import urlencode
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -201,6 +202,26 @@ def control_plane_get_proposal(
     """
     _rate_limit_or_429(request)
     return _forward_get("incident", f"/incidents/{incident_id}/proposal")
+
+
+@router.get("/analytics/summary")
+def control_plane_analytics_summary(
+    start: str,
+    end: str,
+    request: Request,
+    user: dict = Depends(verify_token),
+):
+    """Evidence-driven operational analytics summary (Phase 6.3).
+
+    Read-only aggregates over durable records (incident volume, remediation
+    pipeline outcomes, bounded timing with data-quality counters). Any
+    authenticated user may read aggregates; window validation lives
+    downstream in the analytics service (single validation authority) and
+    malformed parameters surface as the relayed 422.
+    """
+    _rate_limit_or_429(request)
+    query = urlencode({"start": start, "end": end})
+    return _forward_get("incident", f"/incidents/analytics/summary?{query}")
 
 
 @router.post("/incidents/{incident_id}/proposal/approve")

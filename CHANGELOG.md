@@ -1,5 +1,52 @@
 # CHANGELOG
 
+## 2026-09-28 — Phase 6.3: evidence-driven operational analytics & remediation intelligence
+
+- **One read-only summary endpoint** — `GET /incidents/analytics/summary`
+  (incident service) forwarded as `GET /v1/analytics/summary` by the
+  API gateway behind the existing JWT `verify_token` auth + rate limit
+  (any authenticated user; aggregates expose no patch content).
+  Application service owns window validation + aggregation; handlers
+  contain no SQL and no business rules.
+- **Bounded, deterministic windows:** half-open UTC `[start, end)` of at
+  most 31 days (service-validated → 422), explicit sorts everywhere,
+  zero-filled UTC day buckets, integer-second timing with nearest-rank
+  p50/p95 (sample and exclusion counts always visible), one pure
+  aggregation (no clock reads), byte-identical responses for identical
+  durable records.
+- **Metrics backed ONLY by durable authoritative records:** incident
+  volume (total/by UTC day/by severity/by status), RCA coverage
+  (evidence presence — never free-text guessing), proposal outcomes
+  (durable status + `approved_at`), pipeline phase partitions
+  (validation/commit/publication/PR from proposal status + latest
+  execution-evidence `stages` notify progression — every proposal lands
+  in exactly one bucket per phase), failures by stage (verbatim
+  `last_failure_stage` group-by), and the two timing intervals whose
+  BOTH timestamps are durable (`generated_at→approved_at`,
+  `approved_at→` execution completion).
+- **No fabrication:** every response carries a fixed data-quality
+  exclusion block (missing timestamps, negative durations, incomplete
+  executions, malformed/unmatched evidence — counters always present,
+  zero unless stated) plus an explicit UNSUPPORTED manifest with
+  BECAUSE/WOULD REQUIRE reasons: counts by service/component, RCA
+  category histogram, rejected/expired proposals, recovery, recurrence,
+  and the five pipeline timing intervals with no durable timestamps.
+- **New repository window read** (port + SQLAlchemy adapter,
+  `list_incidents_in_window`) — parameterized, `created_at` in
+  `[start, end)`, deterministic `ORDER BY created_at, id`, single bulk
+  evidence query, claim overlay applied like every other read. No
+  schema change, no new table, no new dependency; Phase 6.2.1 lease/CAS
+  and 6.2.2 sandbox semantics untouched.
+- §17 self-observability: one bounded-label counter
+  (`analytics_summary_requests_total{outcome}`) through the existing
+  shared metrics facade — metrics never break queries and Prometheus is
+  never a data source for analytics.
+- Tests: service unit/data-quality/determinism + E2E fixture through
+  the REAL repository adapter (SQLite), controller contract (422 map),
+  HTTP E2E (FastAPI param validation, route non-shadowing, byte
+  determinism), gateway auth/forward/relay matrix (2 new modules
+  registered in CI → 30).
+
 ## 2026-09-28 — Phase 6.2.2 corrective pass: read-only validation workspace & target integrity
 
 - **The real remediation Git workspace is now bound READ-ONLY into the

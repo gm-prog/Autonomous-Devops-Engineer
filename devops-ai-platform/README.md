@@ -881,3 +881,64 @@ duplicate reconcile, concurrency invariant), controller HTTP mapping,
 gateway operator routes (auth/role/stamp/relay/internal-prefix), and a
 real-git integration E2E (persisted proposal → approval → execution →
 local bare-origin push → draft PR, plus no-publish failure cases).
+
+## Phase 6.3 — Evidence-driven operational analytics & remediation intelligence
+
+`GET /incidents/analytics/summary?start=<ISO 8601>&end=<ISO 8601>`
+(fastapi-app: forwarded as `GET /v1/analytics/summary` by the API gateway
+behind the existing JWT `verify_token` auth + rate limit). One summary
+endpoint, one application service
+(`application/services/operational_analytics_service.py`) that owns
+window validation and aggregation; handlers carry no SQL and no rules,
+the repository port gained ONE window-bounded read
+(`list_incidents_in_window`, parameterized `created_at >= start AND
+created_at < end`, `ORDER BY created_at, id`, one bulk evidence query,
+claim overlay applied like every other read — no schema change).
+
+**Window contract.** Half-open UTC `[start, end)`, at most 31 days,
+service-validated (inverted/oversized/malformed → 422 with an explicit
+detail). Naive datetimes are treated as UTC, aware ones normalized.
+Aggregation is pure — no clock reads — so identical durable records
+always produce byte-identical JSON: fixed sorts, zero-filled UTC day
+buckets, integer-second timing with nearest-rank p50/p95.
+
+**Metrics (durable sources only).** Incident volume (total / by UTC day /
+by severity / by status) from `devops_incidents`; RCA coverage (reached /
+without / malformed partition) from `kind="rca_result"` evidence
+presence — never by guessing at free text; proposal outcomes from
+durable `status` + `approved_at`; pipeline phases (validation, commit,
+publication, pull request) as exact per-proposal partitions derived from
+proposal status plus the latest `kind="remediation_execution"` evidence
+`stages` notify progression (membership and `validation.completed.passed`
+only); failures grouped verbatim by `last_failure_stage`. Timing exposes
+exactly the two intervals where BOTH timestamps are durable and
+compatible: `proposal → approval` (`generated_at → approved_at`) and
+`approval → execution completion` (`approved_at →` latest execution
+evidence `observed_at`).
+
+**No fabrication.** Every response carries `data_quality.exclusions`
+(fixed reason vocabulary, counters always present, zero unless stated:
+missing timestamps, negative durations, incomplete executions,
+malformed/unmatched evidence, out-of-window defence) and an explicit
+`unsupported` manifest with BECAUSE/WOULD REQUIRE reasons:
+counts by service/component (no dedicated field), RCA category
+distribution (free text), rejected/expired proposal counts (never
+persisted — the approval TTL only gates approval), recovery and
+recurrence outcomes (no durable identity), and the five pipeline timing
+intervals with no durable timestamps (`HotfixProposal.executed_at` is
+never written in production).
+
+### Honest limitations (Phase 6.3)
+
+* Read-only analytics over incident-service records only — no
+  ML/forecasting/anomaly detection, no LLM metrics, no dashboards, no
+  new DB/queue/warehouse, no remediation/approval/rollback automation.
+* Unauthorized-workflow outcomes (rejected/expired) and lifecycle
+  outcomes with no durable field (recovery, recurrence, service
+  attribution) are reported as UNSUPPORTED, never estimated.
+* The gateway forwards raw parameters (single validation authority
+  downstream); the gateway rate limit applies, the incident service
+  itself has no in-service auth (matching every existing read route).
+* §17 self-observability is a single bounded-label counter
+  (`analytics_summary_requests_total{outcome}`) via the shared metrics
+  facade; Prometheus is never an analytics data source.

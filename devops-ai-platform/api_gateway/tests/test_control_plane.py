@@ -376,3 +376,88 @@ class ProposalExecutionRouteTests(unittest.TestCase):
                 )
                 self.assertEqual(resp.status_code, 404)
                 post.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.3: operational analytics summary (authenticated, read-only forward)
+# --------------------------------------------------------------------------- #
+
+ANALYTICS_GET = (
+    "/v1/analytics/summary"
+    "?start=2026-09-01T00%3A00%3A00Z&end=2026-09-08T00%3A00%3A00Z"
+)
+ANALYTICS_DOWNSTREAM = (
+    "http://incident-service:8050/incidents/analytics/summary"
+    "?start=2026-09-01T00%3A00%3A00Z&end=2026-09-08T00%3A00%3A00Z"
+)
+
+
+class AnalyticsSummaryRouteTests(unittest.TestCase):
+    """Phase 6.3: gateway authentication + verbatim GET forward.
+
+    Analytics aggregates are read-only and expose no patch content, so
+    any authenticated user may read them (``verify_token`` only) — unlike
+    the proposal read route which requires an operator role.
+    """
+
+    def test_unauthenticated_get_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(ANALYTICS_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_malformed_token_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(ANALYTICS_GET, headers=_authed("not-a-jwt"))
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_any_authenticated_user_may_read_aggregates(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        body = {"window": {"timezone": "UTC"}, "incidents": {"total": 3}}
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(ANALYTICS_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(get.call_args.args[0], ANALYTICS_DOWNSTREAM)
+        get.assert_called_once()
+
+    def test_operator_get_is_forwarded_and_relayed(self):
+        token = _operator()
+        body = {"incidents": {"total": 0}, "unsupported": []}
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(ANALYTICS_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        get.assert_called_once()
+
+    def test_downstream_window_rejection_is_relayed(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                422, {"detail": "window must not exceed 31 days"}
+            )
+            resp = client.get(ANALYTICS_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("31 days", resp.json()["detail"])
+
+    def test_unreachable_downstream_is_502(self):
+        import requests as requests_lib
+
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.side_effect = requests_lib.ConnectionError("refused")
+            resp = client.get(ANALYTICS_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 502)
+
+    def test_internal_prefix_grants_nothing(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            resp = client.get(
+                "/api/internal/analytics/summary?start=x&end=y",
+                headers=_authed(token),
+            )
+        self.assertEqual(resp.status_code, 404)
+        get.assert_not_called()

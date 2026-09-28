@@ -108,6 +108,61 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             incidents.append(incident)
         return incidents
 
+    def list_incidents_in_window(
+        self, start: datetime, end: datetime
+    ) -> List[IncidentAggregate]:
+        """Phase 6.3 analytics read: incidents with created_at in [start, end).
+
+        Half-open interval, deterministic ordering (created_at ASC, id ASC),
+        and a single bulk evidence query (ordered by incident_id, observed_at,
+        id) so the aggregation over these records is reproducible. Read-only:
+        no schema change, no writes, parameterized predicates only.
+        """
+        with self.engine.connect() as connection:
+            rows = connection.execute(
+                select(incidents_table)
+                .where(
+                    incidents_table.c.created_at >= start,
+                    incidents_table.c.created_at < end,
+                )
+                .order_by(
+                    incidents_table.c.created_at.asc(),
+                    incidents_table.c.id.asc(),
+                )
+            ).mappings().all()
+
+            evidence_by_incident: dict = {}
+            incident_ids = [row["id"] for row in rows]
+            if incident_ids:
+                evidence_rows = connection.execute(
+                    select(evidence_table)
+                    .where(evidence_table.c.incident_id.in_(incident_ids))
+                    .order_by(
+                        evidence_table.c.incident_id.asc(),
+                        evidence_table.c.observed_at.asc(),
+                        evidence_table.c.id.asc(),
+                    )
+                ).mappings().all()
+                for item in evidence_rows:
+                    evidence_by_incident.setdefault(item["incident_id"], []).append(
+                        IncidentEvidence(
+                            id=item["id"],
+                            kind=item["kind"],
+                            source=item["source"],
+                            observed_at=item["observed_at"],
+                            payload=json.loads(item["payload"]),
+                        )
+                    )
+
+            incidents: List[IncidentAggregate] = []
+            for row in rows:
+                incident = self._from_row(
+                    row, evidence_by_incident.get(row["id"], [])
+                )
+                self._apply_claim_overlay(incident)
+                incidents.append(incident)
+            return incidents
+
     # ------------------------------------------------------------------ #
     # Phase 6.2.1: durable execution coordination (source of truth for
     # lease ownership + persisted stage cursor; short transactions only —

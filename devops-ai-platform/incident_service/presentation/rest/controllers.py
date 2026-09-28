@@ -1,8 +1,9 @@
 from typing import Any, Dict, List
 
 import logging
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from incident_service.application.dependencies import get_incident_repository
@@ -17,6 +18,10 @@ from incident_service.domain.repository_interface import IncidentRepositoryPort
 from incident_service.domain.entities.incident_evidence import IncidentEvidence
 from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 from incident_service.infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
+from incident_service.application.services.operational_analytics_service import (
+    InvalidAnalyticsWindowError,
+    OperationalAnalyticsService,
+)
 from incident_service.application.services.proposal_generation_service import (
     ProposalGenerationService,
 )
@@ -144,6 +149,32 @@ def list_current_anomalies(
 ):
     """Returns persisted incidents that are not in a terminal state."""
     return [_serialize_incident(item) for item in repository.get_active_incidents()]
+
+
+@router.get("/analytics/summary", response_model=Dict[str, Any])
+def get_operational_analytics_summary(
+    start: datetime = Query(
+        ..., description="Inclusive window start, ISO 8601 (naive = UTC)"
+    ),
+    end: datetime = Query(
+        ..., description="Exclusive window end, ISO 8601 (naive = UTC)"
+    ),
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Phase 6.3 evidence-driven operational analytics (read-only).
+
+    Validates a bounded half-open UTC window ``[start, end)`` of at most
+    31 days (application service owns validation + aggregation), then
+    aggregates only durable authoritative records. Every response carries
+    data-quality exclusion counters and an explicit UNSUPPORTED manifest
+    for metrics with no durable backing.
+    """
+    try:
+        return OperationalAnalyticsService(repository).summarize(
+            start=start, end=end
+        )
+    except InvalidAnalyticsWindowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/{incident_id}", response_model=Dict[str, Any])
