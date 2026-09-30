@@ -791,5 +791,256 @@ class EndToEndSqliteFixtureTests(unittest.TestCase):
         self.assertIn("unsupported", empty)
 
 
+class ValidationMetadataTests(unittest.TestCase):
+    """Phase 6.3 corrective Fix #2: only a well-formed ``passed`` boolean
+    classifies validation; malformed metadata is a DQ exclusion, never a
+    fabricated validation failure (and never later-phase success)."""
+
+    def _summary(self, stages, status="EXECUTION_FAILED", url=""):
+        incident = _incident("inc-meta", W_START)
+        incident.patch_proposals.append(
+            _proposal(
+                "p-meta",
+                status=status,
+                approved_at=W_START + timedelta(hours=2),
+                pull_request_url=url,
+            )
+        )
+        incident.evidence.append(
+            _exec_evidence(
+                "ev-meta",
+                "p-meta",
+                stages,
+                W_START + timedelta(hours=3),
+                status,
+            )
+        )
+        return OperationalAnalyticsService(FakeRepository([incident])).summarize(
+            start=W_START, end=W_END
+        )
+
+    def test_valid_passed_true_is_success(self):
+        summary = self._summary(
+            [
+                _stage("validation.started"),
+                _stage("validation.completed", passed=True),
+            ]
+        )
+        self.assertEqual(
+            summary["remediation"]["validation"],
+            {"succeeded": 1, "failed": 0, "not_reached": 0},
+        )
+        counts = _dq_counts(summary)
+        self.assertEqual(counts[("execution", "validation_metadata_malformed")], 0)
+
+    def test_valid_passed_false_is_validation_failure(self):
+        summary = self._summary(
+            [
+                _stage("validation.started"),
+                _stage("validation.completed", passed=False),
+            ]
+        )
+        self.assertEqual(
+            summary["remediation"]["validation"],
+            {"succeeded": 0, "failed": 1, "not_reached": 0},
+        )
+        counts = _dq_counts(summary)
+        self.assertEqual(counts[("execution", "validation_metadata_malformed")], 0)
+
+    def _assert_malformed_not_failed(self, summary):
+        remediation = summary["remediation"]
+        self.assertEqual(
+            remediation["validation"],
+            {"succeeded": 0, "failed": 0, "not_reached": 1},
+        )
+        counts = _dq_counts(summary)
+        self.assertEqual(
+            counts[("execution", "validation_metadata_malformed")], 1
+        )
+        # malformed evidence alone must not reach commit/publication/PR
+        self.assertEqual(
+            remediation["commit"],
+            {"succeeded": 0, "failed": 0, "not_reached": 1},
+        )
+        self.assertEqual(
+            remediation["publication"],
+            {"succeeded": 0, "failed": 0, "not_reached": 1},
+        )
+        self.assertEqual(
+            remediation["pull_request"],
+            {"created": 0, "failed": 0, "not_reached": 1},
+        )
+        # one-bucket partition preserved
+        for phase in ("validation", "commit", "publication"):
+            buckets = remediation[phase]
+            self.assertEqual(sum(buckets.values()), 1, phase)
+        self.assertEqual(sum(remediation["pull_request"].values()), 1)
+
+    def test_non_mapping_metadata_is_dq_not_validation_failure(self):
+        summary = self._summary(
+            [
+                _stage("validation.started"),
+                {"stage": "validation.completed", "metadata": "not-a-mapping"},
+            ]
+        )
+        self._assert_malformed_not_failed(summary)
+
+    def test_missing_passed_key_is_dq_not_validation_failure(self):
+        summary = self._summary(
+            [
+                _stage("validation.started"),
+                _stage("validation.completed"),  # metadata {} — no `passed`
+            ]
+        )
+        self._assert_malformed_not_failed(summary)
+
+    def test_non_boolean_passed_is_dq_not_validation_failure(self):
+        summary = self._summary(
+            [
+                _stage("validation.started"),
+                _stage("validation.completed", passed="yes"),
+            ]
+        )
+        self._assert_malformed_not_failed(summary)
+
+    def test_malformed_metadata_cannot_fabricate_publication_or_pr_success(self):
+        # durable progression dies at validation with garbage metadata:
+        # no commit/remote/PR stage names, no PR url — later phases must
+        # stay not_reached and pull_request.created must remain 0.
+        summary = self._summary(
+            [{"stage": "validation.completed", "metadata": ["garbage"]}]
+        )
+        remediation = summary["remediation"]
+        self.assertEqual(remediation["publication"]["succeeded"], 0)
+        self.assertEqual(remediation["pull_request"]["created"], 0)
+        self.assertEqual(remediation["commit"]["succeeded"], 0)
+        self.assertEqual(
+            _dq_counts(summary)[("execution", "validation_metadata_malformed")],
+            1,
+        )
+
+    def test_malformed_metadata_with_pr_created_status_stays_partitioned(self):
+        # durable terminal status is authoritative for pipeline success;
+        # the malformed record is still surfaced as DQ
+        summary = self._summary(
+            [{"stage": "validation.completed", "metadata": None}],
+            status="PR_CREATED",
+            url="https://github.com/o/r/pull/3",
+        )
+        remediation = summary["remediation"]
+        self.assertEqual(
+            remediation["validation"],
+            {"succeeded": 1, "failed": 0, "not_reached": 0},
+        )
+        self.assertEqual(
+            _dq_counts(summary)[("execution", "validation_metadata_malformed")],
+            1,
+        )
+
+
+class CohortWindowSemanticsTests(unittest.TestCase):
+    """Phase 6.3 corrective Fix #3: the window selects incidents by
+    ``incident.created_at``; child facts of a selected incident are
+    analyzed even when their own timestamps fall outside the window, and
+    child facts inside the window never pull an outside incident in.
+    (Exact-boundary ``created_at == start``/``== end`` SQL behaviour is
+    pinned in EndToEndSqliteFixtureTests.)"""
+
+    def test_child_event_outside_window_stays_in_cohort(self):
+        incident = _incident("inc-cohort-in", W_START + timedelta(days=1))
+        late_generated = W_END + timedelta(days=10)  # well after window end
+        late_approved = late_generated + timedelta(hours=2)
+        proposal = _proposal(
+            "proposal-late",
+            status="PR_CREATED",
+            generated_at=late_generated,
+            approved_at=late_approved,
+            pull_request_url="https://github.com/o/r/pull/77",
+        )
+        incident.patch_proposals.append(proposal)
+        incident.evidence.append(
+            _exec_evidence(
+                "ev-late",
+                "proposal-late",
+                [
+                    _stage("validation.completed", passed=True),
+                    _stage("commit.created", commit_sha="d" * 40),
+                    _stage("remote.published", branch="fix/late"),
+                    _stage("pr.created", pull_request_url="https://github.com/o/r/pull/77"),
+                ],
+                late_approved + timedelta(seconds=60),
+                "PR_CREATED",
+            )
+        )
+
+        summary = OperationalAnalyticsService(
+            FakeRepository([incident])
+        ).summarize(start=W_START, end=W_END)
+        self.assertEqual(summary["incidents"]["total"], 1)
+        self.assertEqual(summary["remediation"]["proposals_created"], 1)
+        self.assertEqual(summary["remediation"]["approved"], 1)
+        # the child timing facts are analyzed as part of the cohort
+        self.assertEqual(
+            summary["timing"]["proposal_to_approval"]["sample_count"], 1
+        )
+        self.assertEqual(
+            summary["timing"]["proposal_to_approval"]["p50_seconds"],
+            int((late_approved - late_generated).total_seconds()),
+        )
+        self.assertEqual(
+            summary["timing"]["approval_to_execution_completion"]["sample_count"],
+            1,
+        )
+
+    def test_child_event_inside_window_cannot_pull_outside_incident(self):
+        incident = _incident("inc-cohort-out", W_END + timedelta(days=2))
+        inside_child = _proposal(
+            "proposal-inside",
+            status="PROPOSED",
+            generated_at=W_START + timedelta(days=1),
+        )
+        incident.patch_proposals.append(inside_child)
+        incident.evidence.append(
+            _rca_evidence(
+                "ev-inside",
+                {"root_cause": "inside-window rca"},
+                W_START + timedelta(days=2),
+            )
+        )
+
+        summary = OperationalAnalyticsService(
+            FakeRepository([incident])
+        ).summarize(start=W_START, end=W_END)
+        self.assertEqual(summary["incidents"]["total"], 0)
+        self.assertEqual(summary["remediation"]["proposals_created"], 0)
+        self.assertEqual(summary["incidents"]["reached_rca"], 0)
+        counts = _dq_counts(summary)
+        self.assertEqual(counts[("window", "incident_outside_window")], 1)
+        self.assertEqual(
+            summary["data_quality"]["incidents_considered"], 1
+        )
+
+    def test_exact_start_included_and_exact_end_excluded_sql_level(self):
+        # Explicit pins of the half-open bounds against the REAL adapter:
+        # created_at == start → included; created_at == end → excluded.
+        with tempfile.TemporaryDirectory() as temp:
+            repository = PostgresIncidentRepositoryAdapter(
+                f"sqlite:///{os.path.join(temp, 'cohort-bounds.db')}"
+            )
+            created = W_START + timedelta(hours=6)
+            at_start = _incident("inc-bound-start", created)
+            repository.save_incident(at_start)
+
+            start_inclusive = OperationalAnalyticsService(
+                repository
+            ).summarize(start=created, end=created + timedelta(hours=1))
+            self.assertEqual(start_inclusive["incidents"]["total"], 1)
+
+            end_exclusive = OperationalAnalyticsService(
+                repository
+            ).summarize(start=created - timedelta(hours=1), end=created)
+            self.assertEqual(end_exclusive["incidents"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

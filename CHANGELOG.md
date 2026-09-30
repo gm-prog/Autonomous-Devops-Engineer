@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## 2026-09-28 — Phase 6.3 corrective pass: analytics read path, metadata honesty, cohort contract
+
+- **No N+1 on the analytics window read:** `list_incidents_in_window`
+  no longer applies the per-incident claim overlay (analytics does not
+  need live execution-lease/claim state) — exactly two statements
+  (incident window query + one bulk evidence query) regardless of cohort
+  size, proven by a query-budget regression test. Normal reads
+  (`get_incident_by_id`/`get_active_incidents`) keep their overlay and
+  all claim/CAS/lease semantics are untouched.
+- **Malformed execution metadata can no longer fabricate outcomes:**
+  validation is classified only by a well-formed boolean
+  `validation.completed.passed` (True → success, False + finished
+  FAILED attempt → validation failure); non-mapping metadata, a missing
+  `passed` key, or a non-boolean value is recorded as the new data-quality
+  reason `execution:validation_metadata_malformed` and classified as NOT
+  failed (partition preserved). Publication/PR phases remain pure
+  durable-stage-membership checks (metadata never read there).
+- **Incident-cohort window semantics locked:** documented in the service
+  docstring + README and pinned by tests — the window selects incidents
+  by `incident.created_at` (half-open UTC `[start, end)`); child facts
+  of selected incidents are analyzed even when their own timestamps fall
+  outside the window, and in-window child events never pull an
+  out-of-window incident into the cohort.
+- **Dead Phase 6.3 leftovers removed:** unused `EXECUTION_STAGES` import;
+  unreachable DQ vocabulary `timing_approval_to_completion:evidence_payload_malformed`;
+  stale README claim that validation "executes in-process on the
+  incident-service host" (contradicts the Phase 6.2.2 container sandbox).
+
 ## 2026-09-28 — Phase 6.3: evidence-driven operational analytics & remediation intelligence
 
 - **One read-only summary endpoint** — `GET /incidents/analytics/summary`

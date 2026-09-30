@@ -29,6 +29,16 @@ exclusion counts always visible; no percentages are exposed (there is no
 supported categorical distribution to divide by); data-quality exclusion
 counters are always present in every response; aggregation is pure (no
 clock reads — the window is fully caller-specified).
+
+**Incident-cohort window semantics (not event-time analytics).** The
+window selects incidents by ``incident.created_at`` in ``[start, end)``.
+All RCA, remediation, execution and timing facts attached to those
+selected incidents are analyzed as part of that incident cohort, even
+when child timestamps fall outside the window: e.g. an incident created
+inside the window with a proposal generated later contributes that
+proposal (and its timing facts) to the summary, while an incident
+created outside the window is never pulled in by child events that fall
+inside it.
 """
 
 from collections import Counter
@@ -37,9 +47,6 @@ from datetime import datetime, timedelta, timezone
 from math import ceil
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from incident_service.application.services.proposal_execution_policy import (
-    EXECUTION_STAGES,
-)
 from incident_service.application.services.proposal_execution_service import (
     EXECUTION_EVIDENCE_KIND,
 )
@@ -82,12 +89,12 @@ _DQ_REASONS: Tuple[Tuple[str, str], ...] = (
     ("execution", "execution_evidence_malformed"),
     ("execution", "execution_evidence_unmatched"),
     ("execution", "execution_stages_malformed"),
+    ("execution", "validation_metadata_malformed"),
     ("failures_by_stage", "missing_last_failure_stage"),
     ("timing_proposal_to_approval", "missing_generated_at"),
     ("timing_proposal_to_approval", "negative_duration"),
     ("timing_approval_to_completion", "execution_completion_missing"),
     ("timing_approval_to_completion", "negative_duration"),
-    ("timing_approval_to_completion", "evidence_payload_malformed"),
 )
 
 
@@ -114,19 +121,25 @@ def _nearest_rank(sorted_values: Sequence[int], percentile: float) -> Optional[i
     return sorted_values[min(rank, len(sorted_values)) - 1]
 
 
-def _last_stage_metadata(
+def _last_stage_entry(
     stages: Sequence[Any], notify_name: str
-) -> Optional[Mapping[str, Any]]:
-    """Metadata of the LAST occurrence of ``notify_name`` (deterministic)."""
+) -> Tuple[bool, Any]:
+    """``(present, metadata)`` of the LAST occurrence of ``notify_name``.
+
+    ``metadata`` is returned raw so callers can distinguish an absent
+    stage, a valid mapping, and malformed metadata — malformed metadata
+    is never silently coerced to ``{}`` (that coercion used to turn
+    garbage into ``passed=False`` and fabricate validation failures).
+    """
     for entry in reversed(stages):
         if isinstance(entry, Mapping) and entry.get("stage") == notify_name:
-            metadata = entry.get("metadata")
-            return metadata if isinstance(metadata, Mapping) else {}
-    return None
+            return True, entry.get("metadata")
+    return False, None
 
 
 def _has_stage(stages: Sequence[Any], notify_name: str) -> bool:
-    return _last_stage_metadata(stages, notify_name) is not None or any(
+    """Pure membership test over durable stage names (metadata-agnostic)."""
+    return any(
         isinstance(entry, Mapping) and entry.get("stage") == notify_name
         for entry in stages
     )
@@ -550,18 +563,40 @@ class OperationalAnalyticsService:
         pipeline_succeeded = status == "PR_CREATED"
 
         # --- validation ------------------------------------------------
-        completed = _last_stage_metadata(stages, _NOTIFY_VALIDATION_COMPLETED)
-        validation_passed = pipeline_succeeded or (
-            completed is not None and bool(completed.get("passed"))
+        # Only a well-formed ``passed`` boolean classifies the outcome:
+        #   True  → validation succeeded
+        #   False (EXECUTION_FAILED) → validation failed
+        #   malformed / non-mapping / missing-passed → data-quality
+        #   exclusion, classified as NOT failed (a durable stage name can
+        #   never be turned into a fabricated validation failure).
+        completed_present, completed_metadata = _last_stage_entry(
+            stages, _NOTIFY_VALIDATION_COMPLETED
         )
-        validation_failed = False
-        if status == "EXECUTION_FAILED":
-            if completed is not None and not bool(completed.get("passed")):
-                validation_failed = True
-            elif not validation_passed and _has_stage(
-                stages, _NOTIFY_VALIDATION_STARTED
-            ):
-                validation_failed = True
+        completed_valid = (
+            completed_present
+            and isinstance(completed_metadata, Mapping)
+            and isinstance(completed_metadata.get("passed"), bool)
+        )
+        if completed_present and not completed_valid:
+            exclusions[_dq_key("execution", "validation_metadata_malformed")] += 1
+        if completed_valid:
+            validation_passed = pipeline_succeeded or (
+                completed_metadata["passed"] is True
+            )
+            validation_failed = (
+                status == "EXECUTION_FAILED"
+                and completed_metadata["passed"] is False
+            )
+        else:
+            # No usable validation outcome: fall back only to the durable
+            # "validation stage started but never completed" evidence —
+            # and only for a finished FAILED attempt.
+            validation_passed = pipeline_succeeded
+            validation_failed = (
+                status == "EXECUTION_FAILED"
+                and not completed_present
+                and _has_stage(stages, _NOTIFY_VALIDATION_STARTED)
+            )
         if validation_passed:
             buckets["validation"]["succeeded"] += 1
         elif validation_failed:
@@ -654,11 +689,7 @@ class OperationalAnalyticsService:
         )
         completion_excluded = sum(
             exclusions.get(_dq_key(completion_scope, reason), 0)
-            for reason in (
-                "execution_completion_missing",
-                "negative_duration",
-                "evidence_payload_malformed",
-            )
+            for reason in ("execution_completion_missing", "negative_duration")
         )
         return TimingSection(
             proposal_to_approval=TimingStats.from_samples(

@@ -835,9 +835,11 @@ Phases 6.2.1A/B/C are unchanged.
   silently expanded into the remediation trust chain.
 * **Validation-runner sandbox** — the remediation validation runner bounds
   commands with `shell=False`, fixed profiles, timeouts and env
-  sanitation, but it executes in-process on the incident-service host, not
-  in a container/gVisor sandbox. Untrusted patch content is still checked
-  (`git apply --check` + path rules); full isolation remains open work.
+  sanitation; since Phase 6.2.2 the workload executes only inside a
+  digest-pinned, network-less container sandbox (no host-execution
+  fallback). Untrusted patch content is still checked
+  (`git apply --check` + path rules); workspace preparation, patch
+  application and commit remain host-side fixed-argv git operations.
 * **Two stacks exist** — the repository-root `docker-compose.yml` is the
   broad *development* stack (Postgres/Redis/Qdrant/gateway/Prometheus/
   Grafana + backend services with several host ports for local debugging).
@@ -892,8 +894,9 @@ endpoint, one application service
 window validation and aggregation; handlers carry no SQL and no rules,
 the repository port gained ONE window-bounded read
 (`list_incidents_in_window`, parameterized `created_at >= start AND
-created_at < end`, `ORDER BY created_at, id`, one bulk evidence query,
-claim overlay applied like every other read — no schema change).
+created_at < end`, `ORDER BY created_at, id`, one bulk evidence query —
+exactly two statements regardless of cohort size, deliberately WITHOUT
+the per-incident claim overlay — no schema change).
 
 **Window contract.** Half-open UTC `[start, end)`, at most 31 days,
 service-validated (inverted/oversized/malformed → 422 with an explicit
@@ -901,6 +904,14 @@ detail). Naive datetimes are treated as UTC, aware ones normalized.
 Aggregation is pure — no clock reads — so identical durable records
 always produce byte-identical JSON: fixed sorts, zero-filled UTC day
 buckets, integer-second timing with nearest-rank p50/p95.
+
+**Incident-cohort semantics (not event-time analytics).** The window
+selects incidents by `incident.created_at`. All RCA, remediation,
+execution, and timing facts attached to those selected incidents are
+analyzed as part of that incident cohort, even when child timestamps
+fall outside the window (an incident created inside the window keeps a
+proposal generated later; child events inside the window never pull an
+out-of-window incident into the cohort).
 
 **Metrics (durable sources only).** Incident volume (total / by UTC day /
 by severity / by status) from `devops_incidents`; RCA coverage (reached /

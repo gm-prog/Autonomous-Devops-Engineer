@@ -115,8 +115,17 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
 
         Half-open interval, deterministic ordering (created_at ASC, id ASC),
         and a single bulk evidence query (ordered by incident_id, observed_at,
-        id) so the aggregation over these records is reproducible. Read-only:
-        no schema change, no writes, parameterized predicates only.
+        id) so the aggregation over these records is reproducible: exactly
+        TWO statements regardless of how many incidents match — never one
+        query per incident. Read-only: no schema change, no writes,
+        parameterized predicates only.
+
+        The claim overlay is deliberately NOT applied here (unlike
+        get_incident_by_id/get_active_incidents): analytics does not need
+        live execution-lease/claim state, and overlaying would issue one
+        execution_claims query per incident (N+1). Analytics reads the
+        durable proposal JSON mirrors persisted alongside claim updates.
+        Normal read semantics and claim/CAS behavior are untouched.
         """
         with self.engine.connect() as connection:
             rows = connection.execute(
@@ -154,14 +163,10 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                         )
                     )
 
-            incidents: List[IncidentAggregate] = []
-            for row in rows:
-                incident = self._from_row(
-                    row, evidence_by_incident.get(row["id"], [])
-                )
-                self._apply_claim_overlay(incident)
-                incidents.append(incident)
-            return incidents
+            return [
+                self._from_row(row, evidence_by_incident.get(row["id"], []))
+                for row in rows
+            ]
 
     # ------------------------------------------------------------------ #
     # Phase 6.2.1: durable execution coordination (source of truth for
