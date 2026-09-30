@@ -23,7 +23,14 @@ import tempfile
 import unittest
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
+from sqlalchemy import event
+
+from incident_service.application.services.change_intelligence_service import (
+    ChangeIntelligenceService,
+    ReleaseDecision,
+)
 from incident_service.application.services.operational_analytics_service import (
     InvalidAnalyticsWindowError,
     OperationalAnalyticsService,
@@ -34,6 +41,14 @@ from incident_service.domain.entities.incident_evidence import IncidentEvidence
 from incident_service.domain.repository_interface import IncidentRepositoryPort
 from incident_service.infrastructure.database.postgres_incident_repo import (
     PostgresIncidentRepositoryAdapter,
+)
+
+# Reuse the existing deployment-evidence fixture (genuine platform
+# provenance when the identity is canonical; see Phase 6.1 binding tests).
+from incident_service.presentation.rest.test_remediation_authorization import (
+    OTHER_SHA,
+    SOURCE_SHA,
+    _deployment_evidence,
 )
 
 UTC = timezone.utc
@@ -1040,6 +1055,532 @@ class CohortWindowSemanticsTests(unittest.TestCase):
                 repository
             ).summarize(start=created - timedelta(hours=1), end=created)
             self.assertEqual(end_exclusive["incidents"]["total"], 0)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.4 — change intelligence & release health
+# --------------------------------------------------------------------------- #
+
+_HEALTHY_KIND_EXTRA = {"health_check_status": "PASS"}
+
+
+def _change_incident(
+    incident_id,
+    created_at,
+    *,
+    severity="HIGH",
+    status="Fixed",
+    run_id="run-health",
+    kind_extra=None,
+):
+    """Incident carrying a durable deployment-run evidence record."""
+    incident = _incident(incident_id, created_at, severity=severity, status=status)
+    incident.evidence.append(
+        _deployment_evidence(
+            run_id=run_id,
+            evidence_id=f"deploy-{incident_id}",
+            kind_extra=dict(
+                _HEALTHY_KIND_EXTRA if kind_extra is None else kind_extra
+            ),
+        )
+    )
+    return incident
+
+
+def _assess(incidents, run_id="run-health"):
+    return ChangeIntelligenceService(FakeRepository(incidents)).assess(
+        deployment_run_id=run_id, start=W_START, end=W_END
+    )
+
+
+class ChangeCorrelationTests(unittest.TestCase):
+    """Phase 6.4 Deliverable A: links exist only on durable identifiers."""
+
+    def test_exact_deployment_run_id_links_with_strong_basis(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        summary = _assess([carrier])
+        impact = summary["change_impact"]
+        self.assertEqual(impact["incident_count"], 1)
+        self.assertEqual(impact["link_basis"], "deployment_run_id")
+        self.assertEqual(impact["linked_incidents"][0]["link_basis"], "deployment_run_id")
+        self.assertEqual(impact["linked_incidents"][0]["incident_id"], "inc-carrier")
+        self.assertEqual(impact["repository_name"], "acme/checkout")
+        self.assertEqual(impact["source_sha"], SOURCE_SHA)
+        self.assertEqual(impact["highest_incident_severity"], "HIGH")
+        self.assertIsNotNone(impact["first_incident_at"])
+
+    def test_exact_repository_plus_sha_links_with_supporting_basis(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        redeploy_same_sha = _incident("inc-redeploy", W_START + timedelta(hours=2))
+        redeploy_same_sha.evidence.append(
+            _deployment_evidence(
+                run_id="run-other",
+                evidence_id="deploy-redeploy",
+                kind_extra=dict(_HEALTHY_KIND_EXTRA),
+            )
+        )
+        summary = _assess([carrier, redeploy_same_sha])
+        links = {
+            link["incident_id"]: link["link_basis"]
+            for link in summary["change_impact"]["linked_incidents"]
+        }
+        self.assertEqual(
+            links,
+            {
+                "inc-carrier": "deployment_run_id",
+                "inc-redeploy": "repository_source_sha",
+            },
+        )
+
+    def test_wrong_sha_is_not_linked(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        wrong_sha = _incident("inc-wrong-sha", W_START + timedelta(hours=2))
+        wrong_sha.evidence.append(
+            _deployment_evidence(
+                run_id="run-other",
+                head_sha=OTHER_SHA,
+                evidence_id="deploy-wrong-sha",
+                kind_extra=dict(_HEALTHY_KIND_EXTRA),
+            )
+        )
+        summary = _assess([carrier, wrong_sha])
+        self.assertEqual(summary["change_impact"]["incident_count"], 1)
+        self.assertEqual(
+            summary["change_impact"]["linked_incidents"][0]["incident_id"],
+            "inc-carrier",
+        )
+
+    def test_wrong_repository_is_not_linked(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        wrong_repo = _incident("inc-wrong-repo", W_START + timedelta(hours=2))
+        wrong_repo.evidence.append(
+            _deployment_evidence(
+                run_id="run-other",
+                name="evil/checkout",
+                evidence_id="deploy-wrong-repo",
+                kind_extra=dict(_HEALTHY_KIND_EXTRA),
+            )
+        )
+        summary = _assess([carrier, wrong_repo])
+        self.assertEqual(summary["change_impact"]["incident_count"], 1)
+
+    def test_timestamp_proximity_alone_is_never_authoritative(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        nearby = _incident("inc-nearby", W_START + timedelta(hours=1, seconds=5))
+        summary = _assess([carrier, nearby])
+        self.assertEqual(summary["change_impact"]["incident_count"], 1)
+        ids = [
+            link["incident_id"]
+            for link in summary["change_impact"]["linked_incidents"]
+        ]
+        self.assertEqual(ids, ["inc-carrier"])
+
+    def test_unknown_deployment_raises_lookup_for_404(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        with self.assertRaises(LookupError):
+            _assess([carrier], run_id="run-unknown")
+
+    def test_malformed_deployment_evidence_is_counted_not_fatal(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        broken = _incident("inc-broken", W_START + timedelta(hours=2))
+        broken.evidence.append(
+            IncidentEvidence(
+                id="deploy-broken",
+                kind="deployment_run",
+                source="deployment-service",
+                payload=["not-a-mapping"],
+            )
+        )
+        summary = _assess([carrier, broken])
+        counts = _dq_counts(summary)
+        self.assertEqual(
+            counts[("correlation", "deployment_evidence_malformed")], 1
+        )
+        self.assertEqual(summary["decision"], ReleaseDecision.HEALTHY.value)
+
+
+class ReleaseHealthDecisionTests(unittest.TestCase):
+    """Phase 6.4 Deliverable B: explicit deterministic rule evaluation."""
+
+    def test_known_good_authoritative_evidence_is_healthy(self):
+        carrier = _change_incident(
+            "inc-carrier", W_START + timedelta(hours=1), status="Fixed"
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "HEALTHY")
+        self.assertEqual(summary["reasons"], ["all_required_evidence_healthy"])
+        self.assertTrue(summary["signals"]["provenance_valid"])
+        self.assertEqual(summary["signals"]["deployment_state"], "DEPLOYED")
+        self.assertEqual(summary["signals"]["health_check_status"], "PASS")
+        self.assertEqual(summary["signals"]["linked_unresolved_count"], 0)
+        for item in summary["data_quality"]["exclusions"]:
+            self.assertEqual(item["count"], 0, item)
+
+    def test_unresolved_linked_incident_is_degraded(self):
+        carrier = _change_incident(
+            "inc-carrier", W_START + timedelta(hours=1), status="Raised"
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "DEGRADED")
+        self.assertEqual(summary["reasons"], ["linked_unresolved_incidents"])
+        self.assertEqual(summary["signals"]["linked_unresolved_count"], 1)
+
+    def test_rollback_pending_state_is_degraded(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={
+                "health_check_status": "PASS",
+                "state": "ROLLBACK_PENDING",
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "DEGRADED")
+        self.assertEqual(summary["reasons"], ["deployment_state_degraded"])
+
+    def test_failed_linked_remediation_is_degraded(self):
+        carrier = _change_incident(
+            "inc-carrier", W_START + timedelta(hours=1), status="Fixed"
+        )
+        carrier.patch_proposals.append(
+            _proposal(
+                "p-broken",
+                status="EXECUTION_FAILED",
+                approved_at=W_START + timedelta(hours=2),
+                last_failure_stage="validation.completed",
+            )
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "DEGRADED")
+        self.assertEqual(summary["reasons"], ["linked_remediation_failed"])
+        self.assertEqual(
+            summary["signals"]["linked_remediation_failed_count"], 1
+        )
+
+    def test_health_check_fail_is_failed(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={"health_check_status": "FAIL"},
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "FAILED")
+        self.assertEqual(summary["reasons"], ["deployment_health_check_failed"])
+
+    def test_failed_deployment_state_is_failed(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={
+                "health_check_status": "PASS",
+                "state": "DEPLOYMENT_FAILED",
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "FAILED")
+        self.assertEqual(summary["reasons"], ["deployment_state_failed"])
+
+    def test_rollback_fail_is_failed(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={
+                "health_check_status": "PASS",
+                "rollback_status": "FAIL",
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "FAILED")
+        self.assertEqual(summary["reasons"], ["deployment_rollback_failed"])
+
+    def test_failed_outranks_degraded_and_gaps_in_fixed_reason_order(self):
+        carrier = _change_incident(
+            "inc-carrier",  # non-terminal status would fire DEGRADED
+            W_START + timedelta(hours=1),
+            status="Raised",
+            kind_extra={
+                "health_check_status": "FAIL",
+                "rollback_status": "FAIL",
+                "state": "DEPLOYMENT_FAILED",
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "FAILED")
+        self.assertEqual(
+            summary["reasons"],
+            [
+                "deployment_state_failed",
+                "deployment_health_check_failed",
+                "deployment_rollback_failed",
+            ],
+        )
+
+    def test_missing_health_check_is_inconclusive_not_healthy(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={},  # no health_check_status key
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "INCONCLUSIVE")
+        self.assertEqual(summary["reasons"], ["health_check_missing"])
+
+    def test_unavailable_health_check_is_inconclusive(self):
+        for value in ("BLOCKED", "TIMEOUT"):
+            with self.subTest(value=value):
+                carrier = _change_incident(
+                    "inc-carrier",
+                    W_START + timedelta(hours=1),
+                    status="Fixed",
+                    kind_extra={"health_check_status": value},
+                )
+                summary = _assess([carrier])
+                self.assertEqual(summary["decision"], "INCONCLUSIVE")
+                self.assertEqual(summary["reasons"], ["health_check_unavailable"])
+
+    def test_missing_provenance_is_inconclusive(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={"health_check_status": "PASS"},
+        )
+        # non-canonical repository name cannot build a provenance record
+        carrier.evidence = [
+            item
+            for item in carrier.evidence
+            if item.kind != "deployment_run"
+        ]
+        carrier.evidence.append(
+            _deployment_evidence(
+                run_id="run-health",
+                name="bad name",
+                evidence_id="deploy-noprovenance",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "INCONCLUSIVE")
+        self.assertEqual(summary["reasons"], ["provenance_missing"])
+        self.assertIsNone(summary["signals"]["provenance_valid"])
+
+    def test_missing_target_sha_is_inconclusive_with_structured_reasons(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={
+                "health_check_status": "PASS",
+                "source_revision": {"head_sha": "", "commits": []},
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "INCONCLUSIVE")
+        self.assertEqual(
+            summary["reasons"],
+            ["target_sha_missing", "provenance_missing"],
+        )
+
+    def test_nonterminal_state_is_inconclusive(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={
+                "health_check_status": "PASS",
+                "state": "DEPLOYING",
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "INCONCLUSIVE")
+        self.assertEqual(
+            summary["reasons"],
+            ["deployment_state_nonterminal", "provenance_invalid"],
+        )
+
+    def test_unrecognized_rollback_status_is_inconclusive(self):
+        carrier = _change_incident(
+            "inc-carrier",
+            W_START + timedelta(hours=1),
+            status="Fixed",
+            kind_extra={
+                "health_check_status": "PASS",
+                "rollback_status": "PENDING",
+            },
+        )
+        summary = _assess([carrier])
+        self.assertEqual(summary["decision"], "INCONCLUSIVE")
+        self.assertEqual(summary["reasons"], ["rollback_status_unrecognized"])
+
+    def test_data_quality_vocabulary_is_always_fully_present(self):
+        carrier = _change_incident(
+            "inc-carrier", W_START + timedelta(hours=1), status="Fixed"
+        )
+        summary = _assess([carrier])
+        expected = [
+            ("correlation", "deployment_evidence_malformed"),
+            ("signals", "target_sha_missing"),
+            ("signals", "repository_missing"),
+            ("signals", "deployment_state_missing"),
+            ("signals", "deployment_state_unrecognized"),
+            ("signals", "deployment_state_nonterminal"),
+            ("signals", "health_check_missing"),
+            ("signals", "health_check_unavailable"),
+            ("signals", "rollback_status_unrecognized"),
+            ("signals", "provenance_missing"),
+            ("signals", "provenance_invalid"),
+        ]
+        self.assertEqual(
+            [
+                (item["scope"], item["reason"])
+                for item in summary["data_quality"]["exclusions"]
+            ],
+            expected,
+        )
+        self.assertEqual(summary["data_quality"]["incidents_considered"], 1)
+
+    def test_identical_inputs_and_window_produce_identical_json(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        other = _change_incident("inc-other", W_START + timedelta(hours=2))
+        first = _assess([carrier, other])
+        second = _assess([carrier, other])
+        self.assertEqual(json.dumps(first), json.dumps(second))
+        shuffled = _assess([other, carrier])
+        self.assertEqual(json.dumps(first), json.dumps(shuffled))
+
+    def test_assessment_never_mutates_through_the_repository(self):
+        carrier = _change_incident("inc-carrier", W_START + timedelta(hours=1))
+        repository = FakeRepository([carrier])
+        with patch.object(
+            repository, "save_incident", side_effect=AssertionError("read-only")
+        ) as save:
+            ChangeIntelligenceService(repository).assess(
+                deployment_run_id="run-health", start=W_START, end=W_END
+            )
+        save.assert_not_called()
+
+
+class ChangeHealthWindowTests(unittest.TestCase):
+    """Phase 6.4: Phase 6.3 window contract applies verbatim."""
+
+    def test_inverted_window_is_rejected(self):
+        with self.assertRaises(InvalidAnalyticsWindowError):
+            ChangeIntelligenceService(FakeRepository()).assess(
+                deployment_run_id="run-x", start=W_END, end=W_START
+            )
+
+    def test_oversized_window_is_rejected(self):
+        with self.assertRaises(InvalidAnalyticsWindowError):
+            ChangeIntelligenceService(FakeRepository()).assess(
+                deployment_run_id="run-x",
+                start=W_START,
+                end=W_START + timedelta(days=31, seconds=1),
+            )
+
+
+class ChangeHealthQueryBudgetTests(unittest.TestCase):
+    """Phase 6.4: bounded read path over the REAL repository adapter."""
+
+    _START = W_START
+    _END = W_END
+
+    def _seed(self, repository):
+        carrier = _change_incident(
+            "inc-budget-carrier", W_START + timedelta(hours=1), status="Fixed"
+        )
+        repository.save_incident(carrier)
+        for index in range(2):
+            plain = _incident(
+                f"inc-budget-plain-{index}", W_START + timedelta(hours=3 + index)
+            )
+            repository.save_incident(plain)
+
+    def test_assess_is_two_selects_and_read_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = PostgresIncidentRepositoryAdapter(
+                f"sqlite:///{os.path.join(temp_dir, 'change-health.db')}"
+            )
+            self._seed(repository)
+
+            statements = []
+
+            def before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+                statements.append(statement)
+
+            event.listen(
+                repository.engine, "before_cursor_execute", before_cursor_execute
+            )
+            try:
+                with patch.object(
+                    repository,
+                    "save_incident",
+                    side_effect=AssertionError("read-only"),
+                ):
+                    summary = ChangeIntelligenceService(repository).assess(
+                        deployment_run_id="run-health",
+                        start=self._START,
+                        end=self._END,
+                    )
+            finally:
+                event.remove(
+                    repository.engine, "before_cursor_execute", before_cursor_execute
+                )
+
+            selects = [
+                sql
+                for sql in statements
+                if sql.strip().upper().startswith("SELECT")
+            ]
+            self.assertLessEqual(len(selects), 2)
+            self.assertFalse(
+                any("execution_claims" in sql for sql in selects), selects
+            )
+            self.assertEqual(summary["decision"], "HEALTHY")
+            self.assertEqual(summary["change_impact"]["incident_count"], 1)
+
+    def test_exact_start_included_and_exact_end_excluded(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = PostgresIncidentRepositoryAdapter(
+                f"sqlite:///{os.path.join(temp_dir, 'change-bounds.db')}"
+            )
+            self._seed(repository)
+            created = W_START + timedelta(hours=1)  # carrier created_at
+
+            included = ChangeIntelligenceService(repository).assess(
+                deployment_run_id="run-health",
+                start=created,
+                end=created + timedelta(hours=1),
+            )
+            self.assertEqual(included["change_impact"]["incident_count"], 1)
+
+            with self.assertRaises(LookupError):
+                ChangeIntelligenceService(repository).assess(
+                    deployment_run_id="run-health",
+                    start=created - timedelta(hours=1),
+                    end=created,
+                )
+
+    def test_incident_outside_window_is_not_in_cohort(self):
+        # cohort semantics: a carrier created after the window end is not
+        # part of the cohort, so its evidence is unknown to this
+        # assessment window -> LookupError (404 at the API layer)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = PostgresIncidentRepositoryAdapter(
+                f"sqlite:///{os.path.join(temp_dir, 'change-cohort.db')}"
+            )
+            outside = _change_incident("inc-outside", W_END + timedelta(days=2))
+            repository.save_incident(outside)
+            with self.assertRaises(LookupError):
+                ChangeIntelligenceService(repository).assess(
+                    deployment_run_id="run-health",
+                    start=W_START,
+                    end=W_END,
+                )
 
 
 if __name__ == "__main__":

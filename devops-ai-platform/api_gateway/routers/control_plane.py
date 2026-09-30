@@ -224,6 +224,29 @@ def control_plane_analytics_summary(
     return _forward_get("incident", f"/incidents/analytics/summary?{query}")
 
 
+@router.get("/changes/{deployment_run_id}/health")
+def control_plane_change_health(
+    deployment_run_id: str,
+    start: str,
+    end: str,
+    request: Request,
+    user: dict = Depends(verify_token),
+):
+    """Evidence-backed release-health assessment (Phase 6.4).
+
+    Read-only decision foundation: HEALTHY / DEGRADED / FAILED /
+    INCONCLUSIVE over a bounded observation window. Any authenticated
+    user may read it (no patch content); window validation and the rule
+    evaluator live downstream (single validation authority) and unknown
+    deployments surface as the relayed 404.
+    """
+    _rate_limit_or_429(request)
+    query = urlencode({"start": start, "end": end})
+    return _forward_get(
+        "incident", f"/changes/{deployment_run_id}/health?{query}"
+    )
+
+
 @router.post("/incidents/{incident_id}/proposal/approve")
 def control_plane_approve_proposal(
     incident_id: str,

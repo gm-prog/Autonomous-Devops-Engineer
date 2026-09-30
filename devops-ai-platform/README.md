@@ -953,3 +953,94 @@ never written in production).
 * §17 self-observability is a single bounded-label counter
   (`analytics_summary_requests_total{outcome}`) via the shared metrics
   facade; Prometheus is never an analytics data source.
+
+## Phase 6.4 — Change intelligence & release verification foundation
+
+`GET /changes/{deployment_run_id}/health?start=<ISO 8601>&end=<ISO 8601>`
+(fastapi-app: forwarded as `GET /v1/changes/{deployment_run_id}/health` by
+the API gateway behind the existing JWT `verify_token` auth + rate
+limit; any authenticated user — aggregates expose no patch content).
+One typed, read-only assessment service
+(`application/services/change_intelligence_service.py`) owns correlation
+and the deterministic rule evaluator; handlers carry no SQL and no
+rules; persistence is the existing incident/evidence read (the Phase 6.3
+window-bounded repository read — two statements, no N+1, no new table).
+
+**What a change ↔ incident link means.** A link is an evidence-backed
+association (correlation), never causal proof. Hierarchy, on durable
+identifiers only:
+
+1. `deployment_run_id` — an incident's `kind="deployment_run"` evidence
+   payload records the exact deployment run id (strong basis);
+2. `repository_source_sha` — exact `repository_name` + exact deployed
+   `source_revision.head_sha` matching the authoritative record for that
+   run (supporting basis).
+
+The authoritative record for a run is the latest exact-id evidence
+record by `(observed_at, evidence_id)` (the same deterministic winner
+rule as remediation target binding). Timestamp proximity alone never
+creates a link; service/component identity is never guessed from title
+text. Language: linked / associated / observed after deployment — not
+"caused by".
+
+**The four decisions** (exactly these values; structured reason tokens,
+no prose):
+
+* `HEALTHY` — state `DEPLOYED`, health check `PASS`, valid platform
+  provenance describing this record, complete identity, rollback absent
+  or `PASS`, no unresolved linked incident, no failed linked remediation
+  (reason `all_required_evidence_healthy`).
+* `DEGRADED` — operational deterioration without terminal failure:
+  state `ROLLBACK_PENDING`/`ROLLED_BACK` (`deployment_state_degraded`),
+  ≥1 linked incident whose status is not terminal (`Fixed`/`Resolved`
+  vocabulary — `linked_unresolved_incidents`), or a linked incident with
+  a durable `EXECUTION_FAILED` proposal (`linked_remediation_failed`).
+* `FAILED` — an authoritative failure field: state in
+  {`VALIDATION_FAILED`, `DRY_RUN_FAILED`, `DEPLOYMENT_FAILED`,
+  `ROLLBACK_FAILED`} (`deployment_state_failed`), health check `FAIL`
+  (`deployment_health_check_failed`), or rollback `FAIL`
+  (`deployment_rollback_failed`).
+* `INCONCLUSIVE` — required evidence missing/untrustworthy (target SHA,
+  repository, state missing/unrecognized/nonterminal, health check
+  missing/`BLOCKED`/`TIMEOUT`/unknown, unrecognized rollback status,
+  provenance missing/invalid). Incomplete evidence is never forced to
+  `HEALTHY`, and malformed evidence is never `FAILED` without an
+  independent authoritative failure field.
+
+**Signal sources & rule semantics.** All signals are durable evidence
+fields captured by the deployment-evidence collector (state,
+health_check status, rollback status, provenance, artifact/plan hashes,
+source SHA) plus in-cohort incident/proposal records (status, severity,
+`EXECUTION_FAILED` outcomes). Rules are explicit, typed, bounded,
+order-independent (fixed precedence `FAILED` > `DEGRADED` >
+`INCONCLUSIVE` > `HEALTHY`, fixed reason order); no ML, LLM,
+probabilistic scoring or heuristic confidence exists here.
+
+**Observation window.** The Phase 6.3 contract verbatim: caller-
+supplied UTC half-open `[start, end)`, ≤31 days (invalid/oversized →
+422), identical persisted inputs + identical window → byte-identical
+response. The window selects the incident cohort; deployment evidence
+attached to in-window incidents defines what the assessment can know.
+Unknown deployment in scope → 404.
+
+**Explicitly unsupported** (never attempted in 6.4): automatic
+rollback, canary/blue-green/Kubernetes rollout control, service-mesh or
+feature-flag integration, ML anomaly detection, predictive failure
+models, LLM health decisions, live Prometheus as a health source, new
+event bus/warehouse/dashboard, and any mutation — the endpoint is read-
+only and cannot approve, remediate, roll back, or deploy.
+
+### Honest limitations (Phase 6.4)
+
+* Correlation ≠ causation: linked incidents are associations on exact
+  identifiers; no causal attestation is produced or implied.
+* Assessments can only cover deployments that have durable
+  `deployment_run` evidence inside the observation window (evidence
+  lives on incidents); a change with no such evidence returns 404, not
+  a synthetic HEALTHY.
+* Deployment signals are the durable evidence snapshot captured at
+  attach time — not a live query of the deployment service or
+  Prometheus; state changes after attachment are not re-read.
+* `provenance_invalid` is recorded on non-`DEPLOYED` records by design
+  (platform provenance is authoritative for `DEPLOYED`); it is a data-
+  quality fact and never drives `FAILED` alone.

@@ -112,5 +112,87 @@ class AnalyticsSummaryHttpTests(unittest.TestCase):
         self.assertEqual(before.json()["incidents"]["total"], 0)
 
 
+class ChangeHealthHttpTests(unittest.TestCase):
+    """Phase 6.4 health endpoint over real HTTP (TestClient + SQLite)."""
+
+    HEALTH = "/changes/run-http/health"
+    HEALTH_WINDOW = WINDOW  # same Phase 6.3 window contract
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(self._temp.name, 'http-health.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        incident_app.dependency_overrides[
+            controllers_module.get_incident_repository
+        ] = lambda: self.repository
+        self.client = TestClient(incident_app)
+
+    def tearDown(self):
+        incident_app.dependency_overrides.clear()
+        self._temp.cleanup()
+
+    def _seed_carrier(self):
+        from incident_service.presentation.rest.test_remediation_authorization import (
+            _deployment_evidence,
+        )
+
+        incident = IncidentAggregate(
+            id="inc-http-health",
+            title="[sentry] 5xx on checkout",
+            severity="CRITICAL",
+            context_details="error budget burn",
+        )
+        incident.created_at = datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id="run-http",
+                evidence_id="deploy-http-health",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        self.repository.save_incident(incident)
+
+    def test_unknown_deployment_is_404(self):
+        resp = self.client.get(self.HEALTH + self.HEALTH_WINDOW)
+        self.assertEqual(resp.status_code, 404, resp.text)
+        self.assertIn("no deployment-run evidence", resp.json()["detail"])
+
+    def test_seeded_change_is_200_and_byte_deterministic(self):
+        self._seed_carrier()
+        first = self.client.get(self.HEALTH + self.HEALTH_WINDOW)
+        second = self.client.get(self.HEALTH + self.HEALTH_WINDOW)
+        self.assertEqual(first.status_code, 200, first.text)
+        body = first.json()
+        self.assertEqual(body["deployment_run_id"], "run-http")
+        self.assertIn(
+            body["decision"], {"HEALTHY", "DEGRADED", "FAILED", "INCONCLUSIVE"}
+        )
+        self.assertEqual(first.content, second.content)
+
+    def test_missing_parameters_are_422(self):
+        resp = self.client.get(self.HEALTH)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_malformed_datetime_is_422(self):
+        resp = self.client.get(
+            self.HEALTH + "?start=nope&end=2026-09-08T00:00:00Z"
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_oversized_window_is_422(self):
+        resp = self.client.get(
+            self.HEALTH + "?start=2026-08-01T00:00:00Z&end=2026-09-08T00:00:00Z"
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("31 days", resp.json()["detail"])
+
+    def test_inverted_window_is_422(self):
+        resp = self.client.get(
+            self.HEALTH + "?start=2026-09-08T00:00:00Z&end=2026-09-01T00:00:00Z"
+        )
+        self.assertEqual(resp.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()

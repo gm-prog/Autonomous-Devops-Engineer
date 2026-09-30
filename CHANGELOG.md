@@ -1,5 +1,51 @@
 # CHANGELOG
 
+## 2026-09-28 — Phase 6.4: change intelligence & release verification foundation
+
+- **One typed read-only endpoint** —
+  `GET /changes/{deployment_run_id}/health?start&end` (incident service),
+  forwarded as `GET /v1/changes/{deployment_run_id}/health` by the API
+  gateway behind the existing JWT `verify_token` auth + rate limit (any
+  authenticated user; no patch content). Application service owns
+  correlation + the deterministic rule evaluator; repository owns reads;
+  no SQL in handlers; no mutation path exists on this surface.
+- **Change ↔ incident correlation on durable identifiers only:**
+  strong basis = exact `deployment_run_id` in incident
+  `kind="deployment_run"` evidence; supporting basis = exact
+  `repository_name` + exact deployed `head_sha` matching the
+  authoritative record (latest exact-id record by `(observed_at,
+  evidence_id)` — the remediation-binding winner rule). Timestamp
+  proximity never links; correlation is reported as association, not
+  causation. Reuses collector-captured fields and the Stage-5
+  `_provenance_satisfies_record` identity guarantee — no second
+  deployment database, no new schema.
+- **Release health decisions** — exactly `HEALTHY` / `DEGRADED` /
+  `FAILED` / `INCONCLUSIVE`, from explicit typed rules with fixed
+  precedence and fixed structured reason tokens (no ML/LLM/probabilistic
+  scoring). FAILED = authoritative failure fields (terminal-failed
+  state, health `FAIL`, rollback `FAIL`); DEGRADED = deterioration
+  (rollback-pending/rolled-back state, unresolved linked incidents using
+  the existing `Fixed`/`Resolved` terminal vocabulary, linked
+  `EXECUTION_FAILED` remediation); INCONCLUSIVE = required evidence
+  missing/untrustworthy (identity, state, health, provenance gaps) —
+  never forced to HEALTHY; malformed evidence never becomes FAILED
+  without an independent authoritative field. HEALTHY requires the full
+  green set (state `DEPLOYED`, health `PASS`, valid provenance,
+  complete identity, no unresolved/failed linked work).
+- **Bounded reads & window contract** — reuses the Phase 6.3 window
+  read (two statements total, no N+1: no per-incident claim queries, no
+  per-evidence loops) and the Phase 6.3 window validator verbatim (UTC
+  half-open `[start, end)`, ≤31 days, 422 invalid/oversized, 404
+  unknown-in-window, byte-identical determinism). Data-quality block
+  mirrors Phase 6.3 (fixed exclusion vocabulary always fully present).
+- Tests (existing modules only — no CI workflow change): correlation
+  basis/anti-patterns (wrong SHA/repo, timestamp proximity),
+  the four decisions + reason-order determinism, DQ vocabulary pin,
+  read-only/mutation guards, no-patch-material assertion, window/bounds
+  ([start,end) exact-boundary + cohort 404), real-adapter query-budget
+  regression, HTTP E2E (422/404/200 + byte determinism), gateway
+  auth/forward/relay matrix.
+
 ## 2026-09-28 — Phase 6.3 corrective pass: analytics read path, metadata honesty, cohort contract
 
 - **No N+1 on the analytics window read:** `list_incidents_in_window`

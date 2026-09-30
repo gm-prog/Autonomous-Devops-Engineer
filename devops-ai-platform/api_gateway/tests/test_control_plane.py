@@ -461,3 +461,87 @@ class AnalyticsSummaryRouteTests(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 404)
         get.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.4: change-intelligence release health (authenticated, read-only)
+# --------------------------------------------------------------------------- #
+
+CHANGES_HEALTH_GET = (
+    "/v1/changes/run-9/health"
+    "?start=2026-09-01T00%3A00%3A00Z&end=2026-09-08T00%3A00%3A00Z"
+)
+CHANGES_HEALTH_DOWNSTREAM = (
+    "http://incident-service:8050/changes/run-9/health"
+    "?start=2026-09-01T00%3A00%3A00Z&end=2026-09-08T00%3A00%3A00Z"
+)
+
+
+class ChangeHealthRouteTests(unittest.TestCase):
+    """Phase 6.4: gateway authentication + verbatim GET forward.
+
+    Read-only assessment (no patch content): any authenticated user may
+    read it, mirroring the analytics summary route.
+    """
+
+    def test_unauthenticated_get_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(CHANGES_HEALTH_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_malformed_token_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(CHANGES_HEALTH_GET, headers=_authed("not-a-jwt"))
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_any_authenticated_user_may_read_the_assessment(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        body = {"decision": "HEALTHY", "reasons": ["all_required_evidence_healthy"]}
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(CHANGES_HEALTH_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(get.call_args.args[0], CHANGES_HEALTH_DOWNSTREAM)
+        get.assert_called_once()
+
+    def test_downstream_unknown_deployment_404_is_relayed(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                404, {"detail": "no deployment-run evidence for 'run-9' within the observation window"}
+            )
+            resp = client.get(CHANGES_HEALTH_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("no deployment-run evidence", resp.json()["detail"])
+
+    def test_downstream_window_rejection_422_is_relayed(self):
+        token = _operator()
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                422, {"detail": "window must not exceed 31 days"}
+            )
+            resp = client.get(CHANGES_HEALTH_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("31 days", resp.json()["detail"])
+
+    def test_unreachable_downstream_is_502(self):
+        import requests as requests_lib
+
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.side_effect = requests_lib.ConnectionError("refused")
+            resp = client.get(CHANGES_HEALTH_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 502)
+
+    def test_internal_prefix_grants_nothing(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            resp = client.get(
+                "/api/internal/changes/run-9/health?start=x&end=y",
+                headers=_authed(token),
+            )
+        self.assertEqual(resp.status_code, 404)
+        get.assert_not_called()
