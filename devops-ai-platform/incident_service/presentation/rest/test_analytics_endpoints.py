@@ -10,6 +10,7 @@ is covered over real HTTP in ``tests/test_analytics_summary_e2e.py``.
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
