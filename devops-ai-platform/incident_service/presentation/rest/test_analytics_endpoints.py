@@ -389,6 +389,7 @@ class ChangeLiveHealthEndpointTests(unittest.TestCase):
 class _FakeGateRepository:
     def __init__(self):
         self._incidents = []
+        self._gate_evaluations = []
         incident = IncidentAggregate(
             id="inc-gate-1",
             title="[release] gate",
@@ -411,6 +412,17 @@ class _FakeGateRepository:
 
     def save_incident(self, *args, **kwargs):
         raise AssertionError("gate controller must be read-only")
+
+    def save_progressive_release_gate_evaluation(self, evaluation):
+        self._gate_evaluations.append(dict(evaluation))
+        return dict(evaluation)
+
+    def get_progressive_release_gate_evaluations(self, deployment_run_id, limit=50):
+        rows = [
+            row for row in self._gate_evaluations
+            if row["deployment_run_id"] == deployment_run_id
+        ]
+        return list(reversed(rows))[:limit]
 
 
 class _FakeGatePrometheus:
@@ -534,6 +546,51 @@ class ChangeReleaseGateEndpointTests(unittest.TestCase):
             )
         self.assertEqual(body["gate_decision"], "PROMOTE")
         save.assert_not_called()
+
+
+class ChangeReleaseGateHistoryEndpointTests(unittest.TestCase):
+    def test_history_route_is_registered(self):
+        paths = [getattr(route, "path", "") for route in changes_router.routes]
+        self.assertIn("/changes/{deployment_run_id}/gate/history", paths)
+
+    def test_history_returns_persisted_state(self):
+        repo = _FakeGateRepository()
+        now = W_END
+        row = {
+            "evaluation_id": "eval-1",
+            "deployment_run_id": "run-gate-1",
+            "source_sha": "a" * 40,
+            "repository_name": "gm-prog/example",
+            "target_percentage": 5,
+            "observation_start": W_START,
+            "observation_end": W_END,
+            "baseline_deployment_run_id": None,
+            "baseline_source_sha": None,
+            "health_decision": "HEALTHY",
+            "gate_decision": "PROMOTE",
+            "reasons": ["all_required_signals_healthy"],
+            "live_assessment": {"decision": "HEALTHY"},
+            "policy_version": "6.6.1",
+            "request_fingerprint": "b" * 64,
+            "assessment_fingerprint": "c" * 64,
+            "observed_at": now,
+            "expires_at": now + timedelta(minutes=15),
+        }
+        repo.save_progressive_release_gate_evaluation(row)
+        from incident_service.presentation.rest.changes_controller import get_change_release_gate_history
+        body = get_change_release_gate_history(
+            deployment_run_id="run-gate-1", limit=50, repository=repo
+        )
+        self.assertEqual(body["count"], 1)
+        self.assertTrue(body["evaluations"][0]["fresh"])
+
+    def test_history_invalid_limit_maps_to_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            from incident_service.presentation.rest.changes_controller import get_change_release_gate_history
+            get_change_release_gate_history(
+                deployment_run_id="run-gate-1", limit=0, repository=_FakeGateRepository()
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
 
 
 if __name__ == "__main__":
