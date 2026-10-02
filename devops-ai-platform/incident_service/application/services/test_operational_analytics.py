@@ -75,6 +75,12 @@ class FakeRepository(IncidentRepositoryPort):
         assert start < end
         return list(self._incidents)
 
+    def save_progressive_release_gate_evaluation(self, evaluation):
+        raise AssertionError("analytics tests must not persist gate evaluations")
+
+    def get_progressive_release_gate_evaluations(self, deployment_run_id, limit=50):
+        raise AssertionError("analytics tests must not read gate evaluations")
+
 
 def _incident(incident_id, created_at, severity="HIGH", status="Raised"):
     incident = IncidentAggregate(
