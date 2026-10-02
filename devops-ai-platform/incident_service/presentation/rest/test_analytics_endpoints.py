@@ -485,6 +485,38 @@ class ChangeReleaseGateEndpointTests(unittest.TestCase):
         paths = [getattr(route, "path", "") for route in changes_router.routes]
         self.assertIn("/changes/{deployment_run_id}/gate", paths)
 
+    def test_direct_controller_call_rejects_fastapi_query_sentinel(self):
+        """A direct handler call must not accidentally treat Query(None) as a
+        real baseline identifier."""
+        from fastapi import Query
+
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_release_gate(
+                deployment_run_id="run-gate-1",
+                start=W_START,
+                end=W_END,
+                target_percentage=5,
+                baseline_deployment_run_id=Query(None),
+                repository=self._repo(),
+                prometheus=_FakeGatePrometheus(),
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_non_string_baseline_is_rejected_before_telemetry(self):
+        prometheus = _FakeGatePrometheus()
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_release_gate(
+                deployment_run_id="run-gate-1",
+                start=W_START,
+                end=W_END,
+                target_percentage=5,
+                baseline_deployment_run_id=123,
+                repository=self._repo(),
+                prometheus=prometheus,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(prometheus.calls, [])
+
     def test_gate_is_read_only(self):
         repo = self._repo()
         with patch.object(
@@ -496,6 +528,7 @@ class ChangeReleaseGateEndpointTests(unittest.TestCase):
                 start=W_START,
                 end=W_END,
                 target_percentage=5,
+                baseline_deployment_run_id=None,
                 repository=repo,
                 prometheus=_FakeGatePrometheus(),
             )
