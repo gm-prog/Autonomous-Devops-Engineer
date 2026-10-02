@@ -30,6 +30,14 @@ if PROMETHEUS_AVAILABLE:
         ['service']
     )
 
+    # Phase 6.3: operational analytics self-observability only — bounded
+    # outcome vocabulary (ok | window_rejected); never per-incident labels.
+    analytics_summary_requests = Counter(
+        'analytics_summary_requests_total',
+        'Operational analytics summary queries served by the incident service',
+        ['outcome']
+    )
+
     # Histograms
     incident_resolution_time = Histogram(
         'incident_resolution_seconds',
@@ -68,6 +76,7 @@ else:
     incidents_ingested = MockMetric()
     hotfixes_generated = MockMetric()
     hotfixes_applied = MockMetric()
+    analytics_summary_requests = MockMetric()
     incident_resolution_time = MockMetric()
     gemini_api_latency = MockMetric()
     agent_active_tasks = MockMetric()

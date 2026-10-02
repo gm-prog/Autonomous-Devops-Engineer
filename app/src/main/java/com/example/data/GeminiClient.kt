@@ -140,7 +140,8 @@ object GeminiClient {
         }
     }
 
-    private fun parseTag(text: String, tag: String): String {
+    // internal: unit-tested in GeminiClientParseTest
+    internal fun parseTag(text: String, tag: String): String {
         val openTag = "<$tag>"
         val closeTag = "</$tag>"
         val startIndex = text.indexOf(openTag)
