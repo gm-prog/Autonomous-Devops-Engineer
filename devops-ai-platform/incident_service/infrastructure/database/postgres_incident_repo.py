@@ -719,7 +719,14 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             else:
                 row = dict(existing)
                 for key in immutable_keys:
-                    if row.get(key) != values.get(key):
+                    existing_value = row.get(key)
+                    incoming_value = values.get(key)
+                    if isinstance(existing_value, datetime) or isinstance(
+                        incoming_value, datetime
+                    ):
+                        existing_value = _aware_utc(existing_value)
+                        incoming_value = _aware_utc(incoming_value)
+                    if existing_value != incoming_value:
                         raise ValueError(
                             "progressive release evaluation identity conflict"
                         )
