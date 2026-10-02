@@ -319,3 +319,32 @@ def control_plane_execute_proposal(
     return _forward_post(
         "incident", f"/incidents/{incident_id}/proposal/execute", forwarded
     )
+
+
+@router.get("/changes/{deployment_run_id}/gate")
+def control_plane_change_release_gate(
+    deployment_run_id: str,
+    start: str,
+    end: str,
+    target_percentage: int,
+    request: Request,
+    baseline_deployment_run_id: Optional[str] = None,
+    user: dict = Depends(verify_token),
+):
+    """Read-only Phase 6.6 progressive-release gate.
+
+    Any authenticated user may read the evidence-based gate. No deployment
+    mutation, traffic shift, approval, or rollback occurs at this endpoint.
+    """
+    _rate_limit_or_429(request)
+    params = {
+        "start": start,
+        "end": end,
+        "target_percentage": target_percentage,
+    }
+    if baseline_deployment_run_id:
+        params["baseline_deployment_run_id"] = baseline_deployment_run_id
+    query = urlencode(params)
+    return _forward_get(
+        "incident", f"/changes/{deployment_run_id}/gate?{query}"
+    )

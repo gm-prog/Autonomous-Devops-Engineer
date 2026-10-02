@@ -22,6 +22,7 @@ from incident_service.infrastructure.database.postgres_incident_repo import (
 from incident_service.presentation.rest.changes_controller import (
     get_change_health,
     get_change_live_health,
+    get_change_release_gate,
     router as changes_router,
 )
 from incident_service.presentation.rest.controllers import (
@@ -382,6 +383,123 @@ class ChangeLiveHealthEndpointTests(unittest.TestCase):
             any(path.endswith("/live-health") for path in paths),
             paths,
         )
+
+
+class _FakeGateRepository:
+    def __init__(self):
+        self._incidents = []
+        incident = IncidentAggregate(
+            id="inc-gate-1",
+            title="[release] gate",
+            severity="HIGH",
+            context_details="gate fixture",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id="run-gate-1",
+                evidence_id="gate-evidence-1",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        self._incidents.append(incident)
+
+    def list_incidents_in_window(self, start, end):
+        return list(self._incidents)
+
+    def save_incident(self, *args, **kwargs):
+        raise AssertionError("gate controller must be read-only")
+
+
+class _FakeGatePrometheus:
+    def __init__(self, error=None, cpu=0.30, request=10.0):
+        self.error = error
+        self.cpu = cpu
+        self.request = request
+        self.calls = []
+
+    def query_range_metric(self, template_name, start, end):
+        self.calls.append(template_name)
+        if self.error is not None:
+            raise self.error
+        value = self.request if template_name == "request_rate" else self.cpu
+        return RangeQueryResult(
+            template=template_name,
+            query="q",
+            start=W_START.timestamp(),
+            end=W_END.timestamp(),
+            step_seconds=60,
+            series=(
+                RangeSeries(
+                    labels={"deployment_id": "run-gate-1"},
+                    samples=tuple(
+                        RangeSample(
+                            timestamp=W_START.timestamp() + 3600 + i * 600,
+                            value=value,
+                        )
+                        for i in range(6)
+                    ),
+                ),
+            ),
+        )
+
+
+
+
+class ChangeReleaseGateEndpointTests(unittest.TestCase):
+    """Phase 6.6 controller contract: read-only gate evaluation."""
+
+    def _repo(self):
+        return _FakeGateRepository()
+
+    def _call(self, percentage=5, baseline=None, prometheus=None):
+        return get_change_release_gate(
+            deployment_run_id="run-gate-1",
+            start=W_START,
+            end=W_END,
+            target_percentage=percentage,
+            baseline_deployment_run_id=baseline,
+            repository=self._repo(),
+            prometheus=prometheus or _FakeGatePrometheus(),
+        )
+
+    def test_healthy_gate_promotes(self):
+        body = self._call()
+        self.assertEqual(body["gate_decision"], "PROMOTE")
+        self.assertEqual(body["target_percentage"], 5)
+
+    def test_above_five_requires_baseline(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(percentage=25)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("baseline", str(ctx.exception.detail))
+
+    def test_invalid_percentage_maps_to_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(percentage=10)
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_route_is_registered(self):
+        paths = [getattr(route, "path", "") for route in changes_router.routes]
+        self.assertIn("/changes/{deployment_run_id}/gate", paths)
+
+    def test_gate_is_read_only(self):
+        repo = self._repo()
+        with patch.object(
+            repo, "save_incident",
+            side_effect=AssertionError("gate must be read-only"),
+        ) as save:
+            body = get_change_release_gate(
+                deployment_run_id="run-gate-1",
+                start=W_START,
+                end=W_END,
+                target_percentage=5,
+                repository=repo,
+                prometheus=_FakeGatePrometheus(),
+            )
+        self.assertEqual(body["gate_decision"], "PROMOTE")
+        save.assert_not_called()
 
 
 if __name__ == "__main__":

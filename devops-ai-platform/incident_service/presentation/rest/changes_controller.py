@@ -28,6 +28,10 @@ from incident_service.application.services.change_intelligence_service import (
 from incident_service.application.services.live_release_verification_service import (
     LiveReleaseVerificationService,
 )
+from incident_service.application.services.progressive_release_gate_service import (
+    InvalidProgressiveReleaseGateRequest,
+    ProgressiveReleaseGateService,
+)
 from incident_service.application.services.operational_analytics_service import (
     InvalidAnalyticsWindowError,
 )
@@ -95,6 +99,49 @@ def get_change_live_health(
             baseline_deployment_run_id=baseline_deployment_run_id,
         )
     except InvalidAnalyticsWindowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{deployment_run_id}/gate", response_model=Dict[str, Any])
+def get_change_release_gate(
+    deployment_run_id: str,
+    start: datetime = Query(
+        ..., description="Verification window start, ISO 8601 (naive = UTC)"
+    ),
+    end: datetime = Query(
+        ..., description="Verification window end, ISO 8601 (naive = UTC)"
+    ),
+    target_percentage: int = Query(
+        ..., description="Requested progressive exposure: 5, 25, 50, or 100"
+    ),
+    baseline_deployment_run_id: Optional[str] = Query(
+        None,
+        description=(
+            "Explicit baseline release required for exposure above 5%; "
+            "its identity must remain attributable by Phase 6.5."
+        ),
+    ),
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+    prometheus=Depends(get_live_prometheus_client),
+):
+    """Read-only Phase 6.6 progressive-release gate.
+
+    No rollout, traffic shift, approval, or rollback occurs here. The service
+    maps the Phase 6.5 evidence decision to PROMOTE/PAUSE/ABORT/INCONCLUSIVE.
+    """
+    try:
+        return ProgressiveReleaseGateService(repository, prometheus).evaluate(
+            deployment_run_id=deployment_run_id,
+            start=start,
+            end=end,
+            target_percentage=target_percentage,
+            baseline_deployment_run_id=baseline_deployment_run_id,
+        )
+    except InvalidAnalyticsWindowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except InvalidProgressiveReleaseGateRequest as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

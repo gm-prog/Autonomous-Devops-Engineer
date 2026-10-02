@@ -18,6 +18,10 @@ from unittest.mock import patch
 from incident_service.application.services.live_release_verification_service import (
     LiveReleaseVerificationService,
 )
+from incident_service.application.services.progressive_release_gate_service import (
+    InvalidProgressiveReleaseGateRequest,
+    ProgressiveReleaseGateService,
+)
 from incident_service.application.services.operational_analytics_service import (
     InvalidAnalyticsWindowError,
 )
@@ -954,3 +958,79 @@ class LiveQueryBudgetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressiveReleaseGateServiceTests(unittest.TestCase):
+    """Phase 6.6: deterministic gate mapping over Phase 6.5 evidence."""
+
+    def _service(self, prometheus):
+        return ProgressiveReleaseGateService(
+            FakeRepository([_carrier("run-gate", "gate-1")]), prometheus
+        )
+
+    def _evaluate(
+        self,
+        prometheus,
+        target_percentage=5,
+        baseline=None,
+    ):
+        return self._service(prometheus).evaluate(
+            deployment_run_id="run-gate",
+            start=W_START,
+            end=W_END,
+            target_percentage=target_percentage,
+            baseline_deployment_run_id=baseline,
+        )
+
+    def test_healthy_promotes_at_5_percent(self):
+        out = self._evaluate(FakePrometheus(cpu=0.30, request=10.0))
+        self.assertEqual(out["gate_decision"], "PROMOTE")
+        self.assertEqual(out["health_decision"], "HEALTHY")
+        self.assertEqual(out["target_percentage"], 5)
+
+    def test_degraded_pauses(self):
+        out = self._evaluate(FakePrometheus(cpu=0.75, request=10.0))
+        self.assertEqual(out["gate_decision"], "PAUSE")
+        self.assertEqual(out["health_decision"], "DEGRADED")
+
+    def test_failed_aborts(self):
+        out = self._evaluate(FakePrometheus(cpu=0.95, request=10.0))
+        self.assertEqual(out["gate_decision"], "ABORT")
+        self.assertEqual(out["health_decision"], "FAILED")
+
+    def test_inconclusive_stays_inconclusive(self):
+        out = self._evaluate(
+            FakePrometheus(error=PrometheusUnavailableError("refused"))
+        )
+        self.assertEqual(out["gate_decision"], "INCONCLUSIVE")
+        self.assertEqual(out["health_decision"], "INCONCLUSIVE")
+
+    def test_exposure_above_five_requires_explicit_baseline(self):
+        with self.assertRaises(InvalidProgressiveReleaseGateRequest):
+            self._evaluate(FakePrometheus(), target_percentage=25)
+
+    def test_allowed_exposure_percentages_are_fixed(self):
+        for percentage in (5, 25, 50, 100):
+            with self.subTest(percentage=percentage):
+                kwargs = {"baseline": "run-gate"} if percentage > 5 else {}
+                out = self._evaluate(
+                    FakePrometheus(cpu=0.30, request=10.0),
+                    target_percentage=percentage,
+                    **kwargs,
+                )
+                self.assertEqual(out["gate_decision"], "PROMOTE")
+                self.assertEqual(out["target_percentage"], percentage)
+
+    def test_invalid_exposure_is_rejected(self):
+        for percentage in (0, 1, 10, 49, 75, 101, True):
+            with self.subTest(percentage=percentage):
+                with self.assertRaises(InvalidProgressiveReleaseGateRequest):
+                    self._evaluate(
+                        FakePrometheus(), target_percentage=percentage
+                    )
+
+    def test_gate_is_read_only(self):
+        prometheus = FakePrometheus()
+        out = self._evaluate(prometheus)
+        self.assertIn("live_assessment", out)
+        self.assertEqual(prometheus.calls, ["request_rate", "cpu_saturation"])
