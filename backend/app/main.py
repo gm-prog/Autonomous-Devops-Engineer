@@ -15,6 +15,11 @@ from qdrant_client.http import models as qmodels
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from .release_identity import (
+    DEPLOYMENT_ID_ENV,
+    SOURCE_SHA_ENV,
+    apply_release_identity,
+)
 from .services.analysis import analyze_repository
 
 # --- LOGGER CONFIGURATION ---
@@ -86,6 +91,16 @@ API_REQUESTS = Counter(
     "devops_api_requests_total",
     "Total API requests processed by the operator gateway",
     ["method", "path"],
+)
+
+# Phase 6.5.1: authoritative release identity carrier. Operator/runtime
+# inputs only (never HTTP/user input): a fully valid DEVOPS_DEPLOYMENT_ID
+# + DEVOPS_SOURCE_SHA exposes exactly one low-volume
+# devops_release_identity_info series; missing/invalid identity exposes
+# NO series, so live verification stays INCONCLUSIVE rather than guessing.
+RELEASE_IDENTITY_APPLIED = apply_release_identity(
+    os.getenv(DEPLOYMENT_ID_ENV, ""),
+    os.getenv(SOURCE_SHA_ENV, ""),
 )
 
 @asynccontextmanager

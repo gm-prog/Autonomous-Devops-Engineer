@@ -1095,16 +1095,30 @@ Nothing else counts. Label `service_version` is deliberately not
 authoritative (durable identity carries no version string to match —
 accepting it would be guessing). Timestamps are never consulted:
 samples that merely occur inside the release's time window are **not**
-attributed to it. Both query templates group `by (job, deployment_id,
-source_sha)` so attribution survives aggregation without adding
-unbounded/high-cardinality labels to any instrumentation.
+attributed to it.
+
+**Release identity carrier (Phase 6.5.1).** The backend runtime exposes
+exactly one low-volume info metric,
+`devops_release_identity_info{deployment_id,source_sha} 1`, populated
+at startup from two operator/runtime environment inputs —
+`DEVOPS_DEPLOYMENT_ID` (exact Phase 6.4 deployment run id) and
+`DEVOPS_SOURCE_SHA` (exact lowercase 40-hex SHA), both validated
+fail-closed in `backend/app/release_identity.py` (blank, uppercase,
+short, prefixed, whitespace or control-character values are rejected
+and expose **no** series — never fabricated). Both SLI templates
+inherit those two labels onto their results via a vector join on the
+scrape-target identity `on(job, instance)` with
+`group_left(deployment_id, source_sha)`, so attribution survives
+aggregation while release identity stays on the single carrier series
+instead of multiplying across every request sample. No carrier series
+→ empty join → `attribution_unavailable` → INCONCLUSIVE.
 
 **Supported SLIs (fixed catalog, real telemetry only).**
 
 | SLI | Predefined query | Backed by |
 |---|---|---|
-| `request_rate` | `sum by (job, deployment_id, source_sha) (rate(devops_api_requests_total[5m]))` | backend gateway `Counter` (`backend/app/main.py`), scraped via `monitoring/prometheus.yml` |
-| `cpu_saturation` | `avg by (job, deployment_id, source_sha) (rate(process_cpu_seconds_total[2m]))` | default `prometheus_client` process collector on the same scrape targets |
+| `request_rate` | `sum by (job, instance, deployment_id, source_sha) (rate(devops_api_requests_total[5m]) * on(job, instance) group_left(deployment_id, source_sha) devops_release_identity_info)` | backend gateway `Counter` (`backend/app/main.py`), scraped via `monitoring/prometheus.yml`, identity joined from the carrier metric |
+| `cpu_saturation` | `avg by (job, instance, deployment_id, source_sha) (rate(process_cpu_seconds_total[2m]) * on(job, instance) group_left(deployment_id, source_sha) devops_release_identity_info)` | default `prometheus_client` process collector on the same scrape target, identity joined from the carrier metric |
 
 Error-rate and latency SLIs are intentionally absent: no error-labeled
 or duration-histogram metric exists in this repository's telemetry
@@ -1159,13 +1173,15 @@ shift traffic, roll back, or act on its decision.
 * Live verification verifies — it never acts: no traffic shifting,
   rollback, or remediation exists on this surface (CONTROL/ACT are
   later phases).
-* Attribution depends on producers exposing `deployment_id`/
-  `source_sha` labels on their series. Current in-repo instrumentation
-  does **not** add release labels (adding unbounded labels blindly is
-  forbidden), so against today's real scrape data assessments will
-  correctly return INCONCLUSIVE/`attribution_unavailable` until
-  producers adopt the contract — the rules are exercised end-to-end in
-  tests against the mocked Prometheus boundary.
+* Attribution now flows through the Phase 6.5.1 identity carrier:
+  real attribution requires the deployment runtime to inject
+  `DEVOPS_DEPLOYMENT_ID` + `DEVOPS_SOURCE_SHA` into the workload so
+  `devops_release_identity_info` exists (request-counter samples stay
+  free of release labels). With those variables absent/invalid — as in
+  today's default stack — assessments correctly return
+  INCONCLUSIVE/`attribution_unavailable`; the join, attribution and
+  decision rules are exercised end-to-end against the mocked
+  Prometheus boundary.
 * Telemetry is read live at request time from Prometheus (when
   reachable); it is not persisted by this path, and the verification
   window must cover both candidate and baseline durable evidence for

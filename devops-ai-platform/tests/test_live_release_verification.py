@@ -256,6 +256,57 @@ class BoundedRangeQueryTests(unittest.TestCase):
                 )
             conn.assert_not_called()
 
+    # ---- Phase 6.5.1 identity-carrier join ---- #
+
+    def test_template_catalog_names_remain_the_supported_set(self):
+        self.assertEqual(
+            PrometheusScraperClient.template_names(),
+            ("request_rate", "cpu_saturation"),
+        )
+
+    def test_templates_join_identity_carrier_on_scrape_target(self):
+        expectations = {
+            "request_rate": "rate(devops_api_requests_total[5m])",
+            "cpu_saturation": "rate(process_cpu_seconds_total[2m])",
+        }
+        for name, logical_query in expectations.items():
+            with self.subTest(template=name):
+                expr = scraper_module._RANGE_TEMPLATES[name]
+                # logical SLI query preserved verbatim inside the template
+                self.assertIn(logical_query, expr)
+                # join to the low-volume carrier on the verified target keys
+                self.assertIn("devops_release_identity_info", expr)
+                self.assertIn("* on(job, instance)", expr)
+                self.assertIn("group_left(deployment_id, source_sha)", expr)
+
+    def test_template_by_clause_propagates_only_authoritative_identity(self):
+        for name, aggregate in (("request_rate", "sum"), ("cpu_saturation", "avg")):
+            with self.subTest(template=name):
+                expr = scraper_module._RANGE_TEMPLATES[name]
+                prefix = f"{aggregate} by ("
+                self.assertTrue(expr.startswith(prefix), expr)
+                by_clause = expr[len(prefix) : expr.index(")")]
+                keys = [key.strip() for key in by_clause.split(",")]
+                self.assertEqual(
+                    keys,
+                    ["job", "instance", "deployment_id", "source_sha"],
+                )
+                # only the two authoritative identity labels propagate
+                self.assertEqual(
+                    {"deployment_id", "source_sha"},
+                    set(keys) & {"deployment_id", "source_sha"},
+                )
+                # nothing user-supplied or high-cardinality joins in
+                for forbidden in (
+                    "path=",
+                    "method=",
+                    "incident",
+                    "user",
+                    "pr_",
+                    "timestamp",
+                ):
+                    self.assertNotIn(forbidden, by_clause)
+
     def test_window_bound_is_enforced_without_any_http(self):
         with patch.object(scraper_module.http.client, "HTTPConnection") as conn:
             with self.assertRaises(PrometheusQueryError):
@@ -533,6 +584,26 @@ class LiveAttributionTests(unittest.TestCase):
         self.assertEqual(
             live["release_identity"]["deployment_run_id"], "run-live"
         )
+
+    def test_join_output_series_shape_attributes_both_slis(self):
+        # Exact label shape produced by the Phase 6.5.1 carrier join:
+        # (job, instance) target keys + propagated deployment_id/source_sha.
+        class JoinedShape(FakePrometheus):
+            def query_range_metric(self, template_name, start, end):
+                self.calls.append(template_name)
+                value = 10.0 if template_name == "request_rate" else 0.3
+                return _result(template_name, [({
+                    "job": "devops-api-gateway",
+                    "instance": "api:8000",
+                    "deployment_id": "run-live",
+                    "source_sha": SOURCE_SHA,
+                }, [value] * 6)])
+
+        out = _verify(self.repository, JoinedShape())
+        live = out["live_assessment"]
+        self.assertEqual(live["decision"], "HEALTHY")
+        self.assertEqual(live["reasons"], ["all_required_signals_healthy"])
+        self.assertTrue(all(item["value"] is not None for item in live["slis"]))
 
     def test_persistence_is_never_touched(self):
         with patch.object(

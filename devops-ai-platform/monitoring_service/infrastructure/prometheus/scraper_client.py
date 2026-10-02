@@ -26,22 +26,35 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _CHUNK_BYTES = 64 * 1024
 
 #: Predefined query templates — the only PromQL this client will ever run
-#: (Phase 6.5: no arbitrary user-supplied PromQL). Each template groups by
-#: the authoritative release-identity labels so attribution survives
-#: aggregation: ``deployment_id`` (exact deployment run id) and
-#: ``source_sha`` (exact 40-hex source SHA). Both metric names are backed
-#: by real telemetry in this repository: ``devops_api_requests_total`` is
+#: (Phase 6.5: no arbitrary user-supplied PromQL). Each template inherits
+#: the authoritative release identity (``deployment_id`` — exact
+#: deployment run id; ``source_sha`` — exact 40-hex source SHA) from the
+#: low-volume ``devops_release_identity_info`` carrier via a vector join
+#: on the scrape-target identity ``(job, instance)`` — the labels
+#: monitoring/prometheus.yml guarantees on every series from the target
+#: (job_name ``devops-api-gateway``, target ``api:8000``). Only
+#: ``deployment_id`` and ``source_sha`` are propagated by
+#: ``group_left``; when no carrier series exists the join yields an
+#: empty result and Phase 6.5 reports attribution unavailable
+#: (INCONCLUSIVE) — never a guess. Both metric names are backed by real
+#: telemetry in this repository: ``devops_api_requests_total`` is
 #: instrumented in backend/app/main.py and scraped via
 #: monitoring/prometheus.yml; ``process_cpu_seconds_total`` is exposed by
-#: the default prometheus_client process collector on every scrape target.
+#: the default prometheus_client process collector on the same target.
 _RANGE_TEMPLATES: Dict[str, str] = {
     "request_rate": (
-        "sum by (job, deployment_id, source_sha) "
-        "(rate(devops_api_requests_total[5m]))"
+        "sum by (job, instance, deployment_id, source_sha) ("
+        "rate(devops_api_requests_total[5m])"
+        " * on(job, instance)"
+        " group_left(deployment_id, source_sha)"
+        " devops_release_identity_info)"
     ),
     "cpu_saturation": (
-        "avg by (job, deployment_id, source_sha) "
-        "(rate(process_cpu_seconds_total[2m]))"
+        "avg by (job, instance, deployment_id, source_sha) ("
+        "rate(process_cpu_seconds_total[2m])"
+        " * on(job, instance)"
+        " group_left(deployment_id, source_sha)"
+        " devops_release_identity_info)"
     ),
 }
 

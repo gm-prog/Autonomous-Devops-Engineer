@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-10-02 — Phase 6.5.1: runtime release identity carrier for Prometheus attribution
+
+- **Identity provider** (`backend/app/release_identity.py`) —
+  `DEVOPS_DEPLOYMENT_ID` (exact Phase 6.4 deployment run id, 1–128
+  chars, no control characters, preserved verbatim) + `DEVOPS_SOURCE_SHA`
+  (exact lowercase 40-hex: uppercase/whitespace/prefixed/short rejected)
+  validated fail-closed at startup; deterministic, unit-testable,
+  values never echoed. Root compose passes both through to the api
+  service as empty-default env (no hard-coded identity, no secrets).
+- **Low-volume carrier metric** — exactly one
+  `devops_release_identity_info{deployment_id,source_sha} 1` series on
+  valid identity; invalid/missing identity exposes **no** series (never
+  fabricated) so Phase 6.5 stays INCONCLUSIVE. Release labels are NOT
+  added to `devops_api_requests_total` (method/path dimensions
+  unchanged) — identity stays on one series per process instead of
+  multiplying time series.
+- **PromQL join** — both fixed templates now inherit identity via
+  `* on(job, instance) group_left(deployment_id, source_sha)
+  devops_release_identity_info` before the existing `sum`/`avg`
+  aggregation (join keys = scrape-target labels from
+  `monitoring/prometheus.yml`: job `devops-api-gateway`, target
+  `api:8000`). Template names, query budget (1/SLI), attribution
+  rules, decisions, byte/sample bounds, timeout and instant-query
+  contract unchanged; no arbitrary PromQL, no new dependencies.
+- Tests: new `backend/tests/test_release_identity.py` (validation
+  matrix, single-series/value-1 exposition, no-series on invalid,
+  request-counter dimensions intact, no release labels on any app
+  metric) + template join/by-clause proofs and joined-output-shape
+  attribution in `tests/test_live_release_verification.py`.
+
 ## 2026-10-02 — Phase 6.5 corrective: bound Prometheus range-query response body
 
 - `PrometheusScraperClient` range path now enforces a fixed
