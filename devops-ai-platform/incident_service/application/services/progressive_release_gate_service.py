@@ -71,6 +71,21 @@ def _validate_target_percentage(value: int) -> int:
         )
     return value
 
+def _validate_baseline_deployment_id(
+    value: Optional[str],
+) -> Optional[str]:
+    """Keep the application boundary strictly typed.
+
+    FastAPI parses the public query parameter before the controller invokes
+    this service. Direct callers/tests must follow the same contract: a
+    baseline is either omitted/None or a deployment-run identifier string.
+    """
+    if value is not None and not isinstance(value, str):
+        raise InvalidProgressiveReleaseGateRequest(
+            "baseline_deployment_run_id must be a string or null"
+        )
+    return value
+
 
 class ProgressiveReleaseGateService:
     """Read-only progressive-release gate over the Phase 6.5 verifier."""
@@ -99,6 +114,9 @@ class ProgressiveReleaseGateService:
         baseline_deployment_run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         target_percentage = _validate_target_percentage(target_percentage)
+        baseline_deployment_run_id = _validate_baseline_deployment_id(
+            baseline_deployment_run_id
+        )
 
         if (
             target_percentage > BASELINE_REQUIRED_AFTER_PERCENT
