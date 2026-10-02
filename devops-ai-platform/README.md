@@ -1073,6 +1073,16 @@ resultType, non-finite values, or sample-cap overflow all become
 structured data-quality gaps — never partial data. The existing
 `query_instant_metric()` behavior is preserved unchanged.
 
+**Response-body bound (corrective hardening).** The range-query client
+buffers at most `MAX_RESPONSE_BYTES = 4 MiB` per response: an oversized
+declared `Content-Length` is refused before any body read, and
+unknown-length/chunked bodies are read in bounded 64 KiB chunks with
+the same ceiling (at most limit + 1 probe byte ever buffered), so an
+oversized body is never JSON-decoded. This bounds **this client's
+response buffering** together with the independent
+`MAX_RESPONSE_SAMPLES = 10 000` logical-result limit — it is not a
+claim of absolute Prometheus or process memory safety.
+
 **Exact release attribution (the authoritative telemetry fields).** A
 telemetry series is attributable to a release **only** by exact string
 match of its labels against the Phase 6.4 authoritative deployment

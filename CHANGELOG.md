@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 2026-10-02 — Phase 6.5 corrective: bound Prometheus range-query response body
+
+- `PrometheusScraperClient` range path now enforces a fixed
+  `MAX_RESPONSE_BYTES = 4 MiB` **before** JSON parsing, alongside the
+  existing independent `MAX_RESPONSE_SAMPLES = 10 000` logical limit:
+  an oversized declared `Content-Length` fails before any body read;
+  missing/chunked length is read in bounded 64 KiB increments that stop
+  at limit + 1 probe byte (no unbounded `response.read()` anywhere on
+  the range path); untrustworthy `Content-Length` fails closed with the
+  typed malformed-response error and messages never echo bodies or
+  headers. Sample-cap, timeout, non-200, window/template/attribution/
+  decision semantics and the instant-query contract are unchanged.
+
 ## 2026-10-02 — Phase 6.5: change-aware live release verification
 
 - **Combined read-only endpoint** —

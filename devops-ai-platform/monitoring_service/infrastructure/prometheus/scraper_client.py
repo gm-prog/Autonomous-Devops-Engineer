@@ -14,6 +14,16 @@ QUERY_TIMEOUT_SECONDS = 5.0
 MAX_RANGE_DAYS = 31
 MAX_RANGE_POINTS = 500
 MAX_RESPONSE_SAMPLES = 10_000
+#: Hard ceiling on buffered response bytes for the range-query HTTP path,
+#: enforced BEFORE JSON parsing (complements MAX_RESPONSE_SAMPLES, which
+#: bounds the logical result size). Fixed at 4 MiB: the 10,000-sample
+#: contract serializes to well under 1 MiB, so valid responses fit with
+#: wide margin while accidental/malicious bodies are refused early. Not
+#: caller-configurable and never derived from request input.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+#: Incremental read size for the unknown-length path (bounded chunks, never
+#: an unbounded response.read()).
+_CHUNK_BYTES = 64 * 1024
 
 #: Predefined query templates — the only PromQL this client will ever run
 #: (Phase 6.5: no arbitrary user-supplied PromQL). Each template groups by
@@ -85,6 +95,31 @@ def _unix(value: datetime) -> float:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).timestamp()
+
+
+def _read_bounded(response) -> bytes:
+    """Read a response body incrementally under MAX_RESPONSE_BYTES.
+
+    Content-Length was already pre-checked when present; this re-enforces
+    the same ceiling for unknown-length/chunked bodies (and distrusts any
+    single framing source alone). Reads at most ``min(_CHUNK_BYTES,
+    remaining + 1)`` per call — the single extra byte is the minimal
+    probe needed to prove overflow — so at most MAX_RESPONSE_BYTES + 1
+    bytes are ever buffered. Never calls the unbounded ``read()``.
+    """
+    chunks = []
+    total = 0
+    while True:
+        remaining = MAX_RESPONSE_BYTES - total
+        chunk = response.read(min(_CHUNK_BYTES, remaining + 1))
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > MAX_RESPONSE_BYTES:
+            raise PrometheusMalformedResponseError(
+                "Prometheus response exceeds configured byte limit"
+            )
+        chunks.append(chunk)
 
 
 class PrometheusScraperClient:
@@ -165,7 +200,14 @@ class PrometheusScraperClient:
         )
 
     def _get(self, path: str) -> bytes:
-        """GET against the configured endpoint with the fixed timeout."""
+        """GET against the configured endpoint with the fixed timeout.
+
+        Fail-closed byte bound: a declared Content-Length over
+        ``MAX_RESPONSE_BYTES`` is refused before any body read; bodies
+        of unknown length are read in bounded chunks until the same
+        ceiling (see :func:`_read_bounded`). Error messages never echo
+        response bodies, headers, or credentials.
+        """
         host, _, port_text = self.endpoint.partition(":")
         port = int(port_text) if port_text.isdigit() else 80
         connection = http.client.HTTPConnection(
@@ -178,8 +220,19 @@ class PrometheusScraperClient:
                 raise PrometheusUnavailableError(
                     f"Prometheus answered HTTP {response.status}"
                 )
-            return response.read()
-        except PrometheusUnavailableError:
+            declared = response.getheader("Content-Length")
+            if declared is not None:
+                value = str(declared).strip()
+                if not value.isdigit():
+                    raise PrometheusMalformedResponseError(
+                        "Prometheus response has an untrusted Content-Length"
+                    )
+                if int(value) > MAX_RESPONSE_BYTES:
+                    raise PrometheusMalformedResponseError(
+                        "Prometheus response exceeds configured byte limit"
+                    )
+            return _read_bounded(response)
+        except PrometheusQueryError:
             raise
         except (OSError, http.client.HTTPException) as exc:
             raise PrometheusUnavailableError(

@@ -11,6 +11,7 @@ boundary is mocked throughout; no live Prometheus server is required.
 
 import json
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -135,6 +136,63 @@ def _verify(repository, prometheus, **kwargs):
 # Deliverable A — bounded Prometheus range query
 # --------------------------------------------------------------------------- #
 
+_AUTO = object()
+
+
+class _FakeHTTPResponse:
+    """http.client.HTTPResponse stand-in with honest read semantics.
+
+    ``read()`` without an explicit amount raises AssertionError, so any
+    unbounded ``response.read()`` on the range-query path fails every
+    test that uses this fake. Optional ``producer(amt)`` simulates an
+    endless chunked stream without allocating the data up front.
+    """
+
+    def __init__(self, body=b"", status=200, content_length=_AUTO, producer=None):
+        self.status = status
+        self._body = body
+        self._pos = 0
+        self._producer = producer
+        self.reads = []  # amt per call; None never occurs (guard above)
+        self.bytes_returned = 0
+        if content_length is _AUTO:
+            content_length = len(body)
+        self._content_length = (
+            None if content_length is None else str(content_length)
+        )
+
+    def getheader(self, name, default=None):
+        if name == "Content-Length":
+            return self._content_length
+        return default
+
+    def read(self, amt=None):
+        if amt is None:
+            raise AssertionError("unbounded response.read() on range path")
+        self.reads.append(amt)
+        if self._producer is not None:
+            chunk = self._producer(amt)
+        else:
+            chunk = self._body[self._pos : self._pos + amt]
+            self._pos += len(chunk)
+        self.bytes_returned += len(chunk)
+        return chunk
+
+
+@contextmanager
+def _fake_http(response):
+    """Patch HTTPConnection.getresponse() to yield ``response``."""
+    connection_patch = patch.object(
+        scraper_module.http.client, "HTTPConnection"
+    )
+    connection_cls = connection_patch.start()
+    try:
+        connection_cls.return_value.getresponse.return_value = response
+        yield connection_cls, response
+    finally:
+        connection_patch.stop()
+
+
 class BoundedRangeQueryTests(unittest.TestCase):
     def _client(self):
         return PrometheusScraperClient()  # default endpoint prometheus:9090
@@ -160,11 +218,7 @@ class BoundedRangeQueryTests(unittest.TestCase):
 
     def test_range_query_is_template_only_bounded_and_read_only(self):
         body = self._matrix_body()
-        with patch.object(
-            scraper_module.http.client, "HTTPConnection"
-        ) as connection_cls:
-            connection_cls.return_value.getresponse.return_value.status = 200
-            connection_cls.return_value.getresponse.return_value.read.return_value = body
+        with _fake_http(_FakeHTTPResponse(body)) as (connection_cls, response):
             result = self._client().query_range_metric("request_rate", W_START, W_END)
 
             connection_cls.assert_called_once_with(
@@ -179,6 +233,9 @@ class BoundedRangeQueryTests(unittest.TestCase):
             self.assertIn(f"query={quote_plus(expected)}", path)
             self.assertIn(f"end={W_END.timestamp():.3f}", path)
             connection_cls.return_value.close.assert_called()
+            # body consumed only through bounded, explicitly-sized reads
+            self.assertTrue(response.reads)
+            self.assertNotIn(None, response.reads)
 
         self.assertIsInstance(result, RangeQueryResult)
         self.assertEqual(result.template, "request_rate")
@@ -218,15 +275,12 @@ class BoundedRangeQueryTests(unittest.TestCase):
                 self._client().query_range_metric("request_rate", W_START, W_END)
 
     def test_non_200_response_fails_closed(self):
-        with patch.object(scraper_module.http.client, "HTTPConnection") as conn:
-            conn.return_value.getresponse.return_value.status = 503
+        with _fake_http(_FakeHTTPResponse(b"", status=503)):
             with self.assertRaises(PrometheusUnavailableError):
                 self._client().query_range_metric("request_rate", W_START, W_END)
 
     def test_malformed_json_fails_closed(self):
-        with patch.object(scraper_module.http.client, "HTTPConnection") as conn:
-            conn.return_value.getresponse.return_value.status = 200
-            conn.return_value.getresponse.return_value.read.return_value = b"not-json"
+        with _fake_http(_FakeHTTPResponse(b"not-json")):
             with self.assertRaises(PrometheusMalformedResponseError):
                 self._client().query_range_metric("request_rate", W_START, W_END)
 
@@ -240,31 +294,23 @@ class BoundedRangeQueryTests(unittest.TestCase):
         ]
         for body in bodies:
             with self.subTest(body=body[:60]):
-                with patch.object(scraper_module.http.client, "HTTPConnection") as conn:
-                    conn.return_value.getresponse.return_value.status = 200
-                    conn.return_value.getresponse.return_value.read.return_value = body
+                with _fake_http(_FakeHTTPResponse(body)):
                     with self.assertRaises(PrometheusMalformedResponseError):
                         self._client().query_range_metric(
                             "request_rate", W_START, W_END
                         )
 
     def test_unsupported_result_type_fails_closed(self):
-        with patch.object(scraper_module.http.client, "HTTPConnection") as conn:
-            conn.return_value.getresponse.return_value.status = 200
-            conn.return_value.getresponse.return_value.read.return_value = (
-                self._matrix_body(result_type="vector")
-            )
+        with _fake_http(
+            _FakeHTTPResponse(self._matrix_body(result_type="vector"))
+        ):
             with self.assertRaises(PrometheusUnsupportedError):
                 self._client().query_range_metric("request_rate", W_START, W_END)
 
     def test_sample_count_cap_fails_closed(self):
         values = [[1788224400 + i, str(i)] for i in range(10)]
         with patch.object(scraper_module, "MAX_RESPONSE_SAMPLES", 5):
-            with patch.object(scraper_module.http.client, "HTTPConnection") as conn:
-                conn.return_value.getresponse.return_value.status = 200
-                conn.return_value.getresponse.return_value.read.return_value = (
-                    self._matrix_body(values=values)
-                )
+            with _fake_http(_FakeHTTPResponse(self._matrix_body(values=values))):
                 with self.assertRaises(PrometheusMalformedResponseError):
                     self._client().query_range_metric("request_rate", W_START, W_END)
 
@@ -289,6 +335,149 @@ class BoundedRangeQueryTests(unittest.TestCase):
             W_START, W_END + timedelta(days=20)
         )
         self.assertGreater(longer, first)
+
+    # ---- Response-body byte bound (corrective hardening) ---- #
+
+    def test_a_oversized_content_length_fails_before_any_body_read(self):
+        body = self._matrix_body()  # contains distinctive 'api-gateway'
+        response = _FakeHTTPResponse(
+            body,
+            content_length=str(scraper_module.MAX_RESPONSE_BYTES + 1),
+        )
+        with _fake_http(response):
+            with patch.object(
+                scraper_module.json, "loads",
+                side_effect=AssertionError("JSON parser invoked"),
+            ):
+                with self.assertRaises(PrometheusMalformedResponseError) as ctx:
+                    self._client().query_range_metric(
+                        "request_rate", W_START, W_END
+                    )
+        self.assertEqual(response.reads, [])  # body never consumed
+        self.assertEqual(
+            str(ctx.exception),
+            "Prometheus response exceeds configured byte limit",
+        )
+        message = str(ctx.exception)
+        self.assertNotIn("api-gateway", message)  # no body/headers echoed
+        self.assertNotIn(str(scraper_module.MAX_RESPONSE_BYTES + 1), message)
+
+    def test_b_content_length_exactly_at_byte_limit_is_accepted(self):
+        target = 2048
+        payload = json.loads(self._matrix_body())
+        base = json.dumps(payload, separators=(",", ":"))
+        overhead = len(json.dumps({"pad": ""}, separators=(",", ":"))) - 1
+        pad_len = target - len(base) - overhead
+        self.assertGreater(pad_len, 0)
+        payload["pad"] = "x" * pad_len
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(len(body), target)  # declared CL == limit exactly
+
+        with patch.object(scraper_module, "MAX_RESPONSE_BYTES", target):
+            with _fake_http(_FakeHTTPResponse(body)) as (conn, response):
+                result = self._client().query_range_metric(
+                    "request_rate", W_START, W_END
+                )
+        self.assertIsInstance(result, RangeQueryResult)
+        self.assertEqual(response.bytes_returned, target)
+        self.assertTrue(response.reads)
+        self.assertNotIn(None, response.reads)
+
+    def test_c_unknown_length_overflow_fails_at_the_byte_budget(self):
+        target = 4096
+        body = b"x" * (target + 100)  # would-be payload, never parsed
+        with patch.object(scraper_module, "MAX_RESPONSE_BYTES", target):
+            with _fake_http(
+                _FakeHTTPResponse(body, content_length=None)
+            ) as (conn, response):
+                with patch.object(
+                    scraper_module.json, "loads",
+                    side_effect=AssertionError("JSON parser invoked"),
+                ):
+                    with self.assertRaises(PrometheusMalformedResponseError) as ctx:
+                        self._client().query_range_metric(
+                            "request_rate", W_START, W_END
+                        )
+        self.assertIn("byte limit", str(ctx.exception))
+        # incremental, explicitly-sized reads only; stopped at budget + 1 probe
+        self.assertTrue(response.reads)
+        self.assertNotIn(None, response.reads)
+        self.assertEqual(
+            response.bytes_returned, target + 1
+        )
+
+    def test_d_unknown_length_valid_body_succeeds(self):
+        with _fake_http(
+            _FakeHTTPResponse(self._matrix_body(), content_length=None)
+        ) as (conn, response):
+            result = self._client().query_range_metric(
+                "request_rate", W_START, W_END
+            )
+        self.assertIsInstance(result, RangeQueryResult)
+        self.assertTrue(response.reads)
+        self.assertNotIn(None, response.reads)
+
+    def test_e_unknown_length_one_byte_over_limit_fails_deterministically(self):
+        target = 4096
+        body = b"[" * (target + 1)
+        with patch.object(scraper_module, "MAX_RESPONSE_BYTES", target):
+            with _fake_http(
+                _FakeHTTPResponse(body, content_length=None)
+            ) as (conn, response):
+                with self.assertRaises(PrometheusMalformedResponseError) as ctx:
+                    self._client().query_range_metric(
+                        "request_rate", W_START, W_END
+                    )
+        self.assertIn("byte limit", str(ctx.exception))
+        self.assertEqual(response.bytes_returned, target + 1)
+
+    def test_f_sample_limit_still_enforces_under_byte_limit(self):
+        # 10,001 real samples: serialized well under the 4 MiB byte bound,
+        # so the logical MAX_RESPONSE_SAMPLES guard must still reject it.
+        values = [
+            [1788224400 + i, "1"] for i in range(scraper_module.MAX_RESPONSE_SAMPLES + 1)
+        ]
+        body = self._matrix_body(values=values)
+        self.assertLess(len(body), scraper_module.MAX_RESPONSE_BYTES)
+        with _fake_http(_FakeHTTPResponse(body)):
+            with self.assertRaises(PrometheusMalformedResponseError) as ctx:
+                self._client().query_range_metric("request_rate", W_START, W_END)
+        self.assertIn("samples", str(ctx.exception))
+        self.assertNotIn("byte limit", str(ctx.exception))
+
+    def test_untrusted_content_length_fails_closed(self):
+        for bad in ("not-a-number", "", "-5", "12_000", "4194304.5"):
+            with self.subTest(header=bad):
+                with _fake_http(
+                    _FakeHTTPResponse(b"{}", content_length=bad)
+                ) as (conn, response):
+                    with self.assertRaises(PrometheusMalformedResponseError) as ctx:
+                        self._client().query_range_metric(
+                            "request_rate", W_START, W_END
+                        )
+                self.assertIn("untrusted Content-Length", str(ctx.exception))
+                self.assertEqual(response.reads, [])  # refused pre-read
+
+    def test_j_streaming_overflow_stops_at_budget_without_giant_allocation(self):
+        target = 64 * 1024  # small but > _CHUNK_BYTES exercises multi-read loop
+
+        def endless(amt):  # synthetic infinite stream, no bulk allocation
+            return b"x" * amt
+
+        with patch.object(scraper_module, "MAX_RESPONSE_BYTES", target):
+            with _fake_http(
+                _FakeHTTPResponse(content_length=None, producer=endless)
+            ) as (conn, response):
+                with self.assertRaises(PrometheusMalformedResponseError) as ctx:
+                    self._client().query_range_metric(
+                        "request_rate", W_START, W_END
+                    )
+        self.assertIn("byte limit", str(ctx.exception))
+        # reader stopped exactly at budget + minimal probe, after a small,
+        # bounded number of explicitly-sized reads
+        self.assertEqual(response.bytes_returned, target + 1)
+        self.assertLessEqual(len(response.reads), 8)
+        self.assertNotIn(None, response.reads)
 
 
 # --------------------------------------------------------------------------- #
