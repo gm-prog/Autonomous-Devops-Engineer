@@ -62,6 +62,18 @@ class FakeRepository:
     def save_incident(self, *args, **kwargs):
         raise AssertionError("live verification must be read-only")
 
+    def save_progressive_release_gate_evaluation(self, evaluation):
+        self.gate_evaluations = getattr(self, "gate_evaluations", [])
+        self.gate_evaluations.append(dict(evaluation))
+        return dict(evaluation)
+
+    def get_progressive_release_gate_evaluations(self, deployment_run_id, limit=50):
+        rows = [
+            row for row in getattr(self, "gate_evaluations", [])
+            if row["deployment_run_id"] == deployment_run_id
+        ]
+        return sorted(rows, key=lambda row: row["observed_at"], reverse=True)[:limit]
+
 
 def _carrier(run_id, evidence_id, status="Fixed"):
     incident = IncidentAggregate(
