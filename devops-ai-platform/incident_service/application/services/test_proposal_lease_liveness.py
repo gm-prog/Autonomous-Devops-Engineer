@@ -54,20 +54,42 @@ class CountingRepository(PostgresIncidentRepositoryAdapter):
         super().__init__(*args, **kwargs)
         self.renew_calls = 0
         self.renew_error = None
+        # Test-only synchronization: a long-operation test can require
+        # N successful renewals AFTER a named operation boundary without
+        # relying on scheduler-sensitive wall-clock sleeps.
+        self.renew_target = 0
+        self.renewed_event = threading.Event()
+        self.renew_gate = None
+        self.renewals_after_gate = 0
 
     def renew_execution_lease(self, incident_id, proposal_id, owner, *,
                               now, lease_seconds):
         if self.renew_error is not None:
             raise self.renew_error
         self.renew_calls += 1
-        return super().renew_execution_lease(
+        renewed = super().renew_execution_lease(
+            incident_id, proposal_id, owner,
+            now=now, lease_seconds=lease_seconds,
+        )
+        if renewed and (
+            self.renew_gate is None or self.renew_gate.is_set()
+        ):
+            self.renewals_after_gate += 1
+            if (
+                self.renew_target > 0
+                and self.renewals_after_gate >= self.renew_target
+            ):
+                self.renewed_event.set()
+        return renewed
+
             incident_id, proposal_id, owner,
             now=now, lease_seconds=lease_seconds,
         )
 
 
 def _full_sequence(orchestrator, stages, *, hold_seconds=0.0,
-                   hold_after="validation.started", notify_guard=None):
+                   hold_after="validation.started", hold_event=None,
+                   hold_started=None, notify_guard=None):
     """Replay the real stage sequence, optionally holding one boundary."""
     order = [
         ("workspace.created", {"workspace": "ws"}),
@@ -85,18 +107,32 @@ def _full_sequence(orchestrator, stages, *, hold_seconds=0.0,
             notify_guard(name)
         orchestrator.stage_callback(name, dict(metadata))
         stages.append(name)
-        if name == hold_after and hold_seconds:
-            # boundary persisted; long bounded work runs while the
-            # heartbeat keeps the lease alive
-            time.sleep(hold_seconds)
+        if name == hold_after:
+            # The boundary is persisted first. Signal its start, then keep
+            # the operation open until the heartbeat has actually completed
+            # the required renewals. This proves liveness without a fixed
+            # sleep whose outcome depends on host scheduling.
+            if hold_started is not None:
+                hold_started.set()
+            if hold_event is not None:
+                if not hold_event.wait(timeout=5.0):
+                    raise AssertionError(
+                        "heartbeat did not complete the required renewals "
+                        "while the bounded operation was held"
+                    )
+            elif hold_seconds:
+                time.sleep(hold_seconds)
 
 
 class _Orchestrator:
-    def __init__(self, *, hold_seconds=0.0, hold_after="validation.started"):
+    def __init__(self, *, hold_seconds=0.0, hold_after="validation.started",
+                 hold_event=None, hold_started=None):
         self.stage_callback = None
         self.stages = []
         self.hold_seconds = hold_seconds
         self.hold_after = hold_after
+        self.hold_event = hold_event
+        self.hold_started = hold_started
 
     def execute(self, *, incident_id, proposal, repository_slug,
                 validation_profile, stage_callback=None,
@@ -106,6 +142,8 @@ class _Orchestrator:
             self, self.stages,
             hold_seconds=self.hold_seconds,
             hold_after=self.hold_after,
+            hold_event=self.hold_event,
+            hold_started=self.hold_started,
         )
         return _Result("e" * 40)
 
@@ -238,10 +276,15 @@ class ActiveHeartbeatTests(unittest.TestCase):
         ).patch_proposals[0]
 
     def test_long_operation_keeps_lease_alive_and_completes(self):
-        # operation longer than the heartbeat interval: lease must be
-        # renewed while the work is in progress
+        # Synchronize on TWO successful heartbeat renewals after the
+        # validation.started boundary; never depend on a wall-clock sleep.
+        hold_started = threading.Event()
+        self.repository.renew_gate = hold_started
+        self.repository.renew_target = 2
         self.orchestrator = _Orchestrator(
-            hold_seconds=0.15, hold_after="validation.started"
+            hold_after="validation.started",
+            hold_event=self.repository.renewed_event,
+            hold_started=hold_started,
         )
         service = self._service()
         body = self._execute(service)
@@ -256,8 +299,15 @@ class ActiveHeartbeatTests(unittest.TestCase):
         self.assertEqual(self._proposal().status, "PR_CREATED")
 
     def test_long_validation_phase_renews_lease(self):
+        # The operation remains open until the heartbeat has demonstrably
+        # renewed the durable lease twice AFTER validation begins.
+        hold_started = threading.Event()
+        self.repository.renew_gate = hold_started
+        self.repository.renew_target = 2
         orchestrator = _Orchestrator(
-            hold_seconds=0.12, hold_after="validation.started"
+            hold_after="validation.started",
+            hold_event=self.repository.renewed_event,
+            hold_started=hold_started,
         )
         service = self._service(orchestrator=orchestrator)
         body = self._execute(service)
