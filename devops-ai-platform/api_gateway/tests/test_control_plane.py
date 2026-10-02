@@ -646,3 +646,55 @@ class ChangeLiveHealthRouteTests(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 404)
         get.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.6.1: durable gate-analysis history (authenticated, read-only GET)
+# --------------------------------------------------------------------------- #
+
+GATE_HISTORY_GET = "/v1/changes/run-gate-1/gate/history?limit=25"
+GATE_HISTORY_DOWNSTREAM = (
+    "http://incident-service:8050/changes/run-gate-1/gate/history?limit=25"
+)
+
+
+class GateHistoryRouteTests(unittest.TestCase):
+    def test_unauthenticated_history_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(GATE_HISTORY_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_authenticated_history_is_forwarded_verbatim(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        body = {
+            "deployment_run_id": "run-gate-1",
+            "count": 1,
+            "evaluations": [{"evaluation_id": "eval-1", "fresh": True}],
+            "policy_version": "6.6.1",
+        }
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(GATE_HISTORY_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(get.call_args.args[0], GATE_HISTORY_DOWNSTREAM)
+        get.assert_called_once()
+
+    def test_history_downstream_errors_are_relayed(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                422, {"detail": "limit must be an integer between 1 and 100"}
+            )
+            resp = client.get(GATE_HISTORY_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["detail"], "limit must be an integer between 1 and 100")
+
+    def test_history_is_read_only_get(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(200, {"count": 0, "evaluations": []})
+            resp = client.get(GATE_HISTORY_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200)
+        get.assert_called_once()
