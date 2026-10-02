@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 2026-10-02 — Phase 6.6.1: durable progressive-release gate analysis state
+
+- **Durable analysis record** — each read-only gate evaluation is persisted with the authoritative deployment run id, exact source SHA, repository identity, target exposure, observation window, optional baseline identity, health/gate decisions, deterministic reasons, the complete bounded live assessment, policy version, request/assessment fingerprints, and freshness timestamps.
+- **Idempotent + immutable** — identical evidence/request evaluations reuse the same 15-minute evaluation slot; an identity collision with different durable content fails closed rather than overwriting an audit record. Expired records remain history and are marked `fresh=false`.
+- **Fail-closed identity** — gate state is derived only after Phase 6.5 exact release attribution succeeds; persisted state never substitutes for a fresh telemetry assessment and is never an authorization cache.
+- **Read-only history** — incident `GET /changes/{deployment_run_id}/gate/history?limit=...` and gateway `GET /v1/changes/{deployment_run_id}/gate/history?limit=...` expose audit history only. No traffic shifting, deployment mutation, approval, or rollback is performed by either endpoint.
+- **Tests/CI** — repository round-trip, idempotency, freshness expiry, identity-conflict, read-only, controller, and gateway forwarding coverage; the new service test module is explicitly included in the incident CI battery.
+
+
 ## 2026-10-02 — Phase 6.5.2: authoritative deployment identity → workload runtime
 
 - **Real-boundary injection** — the deployment engine binds the
