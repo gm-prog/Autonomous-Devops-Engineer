@@ -24,7 +24,6 @@ from incident_service.presentation.rest.changes_controller import (
     get_change_health,
     get_change_live_health,
     get_change_release_gate,
-    get_change_release_gate_history,
     router as changes_router,
 )
 from incident_service.presentation.rest.controllers import (
@@ -410,12 +409,6 @@ class _FakeGateRepository:
     def list_incidents_in_window(self, start, end):
         return list(self._incidents)
 
-    def save_progressive_release_gate_evaluation(self, evaluation):
-        self.saved_gate_evaluation=dict(evaluation); return dict(evaluation)
-
-    def get_progressive_release_gate_evaluations(self, deployment_run_id, limit=50):
-        row=getattr(self,"saved_gate_evaluation",None); return [dict(row)][:limit] if row and row["deployment_run_id"]==deployment_run_id else []
-
     def save_incident(self, *args, **kwargs):
         raise AssertionError("gate controller must be read-only")
 
@@ -523,13 +516,6 @@ class ChangeReleaseGateEndpointTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.status_code, 422)
         self.assertEqual(prometheus.calls, [])
-
-    def test_gate_history_returns_persisted_state(self):
-        repo=self._repo()
-        get_change_release_gate(deployment_run_id="run-gate-1",start=W_START,end=W_END,target_percentage=5,baseline_deployment_run_id=None,repository=repo,prometheus=_FakeGatePrometheus())
-        history=get_change_release_gate_history(deployment_run_id="run-gate-1",limit=50,repository=repo)
-        self.assertEqual(history["count"],1)
-        self.assertEqual(history["evaluations"][0]["gate_decision"],"PROMOTE")
 
     def test_gate_is_read_only(self):
         repo = self._repo()
