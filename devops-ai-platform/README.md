@@ -16,9 +16,17 @@ CI):
 | Agent swarm | `agent_service` | `agent_service.main:app` :8020 | `GET /agent/streams/{task_id}` (SSE), `/health` |
 | Deployment | `deployment_service` | Celery worker | task `tasks.execute_iac_deployment` (Redis broker) |
 | Monitoring | `monitoring_service` | `monitoring_service.main:app` :8040 | `WS /ws/telemetry/socket/{client_id}`, `POST /api/internal` (observation → threshold event, dispatch target), `/health` |
-| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /incidents/{id}/proposal/approve` + `/execute` (Phase 6.2, approval → draft PR), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
+| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /incidents/{id}/proposal/approve` + `/execute` (Phase 6.2, approval → draft PR), `GET /changes/{deployment_run_id}/health`, `/live-health`, `/gate`, and `/gate/history` (Phases 6.4–6.6.1, read-only evidence/gate analysis), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
 | Reporting | `reporting_service` | (library) | weekly audit-report queries + "PDF" engine |
 | Shared kernel | `shared_kernel` | (library) | domain events, value objects, event publisher, metrics |
+
+## Progressive-release analysis state (Phase 6.6.1)
+
+The progressive gate is currently an **analysis boundary, not a rollout controller**. `GET /changes/{deployment_run_id}/gate` performs the existing Phase 6.5 live verification and maps `HEALTHY → PROMOTE`, `DEGRADED → PAUSE`, `FAILED → ABORT`, and `INCONCLUSIVE → INCONCLUSIVE` for the fixed exposure stages 5%, 25%, 50%, and 100%. Exposure above 5% requires an explicit baseline.
+
+Each evaluation is persisted as an immutable audit record keyed by authoritative release identity plus deterministic request/evidence fingerprints. Repeated identical evaluations within the 15-minute freshness slot are idempotent. `GET /changes/{deployment_run_id}/gate/history` returns historical evaluations and marks expired records `fresh=false`; history never authorizes a later deployment action. The gateway forwards the same read-only history at `/v1/changes/{deployment_run_id}/gate/history`.
+
+No endpoint in this phase changes traffic, mutates a deployment, approves a release, or performs rollback. Those actions remain a later progressive-delivery controller concern.
 
 ## Run the full stack
 
