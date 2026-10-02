@@ -613,6 +613,30 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
             ).mappings().all()
         return [dict(row) for row in rows]
 
+    def save_progressive_release_gate_evaluation(self, evaluation: dict) -> dict:
+        required={"evaluation_id","deployment_run_id","source_sha","repository_name","target_percentage","observation_start","observation_end","health_decision","gate_decision","reasons","live_assessment","policy_version","request_fingerprint","assessment_fingerprint","observed_at","expires_at"}
+        missing=sorted(required.difference(evaluation))
+        if missing: raise ValueError("progressive release evaluation missing fields: "+", ".join(missing))
+        values={"evaluation_id":str(evaluation["evaluation_id"]),"deployment_run_id":str(evaluation["deployment_run_id"]),"source_sha":str(evaluation["source_sha"]),"repository_name":str(evaluation["repository_name"] or ""),"target_percentage":int(evaluation["target_percentage"]),"observation_start":_aware_utc(evaluation["observation_start"]),"observation_end":_aware_utc(evaluation["observation_end"]),"baseline_deployment_run_id":str(evaluation["baseline_deployment_run_id"]) if evaluation.get("baseline_deployment_run_id") is not None else None,"baseline_source_sha":str(evaluation["baseline_source_sha"]) if evaluation.get("baseline_source_sha") is not None else None,"health_decision":str(evaluation["health_decision"]),"gate_decision":str(evaluation["gate_decision"]),"reasons":json.dumps(list(evaluation["reasons"])),"live_assessment":json.dumps(evaluation["live_assessment"],sort_keys=True,separators=(",",":")),"policy_version":str(evaluation["policy_version"]),"request_fingerprint":str(evaluation["request_fingerprint"]),"assessment_fingerprint":str(evaluation["assessment_fingerprint"]),"observed_at":_aware_utc(evaluation["observed_at"]),"expires_at":_aware_utc(evaluation["expires_at"])}
+        with self.engine.begin() as connection:
+            existing=connection.execute(select(progressive_release_gate_evaluations_table).where(progressive_release_gate_evaluations_table.c.evaluation_id==values["evaluation_id"])).mappings().first()
+            if existing is None: connection.execute(progressive_release_gate_evaluations_table.insert().values(**values)); row=values
+            else:
+                row=dict(existing)
+                for key in ("deployment_run_id","source_sha","repository_name","target_percentage","observation_start","observation_end","baseline_deployment_run_id","baseline_source_sha","health_decision","gate_decision","reasons","live_assessment","policy_version","request_fingerprint","assessment_fingerprint"):
+                    if row.get(key)!=values.get(key): raise ValueError("progressive release evaluation identity conflict")
+        return self._gate_evaluation_from_row(row)
+
+    def get_progressive_release_gate_evaluations(self,deployment_run_id: str,limit: int=50)->List[dict]:
+        if not isinstance(limit,int) or isinstance(limit,bool) or not 1<=limit<=100: raise ValueError("limit must be an integer between 1 and 100")
+        with self.engine.connect() as connection:
+            rows=connection.execute(select(progressive_release_gate_evaluations_table).where(progressive_release_gate_evaluations_table.c.deployment_run_id==deployment_run_id).order_by(progressive_release_gate_evaluations_table.c.observed_at.desc(),progressive_release_gate_evaluations_table.c.evaluation_id.desc()).limit(limit)).mappings().all()
+        return [self._gate_evaluation_from_row(dict(row)) for row in rows]
+
+    @staticmethod
+    def _gate_evaluation_from_row(row: dict)->dict:
+        return {"evaluation_id":str(row["evaluation_id"]),"deployment_run_id":str(row["deployment_run_id"]),"source_sha":str(row["source_sha"]),"repository_name":str(row.get("repository_name") or ""),"target_percentage":int(row["target_percentage"]),"observation_start":_aware_utc(row["observation_start"]),"observation_end":_aware_utc(row["observation_end"]),"baseline_deployment_run_id":row.get("baseline_deployment_run_id"),"baseline_source_sha":row.get("baseline_source_sha"),"health_decision":str(row["health_decision"]),"gate_decision":str(row["gate_decision"]),"reasons":list(json.loads(row["reasons"] or "[]")),"live_assessment":json.loads(row["live_assessment"] or "{}"),"policy_version":str(row["policy_version"]),"request_fingerprint":str(row["request_fingerprint"]),"assessment_fingerprint":str(row["assessment_fingerprint"]),"observed_at":_aware_utc(row["observed_at"]),"expires_at":_aware_utc(row["expires_at"])}
+
     def _apply_claim_overlay(self, incident) -> None:
         """Project authoritative claim-row state onto each proposal view.
 
@@ -786,6 +810,21 @@ def _normalize_created_at(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.6.1: durable progressive-release gate evaluations.
+# Immutable analysis/audit records; never a deployment authorization source.
+# ---------------------------------------------------------------------- #
+progressive_release_gate_evaluations_table = Table(
+    "devops_progressive_release_gate_evaluations", metadata,
+    Column("evaluation_id", String(128), primary_key=True), Column("deployment_run_id", String(64), nullable=False, index=True),
+    Column("source_sha", String(40), nullable=False), Column("repository_name", String(255), nullable=False), Column("target_percentage", Integer, nullable=False),
+    Column("observation_start", DateTime(timezone=True), nullable=False), Column("observation_end", DateTime(timezone=True), nullable=False),
+    Column("baseline_deployment_run_id", String(64)), Column("baseline_source_sha", String(40)), Column("health_decision", String(32), nullable=False), Column("gate_decision", String(32), nullable=False),
+    Column("reasons", Text, nullable=False), Column("live_assessment", Text, nullable=False), Column("policy_version", String(32), nullable=False), Column("request_fingerprint", String(64), nullable=False), Column("assessment_fingerprint", String(64), nullable=False),
+    Column("observed_at", DateTime(timezone=True), nullable=False), Column("expires_at", DateTime(timezone=True), nullable=False),
+)
 
 
 # ---------------------------------------------------------------------- #

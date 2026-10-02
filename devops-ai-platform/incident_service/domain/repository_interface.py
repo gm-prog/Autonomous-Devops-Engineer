@@ -26,3 +26,11 @@ class IncidentRepositoryPort(ABC):
         self, start: datetime, end: datetime
     ) -> List[IncidentAggregate]:
         pass
+
+    @abstractmethod
+    def save_progressive_release_gate_evaluation(self, evaluation: dict) -> dict:
+        pass
+
+    @abstractmethod
+    def get_progressive_release_gate_evaluations(self, deployment_run_id: str, limit: int = 50) -> List[dict]:
+        pass
