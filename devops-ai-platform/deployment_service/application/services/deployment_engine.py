@@ -13,6 +13,9 @@ import yaml
 from deployment_service.application.services.health_check_service import HealthCheckService
 from deployment_service.application.services.iac_validator import IaCValidator
 from deployment_service.application.services.kubectl_runner import KubectlRunnerService
+from deployment_service.application.services.release_identity_injection import (
+    bind_release_identity,
+)
 from deployment_service.application.services.source_verification import (
     GitHubSourceVerifier,
 )
@@ -265,6 +268,17 @@ class DeploymentEngine:
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
                 return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
 
+            # Phase 6.5.2 — bind THIS run's authoritative identity into the
+            # workload manifest at the point the real runtime is created.
+            # Values come only from the persisted run record (id +
+            # source_revision.head_sha) — never from the request payload.
+            # Fail-closed: an unusable identity injects nothing, so no
+            # carrier series exists and Phase 6.5 stays INCONCLUSIVE.
+            bind_release_identity(
+                paths["kubernetes"],
+                run.id,
+                run.source_revision.get("head_sha", ""),
+            )
             kubernetes_apply = self.kubectl.apply(paths["kubernetes"], namespace)
             run.execution["kubernetes_apply"] = kubernetes_apply
             run.execution["kubernetes_applied"] = kubernetes_apply.get("status") == "PASS"

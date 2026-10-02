@@ -1113,6 +1113,24 @@ aggregation while release identity stays on the single carrier series
 instead of multiplying across every request sample. No carrier series
 → empty join → `attribution_unavailable` → INCONCLUSIVE.
 
+**Runtime identity injection (Phase 6.5.2).** The carrier's inputs are
+no longer merely operator-supplied: the deployment engine now binds them
+at the real workload-runtime boundary. When a run reaches actual
+execution (`DeploymentEngine.execute` → `kubectl apply`, gated by
+`DEPLOYMENT_EXECUTION_ENABLED=true`), the manifest's container env
+receives `DEVOPS_DEPLOYMENT_ID` = the run's own persisted `id` and
+`DEVOPS_SOURCE_SHA` = that same record's verified
+`source_revision.head_sha` (canonical lowercase 40-hex, independently
+source-verified before the run existed) — both straight from the trusted
+execution context, never from request payloads or client spec fields.
+Client-planted `DEVOPS_*` entries in the submitted manifest are replaced
+(authoritative record wins); an unusable identity injects nothing
+(fail-closed — no fallback, no fabricated identity). The binding happens
+in `deployment_service/.../release_identity_injection.py` immediately
+before `kubectl apply`, i.e. at the point the real workload runtime is
+created — so an executed deployment's runtime is exactly compatible with
+the Phase 6.5.1 carrier contract.
+
 **Supported SLIs (fixed catalog, real telemetry only).**
 
 | SLI | Predefined query | Backed by |
@@ -1173,15 +1191,17 @@ shift traffic, roll back, or act on its decision.
 * Live verification verifies — it never acts: no traffic shifting,
   rollback, or remediation exists on this surface (CONTROL/ACT are
   later phases).
-* Attribution now flows through the Phase 6.5.1 identity carrier:
-  real attribution requires the deployment runtime to inject
-  `DEVOPS_DEPLOYMENT_ID` + `DEVOPS_SOURCE_SHA` into the workload so
-  `devops_release_identity_info` exists (request-counter samples stay
-  free of release labels). With those variables absent/invalid — as in
-  today's default stack — assessments correctly return
-  INCONCLUSIVE/`attribution_unavailable`; the join, attribution and
-  decision rules are exercised end-to-end against the mocked
-  Prometheus boundary.
+* Attribution now flows through the Phase 6.5.1 identity carrier,
+  bound at execution by Phase 6.5.2: runs executed through the real
+  deployment path receive `DEVOPS_DEPLOYMENT_ID` + `DEVOPS_SOURCE_SHA`
+  from their own authoritative record at `kubectl apply` time
+  (request-counter samples stay free of release labels). Identity is
+  absent — and assessments correctly return
+  INCONCLUSIVE/`attribution_unavailable` — whenever no run has executed
+  on that target, execution is disabled, or the compose operator has
+  not passed the variables through; the join, attribution and decision
+  rules are exercised end-to-end against the mocked Prometheus
+  boundary.
 * Telemetry is read live at request time from Prometheus (when
   reachable); it is not persisted by this path, and the verification
   window must cover both candidate and baseline durable evidence for

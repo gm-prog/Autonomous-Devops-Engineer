@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## 2026-10-02 — Phase 6.5.2: authoritative deployment identity → workload runtime
+
+- **Real-boundary injection** — `DeploymentEngine.execute` now binds
+  the authoritative release identity into the workload manifest
+  immediately before `kubectl apply` (the exact point the runtime is
+  created): `DEVOPS_DEPLOYMENT_ID` = the persisted run's own `id`,
+  `DEVOPS_SOURCE_SHA` = that same record's source-verified
+  `source_revision.head_sha`. Both come from the trusted execution
+  context only — never from HTTP payloads, client spec fields, repo
+  names, branches, timestamps or Git HEAD heuristics.
+- **Fail-closed + spoof-proof** (`release_identity_injection.py`) —
+  identity is bound all-or-nothing with the Phase 6.5.1 validation
+  rules (id verbatim 1–128 no-control-chars, SHA exact lowercase
+  40-hex); unusable identity injects nothing (no fallback, no
+  fabrication → no carrier → Phase 6.5 stays INCONCLUSIVE).
+  Client-planted `DEVOPS_*` env entries in the submitted manifest are
+  replaced and duplicates collapsed — the authoritative record wins.
+  Manifests without containers or unparseable YAML pass through
+  unchanged (existing execution behavior preserved).
+- Tests: `deployment_service/tests/test_release_identity_injection.py`
+  — proofs A (exact propagation, unit + engine), B (same-record
+  binding across two runs), C (planted-env overwrite at unit and
+  engine level), D (missing/invalid identity byte-identical
+  fail-closed), F (values accepted by the actual
+  `backend/app/release_identity.py` carrier, producing the
+  `devops_release_identity_info` series against a local registry —
+  no live Prometheus claimed).
+
 ## 2026-10-02 — Phase 6.5.1: runtime release identity carrier for Prometheus attribution
 
 - **Identity provider** (`backend/app/release_identity.py`) —
