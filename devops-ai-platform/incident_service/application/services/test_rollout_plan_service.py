@@ -378,6 +378,7 @@ class RolloutPlanServiceTests(unittest.TestCase):
             self._plan_by_id("eval-foreign-plan", 25, self._ready_controller())
 
     def test_pause_decision_blocks_the_plan(self):
+        # PAUSE at the current durable percentage → evaluated, BLOCKED
         self._bootstrap()
         evaluation = self._evaluate(5, cpu=0.75)
         result = self._plan(evaluation, 5, self._ready_controller(percentage=5))
@@ -387,20 +388,54 @@ class RolloutPlanServiceTests(unittest.TestCase):
             result["reasons"],
         )
 
+    def test_pause_at_different_percentage_is_conflict(self):
+        # current=5, PAUSE, requested=25 → 409 conflict (fail closed)
+        self._bootstrap()
+        evaluation = self._evaluate(25, cpu=0.75)
+        self.assertEqual(evaluation["gate_decision"], "PAUSE")
+        with self.assertRaises(RolloutPlanConflict):
+            self._plan_by_id(
+                evaluation["evaluation_id"], 25, self._ready_controller(5)
+            )
+
     def test_abort_decision_blocks_the_plan(self):
+        # ABORT at the current durable percentage → evaluated, BLOCKED
         self._bootstrap()
         evaluation = self._evaluate(5, cpu=0.95)
         result = self._plan(evaluation, 5, self._ready_controller(percentage=5))
         self.assertEqual(result["preflight_status"], PREFLIGHT_BLOCKED)
 
+    def test_abort_at_different_percentage_is_conflict(self):
+        # current=5, ABORT, requested=25 → 409 conflict (fail closed)
+        self._bootstrap()
+        evaluation = self._evaluate(25, cpu=0.95)
+        self.assertEqual(evaluation["gate_decision"], "ABORT")
+        with self.assertRaises(RolloutPlanConflict):
+            self._plan_by_id(
+                evaluation["evaluation_id"], 25, self._ready_controller(5)
+            )
+
     def test_inconclusive_decision_blocks_the_plan(self):
+        # INCONCLUSIVE at the current durable percentage → BLOCKED
+        self._bootstrap()
+        evaluation = self._evaluate(
+            5, error=PrometheusUnavailableError("refused")
+        )
+        self.assertEqual(evaluation["gate_decision"], "INCONCLUSIVE")
+        result = self._plan(evaluation, 5, self._ready_controller(percentage=5))
+        self.assertEqual(result["preflight_status"], PREFLIGHT_BLOCKED)
+
+    def test_inconclusive_at_different_percentage_is_conflict(self):
+        # current=5, INCONCLUSIVE, requested=25 → 409 conflict (fail closed)
         self._bootstrap()
         evaluation = self._evaluate(
             25, error=PrometheusUnavailableError("refused")
         )
-        result = self._plan(evaluation, 25, self._ready_controller(percentage=5))
-        self.assertEqual(result["preflight_status"], PREFLIGHT_BLOCKED)
         self.assertEqual(evaluation["gate_decision"], "INCONCLUSIVE")
+        with self.assertRaises(RolloutPlanConflict):
+            self._plan_by_id(
+                evaluation["evaluation_id"], 25, self._ready_controller(5)
+            )
 
     # --------------------------------------------- stage progression
 
@@ -528,7 +563,70 @@ class RolloutPlanServiceTests(unittest.TestCase):
 
     # -------------------------------------------------- determinism
 
+    def test_distinct_fresh_evaluations_share_intent_identity(self):
+        """Two independent fresh evaluations of the SAME desired state
+        (run + SHA + current + requested) must yield one intent id —
+        the id identifies the desired rollout state, not the
+        gate-evaluation instance."""
+        self._bootstrap()
+        evaluation_a = self._evaluate(25, cpu=0.30)
+        evaluation_b = self._evaluate(25, cpu=0.45)
+        self.assertNotEqual(
+            evaluation_a["evaluation_id"],
+            evaluation_b["evaluation_id"],
+            "fixtures must be distinct evaluations",
+        )
+        first = self._plan(evaluation_a, 25, self._ready_controller(5))
+        second = self._plan(evaluation_b, 25, self._ready_controller(5))
+        self.assertEqual(
+            first["intent"]["intent_id"], second["intent"]["intent_id"]
+        )
+
+    def test_intent_id_changes_with_each_identity_component(self):
+        """Exactly four identity inputs: changing any one of them —
+        deployment_run_id, source_sha, current_percentage,
+        requested_percentage — must change the intent id. Direct calls
+        because plan() legality/stage binding make per-component
+        isolation unreachable through the endpoint (run-level isolation
+        is corroborated externally below)."""
+        base = RolloutPlanService._intent_id(RUN_ID, SHA, 5, 25)
+        self.assertRegex(base, r"^ti_[0-9a-f]{24}$")
+        others = (
+            ("different deployment_run_id", (OTHER_RUN_ID, SHA, 5, 25)),
+            ("different source_sha", (RUN_ID, "b" * 40, 5, 25)),
+            ("different current_percentage", (RUN_ID, SHA, 25, 25)),
+            ("different requested_percentage", (RUN_ID, SHA, 5, 50)),
+        )
+        for label, args in others:
+            with self.subTest(component=label):
+                self.assertNotEqual(base, RolloutPlanService._intent_id(*args))
+
+        # external corroboration for deployment_run_id: a second run,
+        # same SHA/current/requested, plan() contract path
+        other_evaluation = self._evaluate(5, run_id=OTHER_RUN_ID)
+        self._stage_service().transition(
+            OTHER_RUN_ID, 0, 5, other_evaluation["evaluation_id"], SHA
+        )
+        self._bootstrap()
+        other_promote = self._evaluate(25, run_id=OTHER_RUN_ID)
+        own_promote = self._evaluate(25)
+        other_result = self._plan_by_id(
+            other_promote["evaluation_id"],
+            25,
+            self._ready_controller(5),
+            run_id=OTHER_RUN_ID,
+        )
+        own_result = self._plan(own_promote, 25, self._ready_controller(5))
+        self.assertNotEqual(
+            own_result["intent"]["intent_id"],
+            other_result["intent"]["intent_id"],
+        )
+
     def test_intent_and_status_are_deterministic(self):
+        # Repeated invocation over identical inputs is stable. This does
+        # NOT rely on reusing a single evaluation id: two distinct fresh
+        # evaluations of the same desired state map to the same intent
+        # (test_distinct_fresh_evaluations_share_intent_identity).
         self._bootstrap()
         evaluation = self._evaluate(25)
         first = self._plan(evaluation, 25, self._ready_controller(5))

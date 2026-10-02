@@ -283,10 +283,12 @@ class RolloutPlanService:
                 "presented evaluation is stale (refusing to plan)"
             )
 
-        # ---- next legal stage only for forward PROMOTE plans
-        # (5 → 25 → 50 → 100; no skips/reversals). PAUSE/ABORT/
-        # INCONCLUSIVE evaluations describe staying put and are blocked
-        # below — they never advance the stage either.
+        # ---- stage legality (fail closed; never advances the stage)
+        # PROMOTE plans forward only: 5 → 25 → 50 → 100 (no skips/
+        # reversals). PAUSE/ABORT/INCONCLUSIVE decisions may only plan
+        # at the current durable percentage — a different requested
+        # percentage is a conflict, and none of them ever advances
+        # the stage either.
         decision = str(evaluation["gate_decision"])
         if decision == "PROMOTE":
             if current == ROLLOUT_STAGE_SEQUENCE[-1]:
@@ -302,11 +304,17 @@ class RolloutPlanService:
                         f"requested_percentage must be exactly {expected_next} "
                         f"(never skip or reverse stages)"
                     )
+        elif requested != current:
+            raise RolloutPlanConflict(
+                f"{decision} decisions may only plan at the current "
+                f"durable percentage ({current}); requested_percentage="
+                f"{requested} does not match the rollout stage"
+            )
 
         intent = TrafficIntent(
             intent_id=self._intent_id(
-                str(stage["stage_state_id"]),
-                evaluation_id,
+                deployment_run_id,
+                source_sha,
                 current,
                 requested,
             ),
@@ -435,16 +443,24 @@ class RolloutPlanService:
 
     @staticmethod
     def _intent_id(
-        stage_state_id: str,
-        evaluation_id: str,
+        deployment_run_id: str,
+        source_sha: str,
         current: int,
         requested: int,
     ) -> str:
-        digest = hashlib.sha256(
-            f"{stage_state_id}:{evaluation_id}:{current}:{requested}".encode(
-                "utf-8"
-            )
-        ).hexdigest()
+        """Deterministic identity of the DESIRED traffic state.
+
+        Only the four contract inputs take part — ``deployment_run_id``,
+        ``source_sha``, ``current_percentage``, ``requested_percentage``.
+        Never ``stage_state_id``, ``evaluation_id``, timestamps, display
+        names, branches, PR titles, k8s names, image tags, or provider/
+        observation output: the id identifies the desired rollout state,
+        not a particular gate-evaluation instance. Two independent fresh
+        evaluations of the same desired state therefore yield the same
+        intent id.
+        """
+        canonical = f"{deployment_run_id}:{source_sha}:{current}:{requested}"
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return f"ti_{digest[:24]}"
 
     @staticmethod
