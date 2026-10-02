@@ -145,3 +145,18 @@ def get_change_release_gate(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{deployment_run_id}/gate/history", response_model=Dict[str, Any])
+def get_change_release_gate_history(
+    deployment_run_id: str,
+    limit: int = Query(50, description="Maximum persisted evaluations to return (1-100)"),
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Return durable gate-analysis history; stale rows are informational only."""
+    try:
+        return ProgressiveReleaseGateService(repository, prometheus=None).history(
+            deployment_run_id=deployment_run_id, limit=limit
+        )
+    except InvalidProgressiveReleaseGateRequest as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
