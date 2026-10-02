@@ -403,3 +403,32 @@ def control_plane_change_rollout_state_transition(
         f"/changes/{deployment_run_id}/rollout-state/transition",
         payload,
     )
+
+
+@router.get("/changes/{deployment_run_id}/rollout-plan")
+def control_plane_change_rollout_plan(
+    deployment_run_id: str,
+    evaluation_id: str,
+    requested_percentage: int,
+    source_sha: str,
+    request: Request,
+    user: dict = Depends(verify_token),
+):
+    """Phase 6.7.1 — read-only traffic preflight (any authenticated user).
+
+    Forwards only the minimum bound inputs and relays the preflight
+    result verbatim. No mutation endpoint exists here: this route can
+    never shift traffic, mutate Kubernetes, or advance the rollout
+    stage (operator role is not requested because nothing is mutated).
+    """
+    _rate_limit_or_429(request)
+    query = urlencode(
+        {
+            "evaluation_id": evaluation_id,
+            "requested_percentage": requested_percentage,
+            "source_sha": source_sha,
+        }
+    )
+    return _forward_get(
+        "incident", f"/changes/{deployment_run_id}/rollout-plan?{query}"
+    )

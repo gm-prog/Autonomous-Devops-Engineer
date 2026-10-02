@@ -38,6 +38,11 @@ from incident_service.application.services.progressive_rollout_stage_service imp
     ProgressiveRolloutStageService,
     RolloutStageConflict,
 )
+from incident_service.application.services.rollout_plan_service import (
+    InvalidRolloutPlanRequest,
+    RolloutPlanConflict,
+    RolloutPlanService,
+)
 from incident_service.application.services.operational_analytics_service import (
     InvalidAnalyticsWindowError,
 )
@@ -228,6 +233,44 @@ def post_change_rollout_state_transition(
     except InvalidRolloutStageRequest as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RolloutStageConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{deployment_run_id}/rollout-plan", response_model=Dict[str, Any])
+def get_change_rollout_plan(
+    deployment_run_id: str,
+    evaluation_id: str = Query(
+        ..., description="Exact fresh gate-evaluation id the plan is bound to"
+    ),
+    requested_percentage: int = Query(
+        ..., description="Requested next exposure: 5, 25, 50, or 100"
+    ),
+    source_sha: str = Query(
+        ..., description="Exact authoritative 40-hex lowercase source SHA"
+    ),
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Phase 6.7.1 — read-only traffic preflight (plan ONLY).
+
+    Returns rollout identity, durable stage, the exact fresh gate
+    evaluation, observed traffic state, requested target, preflight
+    status (READY/NO_OP/BLOCKED/CONFLICT/INCONCLUSIVE) and reasons.
+    This endpoint never mutates traffic: no kubectl, no provider write,
+    no rollout-stage change. Missing state/evaluation → 404, conflicts →
+    409, malformed input → 422.
+    """
+    try:
+        return RolloutPlanService(repository).plan(
+            deployment_run_id=deployment_run_id,
+            evaluation_id=evaluation_id,
+            requested_percentage=requested_percentage,
+            source_sha=source_sha,
+        )
+    except InvalidRolloutPlanRequest as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RolloutPlanConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

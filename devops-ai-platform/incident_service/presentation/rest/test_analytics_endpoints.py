@@ -25,6 +25,7 @@ from incident_service.presentation.rest.changes_controller import (
     get_change_health,
     get_change_live_health,
     get_change_release_gate,
+    get_change_rollout_plan,
     get_change_rollout_state,
     post_change_rollout_state_transition,
     router as changes_router,
@@ -858,6 +859,204 @@ class RolloutStageEndpointTests(unittest.TestCase):
             evidence_before,
         )
         # evaluations are append-only audit rows: none mutated or removed
+        self.assertEqual(
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            ),
+            evaluations_before,
+        )
+
+
+class RolloutPlanEndpointTests(unittest.TestCase):
+    """Phase 6.7.1 controller contract: read-only traffic preflight.
+
+    Uses the default (deliberately unavailable) traffic provider — the
+    only honest production configuration today — so a 200 preflight is
+    INCONCLUSIVE/READY-class logic proven at the service layer and this
+    surface proves mapping, validation, and zero mutation.
+    """
+
+    SHA = "a" * 40
+    RUN_ID = "run-rollout-plan-http"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.repository = PostgresIncidentRepositoryAdapter(
+            f"sqlite:///{os.path.join(self._temp.name, 'plan-http.db')}"
+        )
+        incident = IncidentAggregate(
+            id="inc-rollout-plan-http",
+            title="[release] rollout plan http",
+            severity="HIGH",
+            context_details="rollout plan http fixture",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id=self.RUN_ID,
+                evidence_id="plan-http-evidence",
+                head_sha=self.SHA,
+                kind_extra={
+                    "health_check_status": "PASS",
+                    "source_sha": self.SHA,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+        self.now = datetime.now(timezone.utc)
+
+    def _evaluate(self, target=5, cpu=0.30):
+        from incident_service.application.services.progressive_release_gate_service import (
+            ProgressiveReleaseGateService,
+        )
+
+        run_id = self.RUN_ID
+
+        class _RolloutPrometheus(_FakeGatePrometheus):
+            def query_range_metric(inner_self, template_name, start, end):
+                inner_self.calls.append(template_name)
+                value = (
+                    inner_self.request
+                    if template_name == "request_rate"
+                    else inner_self.cpu
+                )
+                return RangeQueryResult(
+                    template=template_name,
+                    query="q",
+                    start=W_START.timestamp(),
+                    end=W_END.timestamp(),
+                    step_seconds=60,
+                    series=(
+                        RangeSeries(
+                            labels={"deployment_id": run_id},
+                            samples=tuple(
+                                RangeSample(
+                                    timestamp=W_START.timestamp()
+                                    + 3600
+                                    + i * 600,
+                                    value=value,
+                                )
+                                for i in range(6)
+                            ),
+                        ),
+                    ),
+                )
+
+        return ProgressiveReleaseGateService(
+            self.repository,
+            _RolloutPrometheus(cpu=cpu),
+            now_factory=lambda: self.now,
+        ).evaluate(
+            self.RUN_ID,
+            W_START,
+            W_END,
+            target,
+            baseline_deployment_run_id=(
+                self.RUN_ID if target > 5 else None
+            ),
+        )
+
+    def _bootstrap(self):
+        evaluation = self._evaluate(5)
+        return post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=0,
+                target_percentage=5,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+
+    def _plan(self, evaluation, requested):
+        return get_change_rollout_plan(
+            deployment_run_id=self.RUN_ID,
+            evaluation_id=evaluation["evaluation_id"],
+            requested_percentage=requested,
+            source_sha=self.SHA,
+            repository=self.repository,
+        )
+
+    def test_route_is_registered(self):
+        paths = [
+            getattr(route, "path", "") for route in changes_router.routes
+        ]
+        self.assertIn("/changes/{deployment_run_id}/rollout-plan", paths)
+
+    def test_unavailable_provider_returns_200_inconclusive(self):
+        self._bootstrap()
+        evaluation = self._evaluate(25)
+        body = self._plan(evaluation, 25)
+        self.assertEqual(body["preflight_status"], "INCONCLUSIVE")
+        self.assertEqual(body["observed_traffic"]["provider"], "unavailable")
+        self.assertEqual(body["requested_percentage"], 25)
+        self.assertEqual(body["rollout"]["current_percentage"], 5)
+        self.assertEqual(
+            body["evaluation"]["evaluation_id"], evaluation["evaluation_id"]
+        )
+
+    def test_missing_rollout_state_is_404(self):
+        evaluation = self._evaluate(5)
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_plan(
+                deployment_run_id="run-unknown-plan",
+                evaluation_id=evaluation["evaluation_id"],
+                requested_percentage=5,
+                source_sha=self.SHA,
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_unknown_evaluation_is_404(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_plan(
+                deployment_run_id=self.RUN_ID,
+                evaluation_id="missing-eval",
+                requested_percentage=25,
+                source_sha=self.SHA,
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_illegal_stage_jump_is_409(self):
+        self._bootstrap()
+        evaluation = self._evaluate(50)
+        with self.assertRaises(HTTPException) as ctx:
+            self._plan(evaluation, 50)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_malformed_input_is_422(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_plan(
+                deployment_run_id=self.RUN_ID,
+                evaluation_id="whatever",
+                requested_percentage=10,  # not in 5/25/50/100
+                source_sha=self.SHA,
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_plan_is_read_only_over_every_durable_record(self):
+        self._bootstrap()
+        stage_before = self.repository.get_progressive_rollout_stage(
+            self.RUN_ID
+        )
+        evaluation = self._evaluate(25)
+        evaluations_before = list(
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            )
+        )
+        self._plan(evaluation, 25)
+        self.assertEqual(
+            self.repository.get_progressive_rollout_stage(self.RUN_ID),
+            stage_before,
+        )
         self.assertEqual(
             self.repository.get_progressive_release_gate_evaluations(
                 self.RUN_ID

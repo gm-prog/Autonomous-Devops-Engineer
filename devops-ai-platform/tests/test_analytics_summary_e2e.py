@@ -517,5 +517,176 @@ class RolloutStageHttpTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404, resp.text)
 
 
+class RolloutPlanHttpTests(unittest.TestCase):
+    """Phase 6.7.1 rollout-plan over real HTTP (TestClient + SQLite).
+
+    Proves FastAPI query parsing (missing/malformed → 422), 404/409/200
+    mapping through the real router, and that the read-only preflight
+    performs zero durable writes with the default unavailable provider.
+    """
+
+    SHA = "a" * 40
+    RUN_ID = "run-rollout-plan-e2e"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(self._temp.name, 'plan-e2e.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        incident_app.dependency_overrides[
+            controllers_module.get_incident_repository
+        ] = lambda: self.repository
+        self.client = TestClient(incident_app)
+
+        from incident_service.presentation.rest.test_remediation_authorization import (
+            _deployment_evidence,
+        )
+
+        incident = IncidentAggregate(
+            id="inc-rollout-plan-e2e",
+            title="[release] rollout plan e2e",
+            severity="HIGH",
+            context_details="rollout plan http fixture",
+        )
+        incident.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc) + timedelta(
+            hours=1
+        )
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id=self.RUN_ID,
+                evidence_id="plan-e2e-evidence",
+                head_sha=self.SHA,
+                kind_extra={
+                    "health_check_status": "PASS",
+                    "source_sha": self.SHA,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+        self.now = datetime.now(timezone.utc)
+        self.addCleanup(incident_app.dependency_overrides.clear)
+        self.addCleanup(self._temp.cleanup)
+
+    def _evaluate(self, target=5, cpu=0.30):
+        from incident_service.application.services.progressive_release_gate_service import (
+            ProgressiveReleaseGateService,
+        )
+
+        run_id = self.RUN_ID
+        start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 9, 8, tzinfo=timezone.utc)
+
+        class _Prom:
+            def query_range_metric(inner, template_name, s, e):
+                value = 10.0 if template_name == "request_rate" else cpu
+                return RangeQueryResult(
+                    template=template_name,
+                    query="q",
+                    start=start.timestamp(),
+                    end=end.timestamp(),
+                    step_seconds=60,
+                    series=(
+                        RangeSeries(
+                            labels={"deployment_id": run_id},
+                            samples=tuple(
+                                RangeSample(
+                                    timestamp=start.timestamp() + 3600 + i * 600,
+                                    value=value,
+                                )
+                                for i in range(6)
+                            ),
+                        ),
+                    ),
+                )
+
+        return ProgressiveReleaseGateService(
+            self.repository,
+            _Prom(),
+            now_factory=lambda: self.now,
+        ).evaluate(
+            self.RUN_ID,
+            start,
+            end,
+            target,
+            baseline_deployment_run_id=(
+                self.RUN_ID if target > 5 else None
+            ),
+        )
+
+    def _bootstrap_over_http(self):
+        evaluation = self._evaluate(5)
+        resp = self.client.post(
+            "/changes/run-rollout-plan-e2e/rollout-state/transition",
+            json={
+                "expected_percentage": 0,
+                "target_percentage": 5,
+                "evaluation_id": evaluation["evaluation_id"],
+                "source_sha": evaluation["source_sha"],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return evaluation
+
+    def _query(self, evaluation, requested):
+        return (
+            "/changes/run-rollout-plan-e2e/rollout-plan"
+            f"?evaluation_id={evaluation['evaluation_id']}"
+            f"&requested_percentage={requested}"
+            f"&source_sha={self.SHA}"
+        )
+
+    def test_missing_parameters_are_422(self):
+        resp = self.client.get("/changes/run-rollout-plan-e2e/rollout-plan")
+        self.assertEqual(resp.status_code, 422)
+
+    def test_malformed_parameters_are_422(self):
+        evaluation = self._evaluate(5)
+        base = self._query(evaluation, 5)
+        for bad in (
+            base.replace(f"requested_percentage=5", "requested_percentage=ten"),
+            base.replace(f"requested_percentage=5", "requested_percentage=7"),
+            base.replace(f"source_sha={self.SHA}", f"source_sha={self.SHA.upper()}"),
+        ):
+            with self.subTest(url=bad):
+                resp = self.client.get(bad)
+                self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_unknown_state_is_404_over_http(self):
+        evaluation = self._evaluate(5)
+        resp = self.client.get(
+            "/changes/run-unknown-plan/rollout-plan"
+            f"?evaluation_id={evaluation['evaluation_id']}"
+            "&requested_percentage=5"
+            f"&source_sha={self.SHA}"
+        )
+        self.assertEqual(resp.status_code, 404, resp.text)
+
+    def test_illegal_jump_is_409_over_http(self):
+        self._bootstrap_over_http()
+        evaluation = self._evaluate(50)
+        resp = self.client.get(self._query(evaluation, 50))
+        self.assertEqual(resp.status_code, 409, resp.text)
+
+    def test_preflight_200_with_unavailable_provider(self):
+        self._bootstrap_over_http()
+        stage_before = self.repository.get_progressive_rollout_stage(
+            self.RUN_ID
+        )
+        evaluation = self._evaluate(25)
+        resp = self.client.get(self._query(evaluation, 25))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["preflight_status"], "INCONCLUSIVE")
+        self.assertEqual(body["observed_traffic"]["provider"], "unavailable")
+        self.assertEqual(body["requested_percentage"], 25)
+        self.assertEqual(body["intent"]["deployment_run_id"], self.RUN_ID)
+        self.assertEqual(body["intent"]["source_sha"], self.SHA)
+        # read-only: durable stage untouched
+        self.assertEqual(
+            self.repository.get_progressive_rollout_stage(self.RUN_ID),
+            stage_before,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

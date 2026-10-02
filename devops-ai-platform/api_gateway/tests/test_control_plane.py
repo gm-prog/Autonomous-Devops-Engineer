@@ -823,3 +823,74 @@ class RolloutStateRouteTests(unittest.TestCase):
                 )
             self.assertEqual(resp.status_code, status)
             self.assertEqual(resp.json()["detail"], detail)
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.7.1: read-only traffic preflight (authenticated GET forward; there
+# is deliberately NO mutation endpoint at the gateway in this phase)
+# --------------------------------------------------------------------------- #
+
+ROLLOUT_PLAN_GET = (
+    "/v1/changes/run-rollout-1/rollout-plan"
+    "?evaluation_id=eval-1&requested_percentage=25&source_sha="
+    + "a" * 40
+)
+ROLLOUT_PLAN_DOWNSTREAM = (
+    "http://incident-service:8050/changes/run-rollout-1/rollout-plan"
+    "?evaluation_id=eval-1&requested_percentage=25&source_sha="
+    + "a" * 40
+)
+
+
+class RolloutPlanRouteTests(unittest.TestCase):
+    def test_unauthenticated_plan_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(ROLLOUT_PLAN_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_authenticated_plan_is_forwarded_verbatim(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        body = {
+            "rollout": {"deployment_run_id": "run-rollout-1", "state": "ACTIVE"},
+            "evaluation": {"evaluation_id": "eval-1", "gate_decision": "PROMOTE"},
+            "requested_percentage": 25,
+            "preflight_status": "INCONCLUSIVE",
+            "reasons": ["observed traffic state cannot be established reliably"],
+            "observed_traffic": {"provider": "unavailable"},
+        }
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(ROLLOUT_PLAN_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(get.call_args.args[0], ROLLOUT_PLAN_DOWNSTREAM)
+        get.assert_called_once()
+
+    def test_plan_conflicts_and_validation_errors_are_relayed(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        for status, detail in (
+            (409, "requested_percentage must be exactly 25"),
+            (422, "source_sha must be the exact 40-character lowercase hex SHA"),
+            (404, "rollout state not found"),
+        ):
+            with self.subTest(status=status), _get_mock() as get:
+                get.return_value = _downstream(status, {"detail": detail})
+                resp = client.get(ROLLOUT_PLAN_GET, headers=_authed(token))
+            self.assertEqual(resp.status_code, status)
+            self.assertEqual(resp.json()["detail"], detail)
+
+    def test_plan_is_a_read_only_get(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(200, {"preflight_status": "READY"})
+            resp = client.get(ROLLOUT_PLAN_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200)
+        get.assert_called_once()
+        # no POST/apply route exists for plans at the gateway
+        with _post_mock() as post:
+            resp = client.post(
+                "/v1/changes/run-rollout-1/rollout-plan", json={}
+            )
+        self.assertIn(resp.status_code, (404, 405))
+        post.assert_not_called()
