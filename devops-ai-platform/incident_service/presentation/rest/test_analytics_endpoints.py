@@ -555,7 +555,7 @@ class ChangeReleaseGateHistoryEndpointTests(unittest.TestCase):
 
     def test_history_returns_persisted_state(self):
         repo = _FakeGateRepository()
-        now = W_END
+        now = datetime.now(timezone.utc)
         row = {
             "evaluation_id": "eval-1",
             "deployment_run_id": "run-gate-1",
