@@ -1,5 +1,53 @@
 # CHANGELOG
 
+## 2026-10-02 — Phase 6.5: change-aware live release verification
+
+- **Combined read-only endpoint** —
+  `GET /changes/{deployment_run_id}/live-health?start&end[&baseline_deployment_run_id]`
+  (incident service; forwarded as `GET /v1/changes/…/live-health` by the
+  API gateway behind JWT `verify_token` + rate limit, any authenticated
+  user). Response = `{durable_assessment, live_assessment}`: the
+  unchanged Phase 6.4 durable result plus the Phase 6.5 live telemetry
+  result — 6.4 decision semantics consumed verbatim, never altered.
+- **Bounded Prometheus range query** — `query_range_metric()` added to
+  the existing `PrometheusScraperClient` (same endpoint configuration;
+  instant-query behavior preserved): fixed 5 s timeout, ≤31-day window,
+  ≤500 points/query, ≤10 000 samples/response, predefined templates
+  only (`request_rate`, `cpu_saturation` — no arbitrary PromQL anywhere
+  in the path), fail-closed typed errors on timeout/HTTP/malformed/
+  unsupported/overflow, deterministic typed models
+  (`RangeQueryResult`/`RangeSeries`/`RangeSample`). Exactly one query
+  per SLI per assessment (no N+1).
+- **Exact release attribution** — a series counts only when label
+  `deployment_id` equals the Phase 6.4 deployment run id or label
+  `source_sha` equals the exact 40-hex source SHA; `service_version` is
+  not authoritative (no durable version exists to match); timestamps
+  never attribute. Templates group `by (job, deployment_id,
+  source_sha)` — no new instrumentation labels added.
+- **Deterministic SLI rules** — fixed precedence
+  FAILED > DEGRADED > INCONCLUSIVE > HEALTHY with structured reason
+  tokens: `cpu_saturation_critical` (≥0.90 cores → FAILED),
+  `cpu_saturation_warning` (≥0.70 → DEGRADED),
+  `request_rate_dropped_vs_baseline` (<50 % of an explicit, attributable
+  baseline → DEGRADED); INCONCLUSIVE for unavailable/malformed/
+  unsupported telemetry, <3 attributable samples, unattributable series,
+  or an unresolvable requested baseline; HEALTHY only with all signals
+  attributable, populated, and within policy. Missing ≠ zero; malformed
+  ≠ signal; time proximity ≠ correlation. Error-rate/latency SLIs
+  intentionally omitted (no backing telemetry in-repo).
+- **Fail-closed HTTP map** — window → 422 (Phase 6.3 validator),
+  unknown run → 404, every telemetry failure → 200 with
+  `INCONCLUSIVE` + fixed six-reason data-quality block. Read-only: no
+  mutation path, no schema, no CI-workflow change.
+- Tests (existing modules + one new platform file): bounded query
+  bounds/timeout/malformed/unsupported/sample-cap, instant-query
+  preservation, exact-attribution matrix (wrong SHA/run, timestamp-only
+  overlap), all four decisions + reason order, baseline
+  valid/missing/unattributable, exact `[start,end)` sample boundaries,
+  fixed 2-query budget with baseline + noise series, query-before-
+  nothing on 404/422, combined read model, controller/E2E/gateway
+  auth+forward+relay matrix.
+
 ## 2026-09-28 — Phase 6.4: change intelligence & release verification foundation
 
 - **One typed read-only endpoint** —

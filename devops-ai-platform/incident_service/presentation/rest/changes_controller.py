@@ -1,20 +1,32 @@
 """Phase 6.4 — change intelligence read API (authenticated at gateway).
 
-One small read-only endpoint: ``GET /changes/{deployment_run_id}/health?start&end``.
-No SQL and no rules in the handler — the application service owns window
-validation, correlation and the deterministic rule evaluator; the
-repository owns persistence reads. This surface can never mutate
-anything (no rollback, approval, or deployment action exists here).
+Small read-only endpoints: ``GET /changes/{deployment_run_id}/health?start&end``
+(durable evidence, Phase 6.4) and
+``GET /changes/{deployment_run_id}/live-health?start&end`` (combined
+durable + attributable live telemetry, Phase 6.5). No SQL and no rules
+in the handlers — the application services own window validation,
+correlation, telemetry attribution and the deterministic rule
+evaluators; the repository owns persistence reads. These surfaces can
+never mutate anything (no rollback, approval, or deployment action
+exists here). Telemetry failures never surface as HTTP errors: they are
+fail-closed data-quality gaps inside a 200 response
+(``decision=INCONCLUSIVE``).
 """
 
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from incident_service.application.dependencies import get_incident_repository
+from incident_service.application.dependencies import (
+    get_incident_repository,
+    get_live_prometheus_client,
+)
 from incident_service.application.services.change_intelligence_service import (
     ChangeIntelligenceService,
+)
+from incident_service.application.services.live_release_verification_service import (
+    LiveReleaseVerificationService,
 )
 from incident_service.application.services.operational_analytics_service import (
     InvalidAnalyticsWindowError,
@@ -42,6 +54,45 @@ def get_change_health(
     try:
         return ChangeIntelligenceService(repository).assess(
             deployment_run_id=deployment_run_id, start=start, end=end
+        )
+    except InvalidAnalyticsWindowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{deployment_run_id}/live-health", response_model=Dict[str, Any])
+def get_change_live_health(
+    deployment_run_id: str,
+    start: datetime = Query(
+        ..., description="Verification window start, ISO 8601 (naive = UTC)"
+    ),
+    end: datetime = Query(
+        ..., description="Verification window end, ISO 8601 (naive = UTC)"
+    ),
+    baseline_deployment_run_id: Optional[str] = Query(
+        None,
+        description=(
+            "Optional explicit baseline release: its deployment run id must "
+            "resolve to durable evidence inside the same window or the "
+            "assessment reports invalid_baseline"
+        ),
+    ),
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+    prometheus=Depends(get_live_prometheus_client),
+):
+    """Combined read model: the unchanged Phase 6.4 durable assessment plus
+    the Phase 6.5 live telemetry assessment (HEALTHY/DEGRADED/FAILED/
+    INCONCLUSIVE) for telemetry attributable to this exact release.
+    Read-only; window validation → 422, unknown run → 404, telemetry
+    unavailable/malformed/unattributable → 200 with INCONCLUSIVE.
+    """
+    try:
+        return LiveReleaseVerificationService(repository, prometheus).verify(
+            deployment_run_id=deployment_run_id,
+            start=start,
+            end=end,
+            baseline_deployment_run_id=baseline_deployment_run_id,
         )
     except InvalidAnalyticsWindowError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

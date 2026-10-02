@@ -545,3 +545,104 @@ class ChangeHealthRouteTests(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 404)
         get.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.5: change-aware live release verification (authenticated, read-only)
+# --------------------------------------------------------------------------- #
+
+CHANGES_LIVE_GET = (
+    "/v1/changes/run-9/live-health"
+    "?start=2026-09-01T00%3A00%3A00Z&end=2026-09-08T00%3A00%3A00Z"
+)
+CHANGES_LIVE_DOWNSTREAM = (
+    "http://incident-service:8050/changes/run-9/live-health"
+    "?start=2026-09-01T00%3A00%3A00Z&end=2026-09-08T00%3A00%3A00Z"
+)
+CHANGES_LIVE_BASELINE_GET = CHANGES_LIVE_GET + "&baseline_deployment_run_id=run-8"
+CHANGES_LIVE_BASELINE_DOWNSTREAM = CHANGES_LIVE_DOWNSTREAM + (
+    "&baseline_deployment_run_id=run-8"
+)
+
+
+class ChangeLiveHealthRouteTests(unittest.TestCase):
+    """Phase 6.5: gateway authentication + verbatim GET forward.
+
+    Read-only combined durable + live assessment (no patch content):
+    any authenticated user may read it, mirroring the health route.
+    """
+
+    def test_unauthenticated_get_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(CHANGES_LIVE_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_malformed_token_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(CHANGES_LIVE_GET, headers=_authed("not-a-jwt"))
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_any_authenticated_user_may_read_the_assessment(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        body = {
+            "durable_assessment": {"decision": "HEALTHY"},
+            "live_assessment": {"decision": "INCONCLUSIVE", "reasons": []},
+        }
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(CHANGES_LIVE_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(get.call_args.args[0], CHANGES_LIVE_DOWNSTREAM)
+        get.assert_called_once()
+
+    def test_baseline_parameter_is_forwarded_verbatim(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(200, {"live_assessment": {}})
+            resp = client.get(
+                CHANGES_LIVE_BASELINE_GET, headers=_authed(token)
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(get.call_args.args[0], CHANGES_LIVE_BASELINE_DOWNSTREAM)
+
+    def test_downstream_unknown_deployment_404_is_relayed(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                404, {"detail": "no deployment-run evidence for 'run-9' within the observation window"}
+            )
+            resp = client.get(CHANGES_LIVE_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("no deployment-run evidence", resp.json()["detail"])
+
+    def test_downstream_window_rejection_422_is_relayed(self):
+        token = _operator()
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                422, {"detail": "window must not exceed 31 days"}
+            )
+            resp = client.get(CHANGES_LIVE_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("31 days", resp.json()["detail"])
+
+    def test_unreachable_downstream_is_502(self):
+        import requests as requests_lib
+
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.side_effect = requests_lib.ConnectionError("refused")
+            resp = client.get(CHANGES_LIVE_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 502)
+
+    def test_internal_prefix_grants_nothing(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            resp = client.get(
+                "/api/internal/changes/run-9/live-health?start=x&end=y",
+                headers=_authed(token),
+            )
+        self.assertEqual(resp.status_code, 404)
+        get.assert_not_called()

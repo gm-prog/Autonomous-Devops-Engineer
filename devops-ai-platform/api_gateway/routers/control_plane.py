@@ -34,7 +34,7 @@ second token system — is documented in the platform README.
 """
 
 import logging
-from typing import Dict
+from typing import Dict, Optional
 from urllib.parse import urlencode
 
 import requests
@@ -244,6 +244,36 @@ def control_plane_change_health(
     query = urlencode({"start": start, "end": end})
     return _forward_get(
         "incident", f"/changes/{deployment_run_id}/health?{query}"
+    )
+
+
+@router.get("/changes/{deployment_run_id}/live-health")
+def control_plane_change_live_health(
+    deployment_run_id: str,
+    start: str,
+    end: str,
+    request: Request,
+    baseline_deployment_run_id: Optional[str] = None,
+    user: dict = Depends(verify_token),
+):
+    """Combined durable + live release verification (Phase 6.5).
+
+    Read-only: any authenticated user (no patch content); window
+    validation, telemetry attribution and the deterministic rule
+    evaluator live downstream (single validation authority). Unknown
+    deployments surface as the relayed 404; invalid windows as the
+    relayed 422; unavailable or unattributable telemetry never errors —
+    it is reported downstream as a 200 INCONCLUSIVE with data-quality
+    counters. The optional baseline run id is forwarded verbatim and is
+    resolved against durable evidence downstream.
+    """
+    _rate_limit_or_429(request)
+    params = {"start": start, "end": end}
+    if baseline_deployment_run_id:
+        params["baseline_deployment_run_id"] = baseline_deployment_run_id
+    query = urlencode(params)
+    return _forward_get(
+        "incident", f"/changes/{deployment_run_id}/live-health?{query}"
     )
 
 

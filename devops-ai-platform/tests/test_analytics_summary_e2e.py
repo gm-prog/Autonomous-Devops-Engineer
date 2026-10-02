@@ -20,7 +20,13 @@ from incident_service.infrastructure.database.postgres_incident_repo import (
     PostgresIncidentRepositoryAdapter,
 )
 from incident_service.main import app as incident_app
+from incident_service.application import dependencies as app_dependencies
 from incident_service.presentation.rest import controllers as controllers_module
+from monitoring_service.infrastructure.prometheus.scraper_client import (
+    RangeQueryResult,
+    RangeSample,
+    RangeSeries,
+)
 
 SUMMARY = "/incidents/analytics/summary"
 WINDOW = "?start=2026-09-01T00:00:00Z&end=2026-09-08T00:00:00Z"
@@ -190,6 +196,137 @@ class ChangeHealthHttpTests(unittest.TestCase):
     def test_inverted_window_is_422(self):
         resp = self.client.get(
             self.HEALTH + "?start=2026-09-08T00:00:00Z&end=2026-09-01T00:00:00Z"
+        )
+        self.assertEqual(resp.status_code, 422)
+
+
+class _FakeLivePrometheus:
+    """Deterministic attributable telemetry over real HTTP tests."""
+
+    def __init__(self):
+        self.calls = []
+
+    def query_range_metric(self, template_name, start, end):
+        self.calls.append(template_name)
+        base_ts = datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc).timestamp()
+        value = 100.0 if template_name == "request_rate" else 0.3
+        return RangeQueryResult(
+            template=template_name,
+            query="q",
+            start=start.timestamp(),
+            end=end.timestamp(),
+            step_seconds=60,
+            series=tuple(
+                RangeSeries(
+                    labels={"deployment_id": run_id},
+                    samples=tuple(
+                        RangeSample(timestamp=base_ts + i * 600, value=value)
+                        for i in range(6)
+                    ),
+                )
+                for run_id in ("run-http", "run-base")
+            ),
+        )
+
+
+class ChangeLiveHealthHttpTests(unittest.TestCase):
+    """Phase 6.5 live-health over real HTTP (TestClient + SQLite + fake
+    Prometheus boundary)."""
+
+    LIVE = "/changes/run-http/live-health"
+    LIVE_WINDOW = WINDOW
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(self._temp.name, 'http-live.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        incident_app.dependency_overrides[
+            controllers_module.get_incident_repository
+        ] = lambda: self.repository
+        self.prometheus = _FakeLivePrometheus()
+        incident_app.dependency_overrides[
+            app_dependencies.get_live_prometheus_client
+        ] = lambda: self.prometheus
+        self.client = TestClient(incident_app)
+        from incident_service.presentation.rest.test_remediation_authorization import (
+            _deployment_evidence,
+        )
+
+        for run_id in ("run-http", "run-base"):
+            incident = IncidentAggregate(
+                id=f"inc-http-{run_id}",
+                title="[sentry] 5xx on checkout",
+                severity="CRITICAL",
+                context_details="error budget burn",
+            )
+            incident.created_at = datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc)
+            incident.status = "Fixed"
+            incident.evidence.append(
+                _deployment_evidence(
+                    run_id=run_id,
+                    evidence_id=f"deploy-{run_id}",
+                    kind_extra={"health_check_status": "PASS"},
+                )
+            )
+            self.repository.save_incident(incident)
+
+    def tearDown(self):
+        incident_app.dependency_overrides.clear()
+        self._temp.cleanup()
+
+    def test_seeded_change_is_200_and_byte_deterministic(self):
+        first = self.client.get(self.LIVE + self.LIVE_WINDOW)
+        second = self.client.get(self.LIVE + self.LIVE_WINDOW)
+        self.assertEqual(first.status_code, 200, first.text)
+        body = first.json()
+        self.assertIn("durable_assessment", body)
+        self.assertIn("live_assessment", body)
+        live = body["live_assessment"]
+        self.assertEqual(live["deployment_run_id"], "run-http")
+        self.assertIn(
+            live["decision"], {"HEALTHY", "DEGRADED", "FAILED", "INCONCLUSIVE"}
+        )
+        self.assertEqual(body["durable_assessment"]["decision"], "HEALTHY")
+        self.assertEqual(first.content, second.content)
+
+    def test_baseline_parameter_is_resolved_and_returned(self):
+        resp = self.client.get(
+            self.LIVE
+            + self.LIVE_WINDOW
+            + "&baseline_deployment_run_id=run-base"
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        live = resp.json()["live_assessment"]
+        self.assertEqual(live["baseline_identity"]["deployment_run_id"], "run-base")
+        self.assertEqual(live["decision"], "HEALTHY")
+
+    def test_unknown_deployment_is_404(self):
+        resp = self.client.get(
+            "/changes/run-unknown/live-health" + self.LIVE_WINDOW
+        )
+        self.assertEqual(resp.status_code, 404, resp.text)
+        self.assertIn("no deployment-run evidence", resp.json()["detail"])
+
+    def test_missing_parameters_are_422(self):
+        resp = self.client.get(self.LIVE)
+        self.assertEqual(resp.status_code, 422)
+
+    def test_malformed_datetime_is_422(self):
+        resp = self.client.get(
+            self.LIVE + "?start=nope&end=2026-09-08T00:00:00Z"
+        )
+        self.assertEqual(resp.status_code, 422)
+
+    def test_oversized_window_is_422(self):
+        resp = self.client.get(
+            self.LIVE + "?start=2026-08-01T00:00:00Z&end=2026-09-08T00:00:00Z"
+        )
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("31 days", resp.json()["detail"])
+
+    def test_inverted_window_is_422(self):
+        resp = self.client.get(
+            self.LIVE + "?start=2026-09-08T00:00:00Z&end=2026-09-01T00:00:00Z"
         )
         self.assertEqual(resp.status_code, 422)
 

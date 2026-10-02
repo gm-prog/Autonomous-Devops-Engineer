@@ -1044,3 +1044,122 @@ only and cannot approve, remediate, roll back, or deploy.
 * `provenance_invalid` is recorded on non-`DEPLOYED` records by design
   (platform provenance is authoritative for `DEPLOYED`); it is a data-
   quality fact and never drives `FAILED` alone.
+
+## Phase 6.5 — Change-aware live release verification
+
+`GET /changes/{deployment_run_id}/live-health?start=<ISO 8601>&end=<ISO 8601>[&baseline_deployment_run_id=…]`
+(fastapi-app: forwarded as `GET /v1/changes/{deployment_run_id}/live-health`
+by the API gateway behind the existing JWT `verify_token` auth + rate
+limit; any authenticated user — no patch content). This is the OBSERVE
+layer following Phase 6.4's JUDGE layer: 6.4 answers whether **durable
+evidence** says a release is healthy; 6.5 answers whether **live
+telemetry attributable to that exact release** supports the same
+conclusion. One response is the combined read model:
+`{"durable_assessment": <unchanged Phase 6.4 result>, "live_assessment":
+<Phase 6.5 result>}`. Phase 6.4 decision semantics are consumed
+verbatim, never re-evaluated.
+
+**Bounded, read-only Prometheus access** (extend-the-existing-client,
+no new metrics stack): `PrometheusScraperClient.query_range_metric()`
+performs a fixed-timeout (5 s) read-only GET against
+`/api/v1/query_range` with **predefined query templates only** — no
+arbitrary PromQL ever reaches Prometheus, from any HTTP surface. Fixed
+bounds: ≤31-day window, ≤500 points per query (minute-aligned step),
+≤10 000 samples per response, and exactly **one query per SLI per
+assessment** (identical call count with or without a baseline — series
+and sample volume cannot fan out into N+1 queries). Fail-closed: timeout,
+connection failure, non-200, malformed JSON/envelope, unexpected
+resultType, non-finite values, or sample-cap overflow all become
+structured data-quality gaps — never partial data. The existing
+`query_instant_metric()` behavior is preserved unchanged.
+
+**Exact release attribution (the authoritative telemetry fields).** A
+telemetry series is attributable to a release **only** by exact string
+match of its labels against the Phase 6.4 authoritative deployment
+record:
+
+1. label `deployment_id` == the deployment run id, **or**
+2. label `source_sha` == the exact 40-hex source SHA.
+
+Nothing else counts. Label `service_version` is deliberately not
+authoritative (durable identity carries no version string to match —
+accepting it would be guessing). Timestamps are never consulted:
+samples that merely occur inside the release's time window are **not**
+attributed to it. Both query templates group `by (job, deployment_id,
+source_sha)` so attribution survives aggregation without adding
+unbounded/high-cardinality labels to any instrumentation.
+
+**Supported SLIs (fixed catalog, real telemetry only).**
+
+| SLI | Predefined query | Backed by |
+|---|---|---|
+| `request_rate` | `sum by (job, deployment_id, source_sha) (rate(devops_api_requests_total[5m]))` | backend gateway `Counter` (`backend/app/main.py`), scraped via `monitoring/prometheus.yml` |
+| `cpu_saturation` | `avg by (job, deployment_id, source_sha) (rate(process_cpu_seconds_total[2m]))` | default `prometheus_client` process collector on the same scrape targets |
+
+Error-rate and latency SLIs are intentionally absent: no error-labeled
+or duration-histogram metric exists in this repository's telemetry
+path, and inventing one would fabricate data.
+
+**Deterministic decision model** (explicit rules, no ML/LLM/
+probabilistic scoring; fixed precedence `FAILED > DEGRADED >
+INCONCLUSIVE > HEALTHY`):
+
+* `FAILED` — `cpu_saturation_critical`: attributable in-window mean ≥
+  0.90 cores.
+* `DEGRADED` — `cpu_saturation_warning`: attributable mean ≥ 0.70
+  cores; or `request_rate_dropped_vs_baseline`: candidate attributable
+  mean < 50 % of an explicitly requested, resolvable, attributable
+  baseline mean.
+* `INCONCLUSIVE` — any data-quality gap: telemetry unavailable,
+  malformed response, unsupported metric, insufficient attributable
+  samples (< 3 per SLI), attribution unavailable, or a requested
+  baseline that cannot be resolved/attributed (`invalid_baseline`).
+* `HEALTHY` — `all_required_signals_healthy`: both SLIs attributable,
+  ≥ 3 in-window samples each, within policy, no gaps.
+
+**Baseline/reference comparison.** The optional
+`baseline_deployment_run_id` parameter names the reference release
+**explicitly** — it must resolve to durable Phase 6.4 evidence inside
+the same window and its telemetry must attribute to that identity, or
+the assessment reports `invalid_baseline` (never “whatever was live
+before”). Without the parameter, only the absolute SLI policies are
+configured and evaluated; no implicit baseline is ever chosen.
+
+**Fail-closed / data-quality contract.** Missing data is never zero
+(an unevaluable SLI reports `value: null` with its true sample count);
+malformed data is never a success or failure signal; time proximity
+never creates correlation. The `data_quality.exclusions` block always
+carries the full fixed vocabulary (`telemetry_unavailable`,
+`malformed_response`, `unsupported_metric`, `insufficient_samples`,
+`attribution_unavailable`, `invalid_baseline`) with counts. HTTP
+mapping: invalid/oversized/inverted window → 422 (Phase 6.3 validator,
+single authority); unknown deployment → 404; **every telemetry failure →
+200 with `decision=INCONCLUSIVE`** (a 5xx would misrepresent missing
+data as an operational failure).
+
+**Explicitly unsupported** (never attempted in 6.5): canary/progressive
+traffic routing, blue/green switching, Kubernetes rollout
+orchestration, automatic rollback, autonomous remediation, ML/LLM
+release judgments, user-defined PromQL, dashboards/UI, new database
+schema, event bus or warehouse. This endpoint is read-only and cannot
+shift traffic, roll back, or act on its decision.
+
+### Honest limitations (Phase 6.5)
+
+* Live verification verifies — it never acts: no traffic shifting,
+  rollback, or remediation exists on this surface (CONTROL/ACT are
+  later phases).
+* Attribution depends on producers exposing `deployment_id`/
+  `source_sha` labels on their series. Current in-repo instrumentation
+  does **not** add release labels (adding unbounded labels blindly is
+  forbidden), so against today's real scrape data assessments will
+  correctly return INCONCLUSIVE/`attribution_unavailable` until
+  producers adopt the contract — the rules are exercised end-to-end in
+  tests against the mocked Prometheus boundary.
+* Telemetry is read live at request time from Prometheus (when
+  reachable); it is not persisted by this path, and the verification
+  window must cover both candidate and baseline durable evidence for
+  baseline comparison to resolve.
+* The baseline window constraint is intentional fail-closed behavior:
+  a baseline whose evidence sits outside the window yields
+  `invalid_baseline`, not a silent substitute.

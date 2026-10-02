@@ -21,6 +21,7 @@ from incident_service.infrastructure.database.postgres_incident_repo import (
 )
 from incident_service.presentation.rest.changes_controller import (
     get_change_health,
+    get_change_live_health,
     router as changes_router,
 )
 from incident_service.presentation.rest.controllers import (
@@ -31,6 +32,12 @@ from incident_service.presentation.rest.controllers import (
 # Phase 6.4 fixture: durable deployment-run evidence (genuine provenance).
 from incident_service.presentation.rest.test_remediation_authorization import (
     _deployment_evidence,
+)
+from monitoring_service.infrastructure.prometheus.scraper_client import (
+    PrometheusUnavailableError,
+    RangeQueryResult,
+    RangeSample,
+    RangeSeries,
 )
 
 UTC = timezone.utc
@@ -219,6 +226,160 @@ class ChangeHealthEndpointTests(unittest.TestCase):
         ]
         self.assertTrue(
             any(path.endswith("/{deployment_run_id}/health") for path in paths),
+            paths,
+        )
+
+
+class _FakeLivePrometheus:
+    """Canned attributable telemetry for controller contract tests."""
+
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def query_range_metric(self, template_name, start, end):
+        self.calls.append(template_name)
+        if self.error is not None:
+            raise self.error
+        base_ts = W_START.timestamp() + 3600
+        value = 10.0 if template_name == "request_rate" else 0.3
+        return RangeQueryResult(
+            template=template_name,
+            query="q",
+            start=W_START.timestamp(),
+            end=W_END.timestamp(),
+            step_seconds=60,
+            series=(
+                RangeSeries(
+                    labels={"deployment_id": "run-live-1"},
+                    samples=tuple(
+                        RangeSample(timestamp=base_ts + i * 600, value=value)
+                        for i in range(6)
+                    ),
+                ),
+            ),
+        )
+
+
+class ChangeLiveHealthEndpointTests(unittest.TestCase):
+    """Phase 6.5 controller contract: combined read model, fail-closed map."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(cls._temp.name, 'live-health.db')}"
+        cls.repository = PostgresIncidentRepositoryAdapter(url)
+        incident = IncidentAggregate(
+            id="inc-live-1",
+            title="[sentry] checkout 5xx",
+            severity="HIGH",
+            context_details="elevated error rate",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id="run-live-1",
+                evidence_id="deploy-live-1",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        cls.repository.save_incident(incident)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temp.cleanup()
+
+    def _call(
+        self,
+        deployment_run_id="run-live-1",
+        start=W_START,
+        end=W_END,
+        baseline_deployment_run_id=None,
+        prometheus=None,
+    ):
+        return get_change_live_health(
+            deployment_run_id=deployment_run_id,
+            start=start,
+            end=end,
+            baseline_deployment_run_id=baseline_deployment_run_id,
+            repository=self.repository,
+            prometheus=prometheus or _FakeLivePrometheus(),
+        )
+
+    def test_success_returns_combined_read_model(self):
+        body = self._call()
+        self.assertIn("durable_assessment", body)
+        self.assertIn("live_assessment", body)
+        durable = body["durable_assessment"]
+        live = body["live_assessment"]
+        self.assertEqual(durable["deployment_run_id"], "run-live-1")
+        self.assertEqual(durable["decision"], "HEALTHY")  # 6.4 semantics intact
+        self.assertIn(
+            live["decision"], {"HEALTHY", "DEGRADED", "FAILED", "INCONCLUSIVE"}
+        )
+        self.assertEqual(live["observation_window"], durable["observation_window"])
+        self.assertEqual(
+            live["release_identity"]["source_sha"],
+            durable["change_impact"]["source_sha"],
+        )
+        self.assertEqual(len(live["slis"]), 2)
+        self.assertIsNone(live["baseline_identity"])
+
+    def test_unknown_deployment_maps_to_http_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(deployment_run_id="run-unknown")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertIn("no deployment-run evidence", str(ctx.exception.detail))
+
+    def test_inverted_window_maps_to_http_422(self):
+        prometheus = _FakeLivePrometheus()
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(start=W_END, end=W_START, prometheus=prometheus)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(prometheus.calls, [])
+
+    def test_oversized_window_maps_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(end=W_START + timedelta(days=31, seconds=1))
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_unreachable_prometheus_still_returns_200_inconclusive(self):
+        body = self._call(
+            prometheus=_FakeLivePrometheus(
+                error=PrometheusUnavailableError("refused")
+            )
+        )
+        live = body["live_assessment"]
+        self.assertEqual(live["decision"], "INCONCLUSIVE")
+        self.assertEqual(live["reasons"], ["telemetry_unavailable"])
+
+    def test_read_endpoint_never_invokes_mutation_paths(self):
+        from unittest.mock import patch
+
+        with patch.object(
+            self.repository,
+            "save_incident",
+            side_effect=AssertionError("live-health must be read-only"),
+        ) as save:
+            self._call()
+        save.assert_not_called()
+
+    def test_response_carries_no_patch_or_credential_material(self):
+        import json as _json
+
+        text = _json.dumps(self._call())
+        self.assertNotIn("diff_patch_payload", text)
+        self.assertNotIn("--- a/", text)
+        self.assertNotIn("authorization", text.lower())
+
+    def test_live_health_route_registered(self):
+        paths = [
+            getattr(route, "path", "")
+            for route in changes_router.routes
+        ]
+        self.assertTrue(
+            any(path.endswith("/live-health") for path in paths),
             paths,
         )
 
