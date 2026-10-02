@@ -82,10 +82,6 @@ class CountingRepository(PostgresIncidentRepositoryAdapter):
                 self.renewed_event.set()
         return renewed
 
-            incident_id, proposal_id, owner,
-            now=now, lease_seconds=lease_seconds,
-        )
-
 
 def _full_sequence(orchestrator, stages, *, hold_seconds=0.0,
                    hold_after="validation.started", hold_event=None,
