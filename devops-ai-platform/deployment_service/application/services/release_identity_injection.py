@@ -187,11 +187,13 @@ def bind_release_identity(
     deployment_id: object,
     source_sha: object,
 ) -> bool:
-    """In-place binding at the execution boundary; True iff identity bound.
+    """In-place binding helper; True iff identity bound into the file.
 
-    Called by the deployment engine immediately before ``kubectl apply`` —
-    i.e. at the point where the real workload runtime is created, from the
-    run's own persisted record only.
+    Kept for compatibility and direct fail-closed tests. The deployment
+    engine does NOT use it as a post-hash step anymore: canonicalization
+    happens once in ``DeploymentEngine._effective_payload`` BEFORE
+    validation, dry-run and ``artifact_hash``, so the approved artifact
+    and the applied manifest are the same bytes.
     """
     text = Path(manifest_path).read_text(encoding="utf-8")
     bound_text, injected = inject_release_identity(text, deployment_id, source_sha)

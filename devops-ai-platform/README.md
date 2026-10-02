@@ -1115,21 +1115,27 @@ instead of multiplying across every request sample. No carrier series
 
 **Runtime identity injection (Phase 6.5.2).** The carrier's inputs are
 no longer merely operator-supplied: the deployment engine now binds them
-at the real workload-runtime boundary. When a run reaches actual
-execution (`DeploymentEngine.execute` → `kubectl apply`, gated by
-`DEPLOYMENT_EXECUTION_ENABLED=true`), the manifest's container env
-receives `DEVOPS_DEPLOYMENT_ID` = the run's own persisted `id` and
+into the **canonical approved artifact**. In `create_dry_run`, right
+after source verification creates the run, the submitted payload is
+canonicalized into an effective payload whose `k8s_yaml` carries
+`DEVOPS_DEPLOYMENT_ID` = the run's own persisted `id` and
 `DEVOPS_SOURCE_SHA` = that same record's verified
 `source_revision.head_sha` (canonical lowercase 40-hex, independently
 source-verified before the run existed) — both straight from the trusted
 execution context, never from request payloads or client spec fields.
-Client-planted `DEVOPS_*` entries in the submitted manifest are replaced
-(authoritative record wins); an unusable identity injects nothing
-(fail-closed — no fallback, no fabricated identity). The binding happens
-in `deployment_service/.../release_identity_injection.py` immediately
-before `kubectl apply`, i.e. at the point the real workload runtime is
-created — so an executed deployment's runtime is exactly compatible with
-the Phase 6.5.1 carrier contract.
+Validation, Kubernetes dry-run, `artifact_hash` and `plan_hash` all
+reference this one effective payload, so the human-approved artifact
+**already contains** the runtime identity; `execute` re-derives the same
+payload deterministically, checks its hash against the approval, writes
+it to disk and passes those exact bytes to `kubectl apply` with no
+post-approval mutation. Client-planted `DEVOPS_*` entries in the
+submitted manifest are replaced before hashing (authoritative record
+wins); an unusable identity injects nothing (fail-closed — no fallback,
+no fabricated identity). Canonicalization lives in
+`deployment_service/.../release_identity_injection.py`
+(`inject_release_identity`, pure) via `DeploymentEngine._effective_payload`,
+making an executed deployment's runtime exactly compatible with the
+Phase 6.5.1 carrier contract.
 
 **Supported SLIs (fixed catalog, real telemetry only).**
 

@@ -14,7 +14,7 @@ from deployment_service.application.services.health_check_service import HealthC
 from deployment_service.application.services.iac_validator import IaCValidator
 from deployment_service.application.services.kubectl_runner import KubectlRunnerService
 from deployment_service.application.services.release_identity_injection import (
-    bind_release_identity,
+    inject_release_identity,
 )
 from deployment_service.application.services.source_verification import (
     GitHubSourceVerifier,
@@ -65,6 +65,27 @@ class DeploymentEngine:
                 "deletions": int(summary.get("deletions", 0)),
             },
         }
+
+    @staticmethod
+    def _effective_payload(payload: Dict[str, Any], deployment_id: Any, source_sha: Any) -> Dict[str, Any]:
+        """Canonical deployment payload (Phase 6.5.2 corrective).
+
+        Returns a copy of the caller payload whose ``k8s_yaml`` is bound to
+        the authoritative release identity taken from THIS run's persisted
+        record (``run.id`` + ``source_revision.head_sha``) — never from the
+        caller. Pure and deterministic: the same inputs always produce the
+        same bytes, so validation, dry-run, ``artifact_hash``, approval and
+        execution all reference one single artifact representation. An
+        unusable identity injects nothing (fail closed — the original
+        ``k8s_yaml`` passes through unchanged, never fabricated).
+        """
+        effective = dict(payload)
+        original = payload.get("k8s_yaml", "")
+        if isinstance(original, str):
+            effective["k8s_yaml"], _ = inject_release_identity(
+                original, deployment_id, source_sha
+            )
+        return effective
 
     @staticmethod
     def _artifact_hash(payload: Dict[str, Any]) -> str:
@@ -131,9 +152,18 @@ class DeploymentEngine:
             source_revision=source_revision,
         )
         run.source_verification = dict(source_verification)
+        # Phase 6.5.2 corrective — canonical effective payload: the caller
+        # payload with k8s_yaml bound to THIS run's authoritative identity.
+        # Everything below (validation, dry-run, artifact/plan hashes)
+        # references this single artifact representation, so the approved
+        # artifact already contains the runtime identity and no mutation is
+        # ever needed after the approval boundary.
+        effective_payload = self._effective_payload(
+            payload, run.id, run.source_revision.get("head_sha", "")
+        )
         run.move(DeploymentState.VALIDATING)
         run.add_log("VALIDATING: static IaC safety and syntax checks started.")
-        run.validation = self.validator.validate(payload.get("dockerfile", ""), payload.get("k8s_yaml", ""), payload.get("terraform_tf", ""), payload.get("pipeline_yaml", ""))
+        run.validation = self.validator.validate(effective_payload.get("dockerfile", ""), effective_payload.get("k8s_yaml", ""), effective_payload.get("terraform_tf", ""), effective_payload.get("pipeline_yaml", ""))
         if run.validation["status"] == "FAIL":
             run.move(DeploymentState.VALIDATION_FAILED)
             run.add_log("VALIDATION_FAILED: blocking IaC checks detected.")
@@ -147,10 +177,10 @@ class DeploymentEngine:
 
         temp_dir = tempfile.mkdtemp(prefix=f"devops-deploy-{run.id}-")
         try:
-            paths = self._write_iac(payload, temp_dir)
+            paths = self._write_iac(effective_payload, temp_dir)
             run.terraform_plan = self.terraform.run_plan(temp_dir, execution=False)
             run.kubernetes_dry_run = self.kubectl.dry_run(paths["kubernetes"])
-            run.artifact_hash = self._artifact_hash(payload)
+            run.artifact_hash = self._artifact_hash(effective_payload)
             run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
             if run.terraform_plan["status"] == "PASS" and run.kubernetes_dry_run["status"] == "PASS":
                 run.move(DeploymentState.DRY_RUN_PASSED)
@@ -240,17 +270,26 @@ class DeploymentEngine:
             raise DeploymentActionError("Only an APPROVED deployment can execute.")
         if run.approval.get("artifact_hash") != artifact_hash or run.approval.get("plan_hash") != plan_hash:
             raise DeploymentActionError("Execution hashes do not match the approval record.")
-        if self._artifact_hash(payload) != artifact_hash:
+        # Phase 6.5.2 corrective — deterministically derive the SAME
+        # effective payload (caller artifacts + THIS run's authoritative
+        # identity) and compare its hash to the approved artifact hash.
+        # One artifact representation crosses the approval boundary: this
+        # exact payload is written to disk and applied without any
+        # post-approval mutation.
+        effective_payload = self._effective_payload(
+            payload, run.id, run.source_revision.get("head_sha", "")
+        )
+        if self._artifact_hash(effective_payload) != artifact_hash:
             raise DeploymentActionError("Submitted artifacts do not match the immutable approved artifact hash.")
         if not self.store.acquire_lock(run.id):
             raise DeploymentActionError("Deployment is already executing.")
 
         temp_dir = tempfile.mkdtemp(prefix=f"devops-exec-{run.id}-")
-        deployment_names = self._deployment_names(payload.get("k8s_yaml", ""))
+        deployment_names = self._deployment_names(effective_payload.get("k8s_yaml", ""))
         try:
             run.move(DeploymentState.DEPLOYING)
             run.add_log("DEPLOYING: starting controlled Terraform and Kubernetes execution.")
-            paths = self._write_iac(payload, temp_dir)
+            paths = self._write_iac(effective_payload, temp_dir)
             terraform_plan = self.terraform.run_plan(temp_dir, execution=True, plan_output_path=paths["terraform_plan"])
             run.execution["terraform_plan"] = terraform_plan
             if terraform_plan.get("status") != "PASS":
@@ -268,17 +307,10 @@ class DeploymentEngine:
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
                 return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
 
-            # Phase 6.5.2 — bind THIS run's authoritative identity into the
-            # workload manifest at the point the real runtime is created.
-            # Values come only from the persisted run record (id +
-            # source_revision.head_sha) — never from the request payload.
-            # Fail-closed: an unusable identity injects nothing, so no
-            # carrier series exists and Phase 6.5 stays INCONCLUSIVE.
-            bind_release_identity(
-                paths["kubernetes"],
-                run.id,
-                run.source_revision.get("head_sha", ""),
-            )
+            # Phase 6.5.2 corrective — the manifest file written above IS
+            # the approved artifact (identity already bound in
+            # create_dry_run); apply it byte-for-byte with no further
+            # mutation after the hash check.
             kubernetes_apply = self.kubectl.apply(paths["kubernetes"], namespace)
             run.execution["kubernetes_apply"] = kubernetes_apply
             run.execution["kubernetes_applied"] = kubernetes_apply.get("status") == "PASS"

@@ -21,7 +21,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-from deployment_service.application.services.deployment_engine import DeploymentEngine
+from deployment_service.application.services.deployment_engine import (
+    DeploymentActionError,
+    DeploymentEngine,
+)
 from deployment_service.application.services import release_identity_injection as injection
 from deployment_service.application.services.release_identity_injection import (
     DEPLOYMENT_ID_ENV,
@@ -151,10 +154,17 @@ def _build_engine(kubectl):
 
 
 class RecordingKubectl(FakeKubectl):
-    """Captures the exact manifest handed to ``kubectl apply``."""
+    """Captures the exact manifest bytes handed to dry_run and apply."""
 
     def __init__(self):
         self.applied_manifests = []
+        self.dry_run_manifests = []
+
+    def dry_run(self, manifest_path, namespace="devops-production-namespace"):
+        self.dry_run_manifests.append(
+            Path(manifest_path).read_text(encoding="utf-8")
+        )
+        return super().dry_run(manifest_path, namespace)
 
     def apply(self, manifest_path, namespace):
         self.applied_manifests.append(
@@ -401,3 +411,180 @@ def test_f_carrier_contract_accepts_engine_identity(monkeypatch):
     assert carrier.apply_release_identity(injected_id, injected_sha, gauge=gauge) is True
     body = generate_latest(registry).decode()
     assert f'{{deployment_id="{injected_id}",source_sha="{injected_sha}"}} 1.0' in body
+
+
+# ------------------------------------------------- provenance invariant
+# Phase 6.5.2 corrective: ONE canonical artifact crosses
+# source-verify → validate → dry-run → artifact_hash → plan_hash →
+# approval → execution hash check → kubectl apply, with no post-approval
+# mutation of the manifest.
+
+
+def test_approved_hash_contains_identity():
+    engine = _build_engine(RecordingKubectl())
+    run = engine.create_dry_run(_payload())
+    # reproduce the canonical effective payload from the run identity alone
+    effective = DeploymentEngine._effective_payload(
+        VALID_PAYLOAD, run.id, run.source_revision["head_sha"]
+    )
+    # the approved artifact hash covers the effective (identity-bound) payload
+    assert run.artifact_hash == DeploymentEngine._artifact_hash(effective)
+    # and that effective manifest carries exactly the authoritative pair
+    env = _identity_env(effective["k8s_yaml"])
+    assert {item["value"] for item in env[DEPLOYMENT_ID_ENV]} == {run.id}
+    assert {item["value"] for item in env[SOURCE_SHA_ENV]} == {
+        run.source_revision["head_sha"]
+    }
+
+
+def test_dry_run_and_apply_use_identical_effective_manifest(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    kubectl = RecordingKubectl()
+    run, completed = _execute_approved(kubectl, _payload())
+    assert completed.state == DeploymentState.DEPLOYED
+    assert len(kubectl.dry_run_manifests) == 1
+    assert len(kubectl.applied_manifests) == 1
+    dry_run_text = kubectl.dry_run_manifests[0]
+    applied_text = kubectl.applied_manifests[0]
+    # byte-for-byte identical: what was dry-run/hashed/approved is applied
+    assert applied_text == dry_run_text
+    # and it is exactly the canonical identity-injected manifest
+    canonical, injected = inject_release_identity(
+        VALID_PAYLOAD["k8s_yaml"],
+        run.id,
+        run.source_revision["head_sha"],
+    )
+    assert injected is True
+    assert applied_text == canonical
+
+
+def test_approval_to_execution_invariant_with_original_caller_payload(monkeypatch):
+    """Approve with stored hashes, execute with the unmodified caller
+    payload: execution succeeds — no post-approval mutation needed."""
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    kubectl = RecordingKubectl()
+    engine = _build_engine(kubectl)
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    approved = engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    assert approved.state == DeploymentState.APPROVED
+    completed = engine.execute(
+        run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash
+    )
+    assert completed.state == DeploymentState.DEPLOYED
+    assert kubectl.applied_manifests[0] == kubectl.dry_run_manifests[0]
+
+
+def test_planted_identity_canonicalized_before_hashing(monkeypatch):
+    planted_manifest = MANIFEST.replace(
+        "value: keep-me",
+        f"value: keep-me\n"
+        f"            - name: {DEPLOYMENT_ID_ENV}\n"
+        f"              value: attacker-fabricated-id",
+    )
+    planted_payload = _payload(k8s_yaml=planted_manifest)
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    kubectl = RecordingKubectl()
+    engine = _build_engine(kubectl)
+    run = engine.create_dry_run(planted_payload)
+    # the approved hash covers the AUTHORITATIVE replacement, never the
+    # attacker's raw manifest
+    effective = DeploymentEngine._effective_payload(
+        planted_payload, run.id, run.source_revision["head_sha"]
+    )
+    assert "attacker-fabricated-id" not in effective["k8s_yaml"]
+    assert run.artifact_hash == DeploymentEngine._artifact_hash(effective)
+    assert run.artifact_hash != DeploymentEngine._artifact_hash(planted_payload)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    completed = engine.execute(
+        run.id, planted_payload, run.artifact_hash, run.plan_hash
+    )
+    assert completed.state == DeploymentState.DEPLOYED
+    assert "attacker-fabricated-id" not in kubectl.applied_manifests[0]
+    assert kubectl.applied_manifests[0] == kubectl.dry_run_manifests[0]
+
+
+def test_payload_mutation_fails_closed_after_approval(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    engine = _build_engine(RecordingKubectl())
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    # mutating a non-identity artifact field is rejected
+    mutated = dict(VALID_PAYLOAD, dockerfile="FROM python:3.11-slim\nUSER 0\n")
+    with pytest.raises(DeploymentActionError, match="do not match"):
+        engine.execute(run.id, mutated, run.artifact_hash, run.plan_hash)
+    # mutating the manifest itself (image field) is rejected too
+    mutated_k8s = dict(
+        VALID_PAYLOAD,
+        k8s_yaml=VALID_PAYLOAD["k8s_yaml"].replace(
+            "image: demo:latest", "image: evil:latest"
+        ),
+    )
+    with pytest.raises(DeploymentActionError, match="do not match"):
+        engine.execute(run.id, mutated_k8s, run.artifact_hash, run.plan_hash)
+
+
+def test_identity_pair_stays_same_record_bound_at_artifact_level(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    sha_a, sha_b = "a" * 40, "b" * 40
+    engine = _build_engine(RecordingKubectl())
+    run_a = engine.create_dry_run(_payload())
+    run_b = engine.create_dry_run(
+        _payload(
+            source_revision=dict(
+                VALID_PAYLOAD["source_revision"], head_sha=sha_b
+            )
+        )
+    )
+    effective_a = DeploymentEngine._effective_payload(
+        VALID_PAYLOAD, run_a.id, run_a.source_revision["head_sha"]
+    )
+    effective_b = DeploymentEngine._effective_payload(
+        VALID_PAYLOAD, run_b.id, run_b.source_revision["head_sha"]
+    )
+    # each artifact binds its OWN record's pair — no cross-run mixing
+    assert {i["value"] for i in _identity_env(effective_a["k8s_yaml"])[DEPLOYMENT_ID_ENV]} == {run_a.id}
+    assert {i["value"] for i in _identity_env(effective_a["k8s_yaml"])[SOURCE_SHA_ENV]} == {sha_a}
+    assert {i["value"] for i in _identity_env(effective_b["k8s_yaml"])[DEPLOYMENT_ID_ENV]} == {run_b.id}
+    assert {i["value"] for i in _identity_env(effective_b["k8s_yaml"])[SOURCE_SHA_ENV]} == {sha_b}
+    assert run_a.artifact_hash == DeploymentEngine._artifact_hash(effective_a)
+    assert run_b.artifact_hash == DeploymentEngine._artifact_hash(effective_b)
+    assert run_a.artifact_hash != run_b.artifact_hash
+
+
+def test_effective_payload_fail_closed_when_identity_unusable():
+    # unusable authoritative identity → no injection, original bytes pass
+    # through (no fabrication, no partial binding)
+    for bad_id, bad_sha in (("", SHA), (RUN_ID, ""), (RUN_ID, SHA.upper())):
+        effective = DeploymentEngine._effective_payload(
+            VALID_PAYLOAD, bad_id, bad_sha
+        )
+        assert effective["k8s_yaml"] == VALID_PAYLOAD["k8s_yaml"]
+        # every other artifact field untouched
+        assert {
+            key: effective[key]
+            for key in ("dockerfile", "terraform_tf", "pipeline_yaml")
+        } == {
+            key: VALID_PAYLOAD[key]
+            for key in ("dockerfile", "terraform_tf", "pipeline_yaml")
+        }
+
+
+def test_strong_artifact_hash_equals_manifest_sent_to_kubectl_apply(monkeypatch):
+    """The regression tripwire: approved artifact_hash == hash of the exact
+    manifest bytes passed to kubectl.apply. Impossible to break silently
+    in a future refactor."""
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    kubectl = RecordingKubectl()
+    engine = _build_engine(kubectl)
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    approved_hash = run.artifact_hash
+    completed = engine.execute(
+        run.id, VALID_PAYLOAD, approved_hash, run.plan_hash
+    )
+    assert completed.state == DeploymentState.DEPLOYED
+    applied_text = kubectl.applied_manifests[0]
+    recomputed = DeploymentEngine._artifact_hash(
+        dict(VALID_PAYLOAD, k8s_yaml=applied_text)
+    )
+    assert approved_hash == recomputed
