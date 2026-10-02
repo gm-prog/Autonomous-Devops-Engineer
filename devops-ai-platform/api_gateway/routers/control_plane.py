@@ -348,3 +348,18 @@ def control_plane_change_release_gate(
     return _forward_get(
         "incident", f"/changes/{deployment_run_id}/gate?{query}"
     )
+
+
+@router.get("/changes/{deployment_run_id}/gate/history")
+def control_plane_change_release_gate_history(
+    deployment_run_id: str,
+    request: Request,
+    limit: int = 50,
+    user: dict = Depends(verify_token),
+):
+    """Read-only durable gate-analysis history; no rollout mutation."""
+    _rate_limit_or_429(request)
+    query = urlencode({"limit": limit})
+    return _forward_get(
+        "incident", f"/changes/{deployment_run_id}/gate/history?{query}"
+    )
