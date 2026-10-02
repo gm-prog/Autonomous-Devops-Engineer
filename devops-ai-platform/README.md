@@ -11,22 +11,26 @@ CI):
 
 | Service | Package | Entrypoint | Exposes |
 |---|---|---|---|
-| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal`, `POST /v1/incidents/{id}/proposal/approve`, `POST /v1/incidents/{id}/proposal/execute` (HS256 JWT, operator roles where noted), `/health` |
+| BFF Gateway | `api_gateway` | `api_gateway.main:app` :8000 | `POST /v1/gateway/dispatch/{service}`, `GET /v1/gateway/metrics`, control plane `POST /v1/deployments/dry-run`, `/v1/deployments/{id}/approve`, `/execute`, `/v1/incidents/{id}/remediation`, `GET /v1/incidents/{id}/proposal`, `POST /v1/incidents/{id}/proposal/approve`, `POST /v1/incidents/{id}/proposal/execute`, `GET /v1/changes/{id}/rollout-state`, `POST /v1/changes/{id}/rollout-state/transition` (HS256 JWT, operator roles where noted), `/health` |
 | Repo context | `repo_service` | `repo_service.main:app` :8010 | `POST /repositories`, `/health` |
 | Agent swarm | `agent_service` | `agent_service.main:app` :8020 | `GET /agent/streams/{task_id}` (SSE), `/health` |
 | Deployment | `deployment_service` | Celery worker | task `tasks.execute_iac_deployment` (Redis broker) |
 | Monitoring | `monitoring_service` | `monitoring_service.main:app` :8040 | `WS /ws/telemetry/socket/{client_id}`, `POST /api/internal` (observation → threshold event, dispatch target), `/health` |
-| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /incidents/{id}/proposal/approve` + `/execute` (Phase 6.2, approval → draft PR), `GET /changes/{deployment_run_id}/health`, `/live-health`, `/gate`, and `/gate/history` (Phases 6.4–6.6.1, read-only evidence/gate analysis), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
+| Incident | `incident_service` | `incident_service.main:app` :8050 | `GET /incidents`, `POST /incidents/{id}/remediation` (provenance-bound), `POST/GET /incidents/{id}/proposal` (Phase 6.1, proposal-only), `POST /incidents/{id}/proposal/approve` + `/execute` (Phase 6.2, approval → draft PR), `GET /changes/{deployment_run_id}/health`, `/live-health`, `/gate`, and `/gate/history` (Phases 6.4–6.6.1, read-only evidence/gate analysis), `GET /changes/{deployment_run_id}/rollout-state` + `POST .../rollout-state/transition` (Phase 6.6.2, durable rollout-stage state only — no traffic/Kubernetes mutation), `POST /alerts/webhooks/sentry` (HMAC, fail-closed), `/health` |
 | Reporting | `reporting_service` | (library) | weekly audit-report queries + "PDF" engine |
 | Shared kernel | `shared_kernel` | (library) | domain events, value objects, event publisher, metrics |
 
 ## Progressive-release analysis state (Phase 6.6.1)
 
-The progressive gate is currently an **analysis boundary, not a rollout controller**. `GET /changes/{deployment_run_id}/gate` performs the existing Phase 6.5 live verification and maps `HEALTHY → PROMOTE`, `DEGRADED → PAUSE`, `FAILED → ABORT`, and `INCONCLUSIVE → INCONCLUSIVE` for the fixed exposure stages 5%, 25%, 50%, and 100%. Exposure above 5% requires an explicit baseline.
+**Phase 6.6 — deterministic gate.** The progressive gate is currently an **analysis boundary, not a rollout controller**. `GET /changes/{deployment_run_id}/gate` performs the existing Phase 6.5 live verification and maps `HEALTHY → PROMOTE`, `DEGRADED → PAUSE`, `FAILED → ABORT`, and `INCONCLUSIVE → INCONCLUSIVE` for the fixed exposure stages 5%, 25%, 50%, and 100%. Exposure above 5% requires an explicit baseline.
 
-Each evaluation is persisted as an immutable audit record keyed by authoritative release identity plus deterministic request/evidence fingerprints. Repeated identical evaluations within the 15-minute freshness slot are idempotent. `GET /changes/{deployment_run_id}/gate/history` returns historical evaluations and marks expired records `fresh=false`; history never authorizes a later deployment action. The gateway forwards the same read-only history at `/v1/changes/{deployment_run_id}/gate/history`.
+**Phase 6.6.1 — durable gate analysis.** Each evaluation is persisted as an immutable audit record keyed by authoritative release identity plus deterministic request/evidence fingerprints. Repeated identical evaluations within the 15-minute freshness slot are idempotent. `GET /changes/{deployment_run_id}/gate/history` returns historical evaluations and marks expired records `fresh=false`; history never authorizes a later deployment action. The gateway forwards the same read-only history at `/v1/changes/{deployment_run_id}/gate/history`.
 
-No endpoint in this phase changes traffic, mutates a deployment, approves a release, or performs rollback. Those actions remain a later progressive-delivery controller concern.
+**Phase 6.6.2 — durable rollout stage state.** Stage state is now a separate durable state machine over one record per deployment: `ACTIVE → PAUSED / ABORTED / COMPLETED` across the fixed sequence 5% → 25% → 50% → 100% (stage state answers "what has the control plane durably reached?", while the gate answers "what does the evidence say?"). `GET /changes/{deployment_run_id}/rollout-state` is a bounded read (missing state fails closed with 404 — never inferred from telemetry, timestamps, or history), and `POST /changes/{deployment_run_id}/rollout-state/transition` applies one explicit transition command bound to the exact fresh gate-evaluation id presented by the caller (`expected_percentage`, `target_percentage`, `evaluation_id`, `source_sha` are the only inputs; identity and repository stay server-side). Stale/wrong/foreign/terminal evaluations, skipped or reversed stages, and `INCONCLUSIVE` decisions are rejected with 409 — `PROMOTE` never mutates the stage by itself. Concurrency converges through an atomic compare-and-set on the durable row (one 25% stage, no duplicates, no regression), and restart recovery rebuilds state purely from persistence. At the gateway: `GET /v1/changes/{deployment_run_id}/rollout-state` (any authenticated user) and `POST /v1/changes/{deployment_run_id}/rollout-state/transition` (operator role, same convention as approve/execute/remediation).
+
+> The system can now durably represent rollout stage decisions, but does not yet mutate production traffic or Kubernetes state.
+
+No endpoint in these phases changes traffic, mutates a deployment, approves a release, or performs rollback. Those actions remain a later progressive-delivery controller concern; this state foundation is not production-ready as a rollout controller.
 
 ## Run the full stack
 
@@ -67,11 +71,12 @@ celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --log
 * **Control plane** — deployments and remediation are driven through named
   gateway routes (`/v1/deployments/*`, `/v1/incidents/{id}/remediation`),
   not by proxying guessed `/api/internal/*` paths (which 404 at the
-  gateway). Every route requires a valid JWT; `approve`, `execute` and
-  `remediation` additionally require an operator role
-  (`operator`, `DevOpsLead`, `ClusterAdmin`) else **403 before any
-  downstream call**. The gateway stamps `requested_by` / `approved_by`
-  from the JWT `sub` — caller-supplied identity strings are overwritten.
+  gateway). Every route requires a valid JWT; `approve`, `execute`,
+  `remediation` and the rollout-state `transition` additionally require
+  an operator role (`operator`, `DevOpsLead`, `ClusterAdmin`) else
+  **403 before any downstream call**. The gateway stamps `requested_by` /
+  `approved_by` from the JWT `sub` — caller-supplied identity strings are
+  overwritten.
   The product is intentionally **single-operator**: any operator may act
   on any run/incident id (no per-user tenancy is claimed or invented);
   ids must exist downstream (404/409 relayed), deployments are guarded by

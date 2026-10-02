@@ -59,6 +59,26 @@ progressive_release_gate_evaluations_table = Table(
     Column("expires_at", DateTime(timezone=True), nullable=False),
 )
 
+# Phase 6.6.2 — one durable rollout stage row per deployment (control
+# state only; never a second source of truth for identity/artifacts/
+# telemetry — it references the gate evaluation instead of copying it).
+progressive_rollout_stages_table = Table(
+    "devops_progressive_rollout_stages",
+    metadata,
+    Column("deployment_run_id", String(64), primary_key=True),
+    Column("stage_state_id", String(128), nullable=False),
+    Column("source_sha", String(40), nullable=False),
+    Column("repository", String(255), nullable=False),
+    Column("current_percentage", Integer, nullable=False),
+    Column("previous_percentage", Integer, nullable=False),
+    Column("state", String(32), nullable=False),
+    Column("last_gate_evaluation_id", String(128), nullable=False),
+    Column("last_gate_decision", String(32), nullable=False),
+    Column("observation_start", DateTime(timezone=True), nullable=False),
+    Column("observation_end", DateTime(timezone=True), nullable=False),
+    Column("updated_at", DateTime(timezone=True), nullable=False),
+)
+
 class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
     """Persists incident aggregates without leaking database concerns into the domain."""
 
@@ -756,6 +776,171 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 .limit(limit)
             ).mappings().all()
         return [self._gate_evaluation_from_row(dict(row)) for row in rows]
+
+    def get_progressive_release_gate_evaluation(
+        self, evaluation_id: str
+    ) -> Optional[dict]:
+        """Bounded single-row lookup of the exact presented evaluation."""
+        if not isinstance(evaluation_id, str) or not evaluation_id.strip():
+            return None
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(progressive_release_gate_evaluations_table).where(
+                    progressive_release_gate_evaluations_table.c.evaluation_id
+                    == evaluation_id
+                )
+            ).mappings().first()
+        return self._gate_evaluation_from_row(dict(row)) if row else None
+
+    # ------------------------------------------------------------ rollout stage
+
+    @staticmethod
+    def _rollout_stage_from_row(row: dict) -> dict:
+        return {
+            "stage_state_id": str(row["stage_state_id"]),
+            "deployment_run_id": str(row["deployment_run_id"]),
+            "source_sha": str(row["source_sha"]),
+            "repository": str(row.get("repository") or ""),
+            "current_percentage": int(row["current_percentage"]),
+            "previous_percentage": int(row["previous_percentage"]),
+            "state": str(row["state"]),
+            "last_gate_evaluation_id": str(row["last_gate_evaluation_id"]),
+            "last_gate_decision": str(row["last_gate_decision"]),
+            "observation_start": _aware_utc(row["observation_start"]),
+            "observation_end": _aware_utc(row["observation_end"]),
+            "updated_at": _aware_utc(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _rollout_stage_values(stage: dict) -> dict:
+        required = {
+            "stage_state_id",
+            "deployment_run_id",
+            "source_sha",
+            "repository",
+            "current_percentage",
+            "previous_percentage",
+            "state",
+            "last_gate_evaluation_id",
+            "last_gate_decision",
+            "observation_start",
+            "observation_end",
+            "updated_at",
+        }
+        missing = sorted(required.difference(stage))
+        if missing:
+            raise ValueError(
+                "progressive rollout stage missing fields: " + ", ".join(missing)
+            )
+        return {
+            "stage_state_id": str(stage["stage_state_id"]),
+            "deployment_run_id": str(stage["deployment_run_id"]),
+            "source_sha": str(stage["source_sha"]).lower(),
+            "repository": str(stage.get("repository") or ""),
+            "current_percentage": int(stage["current_percentage"]),
+            "previous_percentage": int(stage["previous_percentage"]),
+            "state": str(stage["state"]),
+            "last_gate_evaluation_id": str(stage["last_gate_evaluation_id"]),
+            "last_gate_decision": str(stage["last_gate_decision"]),
+            "observation_start": _aware_utc(stage["observation_start"]),
+            "observation_end": _aware_utc(stage["observation_end"]),
+            "updated_at": _aware_utc(stage["updated_at"]),
+        }
+
+    def get_progressive_rollout_stage(
+        self, deployment_run_id: str
+    ) -> Optional[dict]:
+        """Bounded durable lookup; no inference when state is missing."""
+        if not isinstance(deployment_run_id, str) or not deployment_run_id.strip():
+            return None
+        with self.engine.connect() as connection:
+            row = connection.execute(
+                select(progressive_rollout_stages_table).where(
+                    progressive_rollout_stages_table.c.deployment_run_id
+                    == deployment_run_id
+                )
+            ).mappings().first()
+        return self._rollout_stage_from_row(dict(row)) if row else None
+
+    def insert_progressive_rollout_stage(self, stage: dict) -> dict:
+        """Atomic create of the single durable stage row (CAS bootstrap).
+
+        Raises ``ValueError`` when the row already exists — the caller
+        decides whether that converges as an idempotent replay or a
+        conflict; nothing is ever silently overwritten.
+        """
+        values = self._rollout_stage_values(stage)
+        with self.engine.begin() as connection:
+            existing = connection.execute(
+                select(progressive_rollout_stages_table).where(
+                    progressive_rollout_stages_table.c.deployment_run_id
+                    == values["deployment_run_id"]
+                )
+            ).mappings().first()
+            if existing is not None:
+                raise ValueError("progressive rollout stage already exists")
+            connection.execute(
+                progressive_rollout_stages_table.insert().values(**values)
+            )
+        return self._rollout_stage_from_row(values)
+
+    def update_progressive_rollout_stage(
+        self,
+        deployment_run_id: str,
+        *,
+        expected_current_percentage: int,
+        expected_state: str,
+        changes: dict,
+    ) -> Optional[dict]:
+        """Atomic compare-and-set transition of the durable stage.
+
+        The UPDATE is conditioned on the exact percentage and state the
+        caller validated against; a miss returns ``None`` (no row was
+        touched) so two racing workers deterministically converge: one
+        wins, the other replays or fails closed. Single short
+        transaction; no external locks.
+        """
+        allowed_changes = {
+            "state",
+            "current_percentage",
+            "previous_percentage",
+            "last_gate_evaluation_id",
+            "last_gate_decision",
+            "observation_start",
+            "observation_end",
+            "updated_at",
+        }
+        missing = sorted(set(changes).difference(allowed_changes))
+        if missing:
+            raise ValueError(
+                "progressive rollout stage change has unsupported fields: "
+                + ", ".join(missing)
+            )
+        values = {key: value for key, value in changes.items()}
+        for key in ("observation_start", "observation_end", "updated_at"):
+            if key in values:
+                values[key] = _aware_utc(values[key])
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                progressive_rollout_stages_table.update()
+                .where(
+                    progressive_rollout_stages_table.c.deployment_run_id
+                    == deployment_run_id,
+                    progressive_rollout_stages_table.c.current_percentage
+                    == int(expected_current_percentage),
+                    progressive_rollout_stages_table.c.state == expected_state,
+                )
+                .values(**values)
+            )
+            if result.rowcount != 1:
+                return None
+            row = connection.execute(
+                select(progressive_rollout_stages_table).where(
+                    progressive_rollout_stages_table.c.deployment_run_id
+                    == deployment_run_id
+                )
+            ).mappings().first()
+        return self._rollout_stage_from_row(dict(row))
 
     @staticmethod
     def _gate_evaluation_from_row(row: dict) -> dict:

@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from incident_service.application.dependencies import (
     get_incident_repository,
@@ -31,6 +32,11 @@ from incident_service.application.services.live_release_verification_service imp
 from incident_service.application.services.progressive_release_gate_service import (
     InvalidProgressiveReleaseGateRequest,
     ProgressiveReleaseGateService,
+)
+from incident_service.application.services.progressive_rollout_stage_service import (
+    InvalidRolloutStageRequest,
+    ProgressiveRolloutStageService,
+    RolloutStageConflict,
 )
 from incident_service.application.services.operational_analytics_service import (
     InvalidAnalyticsWindowError,
@@ -160,3 +166,68 @@ def get_change_release_gate_history(
         )
     except InvalidProgressiveReleaseGateRequest as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/{deployment_run_id}/rollout-state", response_model=Dict[str, Any])
+def get_change_rollout_state(
+    deployment_run_id: str,
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Phase 6.6.2 — durable progressive-rollout stage state (read-only).
+
+    Bounded lookup of the single authoritative stage record; a missing
+    record fails closed (404) and is never inferred from telemetry,
+    timestamps or history.
+    """
+    try:
+        return ProgressiveRolloutStageService(repository).read(deployment_run_id)
+    except InvalidRolloutStageRequest as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class RolloutStageTransitionRequest(BaseModel):
+    """Minimum control inputs for a stage transition. Identity fields
+    (deployment run id from the path, authoritative repository and
+    source SHA server-side, evaluation contents) are never accepted
+    from the caller beyond this exact binding."""
+
+    expected_percentage: int
+    target_percentage: int
+    evaluation_id: str
+    source_sha: str
+
+
+@router.post(
+    "/{deployment_run_id}/rollout-state/transition",
+    response_model=Dict[str, Any],
+)
+def post_change_rollout_state_transition(
+    deployment_run_id: str,
+    request: RolloutStageTransitionRequest,
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Phase 6.6.2 — explicit stage-transition command.
+
+    Changes ONLY the durable rollout-stage record (5% → 25% → 50% →
+    100%, PAUSE/ABORT, terminal states). The transition is bound to the
+    exact fresh gate evaluation id presented by the caller. No traffic
+    shifting, Kubernetes mutation, rollback, approval, or deployment
+    execution occurs here. Malformed input → 422, missing stage or
+    evaluation → 404, illegal/stale/conflicting transition → 409.
+    """
+    try:
+        return ProgressiveRolloutStageService(repository).transition(
+            deployment_run_id=deployment_run_id,
+            expected_percentage=request.expected_percentage,
+            target_percentage=request.target_percentage,
+            evaluation_id=request.evaluation_id,
+            source_sha=request.source_sha,
+        )
+    except InvalidRolloutStageRequest as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RolloutStageConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

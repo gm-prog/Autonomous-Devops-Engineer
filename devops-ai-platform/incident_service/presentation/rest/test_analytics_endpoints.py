@@ -21,9 +21,12 @@ from incident_service.infrastructure.database.postgres_incident_repo import (
     PostgresIncidentRepositoryAdapter,
 )
 from incident_service.presentation.rest.changes_controller import (
+    RolloutStageTransitionRequest,
     get_change_health,
     get_change_live_health,
     get_change_release_gate,
+    get_change_rollout_state,
+    post_change_rollout_state_transition,
     router as changes_router,
 )
 from incident_service.presentation.rest.controllers import (
@@ -591,6 +594,276 @@ class ChangeReleaseGateHistoryEndpointTests(unittest.TestCase):
                 deployment_run_id="run-gate-1", limit=0, repository=_FakeGateRepository()
             )
         self.assertEqual(ctx.exception.status_code, 422)
+
+
+class RolloutStageEndpointTests(unittest.TestCase):
+    """Phase 6.6.2 controller contract: durable rollout-state surface.
+
+    Direct handler calls (established convention) over a real SQLite
+    adapter; FastAPI body parsing (malformed JSON shape → 422) is proven
+    over real HTTP in ``tests/test_analytics_summary_e2e.py``.
+    """
+
+    SHA = "a" * 40
+    RUN_ID = "run-rollout-http"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.repository = PostgresIncidentRepositoryAdapter(
+            f"sqlite:///{os.path.join(self._temp.name, 'rollout-http.db')}"
+        )
+        incident = IncidentAggregate(
+            id="inc-rollout-http",
+            title="[release] rollout http",
+            severity="HIGH",
+            context_details="rollout state http fixture",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id=self.RUN_ID,
+                evidence_id="rollout-http-evidence",
+                head_sha=self.SHA,
+                kind_extra={
+                    "health_check_status": "PASS",
+                    "source_sha": self.SHA,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+        self.now = datetime.now(timezone.utc)
+
+    def _evaluate(self, target=5, cpu=0.30):
+        from incident_service.application.services.progressive_release_gate_service import (
+            ProgressiveReleaseGateService,
+        )
+
+        run_id = self.RUN_ID
+
+        class _RolloutPrometheus(_FakeGatePrometheus):
+            # attribution series must carry the requested deployment id
+            def query_range_metric(inner_self, template_name, start, end):
+                inner_self.calls.append(template_name)
+                value = (
+                    inner_self.request
+                    if template_name == "request_rate"
+                    else inner_self.cpu
+                )
+                return RangeQueryResult(
+                    template=template_name,
+                    query="q",
+                    start=W_START.timestamp(),
+                    end=W_END.timestamp(),
+                    step_seconds=60,
+                    series=(
+                        RangeSeries(
+                            labels={"deployment_id": run_id},
+                            samples=tuple(
+                                RangeSample(
+                                    timestamp=W_START.timestamp()
+                                    + 3600
+                                    + i * 600,
+                                    value=value,
+                                )
+                                for i in range(6)
+                            ),
+                        ),
+                    ),
+                )
+
+        return ProgressiveReleaseGateService(
+            self.repository,
+            _RolloutPrometheus(cpu=cpu),
+            now_factory=lambda: self.now,
+        ).evaluate(
+            self.RUN_ID,
+            W_START,
+            W_END,
+            target,
+            baseline_deployment_run_id=(
+                self.RUN_ID if target > 5 else None
+            ),
+        )
+
+    def _bootstrap(self):
+        evaluation = self._evaluate(5)
+        return post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=0,
+                target_percentage=5,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+
+    def test_routes_are_registered(self):
+        paths = [
+            getattr(route, "path", "") for route in changes_router.routes
+        ]
+        self.assertIn("/changes/{deployment_run_id}/rollout-state", paths)
+        self.assertIn(
+            "/changes/{deployment_run_id}/rollout-state/transition", paths
+        )
+
+    def test_read_missing_state_is_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_state(
+                deployment_run_id="run-unknown", repository=self.repository
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_read_returns_persisted_stage_200(self):
+        created = self._bootstrap()
+        body = get_change_rollout_state(
+            deployment_run_id=self.RUN_ID, repository=self.repository
+        )
+        self.assertEqual(body, created)
+        self.assertEqual(body["current_percentage"], 5)
+        self.assertEqual(body["state"], "ACTIVE")
+
+    def test_successful_transition_is_200(self):
+        self._bootstrap()
+        evaluation = self._evaluate(25)
+        body = post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=5,
+                target_percentage=25,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+        self.assertEqual(body["current_percentage"], 25)
+        self.assertEqual(body["state"], "ACTIVE")
+
+    def test_illegal_transition_is_409(self):
+        self._bootstrap()
+        evaluation = self._evaluate(50)
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=50,
+                    evaluation_id=evaluation["evaluation_id"],
+                    source_sha=evaluation["source_sha"],
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+        # state untouched by the rejected request
+        self.assertEqual(
+            get_change_rollout_state(
+                deployment_run_id=self.RUN_ID, repository=self.repository
+            )["current_percentage"],
+            5,
+        )
+
+    def test_stale_expected_percentage_is_409(self):
+        self._bootstrap()
+        evaluation = self._evaluate(25)
+        # apply first...
+        post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=5,
+                target_percentage=25,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+        # ...then present the same computation again from a worker that
+        # still believes the stage is at 5% with a different evaluation
+        stale = self._evaluate(5)
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=5,
+                    evaluation_id=stale["evaluation_id"],
+                    source_sha=stale["source_sha"],
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_unknown_evaluation_is_404(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=25,
+                    evaluation_id="missing-evaluation",
+                    source_sha=self.SHA,
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_malformed_service_input_is_422(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=10,  # not in the fixed sequence
+                    evaluation_id="x",
+                    source_sha=self.SHA,
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_transition_only_touches_rollout_state(self):
+        self._bootstrap()
+        incidents_before = self.repository.get_incident_by_id(
+            "inc-rollout-http"
+        )
+        status_before = incidents_before.status
+        evidence_before = [
+            dict(item.payload) for item in incidents_before.evidence
+        ]
+        evaluation = self._evaluate(25)
+        evaluations_before = (
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            )
+        )
+        post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=5,
+                target_percentage=25,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+        incident_after = self.repository.get_incident_by_id(
+            "inc-rollout-http"
+        )
+        self.assertEqual(incident_after.status, status_before)
+        self.assertEqual(
+            [dict(item.payload) for item in incident_after.evidence],
+            evidence_before,
+        )
+        # evaluations are append-only audit rows: none mutated or removed
+        self.assertEqual(
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            ),
+            evaluations_before,
+        )
 
 
 if __name__ == "__main__":

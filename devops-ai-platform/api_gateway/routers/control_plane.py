@@ -363,3 +363,43 @@ def control_plane_change_release_gate_history(
     return _forward_get(
         "incident", f"/changes/{deployment_run_id}/gate/history?{query}"
     )
+
+
+@router.get("/changes/{deployment_run_id}/rollout-state")
+def control_plane_change_rollout_state(
+    deployment_run_id: str,
+    request: Request,
+    user: dict = Depends(verify_token),
+):
+    """Phase 6.6.2 — durable rollout-stage read (any authenticated user).
+
+    Read-only bounded lookup of the control-plane stage record. Missing
+    state fails closed (404 relayed). No rollout mutation happens here.
+    """
+    _rate_limit_or_429(request)
+    return _forward_get(
+        "incident", f"/changes/{deployment_run_id}/rollout-state"
+    )
+
+
+@router.post("/changes/{deployment_run_id}/rollout-state/transition")
+def control_plane_change_rollout_state_transition(
+    deployment_run_id: str,
+    payload: Dict,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Phase 6.6.2 — explicit rollout-stage transition (operator role).
+
+    Same convention as approve/execute/remediation: a valid JWT plus an
+    operator role is required BEFORE any downstream call. The gateway
+    forwards only these minimum control inputs and relays the durable
+    state-machine outcome verbatim — it never shifts traffic, mutates
+    Kubernetes, rolls back, or approves anything.
+    """
+    _rate_limit_or_429(request)
+    return _forward_post(
+        "incident",
+        f"/changes/{deployment_run_id}/rollout-state/transition",
+        payload,
+    )

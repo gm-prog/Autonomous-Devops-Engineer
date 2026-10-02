@@ -11,7 +11,7 @@ temp-file SQLite adapter per test — the legitimate hermetic fixture.
 import os
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
@@ -329,6 +329,192 @@ class ChangeLiveHealthHttpTests(unittest.TestCase):
             self.LIVE + "?start=2026-09-08T00:00:00Z&end=2026-09-01T00:00:00Z"
         )
         self.assertEqual(resp.status_code, 422)
+
+
+class RolloutStageHttpTests(unittest.TestCase):
+    """Phase 6.6.2 rollout-state over real HTTP (TestClient + SQLite).
+
+    Covers what direct handler calls cannot: FastAPI request-body
+    parsing (missing/malformed fields → 422), full 404/409/200 relay
+    through the real router, and that the transition endpoint mutates
+    only durable rollout state.
+    """
+
+    SHA = "a" * 40
+    RUN_ID = "run-rollout-e2e"
+    STATE = "/changes/run-rollout-e2e/rollout-state"
+    TRANSITION = "/changes/run-rollout-e2e/rollout-state/transition"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(self._temp.name, 'rollout-e2e.db')}"
+        self.repository = PostgresIncidentRepositoryAdapter(url)
+        incident_app.dependency_overrides[
+            controllers_module.get_incident_repository
+        ] = lambda: self.repository
+        self.client = TestClient(incident_app)
+
+        from incident_service.presentation.rest.test_remediation_authorization import (
+            _deployment_evidence,
+        )
+
+        incident = IncidentAggregate(
+            id="inc-rollout-e2e",
+            title="[release] rollout e2e",
+            severity="HIGH",
+            context_details="rollout state http fixture",
+        )
+        incident.created_at = datetime(2026, 9, 1, tzinfo=timezone.utc) + timedelta(
+            hours=1
+        )
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id=self.RUN_ID,
+                evidence_id="rollout-e2e-evidence",
+                head_sha=self.SHA,
+                kind_extra={
+                    "health_check_status": "PASS",
+                    "source_sha": self.SHA,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+        self.now = datetime.now(timezone.utc)
+        self.addCleanup(incident_app.dependency_overrides.clear)
+        self.addCleanup(self._temp.cleanup)
+
+    def _evaluate(self, target=5, cpu=0.30):
+        from incident_service.application.services.progressive_release_gate_service import (
+            ProgressiveReleaseGateService,
+        )
+
+        run_id = self.RUN_ID
+        start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 9, 8, tzinfo=timezone.utc)
+
+        class _Prom:
+            def query_range_metric(inner, template_name, s, e):
+                value = 10.0 if template_name == "request_rate" else cpu
+                return RangeQueryResult(
+                    template=template_name,
+                    query="q",
+                    start=start.timestamp(),
+                    end=end.timestamp(),
+                    step_seconds=60,
+                    series=(
+                        RangeSeries(
+                            labels={"deployment_id": run_id},
+                            samples=tuple(
+                                RangeSample(
+                                    timestamp=start.timestamp() + 3600 + i * 600,
+                                    value=value,
+                                )
+                                for i in range(6)
+                            ),
+                        ),
+                    ),
+                )
+
+        return ProgressiveReleaseGateService(
+            self.repository,
+            _Prom(),
+            now_factory=lambda: self.now,
+        ).evaluate(
+            self.RUN_ID,
+            start,
+            end,
+            target,
+            baseline_deployment_run_id=(
+                self.RUN_ID if target > 5 else None
+            ),
+        )
+
+    def _bootstrap_over_http(self):
+        evaluation = self._evaluate(5)
+        resp = self.client.post(
+            self.TRANSITION,
+            json={
+                "expected_percentage": 0,
+                "target_percentage": 5,
+                "evaluation_id": evaluation["evaluation_id"],
+                "source_sha": evaluation["source_sha"],
+            },
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return evaluation
+
+    def test_read_missing_state_is_404(self):
+        resp = self.client.get(self.STATE)
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("rollout state not found", resp.json()["detail"])
+
+    def test_malformed_bodies_are_422(self):
+        malformed = [
+            {},  # missing every field
+            {"expected_percentage": "five", "target_percentage": 5,
+             "evaluation_id": "e", "source_sha": self.SHA},
+            {"expected_percentage": 0, "target_percentage": 5,
+             "evaluation_id": "e"},  # missing source_sha
+        ]
+        for payload in malformed:
+            with self.subTest(payload=sorted(payload)):
+                resp = self.client.post(self.TRANSITION, json=payload)
+                self.assertEqual(resp.status_code, 422, resp.text)
+
+    def test_read_and_transition_over_http(self):
+        self._bootstrap_over_http()
+        read = self.client.get(self.STATE)
+        self.assertEqual(read.status_code, 200, read.text)
+        self.assertEqual(read.json()["current_percentage"], 5)
+        self.assertEqual(read.json()["state"], "ACTIVE")
+
+        evaluation = self._evaluate(25)
+        promote = self.client.post(
+            self.TRANSITION,
+            json={
+                "expected_percentage": 5,
+                "target_percentage": 25,
+                "evaluation_id": evaluation["evaluation_id"],
+                "source_sha": evaluation["source_sha"],
+            },
+        )
+        self.assertEqual(promote.status_code, 200, promote.text)
+        self.assertEqual(promote.json()["current_percentage"], 25)
+        self.assertEqual(
+            self.client.get(self.STATE).json()["current_percentage"], 25
+        )
+
+    def test_illegal_transition_is_409_over_http(self):
+        self._bootstrap_over_http()
+        evaluation = self._evaluate(50)  # 5 → 50 is never a legal step
+        resp = self.client.post(
+            self.TRANSITION,
+            json={
+                "expected_percentage": 5,
+                "target_percentage": 50,
+                "evaluation_id": evaluation["evaluation_id"],
+                "source_sha": evaluation["source_sha"],
+            },
+        )
+        self.assertEqual(resp.status_code, 409, resp.text)
+        # durable state untouched by the rejected request
+        self.assertEqual(
+            self.client.get(self.STATE).json()["current_percentage"], 5
+        )
+
+    def test_unknown_evaluation_is_404_over_http(self):
+        self._bootstrap_over_http()
+        resp = self.client.post(
+            self.TRANSITION,
+            json={
+                "expected_percentage": 5,
+                "target_percentage": 25,
+                "evaluation_id": "missing-eval",
+                "source_sha": self.SHA,
+            },
+        )
+        self.assertEqual(resp.status_code, 404, resp.text)
 
 
 if __name__ == "__main__":

@@ -698,3 +698,128 @@ class GateHistoryRouteTests(unittest.TestCase):
             resp = client.get(GATE_HISTORY_GET, headers=_authed(token))
         self.assertEqual(resp.status_code, 200)
         get.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6.6.2: durable rollout-stage state (authenticated read + operator
+# transition; forward/relay only — the gateway performs no rollout itself)
+# --------------------------------------------------------------------------- #
+
+ROLLOUT_STATE_GET = "/v1/changes/run-rollout-1/rollout-state"
+ROLLOUT_STATE_DOWNSTREAM = (
+    "http://incident-service:8050/changes/run-rollout-1/rollout-state"
+)
+ROLLOUT_TRANSITION = "/v1/changes/run-rollout-1/rollout-state/transition"
+ROLLOUT_TRANSITION_DOWNSTREAM = (
+    "http://incident-service:8050/changes/run-rollout-1/"
+    "rollout-state/transition"
+)
+
+
+class RolloutStateRouteTests(unittest.TestCase):
+    def test_unauthenticated_read_is_rejected_before_forwarding(self):
+        with _get_mock() as get:
+            resp = client.get(ROLLOUT_STATE_GET)
+        self.assertEqual(resp.status_code, 401)
+        get.assert_not_called()
+
+    def test_authenticated_read_is_forwarded_verbatim(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        body = {
+            "stage_state_id": "rst_x",
+            "deployment_run_id": "run-rollout-1",
+            "source_sha": "a" * 40,
+            "repository": "acme/checkout",
+            "current_percentage": 25,
+            "previous_percentage": 5,
+            "state": "ACTIVE",
+            "last_gate_evaluation_id": "eval-1",
+            "last_gate_decision": "PROMOTE",
+            "observation_start": "2026-09-01T00:00:00+00:00",
+            "observation_end": "2026-09-08T00:00:00+00:00",
+            "updated_at": "2026-09-08T12:00:00+00:00",
+        }
+        with _get_mock() as get:
+            get.return_value = _downstream(200, body)
+            resp = client.get(ROLLOUT_STATE_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(get.call_args.args[0], ROLLOUT_STATE_DOWNSTREAM)
+        get.assert_called_once()
+
+    def test_read_missing_state_is_relayed_as_404(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _get_mock() as get:
+            get.return_value = _downstream(
+                404, {"detail": "rollout state not found"}
+            )
+            resp = client.get(ROLLOUT_STATE_GET, headers=_authed(token))
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()["detail"], "rollout state not found")
+
+    def test_unauthenticated_transition_is_rejected_before_forwarding(self):
+        with _post_mock() as post:
+            resp = client.post(ROLLOUT_TRANSITION, json={})
+        self.assertEqual(resp.status_code, 401)
+        post.assert_not_called()
+
+    def test_non_operator_cannot_transition_before_forwarding(self):
+        token = mint_token("bob-developer", roles=["Developer"])
+        with _post_mock() as post:
+            resp = client.post(
+                ROLLOUT_TRANSITION,
+                json={"expected_percentage": 5},
+                headers=_authed(token),
+            )
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn("operator role", resp.json()["detail"])
+        post.assert_not_called()  # no existence probing downstream
+
+    def test_operator_transition_is_forwarded_verbatim(self):
+        payload = {
+            "expected_percentage": 5,
+            "target_percentage": 25,
+            "evaluation_id": "eval-1",
+            "source_sha": "a" * 40,
+        }
+        body = {
+            "deployment_run_id": "run-rollout-1",
+            "current_percentage": 25,
+            "previous_percentage": 5,
+            "state": "ACTIVE",
+        }
+        with _post_mock() as post:
+            post.return_value = _downstream(200, body)
+            resp = client.post(
+                ROLLOUT_TRANSITION,
+                json=payload,
+                headers=_authed(_operator()),
+            )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), body)
+        self.assertEqual(
+            post.call_args.args[0], ROLLOUT_TRANSITION_DOWNSTREAM
+        )
+        self.assertEqual(post.call_args.kwargs["json"], payload)
+        post.assert_called_once()
+
+    def test_downstream_conflicts_and_validation_errors_are_relayed(self):
+        for status, detail in (
+            (409, "expected_percentage does not match the durable stage"),
+            (422, "target_percentage must be one of: 5, 25, 50, 100"),
+            (404, "gate evaluation not found"),
+        ):
+            with self.subTest(status=status), _post_mock() as post:
+                post.return_value = _downstream(status, {"detail": detail})
+                resp = client.post(
+                    ROLLOUT_TRANSITION,
+                    json={
+                        "expected_percentage": 5,
+                        "target_percentage": 25,
+                        "evaluation_id": "eval-1",
+                        "source_sha": "a" * 40,
+                    },
+                    headers=_authed(_operator()),
+                )
+            self.assertEqual(resp.status_code, status)
+            self.assertEqual(resp.json()["detail"], detail)
