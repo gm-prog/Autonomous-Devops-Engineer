@@ -21,37 +21,33 @@ object BackendGatewayClient {
 
     /**
      * Checks if the user-specified API Gateway URL is responsive.
-     * Hits either the root '/' or the '/api/v1/health' endpoint.
+     * Probes the gateway's liveness endpoints in order:
+     *   GET {base}/health          (root backend canonical)
+     *   GET {base}/api/v1/health   (client-compatibility alias)
+     * Only an HTTP 2xx counts as "connected" — a 404 means the URL is
+     * reachable but not the DevOps gateway, so it must NOT be reported as
+     * success (the previous implementation treated 404 as connected, which
+     * let the status pill lie).
      */
     suspend fun testConnection(baseUrlStr: String): Boolean = withContext(Dispatchers.IO) {
         val cleanUrl = baseUrlStr.trim().removeSuffix("/")
         if (cleanUrl.isEmpty()) return@withContext false
 
-        val request = Request.Builder()
-            .url("$cleanUrl/")
-            .get()
-            .build()
-
-        try {
-            client.newCall(request).execute().use { response ->
-                Log.d(TAG, "Connection check: code ${response.code}")
-                return@withContext response.isSuccessful || response.code == 404
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed connection test to $cleanUrl: ${e.message}")
-            // Let's also check if they provide a '/health' subpath
+        for (path in listOf("/health", "/api/v1/health")) {
+            val request = Request.Builder()
+                .url("$cleanUrl$path")
+                .get()
+                .build()
             try {
-                val healthRequest = Request.Builder()
-                    .url("$cleanUrl/api/v1/health")
-                    .get()
-                    .build()
-                client.newCall(healthRequest).execute().use { res ->
-                    return@withContext res.isSuccessful
+                client.newCall(request).execute().use { response ->
+                    Log.d(TAG, "Connection check $cleanUrl$path: code ${response.code}")
+                    if (response.isSuccessful) return@withContext true
                 }
-            } catch (ex: Exception) {
-                return@withContext false
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed connection test to $cleanUrl$path: ${e.message}")
             }
         }
+        false
     }
 
     /**

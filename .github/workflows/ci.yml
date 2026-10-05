@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "dev/**", "arena/**", "integration/**" ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: backend } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: backend/requirements-dev.txt }
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest tests/ -v
+
+  platform-tests:
+    name: Platform smoke tests
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: devops-ai-platform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: devops-ai-platform/requirements.txt }
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest tests/ -v
+
+  api-gateway:
+    name: API gateway checks
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: devops-ai-platform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: devops-ai-platform/requirements.txt }
+      - run: pip install -r requirements.txt pytest httpx
+      - run: python -m compileall -q api_gateway
+      - run: python -m pytest api_gateway/tests -v
+        env:
+          PYTHONPATH: .
+          JWT_SECRET: ci-gateway-secret
+
+  compose:
+    name: Compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f docker-compose.yml config >/dev/null
+        env: { JWT_SECRET: ci-gateway-secret }
+      - run: docker compose -f devops-ai-platform/docker-compose.yml config >/dev/null
+        env: { JWT_SECRET: ci-gateway-secret }

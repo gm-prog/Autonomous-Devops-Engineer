@@ -53,6 +53,12 @@ services:
       - REDIS_PORT=6379
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
+      # Server-side Gemini key (optional). When set, /api/v1/repository/analyze
+      # uses live Gemini instead of the offline template engine — and the key
+      # no longer needs to ship inside the Android APK for remote mode.
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # Comma-separated CORS allow-list (default "*")
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
     depends_on:
       db:
         condition: service_healthy
@@ -94,6 +100,10 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    # Provision the Prometheus datasource on boot so the stack is
+    # observable out-of-the-box (previously no datasource existed).
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
     depends_on:
       - prometheus
 
