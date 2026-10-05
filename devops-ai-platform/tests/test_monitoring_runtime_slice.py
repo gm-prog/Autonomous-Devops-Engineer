@@ -27,9 +27,6 @@ from fastapi.testclient import TestClient
 
 from shared_kernel.domain.provenance import build_provenance_record
 
-from incident_service.application.commands.apply_automated_fix import (
-    ApplyAutomatedFixCommandHandler,
-)
 from incident_service.application.commands.attach_deployment_evidence import (
     AttachDeploymentEvidenceCommand,
     AttachDeploymentEvidenceCommandHandler,
@@ -349,8 +346,6 @@ class VerticalSliceTests(unittest.TestCase):
         )
 
         with patch.object(
-            ApplyAutomatedFixCommandHandler, "handle"
-        ) as apply_spy, patch.object(
             RemediationOrchestrationService, "execute"
         ) as orchestrator_spy, patch(
             "incident_service.infrastructure.source_provider."
@@ -474,7 +469,6 @@ class VerticalSliceTests(unittest.TestCase):
             self.assertEqual(analyzer.calls, 2)
 
         # 7) strict no-side-effect guarantee across the whole chain
-        apply_spy.assert_not_called()
         orchestrator_spy.assert_not_called()
         github_spy.assert_not_called()
         subprocess_run.assert_not_called()

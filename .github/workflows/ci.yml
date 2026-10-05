@@ -72,7 +72,7 @@ jobs:
           incident_service.infrastructure.deployment.test_deployment_evidence_collector
           incident_service.application.services.test_rca_evidence_pack
           incident_service.presentation.rest.test_rca_orchestration
-          incident_service.application.commands.test_apply_automated_fix
+          incident_service.application.commands.test_execution_authority
           incident_service.infrastructure.source_provider.test_github_pr_client
           incident_service.application.services.test_remediation_workspace_service
           incident_service.application.services.test_remediation_workspace_push

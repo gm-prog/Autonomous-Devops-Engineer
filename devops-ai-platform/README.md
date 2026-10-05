@@ -266,10 +266,14 @@ monitoring breach → ThreatThresholdExceededEvent (devops:events)
 
 **Guarantee — proposal only.** Phase 6.1 never clones, modifies, commits,
 pushes, creates branches/PRs, deploys, approves or executes remediation.
-`ApplyAutomatedFixCommandHandler`, the remediation orchestrator and the
-GitHub client are covered by no-side-effect spy tests that still require a
-fully produced + persisted proposal (§22). `risk_class` is metadata and can
-never trigger execution.
+Phase 8.2 **retired** the legacy `ApplyAutomatedFixCommandHandler`
+command entirely (it was the last application-command path that could
+create a PR directly); the remediation orchestrator and the GitHub client
+are covered by no-side-effect spy tests that still require a fully
+produced + persisted proposal (§22), plus repository-wide execution-
+authority audits (`incident_service/application/commands/
+test_execution_authority.py`). `risk_class` is metadata and can never
+trigger execution.
 
 ### Honest limitations (Phase 6.1)
 

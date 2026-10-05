@@ -88,11 +88,11 @@ class IncidentAggregate:
             return
         self.evidence.append(evidence)
 
-    def attach_remediation_proposal(self, proposal: HotfixProposal):
-        if not proposal.is_verified:
-            raise ValueError("remediation proposal must pass deterministic patch verification")
-        self.patch_proposals.append(proposal)
-        self.status = "RemediationProposed"
+    # Phase 8.2 (Task B): the former unguarded `attach_remediation_proposal`
+    # escape hatch (append + promote with no lifecycle/identity policy) was
+    # REMOVED. The only production proposal-attach APIs are
+    # `upsert_remediation_proposal` and `attach_blocked_proposal`, both of
+    # which enforce the Phase 8 lifecycle guards below.
 
     def upsert_remediation_proposal(self, proposal: HotfixProposal):
         """Idempotent proposal attach (§4): a deterministic proposal id
