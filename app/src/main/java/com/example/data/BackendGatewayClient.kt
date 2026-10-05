@@ -2,6 +2,7 @@ package com.example.data
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -66,42 +67,77 @@ object BackendGatewayClient {
         technology: String
     ): DevOpsAnalysisResult? = withContext(Dispatchers.IO) {
         val cleanUrl = baseUrlStr.trim().removeSuffix("/")
-        val endpoint = "$cleanUrl/api/v1/repository/analyze"
-
-        val jsonPayload = JSONObject().apply {
-            put("name", repoName)
-            put("url", repoUrl)
-            put("framework", framework)
-            put("technology", technology)
-        }
-
-        val requestBody = jsonPayload.toString().toRequestBody("application/json".toMediaType())
-        val request = Request.Builder()
-            .url(endpoint)
-            .post(requestBody)
-            .build()
+        if (cleanUrl.isEmpty()) return@withContext null
 
         try {
-            client.newCall(request).execute().use { response ->
+            val createPayload = JSONObject().apply {
+                put("name", repoName)
+                put("url", repoUrl)
+                put("framework", framework)
+                put("technology", technology)
+            }
+            val createRequest = Request.Builder()
+                .url(cleanUrl + "/api/repositories")
+                .post(createPayload.toString().toRequestBody("application/json".toMediaType()))
+                .build()
+
+            val repositoryId = client.newCall(createRequest).execute().use { response ->
                 if (!response.isSuccessful) {
-                    Log.w(TAG, "Remote analysis request returned code ${response.code}")
+                    Log.w(TAG, "Repository registration returned code ${response.code}")
                     return@withContext null
                 }
-                val bodyStr = response.body?.string() ?: return@withContext null
-                val json = JSONObject(bodyStr)
-                
-                // Assuming the fastapi gateway responds with generated structure or reports
-                return@withContext DevOpsAnalysisResult(
-                    dockerfile = json.optString("dockerfile", "").ifEmpty { "## Generated remotely via API Gateway" },
-                    k8sYaml = json.optString("k8s_yaml", "").ifEmpty { "## Kubernetes remote description config" },
-                    terraformTf = json.optString("terraform_tf", "").ifEmpty { "## Terraform remote resource modules" },
-                    pipelineYaml = json.optString("pipeline_yaml", "").ifEmpty { "## Remote GitHub actions workflow configuration" },
-                    report = json.optString("analysis_report", "").ifEmpty { "Successfully generated via remote FastAPI microservices." }
-                )
+                val json = JSONObject(response.body?.string() ?: return@withContext null)
+                json.optInt("id", 0).takeIf { it > 0 } ?: return@withContext null
             }
+
+            val analyzeRequest = Request.Builder()
+                .url(cleanUrl + "/api/repositories/" + repositoryId + "/analyze")
+                .post("{}".toRequestBody("application/json".toMediaType()))
+                .build()
+            client.newCall(analyzeRequest).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.w(TAG, "Remote analysis dispatch returned code ${response.code}")
+                    return@withContext null
+                }
+            }
+
+            repeat(30) {
+                delay(1000)
+                val statusRequest = Request.Builder()
+                    .url(cleanUrl + "/api/repositories/" + repositoryId)
+                    .get()
+                    .build()
+                client.newCall(statusRequest).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val json = JSONObject(response.body?.string() ?: return@use)
+                    when (json.optString("status")) {
+                        "Generated" -> throw RemoteAnalysisComplete(
+                            DevOpsAnalysisResult(
+                                dockerfile = json.optString("dockerfile"),
+                                k8sYaml = json.optString("k8s_yaml"),
+                                terraformTf = json.optString("terraform_tf"),
+                                pipelineYaml = json.optString("pipeline_yaml"),
+                                report = json.optString("analysis_report").ifEmpty {
+                                    "Repository analysis completed by the remote backend."
+                                }
+                            )
+                        )
+                        "Failed" -> throw RemoteAnalysisFailed("Remote repository analysis failed")
+                    }
+                }
+            }
+            null
+        } catch (e: RemoteAnalysisComplete) {
+            e.result
+        } catch (e: RemoteAnalysisFailed) {
+            Log.w(TAG, e.message.orEmpty())
+            null
         } catch (e: Exception) {
             Log.e(TAG, "Remote analysis failed: ${e.message}")
-            return@withContext null
+            null
         }
     }
+
+    private class RemoteAnalysisComplete(val result: DevOpsAnalysisResult) : Exception()
+    private class RemoteAnalysisFailed(message: String) : Exception(message)
 }
