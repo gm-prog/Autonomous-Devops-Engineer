@@ -42,6 +42,13 @@ class ProposalPersistenceFailed(Phase6PipelineError):
     """The proposal could not be persisted."""
 
 
+class ProposalLifecycleConflict(Phase6PipelineError):
+    """Persisted proposal state forbids this lifecycle operation
+    (Phase 8 §4): e.g. regeneration attempting to reset an
+    APPROVED / EXECUTING / PR_CREATED / EXECUTION_FAILED proposal
+    back to PROPOSED. Mapped to HTTP 409 — never silently coerced."""
+
+
 # ---------------------------------------------------------------------- #
 # Phase 6.2: approval + controlled execution
 # ---------------------------------------------------------------------- #

@@ -930,6 +930,9 @@ class ProposalExecutionService:
                 now=self.now(),
                 updates=updates,
                 evidence=evidence,
+                # Phase 8 §28 step 25: incident advances to
+                # RemediationPRCreated in the same durable CAS write.
+                promote_incident_pr_created=True,
             )
         except ExecutionLeaseUnavailable:
             raise

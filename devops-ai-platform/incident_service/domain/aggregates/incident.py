@@ -30,15 +30,51 @@ class IncidentAggregate:
         ]
 
     def move_to_triage(self):
-        if self.status == "Raised":
-            self.status = "Triage"
+        """Raised → Triage. Idempotent only for an already-present Triage
+        state; every other source state is rejected (never coerced)."""
+        if self.status == "Triage":
+            return
+        if self.status != "Raised":
+            raise ValueError(
+                f"Cannot move incident to Triage from state {self.status!r}"
+            )
+        self.status = "Triage"
+
+    def begin_investigation(self):
+        """Triage → Investigating (the explicit required intermediate
+        transition of the canonical lifecycle)."""
+        if self.status == "Investigating":
+            return
+        if self.status != "Triage":
+            raise ValueError(
+                f"Cannot begin investigation from state {self.status!r} "
+                "(requires Triage)"
+            )
+        self.status = "Investigating"
 
     def mark_root_cause_found(self):
-        if self.status not in {"Triage", "Investigating"}:
+        """Investigating → RootCauseFound. Investigating must be entered
+        explicitly first — Triage may not skip straight to RootCauseFound."""
+        if self.status == "RootCauseFound":
+            return
+        if self.status != "Investigating":
             raise ValueError(
-                f"Cannot mark root cause found from incident state {self.status!r}"
+                f"Cannot mark root cause found from incident state {self.status!r} "
+                "(requires Investigating)"
             )
         self.status = "RootCauseFound"
+
+    def mark_remediation_pr_created(self):
+        """RemediationProposed → RemediationPRCreated, persisted exactly
+        when a real PR has been persisted for the approved proposal."""
+        if self.status == "RemediationPRCreated":
+            return
+        if self.status != "RemediationProposed":
+            raise ValueError(
+                f"Cannot mark remediation PR created from state {self.status!r} "
+                "(requires RemediationProposed)"
+            )
+        self.status = "RemediationPRCreated"
 
     def attach_evidence(self, evidence: IncidentEvidence):
         if not evidence.id.strip():
@@ -55,9 +91,37 @@ class IncidentAggregate:
 
     def upsert_remediation_proposal(self, proposal: HotfixProposal):
         """Idempotent proposal attach (§4): a deterministic proposal id
-        replaces any previous instance instead of accumulating duplicates."""
+        replaces any previous instance instead of accumulating duplicates.
+
+        Lifecycle guard (Phase 8 §4/§35): regeneration may refresh a
+        BLOCKED or PROPOSED proposal, but must never reset an approved,
+        executing, failed, or published proposal back to PROPOSED — that
+        would permit a second approval/execution cycle for the same
+        identity and destroy the durable PR record.
+        """
         if not proposal.is_verified:
             raise ValueError("remediation proposal must pass deterministic patch verification")
+        if self.status not in {"RootCauseFound", "RemediationProposed"}:
+            raise ValueError(
+                f"Cannot attach executable proposal from incident state "
+                f"{self.status!r} (requires RootCauseFound — no skipped "
+                "intermediate transitions)"
+            )
+        existing = next(
+            (item for item in self.patch_proposals if item.id == proposal.id),
+            None,
+        )
+        if existing is not None and existing.status in {
+            "APPROVED",
+            "EXECUTING",
+            "PR_CREATED",
+            "EXECUTION_FAILED",
+        }:
+            raise ValueError(
+                f"proposal {proposal.id} is {existing.status}; regeneration "
+                "cannot reset an approved/executing/published proposal to "
+                f"{proposal.status}"
+            )
         self.patch_proposals = [
             item for item in self.patch_proposals if item.id != proposal.id
         ]
@@ -66,9 +130,29 @@ class IncidentAggregate:
 
     def attach_blocked_proposal(self, proposal: HotfixProposal):
         """Persist a BLOCKED (non-executable) proposal without promoting
-        the incident: status must not suggest an executable proposal (§20)."""
+        the incident: status must not suggest an executable proposal (§20).
+
+        Same Phase 8 lifecycle guard as ``upsert_remediation_proposal``:
+        a BLOCKED regeneration may never replace an approved, executing,
+        failed, or published proposal record.
+        """
         if proposal.status != "BLOCKED":
             raise ValueError("blocked proposal must carry status BLOCKED")
+        existing = next(
+            (item for item in self.patch_proposals if item.id == proposal.id),
+            None,
+        )
+        if existing is not None and existing.status in {
+            "APPROVED",
+            "EXECUTING",
+            "PR_CREATED",
+            "EXECUTION_FAILED",
+        }:
+            raise ValueError(
+                f"proposal {proposal.id} is {existing.status}; a BLOCKED "
+                "regeneration cannot replace an approved/executing/published "
+                "proposal"
+            )
         self.patch_proposals = [
             item for item in self.patch_proposals if item.id != proposal.id
         ]

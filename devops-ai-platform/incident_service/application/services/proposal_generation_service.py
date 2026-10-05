@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from incident_service.application.failures import (
     IncidentNotFound,
     InvalidRcaResult,
+    ProposalLifecycleConflict,
     ProposalPersistenceFailed,
     RcaGenerationFailed,
 )
@@ -304,7 +305,10 @@ class ProposalGenerationService:
                 violations=all_violations,
             )
             proposal.proposal_hash = self._hash(proposal, rca)
-            incident.attach_blocked_proposal(proposal)
+            try:
+                incident.attach_blocked_proposal(proposal)
+            except ValueError as exc:
+                raise ProposalLifecycleConflict(str(exc)) from exc
             self._save(incident)
             _log(
                 "proposal.blocked",
@@ -331,7 +335,15 @@ class ProposalGenerationService:
         )
         proposal.proposal_hash = self._hash(proposal, rca)
 
-        incident.upsert_remediation_proposal(proposal)
+        # RCA evidence exists → the incident must reach RootCauseFound
+        # through the explicit canonical chain before an executable
+        # proposal may attach (Phase 8 §4). Idempotent when the caller
+        # already ran /rca (evidence dedup + guarded no-op transitions).
+        self._attach_rca(incident, rca)
+        try:
+            incident.upsert_remediation_proposal(proposal)
+        except ValueError as exc:
+            raise ProposalLifecycleConflict(str(exc)) from exc
         self._save(incident)
         _log(
             "proposal.generated",
@@ -380,13 +392,15 @@ class ProposalGenerationService:
     def _attach_rca(self, incident, rca: RootCauseAnalysis) -> None:
         evidence = incident_service_evidence_from_rca(rca)
         incident.attach_evidence(evidence)
+        # Explicit canonical chain (Phase 8 §4): each promotion is its own
+        # guarded domain transition — no skipped intermediates, no silent
+        # coercion, idempotent when already reached.
         if incident.status == "Raised":
             incident.move_to_triage()
-        if incident.status in {"Triage", "Investigating"}:
-            try:
-                incident.mark_root_cause_found()
-            except ValueError:
-                pass
+        if incident.status == "Triage":
+            incident.begin_investigation()
+        if incident.status == "Investigating":
+            incident.mark_root_cause_found()
 
     def _persist_blocked(
         self,
@@ -428,7 +442,10 @@ class ProposalGenerationService:
             validation_plan=proposal.validation_plan,
             risk_class="BLOCKED",
         )
-        incident.attach_blocked_proposal(proposal)
+        try:
+            incident.attach_blocked_proposal(proposal)
+        except ValueError as exc:
+            raise ProposalLifecycleConflict(str(exc)) from exc
         self._save(incident)
         _log(
             "proposal.blocked",

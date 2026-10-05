@@ -10,6 +10,7 @@ from incident_service.application.dependencies import get_incident_repository
 from incident_service.application.failures import (
     IncidentNotFound,
     InvalidRcaResult,
+    ProposalLifecycleConflict,
     ProposalPersistenceFailed,
     RcaGenerationFailed,
     TargetBindingFailed,
@@ -233,8 +234,14 @@ def investigate_root_cause(
         source="agent-service",
         payload=result,
     ))
-    incident.move_to_triage()
-    incident.mark_root_cause_found()
+    try:
+        # Canonical incident chain (Phase 8 §4): each step is an explicit
+        # guarded domain transition; illegal source states → 409.
+        incident.move_to_triage()
+        incident.begin_investigation()
+        incident.mark_root_cause_found()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     repository.save_incident(incident)
 
     return {
@@ -369,6 +376,10 @@ def generate_remediation_proposal(
         ) from exc
     except TargetBindingFailed as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ProposalLifecycleConflict as exc:
+        # Phase 8 §4: APPROVED/EXECUTING/PR_CREATED proposals are never
+        # reset to PROPOSED by regeneration — explicit 409, no coercion.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ProposalPersistenceFailed as exc:
         raise HTTPException(
             status_code=503,

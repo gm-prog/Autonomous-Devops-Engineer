@@ -197,6 +197,8 @@ class ActiveIncidentListSerializationTests(unittest.TestCase):
 
         incident = IncidentAggregate("inc-list", "cpu", "HIGH", "ctx")
         incident.move_to_triage()
+        incident.begin_investigation()
+        incident.mark_root_cause_found()
         from incident_service.domain.entities.hotfix_proposal import (
             HotfixProposal,
         )
