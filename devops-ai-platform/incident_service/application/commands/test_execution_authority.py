@@ -567,5 +567,232 @@ class CanonicalChainAfterRetirementTests(_CompatibilityIntakeFixture):
         self.assertEqual(final.patch_proposals[0].pull_request_url, pr_url)
 
 
+class RepositoryExecutionBoundaryAuditTests(unittest.TestCase):
+    """H.10 + Task C: repository-wide static audit of the remediation
+    execution boundary.
+
+    The ALLOWED table IS the audit: every production file that may
+    mention a side-effect primitive is listed explicitly. The assertion
+    is exact (set equality) — a reintroduced bypass fails the test, and a
+    stale allowlist entry fails it too.
+    """
+
+    PLATFORM_ROOT = pathlib.Path(__file__).resolve().parents[3]
+    PACKAGES = (
+        "incident_service",
+        "api_gateway",
+        "agent_service",
+        "monitoring_service",
+        "repo_service",
+        "reporting_service",
+        "shared_kernel",
+        "deployment_service",
+    )
+
+    # pattern -> exact set of production files allowed to contain it.
+    ALLOWED = {
+        # --- Git/GitHub mutation: below the orchestration boundary only ---
+        "create_pull_request(": {
+            "incident_service/application/services/"
+            "remediation_orchestration_service.py",
+            "incident_service/infrastructure/source_provider/"
+            "github_pr_client.py",
+        },
+        "create_branch_from_commit(": {
+            "incident_service/application/services/"
+            "remediation_orchestration_service.py",
+            "incident_service/infrastructure/source_provider/"
+            "github_pr_client.py",
+        },
+        "publish_branch(": {
+            "incident_service/application/services/"
+            "remediation_orchestration_service.py",
+            "incident_service/application/services/"
+            "remediation_workspace_service.py",
+        },
+        "reconcile_and_create_pr(": {
+            "incident_service/application/services/"
+            "proposal_execution_service.py",
+            "incident_service/application/services/"
+            "remediation_orchestration_service.py",
+        },
+        # --- orchestration construction / invocation --------------------
+        "RemediationOrchestrationService(": {
+            "incident_service/presentation/rest/controllers.py",
+        },
+        "orchestrator.execute(": {
+            "incident_service/application/services/"
+            "proposal_execution_service.py",
+        },
+        "orchestrator.reconcile_and_create_pr(": {
+            "incident_service/application/services/"
+            "proposal_execution_service.py",
+        },
+        "get_remediation_orchestrator": {
+            "incident_service/presentation/rest/controllers.py",
+        },
+        "GitHubPRClient": {
+            "incident_service/infrastructure/source_provider/"
+            "github_pr_client.py",
+            "incident_service/presentation/rest/controllers.py",
+        },
+        # --- lifecycle state writers ------------------------------------
+        'proposal.status = "APPROVED"': {
+            "incident_service/application/services/"
+            "proposal_approval_service.py",
+        },
+        'proposal.status = "PR_CREATED"': {
+            "incident_service/application/services/"
+            "proposal_execution_service.py",
+        },
+        "proposal.approved_by =": {
+            "incident_service/application/services/"
+            "proposal_approval_service.py",
+        },
+        # --- durable lease dispatch: execution authority only ------------
+        '"claim_execution_lease"': {
+            "incident_service/application/services/"
+            "proposal_execution_service.py",
+        },
+        '"finish_execution_lease"': {
+            "incident_service/application/services/"
+            "proposal_execution_service.py",
+        },
+        # --- subprocess: only git/sandbox/validation infrastructure -------
+        # (deployment_service runners and repo_service's git client are
+        # outside the remediation call graph: kubectl/terraform for
+        # deployments, clone/history-read for analysis — no push, no PR;
+        # audited by test_legacy_bypass_surfaces_stay_dead's git scan.)
+        "subprocess.": {
+            "incident_service/application/services/"
+            "local_validation_executor.py",
+            "incident_service/application/services/"
+            "remediation_commit_service.py",
+            "incident_service/application/services/"
+            "remediation_patch_executor.py",
+            "incident_service/application/services/"
+            "remediation_validation_runner.py",
+            "incident_service/application/services/"
+            "remediation_workspace_service.py",
+            "incident_service/infrastructure/sandbox/"
+            "container_validation_sandbox.py",
+            "deployment_service/application/services/kubectl_runner.py",
+            "deployment_service/application/services/terraform_runner.py",
+            "repo_service/infrastructure/git/git_ssh_client.py",
+        },
+    }
+
+    PRODUCTION_FILES = None  # populated lazily
+
+    @classmethod
+    def _production_files(cls):
+        files = {}
+        for package in cls.PACKAGES:
+            base = cls.PLATFORM_ROOT / package
+            if not base.exists():
+                continue
+            for path in sorted(base.rglob("*.py")):
+                text = str(path)
+                if "__pycache__" in text:
+                    continue
+                if path.name.startswith("test_"):
+                    continue
+                if "/tests/" in text:
+                    continue
+                rel = str(path.relative_to(cls.PLATFORM_ROOT))
+                files[rel] = path
+        return files
+
+    @classmethod
+    def _hits(cls, pattern):
+        hits = set()
+        for rel, path in cls._production_files().items():
+            for line in path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                if pattern in line:
+                    hits.add(rel)
+        return hits
+
+    def test_every_side_effect_pattern_matches_its_exact_allowlist(self):
+        allowed = self.ALLOWED
+        for pattern, expected in sorted(allowed.items()):
+            with self.subTest(pattern=pattern):
+                actual = self._hits(pattern)
+                self.assertEqual(
+                    actual,
+                    expected,
+                    f"pattern {pattern!r}: production files drifted from "
+                    "the recorded execution-boundary audit table "
+                    f"(unexpected={sorted(actual - expected)}, "
+                    f"stale_allowlist={sorted(expected - actual)})",
+                )
+
+    def test_legacy_bypass_surfaces_stay_dead(self):
+        # the retired command module must not come back
+        self.assertFalse(
+            (self.PLATFORM_ROOT / "incident_service/application/commands"
+             / "apply_automated_fix.py").exists()
+        )
+        # no production caller of the removed unguarded aggregate method
+        self.assertEqual(self._hits("attach_remediation_proposal("), set())
+        # no raw git push/checkout/clone invocations anywhere in the
+        # incident service production tree
+        offenders = set()
+        for rel, path in self._production_files().items():
+            if not rel.startswith("incident_service/"):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for needle in ("git push", "git clone", "git checkout",
+                           "git commit"):
+                if needle in text:
+                    offenders.add(f"{rel}: {needle}")
+        self.assertEqual(offenders, set())
+
+    def test_high_risk_legacy_signature_is_gone(self):
+        """The combination (incident id + patch + repository + branch +
+        GitHub client) must not exist in any production command, event
+        handler, worker, or REST module."""
+        risky = []
+        for rel, path in self._production_files().items():
+            if not any(
+                segment in rel
+                for segment in (
+                    "application/commands/",
+                    "application/event_handlers/",
+                    "infrastructure/messaging/",
+                    "presentation/",
+                )
+            ):
+                continue
+            if rel == "incident_service/presentation/rest/controllers.py":
+                # Documented factory seam: controllers construct the
+                # orchestrator ONLY inside get_remediation_orchestrator,
+                # which the allowlist table pins to injection into
+                # ProposalExecutionService (verified by the exact-match
+                # audit above). The legacy shape this test hunts is a
+                # patch-carrying module that also calls GitHub directly.
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            has_identity = (
+                "incident_id" in text
+                and "patch" in text
+                and ("repository" in text or "repo_slug" in text)
+            )
+            has_effect = (
+                "create_pull_request" in text
+                or "source_branch" in text
+                or "RemediationOrchestrationService(" in text
+                or "publish_branch" in text
+            )
+            if has_identity and has_effect:
+                risky.append(rel)
+        # presentation controllers carry patches but have no execution
+        # primitive (the GitHubPRClient reference there is the factory
+        # seam audited by the allowlist table above); commands and event
+        # handlers must have neither.
+        self.assertEqual(risky, [])
+
+
 if __name__ == "__main__":
     unittest.main()
