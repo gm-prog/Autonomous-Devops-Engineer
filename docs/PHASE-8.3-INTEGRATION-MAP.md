@@ -31,6 +31,12 @@ the first runtime-restoration commit), `dev/remediation-pr-orchestration-v1`
 Snapshot commit (common base of everything): **`f7f851393b331585e05b1d9bfa4c8965ab94cd5e`**
 (“Created using Colab”, 10 reachable commits).
 
+Commit-count precision (§16, Phase 8.3.1): the PR #7 row records the
+recon-time head `a0bf760` (Phase 8.2 historical implementation lineage =
+99 reachable commits). The current Phase 8.3 evidence branch head is
+`ee7cffb` = 101 reachable commits — the same 99-commit lineage plus two
+documentation-only commits. “99” never describes the current branch.
+
 ## B. Actual ancestry (§4.2)
 
 ```text
@@ -220,11 +226,19 @@ values match exactly (49 / 256+109 / 71+42; 559 at `a0bf760`).
 ## G. Non-destructive policy (§19-G)
 
 - `main` unchanged (`origin/main` = `7b30a56…`, untouched — recon only).
-- Old PRs unchanged: PR #1/#2/#4/#5/#6 not modified; PR #7 receives
-  commentary only (per §17), no history change.
+- PR #1/#2/#4/#5/#6 not modified (no head, base, body, or state
+  changes). PR #7's historical implementation lineage was not rewritten
+  or modified; Phase 8.3 appended two documentation-only commits to the
+  fixed session branch (`a0bf760` → `ee7cffb`) and added commentary.
 - No force-push; no historical commit rewritten; no ref deleted.
 - Recon operations used: `fetch`, `merge-base`, `rev-list`, `ls-tree`,
   `merge-tree` (dry-run), detached checkouts in throwaway clones, and
-  test runs. No repository ref was created or moved by this phase.
-- PR #7 remains the immutable evidence branch: 99 reachable commits,
-  unchanged by Phase 8.3.
+  test runs. No new Phase 8.3 integration ref was created or moved by
+  this phase; the fixed arena branch was legitimately advanced from
+  `a0bf760` to `ee7cffb` by two documentation-only commits (Issue A
+  correction, Phase 8.3.1).
+- PR #7's historical implementation lineage (through `a0bf760` = 99
+  reachable commits) was preserved without rewrite; the current Phase
+  8.3 evidence branch is `ee7cffb` = 101 reachable commits (the 99 +
+  two documentation-only commits — Issue B/§16 correction, Phase
+  8.3.1).
