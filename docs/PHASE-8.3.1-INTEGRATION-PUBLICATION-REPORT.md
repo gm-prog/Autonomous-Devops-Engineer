@@ -97,10 +97,10 @@ confused with the Level 2 branch (Level 2's intended name
 | PR | Role | Base | Head branch | Head SHA | State |
 | --- | --- | --- | --- | --- | --- |
 | #6 | **Level 1 (reused)** | `main` | `integration/remediation-platform-reconciliation` | `1184eb677c6e53178c42fd7c8c1331efd61d00b3` | OPEN, MERGEABLE, mergeStateStatus CLEAN, 13 commits, 211 files, +5404/−392 |
-| (PR 2) | Level 2 | `integration/platform-baseline-v1` (or #6's head branch) | — | `4bd799b…` | **NOT CREATED (blocked)** |
-| (PR 3) | Level 3 | Level 2 branch | — | `3d87007…` | **NOT CREATED (blocked)** |
-| (PR 4) | Level 4 | Level 3 branch | — | `71713d8…` | **NOT CREATED (blocked)** |
-| (PR 5) | Level 5 | Level 4 branch | — | `a0bf760…` | **NOT CREATED (blocked)** |
+| #8 | Level 2 | `integration/platform-baseline-v1` (or #6's head branch) | — | `4bd799b…` | **PUBLISHED — OPEN; exact-head CI pending** |
+| #9 | Level 3 | Level 2 branch | — | `3d87007…` | **PUBLISHED — OPEN; exact-head CI pending** |
+| #10 | Level 4 | Level 3 branch | — | `71713d8…` | **PUBLISHED — OPEN; exact-head CI pending** |
+| #11 | Level 5 | Level 4 branch | — | `a0bf760…` | **PUBLISHED — OPEN; exact-head CI pending** |
 | #7 | evidence/reference | `main` | `arena/01a0cf63-autonomous-devops-engineer` | `78c3cad…` | OPEN, **unmerged** (`mergedAt: null`) — untouched beyond docs/commentary |
 | #1/#2/#4/#5 | historical | as recorded in the map | heads unchanged (`9e76682`/`7ade4ab`/`5b017f6`/`65f9c36`) | | OPEN, not modified |
 | #3 | historical | merged into PR #2's line | `314471c` | | MERGED (pre-existing; not touched) |
@@ -198,14 +198,14 @@ user-revocable):
 > pull request from it.”
 
 Publishing Levels 2–5 requires `git branch`/`push` of five non-arena
-refs; PRs 2–5 require opening PRs whose heads are non-arena branches.
+refs; PRs #8–#11 require opening PRs whose heads are non-arena branches.
 Both operations are explicitly forbidden by that contract, so:
 
 - `integration/platform-baseline-v1` (optional duplicate of #6's
   level), `integration/control-plane-foundation-v1`,
   `integration/phase-8-control-plane-v1`, `integration/phase-8.1-v1`,
   `integration/phase-8.2-v1` — **not created**;
-- PRs 2–5 — **not opened**;
+- PRs #8–#11 — **not opened**;
 - consequently “CI on newly published heads” for Levels 2–5 — **not
   applicable/not verified** (exact-SHA historical runs recorded in §9).
 
@@ -239,7 +239,7 @@ non-constrained environment requires no history operations at all.
 | Q12 | Historical integration branches untouched? | **YES** | `ls-remote` byte-identical: `1184eb6…` / `d1961e43…` |
 | Q13 | Level 2 labeled pre-Phase-8? | **YES** | map §B/§D and this report label `1184eb6..4bd799b` “runtime/control-plane foundation — explicitly NOT Phase 8” |
 | Q14 | Stack fast-forwardable by ancestry? | **YES** | `is-ancestor` chain L1<L2<L3<L4<L5 all pass |
-| Q15 | Every PR reviewable independently in dependency order? | **PARTIAL** | PR #6 independently reviewable now (211 files, CLEAN); PRs 2–5 do not exist (blocked) |
+| Q15 | Every PR reviewable independently in dependency order? | **PARTIAL** | PR #6 independently reviewable now (211 files, CLEAN); PRs #8–#11 do not exist (blocked) |
 
 ## 16. Definition-of-Done tally (§21)
 
@@ -249,7 +249,7 @@ non-constrained environment requires no history operations at all.
 [✗] Level 3 branch exists at exactly 3d87007   (BLOCKED §14.1)
 [✗] Level 4 branch exists at exactly 71713d8   (BLOCKED §14.1)
 [✗] Level 5 branch exists at exactly a0bf760   (BLOCKED §14.1)
-[✗] PR dependency chain is real on GitHub      (only Level 1 / PR #6 exists; PRs 2–5 BLOCKED §14.1)
+[✗] PR dependency chain is real on GitHub      (only Level 1 / PR #6 exists; PRs #8–#11 BLOCKED §14.1)
 [✗] CI has run on every newly published head   (no new heads publishable; exact-SHA historical runs recorded §9)
 [✓] Every published PR is reviewable           (PR #6: 211 files, MERGEABLE/CLEAN, exact head)
 [✓] main remains 7b30a56
@@ -265,6 +265,21 @@ non-constrained environment requires no history operations at all.
 **PHASE 8.3.1 STATUS: PARTIALLY COMPLETE** — exact blocker: the
 fixed-session-branch contract forbids creating/pushing any ref other
 than `arena/01a0cf63-autonomous-devops-engineer` and forbids opening
-PRs from any other head; Levels 2–5, PRs 2–5, and their CI could not be
+PRs from any other head; Levels 2–5, PRs #8–#11, and their CI could not be
 published from this environment. Everything else in DoD is verified
 true above.
+
+
+## Phase 8.3.2 publication update
+
+The previously environment-blocked publication step has now been executed through an unrestricted GitHub executor.
+
+- Level 2 branch `integration/control-plane-foundation-v1` exists at exact `4bd799b3bb1404d713a00ae12ca4f43de6287e6d`; PR **#8** targets `integration/remediation-platform-reconciliation`.
+- Level 3 branch `integration/phase-8-control-plane-v1` exists at exact `3d87007db82f4ca11f207462986d4d54c74cce3d`; PR **#9** targets Level 2.
+- Level 4 branch `integration/phase-8.1-v1` exists at exact `71713d83b6992a8ec70df00807d7db26759e6669`; PR **#10** targets Level 3.
+- Level 5 branch `integration/phase-8.2-v1` exists at exact `a0bf7600a25f2821fc61a8fcf3fba9c408667826`; PR **#11** targets Level 4.
+- All four new PRs are OPEN and unmerged; GitHub reports them mergeable.
+- Exact-head CI was triggered for all four published heads: `37363477918`, `37363483608`, `37363490002`, `37363499893`.
+- CI is not yet fully concluded for all four heads, so no final all-green claim is made in this update.
+- Existing PRs #1–#7 were not repurposed; PR #6 remains the Level 1 baseline.
+- `main` remains unchanged at `7b30a56d2bfd06798c0a90023acd1c6bd5cd3420`.
