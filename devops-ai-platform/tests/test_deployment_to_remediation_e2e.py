@@ -23,8 +23,10 @@ are replaced with deterministic fakes, exactly as in the engine unit tests.
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from deployment_service.main import app as deployment_app
@@ -219,6 +221,12 @@ class DeploymentToRemediationEndToEndTests(unittest.TestCase):
         incident = IncidentAggregate(incident_id, "Checkout 5xx", "HIGH", "gateway")
         incident.move_to_triage()
         incident.attach_evidence(evidence)
+        from incident_service.presentation.rest.test_remediation_authorization import (
+            promote_to_root_cause_found,
+        )
+
+        # canonical precondition for proposal intake (Phase 8/8.1)
+        promote_to_root_cause_found(incident)
         self.repository.save_incident(incident)
         return incident, evidence
 
@@ -258,11 +266,13 @@ class DeploymentToRemediationEndToEndTests(unittest.TestCase):
             incident.id, "acme/checkout", SHA_A.upper()  # normalization hop
         )
         self.assertNotIsInstance(result, Exception, result)
-        provider.assert_called_once()
-        spy.execute.assert_called_once()
-        self.assertEqual(
-            result["pull_request_url"], "https://github.com/acme/checkout/pull/4242"
-        )
+        # Phase 8.1 shim: binding passes but the legacy route stops at
+        # PROPOSED — no orchestrator, no PR (normalization still honored).
+        provider.assert_not_called()
+        spy.execute.assert_not_called()
+        self.assertEqual(result["status"], "PROPOSED")
+        self.assertEqual(result["source_sha"], SHA_A)
+        self.assertNotIn("pull_request_url", result)
 
     # ---------- F: wrong SHA ----------
 
@@ -329,8 +339,232 @@ class DeploymentToRemediationEndToEndTests(unittest.TestCase):
             "inc-e2e-g", "evil/checkout", SHA_B
         )
         self.assertNotIsInstance(result_b, Exception, result_b)
-        provider_b.assert_called_once()
-        spy_b.execute.assert_called_once()
+        provider_b.assert_not_called()
+        spy_b.execute.assert_not_called()
+        self.assertEqual(result_b["status"], "PROPOSED")
+        self.assertEqual(result_b["repository"], "evil/checkout")
+        self.assertEqual(result_b["source_sha"], SHA_B)
+
+    # ---------- Phase 8.1 §26: legacy → restart → canonical chain -------
+
+    def test_phase81_restart_approve_execute_then_cannot_reset(self):
+        from fastapi import HTTPException
+
+        from incident_service.application.services.proposal_approval_service import (
+            ProposalApprovalService,
+        )
+        from incident_service.application.services.proposal_execution_service import (
+            ProposalExecutionService,
+        )
+        from incident_service.presentation.rest.controllers import (
+            ProposalExecutionRequest,
+            execute_proposal,
+        )
+
+        # 1) legacy intake stops at PROPOSED
+        payload = self._deploy("acme/checkout", SHA_A)
+        incident, _ = self._incident_with_collected_evidence(
+            payload["id"], "inc-p81-26"
+        )
+        spy, provider, result = self._remediate(
+            incident.id, "acme/checkout", SHA_A
+        )
+        self.assertNotIsInstance(result, Exception, result)
+        self.assertEqual(result["status"], "PROPOSED")
+        provider.assert_not_called()
+        spy.execute.assert_not_called()
+
+        # 2) RESTART: a brand-new process = fresh adapter + engine over the
+        #    same durable file; the proposal and version both survive.
+        restarted = PostgresIncidentRepositoryAdapter(
+            f"sqlite:///{os.path.join(self._tmp.name, 'incidents.db')}"
+        )
+        loaded = restarted.get_incident_by_id(incident.id)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.patch_proposals[0].status, "PROPOSED")
+        durable_version = loaded.version
+
+        # 3) canonical approval on the restarted process
+        ProposalApprovalService(restarted).approve(
+            incident_id=incident.id,
+            proposal_id=result["proposal_id"],
+            proposal_hash=result["proposal_hash"],
+            approved_by="alice-operator",
+        )
+        approved = restarted.get_incident_by_id(incident.id)
+        self.assertEqual(approved.patch_proposals[0].status, "APPROVED")
+        self.assertGreater(approved.version, durable_version)
+
+        # 4) canonical execution → PR_CREATED (real execution service,
+        #    orchestrator faked at the documented factory seam only)
+        def orchestrator_factory():
+            def execute(
+                incident_id,
+                proposal,
+                repository_slug,
+                validation_profile,
+                stage_callback=None,
+                before_side_effect=None,
+            ):
+                return SimpleNamespace(
+                    proposal_id=proposal.id,
+                    incident_id=incident_id,
+                    source_sha=proposal.source_sha,
+                    branch_name="automation/remediation/p81/restart",
+                    commit_sha="d" * 40,
+                    pull_request_url="https://github.com/acme/checkout/pull/826",
+                    validation_result=SimpleNamespace(
+                        passed=True,
+                        steps=(SimpleNamespace(name="unit", passed=True),),
+                    ),
+                )
+
+            return SimpleNamespace(execute=execute)
+
+        execution_service = ProposalExecutionService(
+            repository=restarted,
+            orchestrator_factory=orchestrator_factory,
+            ttl_seconds=3600.0,
+        )
+        executed = execute_proposal(
+            incident.id,
+            ProposalExecutionRequest(
+                proposal_id=result["proposal_id"],
+                proposal_hash=result["proposal_hash"],
+                requested_by="alice-operator",
+            ),
+            service=execution_service,
+        )
+        self.assertEqual(executed["status"], "PR_CREATED")
+        pr_url = executed["proposal"]["pull_request_url"]
+
+        # 5) repeat legacy /remediation on the terminal incident → 409;
+        #    it cannot reset PR_CREATED or mint a second proposal/PR.
+        original_repository = self.repository
+        self.repository = restarted
+        try:
+            spy2, provider2, exc2 = self._remediate(
+                incident.id, "acme/checkout", SHA_A
+            )
+        finally:
+            self.repository = original_repository
+        self.assertIsInstance(exc2, HTTPException)
+        self.assertEqual(exc2.status_code, 409)
+        provider2.assert_not_called()
+        spy2.execute.assert_not_called()
+
+        final = restarted.get_incident_by_id(incident.id)
+        self.assertEqual(final.status, "RemediationPRCreated")
+        self.assertEqual(len(final.patch_proposals), 1)
+        self.assertEqual(final.patch_proposals[0].id, result["proposal_id"])
+        self.assertEqual(final.patch_proposals[0].status, "PR_CREATED")
+        self.assertEqual(final.patch_proposals[0].pull_request_url, pr_url)
+
+    # ---------- Phase 8.1 §27: concurrent approve vs regenerate ---------
+
+    def test_phase81_concurrent_approve_vs_regenerate_e2e(self):
+        import threading
+
+        from incident_service.application.failures import (
+            ApprovalPolicyError,
+            IncidentConcurrencyConflict,
+            ProposalIntegrityError,
+        )
+        from incident_service.application.services.proposal_approval_service import (
+            ProposalApprovalService,
+        )
+
+        payload = self._deploy("acme/checkout", SHA_A)
+        incident, _ = self._incident_with_collected_evidence(
+            payload["id"], "inc-p81-27"
+        )
+        _, _, result = self._remediate(incident.id, "acme/checkout", SHA_A)
+        self.assertNotIsInstance(result, Exception, result)
+
+        barrier = threading.Barrier(2)
+        outcomes = {}
+
+        def approve_call():
+            barrier.wait()
+            try:
+                outcomes["approve"] = ProposalApprovalService(
+                    self.repository
+                ).approve(
+                    incident_id=incident.id,
+                    proposal_id=result["proposal_id"],
+                    proposal_hash=result["proposal_hash"],
+                    approved_by="alice-operator",
+                )
+            except (
+                IncidentConcurrencyConflict,
+                ApprovalPolicyError,
+                ProposalIntegrityError,
+            ) as exc:
+                outcomes["approve"] = exc
+
+        def regenerate_call():
+            barrier.wait()
+            try:
+                with patch.object(
+                    controllers_module,
+                    "get_remediation_orchestrator",
+                    return_value=MagicMock(),
+                ) as provider:
+                    outcomes["regenerate"] = create_remediation(
+                        incident.id,
+                        RemediationRequest(
+                            target_filepath="src/service.py",
+                            patch=REMEDIATION_PATCH,
+                            source_sha=SHA_A,
+                            repository_slug="acme/checkout",
+                        ),
+                        self.repository,
+                    )
+                    provider.assert_not_called()
+            except (
+                IncidentConcurrencyConflict,
+                HTTPException,
+            ) as exc:
+                outcomes["regenerate"] = exc
+
+        threads = [
+            threading.Thread(target=approve_call),
+            threading.Thread(target=regenerate_call),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(
+            sorted(outcomes), ["approve", "regenerate"], outcomes
+        )
+        for label, outcome in outcomes.items():
+            if isinstance(outcome, BaseException):
+                self.assertIsInstance(
+                    outcome,
+                    (
+                        IncidentConcurrencyConflict,
+                        HTTPException,
+                        ApprovalPolicyError,
+                        ProposalIntegrityError,
+                    ),
+                    f"{label}: unexpected {outcome!r}",
+                )
+
+        # durable post-race state is coherent: exactly one proposal, and
+        # approval metadata present ⇔ status APPROVED (never a torn mix).
+        final = self.repository.get_incident_by_id(incident.id)
+        self.assertEqual(len(final.patch_proposals), 1)
+        proposal = final.patch_proposals[0]
+        if proposal.status == "APPROVED":
+            self.assertEqual(proposal.approved_by, "alice-operator")
+            self.assertTrue(proposal.approval_hash)
+        else:
+            self.assertEqual(proposal.status, "PROPOSED")
+            self.assertEqual(proposal.approved_by, "")
+            self.assertEqual(proposal.approval_hash, "")
 
 
 if __name__ == "__main__":

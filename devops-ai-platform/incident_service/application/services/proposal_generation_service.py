@@ -364,9 +364,23 @@ class ProposalGenerationService:
 
 
     def _save(self, incident) -> None:
-        """Persistence failure → typed §25 error (never a silent drop)."""
+        """Persistence failure → typed §25 error (never a silent drop).
+        Concurrency conflicts are THEIR OWN truth (Phase 8.1): a stale
+        writer must surface as a 409 conflict, not a generic 503."""
+        from incident_service.application.failures import (
+            IncidentConcurrencyConflict,
+        )
+
         try:
             self.repository.save_incident(incident)
+        except IncidentConcurrencyConflict as exc:
+            # bounded ids only — structured truth for the losing writer
+            _log(
+                "proposal.regeneration_conflict",
+                incident_id=str(getattr(incident, "id", ""))[:64],
+                expected_version=int(getattr(incident, "version", 0)),
+            )
+            raise
         except Exception as exc:
             raise ProposalPersistenceFailed(
                 "proposal could not be persisted"

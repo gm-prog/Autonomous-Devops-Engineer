@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -13,6 +14,19 @@ from incident_service.domain.repository_interface import IncidentRepositoryPort
 
 metadata = MetaData()
 
+_logger = logging.getLogger("IncidentRepository")
+
+
+def _log_event(event: str, **fields) -> None:
+    """Bounded structured event (Phase 8.1 §31): identifiers/versions
+    only — never payloads, SQL text, or secrets."""
+    _logger.info(
+        json.dumps(
+            {"event": event, **{k: fields[k] for k in sorted(fields)}},
+            default=str,
+        )
+    )
+
 incidents_table = Table(
     "devops_incidents",
     metadata,
@@ -23,6 +37,14 @@ incidents_table = Table(
     Column("status", String(64), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     Column("patch_proposals", Text, nullable=False, default="[]"),
+    # Phase 8.1: durable optimistic-concurrency revision (monotonic int).
+    Column(
+        "version",
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    ),
 )
 
 evidence_table = Table(
@@ -94,31 +116,153 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
 
         self.engine = create_engine(normalized_url, pool_pre_ping=True)
         metadata.create_all(self.engine)
+        self._ensure_version_column()
+
+    def _ensure_version_column(self) -> None:
+        """Idempotent in-place schema upgrade (Phase 8.1 §4.4/§4.5).
+
+        ``metadata.create_all()`` never alters existing tables, so this
+        adds ``devops_incidents.version`` to databases created before
+        Phase 8.1 — without touching rows, proposals, evidence, or
+        execution claims. Repeated startup sees the column and no-ops.
+        Applies to fresh AND existing SQLite/PostgreSQL alike.
+        """
+        from sqlalchemy import inspect as sa_inspect, text
+        from sqlalchemy.exc import SQLAlchemyError
+
+        for attempt in (0, 1):
+            columns = {
+                column["name"]
+                for column in sa_inspect(self.engine).get_columns(
+                    "devops_incidents"
+                )
+            }
+            if "version" in columns:
+                return
+            try:
+                with self.engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            "ALTER TABLE devops_incidents "
+                            "ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+                        )
+                    )
+                return
+            except SQLAlchemyError:
+                # Concurrent startup may have added the column first
+                # (SQLite: "duplicate column", PostgreSQL: 42701) →
+                # re-inspect on the final attempt, otherwise fail loudly.
+                if attempt == 1:
+                    raise
+        raise RuntimeError("failed to establish incident version column")
 
     def save_incident(self, incident: IncidentAggregate) -> None:
+        """Optimistic-concurrency save (Phase 8.1 §5).
+
+        ``UPDATE ... WHERE id AND version = expected`` is the freshness
+        GATE — zero affected rows means a stale writer and the whole
+        transaction rolls back with ``IncidentConcurrencyConflict``.
+        Evidence rows are written only AFTER the gate passes, in the
+        same transaction. On success the durable version advances by
+        exactly one and the in-memory aggregate follows.
+        """
+        from incident_service.application.failures import (
+            IncidentConcurrencyConflict,
+        )
+
+        expected = int(incident.version)
         values = self._to_row(incident)
-        with self.engine.begin() as connection:
-            existing = connection.execute(
-                select(incidents_table.c.id).where(incidents_table.c.id == incident.id)
-            ).first()
+        created = False
+        try:
+            with self.engine.begin() as connection:
+                existing = connection.execute(
+                    select(incidents_table.c.id).where(
+                        incidents_table.c.id == incident.id
+                    )
+                ).first()
 
-            if existing:
+                if existing:
+                    result = connection.execute(
+                        update(incidents_table)
+                        .where(
+                            incidents_table.c.id == incident.id,
+                            incidents_table.c.version == expected,
+                        )
+                        .values(**values, version=expected + 1)
+                    )
+                    if result.rowcount != 1:
+                        _log_event(
+                            "incident.write_conflict",
+                            incident_id=incident.id,
+                            expected_version=expected,
+                        )
+                        # raises inside the open transaction → rollback;
+                        # no evidence/proposal writes happen after this.
+                        raise IncidentConcurrencyConflict(
+                            incident.id, expected
+                        )
+                else:
+                    if expected != 0:
+                        # An aggregate that believes it is persisted, but
+                        # the row is gone → stale/foreign state, fail closed.
+                        _log_event(
+                            "incident.write_conflict",
+                            incident_id=incident.id,
+                            expected_version=expected,
+                        )
+                        raise IncidentConcurrencyConflict(
+                            incident.id, expected
+                        )
+                    try:
+                        connection.execute(
+                            # creation persists version 0 (Phase 8.1:
+                            # "creation=0"); every successful update that
+                            # follows does version=expected+1 exactly once.
+                            incidents_table.insert().values(
+                                **values, version=expected
+                            )
+                        )
+                        created = True
+                    except IntegrityError as exc:
+                        # concurrent first-insert race on the incident PK
+                        # only — evidence-row integrity errors below must
+                        # NOT be disguised as concurrency conflicts.
+                        raise IncidentConcurrencyConflict(
+                            incident.id, expected
+                        ) from exc
+
                 connection.execute(
-                    update(incidents_table)
-                    .where(incidents_table.c.id == incident.id)
-                    .values(**values)
+                    delete(evidence_table).where(
+                        evidence_table.c.incident_id == incident.id
+                    )
                 )
-            else:
-                connection.execute(incidents_table.insert().values(**values))
+                if incident.evidence:
+                    connection.execute(
+                        evidence_table.insert(),
+                        [
+                            self._evidence_row(incident.id, item)
+                            for item in incident.evidence
+                        ],
+                    )
+        except IncidentConcurrencyConflict:
+            raise
 
-            connection.execute(
-                delete(evidence_table).where(evidence_table.c.incident_id == incident.id)
+        if created:
+            # creation stays at 0; the in-memory aggregate follows the row.
+            incident.version = expected
+            _log_event(
+                "incident.version_initialized",
+                incident_id=incident.id,
+                new_version=incident.version,
             )
-            if incident.evidence:
-                connection.execute(
-                    evidence_table.insert(),
-                    [self._evidence_row(incident.id, item) for item in incident.evidence],
-                )
+        else:
+            incident.version = expected + 1
+            _log_event(
+                "incident.version_incremented",
+                incident_id=incident.id,
+                expected_version=expected,
+                new_version=incident.version,
+            )
 
     def get_incident_by_id(self, id: str) -> Optional[IncidentAggregate]:
         with self.engine.connect() as connection:
@@ -384,6 +528,14 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                     )
                     if proposals_update.rowcount != 1:
                         raise _CoordinationRace("proposals changed during claim")
+                    # Phase 8.1: this claim write mutates the aggregate's
+                    # proposals JSON → durable version advances once here
+                    # so stale ordinary writers are detected afterwards.
+                    connection.execute(
+                        update(incidents_table)
+                        .where(incidents_table.c.id == incident_id)
+                        .values(version=incidents_table.c.version + 1)
+                    )
 
                 return ("claimed", self.get_incident_by_id(incident_id))
             except IntegrityError:
@@ -553,6 +705,9 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 .values(
                     patch_proposals=self._to_row(incident)["patch_proposals"],
                     status=self._to_row(incident)["status"],
+                    # Phase 8.1 §14: terminal transition increments the
+                    # aggregate version exactly once, same transaction.
+                    version=incidents_table.c.version + 1,
                 )
             )
             if proposals_update.rowcount != 1:
@@ -1096,6 +1251,9 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
         )
         incident.created_at = _normalize_created_at(row["created_at"])
         incident.status = row["status"]
+        # Phase 8.1 §6: hydration MUST carry the durable revision — never
+        # the constructor default (older rows post-migration read 0).
+        incident.version = int(row["version"] or 0)
         incident.domain_events = []
         incident.evidence = list(evidence or [])
 

@@ -13,11 +13,16 @@ class IncidentAggregate:
     including structured evidence, RCA completion, and remediation proposals.
     """
 
-    def __init__(self, id: str, title: str, severity: str, context_details: str):
+    def __init__(self, id: str, title: str, severity: str, context_details: str, version: int = 0):
         self.id = id
         self.title = title
         self.severity = severity
         self.context = context_details
+        # Phase 8.1: durable optimistic-concurrency revision. 0 = new
+        # (never persisted); every successful save advances it exactly
+        # once. Hydration overwrites this with the persisted value —
+        # the database is the authority for aggregate freshness.
+        self.version = int(version)
         self.created_at = datetime.now(timezone.utc)
         self.status = "Raised"
         self.patch_proposals: List[HotfixProposal] = []

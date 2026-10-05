@@ -49,6 +49,23 @@ class ProposalLifecycleConflict(Phase6PipelineError):
     back to PROPOSED. Mapped to HTTP 409 — never silently coerced."""
 
 
+class IncidentConcurrencyConflict(Phase6PipelineError):
+    """Optimistic-concurrency rejection (Phase 8.1 §5): the durable
+    incident aggregate changed since this writer loaded it, so the stale
+    write was refused — NOTHING was overwritten. Mapped to HTTP 409.
+
+    Carries only bounded identifiers (incident id + expected version);
+    never SQL text, payloads, or secrets."""
+
+    def __init__(self, incident_id: str, expected_version: int):
+        self.incident_id = str(incident_id)
+        self.expected_version = int(expected_version)
+        super().__init__(
+            f"incident {self.incident_id} write rejected: stale aggregate "
+            f"version {self.expected_version} (concurrency conflict)"
+        )
+
+
 # ---------------------------------------------------------------------- #
 # Phase 6.2: approval + controlled execution
 # ---------------------------------------------------------------------- #
