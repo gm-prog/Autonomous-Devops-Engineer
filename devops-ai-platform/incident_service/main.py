@@ -10,12 +10,14 @@ import logging
 from fastapi import FastAPI
 
 from .presentation.rest.controllers import router as incidents_router
+from .presentation.rest.changes_controller import router as changes_router
 from .presentation.rest.sentry_webhook_router import router as webhooks_router
 
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="DevOps.AI Incident Service", version="1.0.0")
 app.include_router(incidents_router)
+app.include_router(changes_router)
 app.include_router(webhooks_router)
 
 

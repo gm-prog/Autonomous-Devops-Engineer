@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import Optional, List
 from .aggregates.incident import IncidentAggregate
 
@@ -14,4 +15,14 @@ class IncidentRepositoryPort(ABC):
 
     @abstractmethod
     def get_active_incidents(self) -> List[IncidentAggregate]:
+        pass
+
+    # Phase 6.3: window-bounded analytics read. `start` is inclusive and
+    # `end` is exclusive (half-open UTC interval, caller-validated).
+    # Deterministic ordering (created_at ASC, id ASC) so aggregation over
+    # the same durable records always yields identical results.
+    @abstractmethod
+    def list_incidents_in_window(
+        self, start: datetime, end: datetime
+    ) -> List[IncidentAggregate]:
         pass

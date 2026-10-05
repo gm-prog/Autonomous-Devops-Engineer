@@ -27,6 +27,10 @@ os.environ["QDRANT_HOST"] = "127.0.0.1"
 os.environ["QDRANT_PORT"] = "6334"  # intentionally unreachable
 os.environ.pop("GEMINI_API_KEY", None)
 os.environ["CORS_ORIGINS"] = "*"
+# Phase 6.5.1: release identity is absent in tests — proves the
+# "missing identity -> no carrier series -> INCONCLUSIVE" path end to end.
+os.environ.pop("DEVOPS_DEPLOYMENT_ID", None)
+os.environ.pop("DEVOPS_SOURCE_SHA", None)
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

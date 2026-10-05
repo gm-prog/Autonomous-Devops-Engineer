@@ -188,6 +188,57 @@ def test_sentry_webhook_accepts_valid_signature():
         assert r.json()["automated_triage_initiated"] is True
 
 
+def test_sentry_webhook_rejects_signature_from_a_different_secret():
+    """A valid HMAC computed with the wrong key never authenticates."""
+    from incident_service.main import app
+    with TestClient(app) as c:
+        payload = json.dumps({"data": {"issue": {"title": "x"}}}).encode()
+        r = c.post(
+            "/alerts/webhooks/sentry",
+            content=payload,
+            headers={"Content-Type": "application/json",
+                     "X-Sentry-Signature": _signed(payload, secret="attacker-key")},
+        )
+        assert r.status_code == 401
+
+
+def test_sentry_webhook_rejects_tampered_body():
+    """Signature covers the exact raw body: signing A and sending B fails."""
+    from incident_service.main import app
+    signed_body = json.dumps({"data": {"issue": {"title": "innocent"}}}).encode()
+    sent_body = json.dumps({"data": {"issue": {"title": "pwned"}}}).encode()
+    with TestClient(app) as c:
+        r = c.post(
+            "/alerts/webhooks/sentry",
+            content=sent_body,
+            headers={"Content-Type": "application/json",
+                     "X-Sentry-Signature": _signed(signed_body)},
+        )
+        assert r.status_code == 401
+
+
+def test_sentry_webhook_fails_closed_without_configured_secret():
+    """No SENTRY_WEBHOOK_SECRET → 503, never a permissive accept: the
+    receiver is disabled until it can actually verify."""
+    from incident_service.main import app
+    from incident_service.presentation.rest import sentry_webhook_router
+    from unittest.mock import patch as _patch
+
+    payload = json.dumps({"data": {"issue": {"title": "x"}}}).encode()
+    with _patch.object(sentry_webhook_router, "SENTRY_WEBHOOK_SECRET", ""):
+        with TestClient(app) as c:
+            r = c.post(
+                "/alerts/webhooks/sentry",
+                content=payload,
+                headers={"Content-Type": "application/json",
+                         "X-Sentry-Signature": _signed(payload)},
+            )
+    assert r.status_code == 503
+    # defense in depth: the verifier itself refuses with no secret
+    with _patch.object(sentry_webhook_router, "SENTRY_WEBHOOK_SECRET", ""):
+        assert sentry_webhook_router.verify_sentry_signature(payload, "any") is False
+
+
 # --- deployment service ---------------------------------------------------------------
 
 def test_deployment_service_command_layer():

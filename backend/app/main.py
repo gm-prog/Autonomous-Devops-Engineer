@@ -15,6 +15,11 @@ from qdrant_client.http import models as qmodels
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
+from .release_identity import (
+    DEPLOYMENT_ID_ENV,
+    SOURCE_SHA_ENV,
+    apply_release_identity,
+)
 from .services.analysis import analyze_repository
 
 # --- LOGGER CONFIGURATION ---
@@ -33,7 +38,14 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 # Comma-separated list of allowed CORS origins. Default "*" (no credentials,
 # which is the spec-valid combination). Set e.g. "https://myapp.example.com"
 # for credentialed browser clients.
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000",
+    ).split(",")
+    if o.strip()
+]
 
 QDRANT_COLLECTION = "devops_knowledge_base"
 
@@ -79,6 +91,16 @@ API_REQUESTS = Counter(
     "devops_api_requests_total",
     "Total API requests processed by the operator gateway",
     ["method", "path"],
+)
+
+# Phase 6.5.1: authoritative release identity carrier. Operator/runtime
+# inputs only (never HTTP/user input): a fully valid DEVOPS_DEPLOYMENT_ID
+# + DEVOPS_SOURCE_SHA exposes exactly one low-volume
+# devops_release_identity_info series; missing/invalid identity exposes
+# NO series, so live verification stays INCONCLUSIVE rather than guessing.
+RELEASE_IDENTITY_APPLIED = apply_release_identity(
+    os.getenv(DEPLOYMENT_ID_ENV, ""),
+    os.getenv(SOURCE_SHA_ENV, ""),
 )
 
 @asynccontextmanager
