@@ -96,13 +96,24 @@ version statement, finish's terminal UPDATE).
 
 ### §39 — actual local battery numbers (this run)
 
-| Suite | Command | Result |
+Scope labels matter: each row names the exact command **and** working
+directory. Rows matching a CI job were executed locally with that exact
+command (GitHub Actions job logs are not retrievable through the API in
+this environment, so CI evidence is the per-job conclusion recorded in
+§40/PR #7, not a log-quoted count). Superset rows are broader local
+scopes and are **not** CI jobs. _(Corrected during Phase 8.2 §18: an
+earlier version of this table labeled a `devops-ai-platform/tests/`
+run as the "Backend" CI job — the Backend job runs in `backend/` and
+executes `backend/tests/` = 49.)_
+
+| Suite (scope label) | Exact command + cwd | Result |
 | --- | --- | --- |
-| Incident/RCA/remediation CI job (35 unittest modules) | `python -m unittest <the 35 modules in ci.yml>` | **545 tests, OK, 3 skipped** |
-| Backend job | `pytest tests/` | **169 passed, 75 subtests passed** |
-| Platform smoke job | `pytest tests/ deployment_service/tests` | **256 passed, 109 subtests passed** |
-| API gateway job | `pytest api_gateway/tests` | **71 passed, 42 subtests passed** |
-| Incident application+presentation (superset sanity) | `pytest incident_service/application incident_service/presentation` | **468 passed, 3 skipped, 71 subtests passed** |
+| Incident CI job (35 unittest modules) | `python -m unittest <the 35 modules in ci.yml>` in `devops-ai-platform/` | **545 tests, OK, 3 skipped** |
+| Backend CI job | `python -m pytest tests/ -v` in **`backend/`** | **49 passed** |
+| Platform CI job | `python -m pytest tests/ deployment_service/tests -v` in `devops-ai-platform/` | **256 passed, 109 subtests passed** |
+| API gateway CI job | `python -m pytest api_gateway/tests -v` in `devops-ai-platform/` | **71 passed, 42 subtests passed** |
+| superset: application+presentation | `pytest incident_service/application incident_service/presentation` in `devops-ai-platform/` | **468 passed, 3 skipped, 71 subtests passed** |
+| subset (not a CI job): platform tests dir alone | `pytest tests/` in `devops-ai-platform/` | **169 passed, 75 subtests passed** |
 | Phase 8.1 concurrency module | `pytest incident_service/test_incident_concurrency.py` | **18 passed** |
 
 Prior-phase reference (commit `3d87007`): incident 519 / gw 71+42 /
