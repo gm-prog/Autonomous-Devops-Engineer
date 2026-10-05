@@ -77,6 +77,64 @@ class RetiredLegacyCommandTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
+class RetiredAggregateAttachTests(unittest.TestCase):
+    """Phase 8.2 Task B: the unguarded aggregate escape hatch is gone and
+    the remaining attach APIs enforce the protected-state policy."""
+
+    PROTECTED = ("APPROVED", "EXECUTING", "EXECUTION_FAILED", "PR_CREATED")
+
+    def test_legacy_attach_api_is_removed(self):
+        from incident_service.domain.aggregates.incident import IncidentAggregate
+
+        self.assertFalse(
+            hasattr(IncidentAggregate, "attach_remediation_proposal")
+        )
+        incident = IncidentAggregate("inc-x", "t", "HIGH", "gw")
+        with self.assertRaises(AttributeError):
+            incident.attach_remediation_proposal(None)
+
+    def test_protected_proposal_states_cannot_be_overwritten_by_legacy_caller(
+        self,
+    ):
+        from incident_service.domain.aggregates.incident import IncidentAggregate
+        from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+
+        for protected in self.PROTECTED:
+            with self.subTest(protected=protected):
+                incident = IncidentAggregate(
+                    f"inc-protected-{protected}", "t", "HIGH", "gw"
+                )
+                incident.status = "RemediationProposed"
+                existing = HotfixProposal(
+                    id="proposal-inc-protected-%s" % protected.lower(),
+                    target_filepath="src/service.py",
+                    diff_patch_payload=PATCH,
+                    status=protected,
+                    approved_by="operator" if protected == "APPROVED" else "",
+                )
+                existing.apply_verification_pass()
+                incident.patch_proposals.append(existing)
+
+                intruder = HotfixProposal(
+                    id=existing.id,
+                    target_filepath="src/service.py",
+                    diff_patch_payload=PATCH,
+                    status="PROPOSED",
+                )
+                intruder.apply_verification_pass()
+                with self.assertRaises(ValueError):
+                    incident.upsert_remediation_proposal(intruder)
+
+                # exact existing state unchanged
+                self.assertEqual(
+                    incident.patch_proposals[0].status, protected
+                )
+                self.assertEqual(
+                    incident.patch_proposals[0].approved_by,
+                    "operator" if protected == "APPROVED" else "",
+                )
+
+
 
 if __name__ == "__main__":
     unittest.main()
