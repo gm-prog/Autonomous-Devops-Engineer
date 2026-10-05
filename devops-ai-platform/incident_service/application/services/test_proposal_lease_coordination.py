@@ -52,6 +52,8 @@ def _seed_incident():
 
     incident = IncidentAggregate("inc-lease-1", "cpu", "HIGH", "ctx")
     incident.move_to_triage()
+    incident.begin_investigation()
+    incident.mark_root_cause_found()
     incident.attach_evidence(
         IncidentEvidence(
             id="evt-1",
@@ -1033,6 +1035,8 @@ class MultiProposalClaimProjectionTests(unittest.TestCase):
 
         incident = IncidentAggregate("inc-multi", "cpu", "HIGH", "ctx")
         incident.move_to_triage()
+        incident.begin_investigation()
+        incident.mark_root_cause_found()
         for pid in self.PROPOSALS:
             per_proposal_patch = (
                 f"--- a/app/{pid}.py\n"
@@ -1090,6 +1094,8 @@ class MultiProposalClaimProjectionTests(unittest.TestCase):
         p-b (attempt 4, PR_CREATED, worker-b), p-c (no claim)."""
         incident = IncidentAggregate("inc-active", "cpu", "HIGH", "ctx")
         incident.move_to_triage()
+        incident.begin_investigation()
+        incident.mark_root_cause_found()
         hashes = {}
         for pid in ("p-a", "p-b", "p-c"):
             patch = (

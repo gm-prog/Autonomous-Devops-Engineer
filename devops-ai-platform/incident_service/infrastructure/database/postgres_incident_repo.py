@@ -466,9 +466,17 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
         now: datetime,
         updates: Optional[dict] = None,
         evidence: Optional[IncidentEvidence] = None,
+        promote_incident_pr_created: bool = False,
     ) -> bool:
         """Atomically release the lease and persist the attempt outcome
-        (proposal status + claim cursor + evidence) in one transaction."""
+        (proposal status + claim cursor + evidence) in one transaction.
+
+        Phase 8 §4/§28: with ``promote_incident_pr_created`` the incident
+        lifecycle row advances RemediationProposed → RemediationPRCreated
+        inside the SAME compare-and-set transaction as the proposal's
+        PR_CREATED write — the two can never diverge, and a racing writer
+        fails the CAS instead of double-writing.
+        """
         from incident_service.application.services.proposal_execution_policy import (
             validate_stage_transition,
         )
@@ -530,6 +538,12 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                 if key in updates:
                     setattr(proposal, key, updates[key])
 
+            if promote_incident_pr_created and status == "PR_CREATED":
+                # Guarded domain transition (strict in the aggregate).
+                # Anything other than RemediationProposed/RemediationPRCreated
+                # raises → transaction rolls back → no partial write.
+                incident.mark_remediation_pr_created()
+
             proposals_update = connection.execute(
                 update(incidents_table)
                 .where(
@@ -537,7 +551,8 @@ class PostgresIncidentRepositoryAdapter(IncidentRepositoryPort):
                     incidents_table.c.patch_proposals == observed_json,
                 )
                 .values(
-                    patch_proposals=self._to_row(incident)["patch_proposals"]
+                    patch_proposals=self._to_row(incident)["patch_proposals"],
+                    status=self._to_row(incident)["status"],
                 )
             )
             if proposals_update.rowcount != 1:
