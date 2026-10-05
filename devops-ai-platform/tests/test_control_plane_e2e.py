@@ -195,8 +195,12 @@ class ControlPlaneEndToEndTests(unittest.TestCase):
         self.incident_seq += 1
         incident_id = f"inc-cp-{uuid.uuid4().hex[:10]}"
         incident = IncidentAggregate(incident_id, title, "HIGH", "gateway")
-        incident.move_to_triage()
-        return incident
+        from incident_service.presentation.rest.test_remediation_authorization import (
+            promote_to_root_cause_found,
+        )
+
+        # canonical precondition for any proposal intake (Phase 8/8.1)
+        return promote_to_root_cause_found(incident)
 
     def _deploy_via_gateway(
         self, repository_name="acme/checkout", head_sha=SHA_A, token=None
@@ -276,7 +280,7 @@ class ControlPlaneEndToEndTests(unittest.TestCase):
 
     # ---------- positive chain ----------
 
-    def test_full_chain_operator_dry_run_approve_execute_remediate(self):
+    def test_full_chain_operator_dry_run_approve_execute_shim_stops_at_proposal(self):
         token = _operator_token()
 
         # 1) dry-run: identity stamped from JWT, never from the body
@@ -344,19 +348,22 @@ class ControlPlaneEndToEndTests(unittest.TestCase):
         # 4) evidence → incident (REAL collector over the live endpoint)
         incident = self._incident_with_evidence(deployed["id"])
 
-        # 5) remediation through the gateway: binding passes, orchestrator runs
+        # 5) legacy /remediation through the gateway → compatibility shim:
+        #    binding passes, but the route STOPS at PROPOSED. No
+        #    orchestrator, no PR (Phase 8.1 §42).
         spy, provider, response = self._remediate_via_gateway(
             incident.id,
             {**REMEDIATION_BODY, "source_sha": SHA_A, "repository_slug": "acme/checkout"},
             token=token,
         )
         self.assertEqual(response.status_code, 200, response.text)
-        provider.assert_called_once()
-        spy.execute.assert_called_once()
-        self.assertEqual(
-            response.json()["pull_request_url"],
-            "https://github.com/acme/checkout/pull/4242",
-        )
+        provider.assert_not_called()
+        spy.execute.assert_not_called()
+        body_json = response.json()
+        self.assertEqual(body_json["status"], "PROPOSED")
+        self.assertTrue(body_json["compatibility_shim"])
+        self.assertFalse(body_json["executed"])
+        self.assertNotIn("pull_request_url", body_json)
 
     # ---------- authentication / role matrix ----------
 
@@ -446,8 +453,10 @@ class ControlPlaneEndToEndTests(unittest.TestCase):
             {**REMEDIATION_BODY, "source_sha": SHA_B, "repository_slug": "evil/checkout"},
         )
         self.assertEqual(response2.status_code, 200, response2.text)
-        provider2.assert_called_once()
-        spy2.execute.assert_called_once()
+        provider2.assert_not_called()
+        spy2.execute.assert_not_called()
+        self.assertEqual(response2.json()["status"], "PROPOSED")
+        self.assertTrue(response2.json()["compatibility_shim"])
 
     def test_non_deployed_evidence_is_403(self):
         # dry-run only: state stays AWAITING_APPROVAL, provenance proves it
