@@ -241,4 +241,3 @@ version CAS rejects it** (8.1 §7 test + H.5 version-unchanged assertions).
   `phase-8-concurrency-model.md`), not covered by a dedicated PG suite.
 - CI log contents remain unreadable (status-only); counts come from
   local executions of identical commands (§9).
-
