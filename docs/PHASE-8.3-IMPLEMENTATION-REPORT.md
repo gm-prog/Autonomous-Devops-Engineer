@@ -29,9 +29,13 @@ pushing any branch other than `arena/01a0cf63-autonomous-devops-engineer`.
 - PR #7 (arena) = `f7f8513` + 13 (PR #6) + 65 (pre-Phase-8
   reconstruction) + 1 (8.0) + 5 (8.1) + 5 (8.2) = **99 reachable
   commits** through `a0bf760` (the Phase 8.2 head and recon starting
-  point), linear, 0 merges; the evidence branch subsequently advanced to
-  `ee7cffb` = 101 reachable commits via two Phase 8.3 documentation-only
-  commits (lineage not rewritten).
+  point), linear, 0 merges; the evidence branch subsequently advanced
+  by documentation-only commits — tail `a0bf760 → 7ead35e → ee7cffb →
+  73be996 → 78c3cad` (`git rev-list --count a0bf760..78c3cad` = 4;
+  `git rev-list --count 78c3cad` = 103 reachable commits, both
+  verified), then `4257f33` and this corrective documentation commit
+  (lineage not rewritten; `ee7cffb` and `73be996` are historical
+  intermediate documentation heads, not current).
 - The session clone was found shallow; it was unshallowed before any
   ancestry conclusion was drawn (recon deviation, recorded).
 
@@ -129,7 +133,7 @@ developer-local state.
 | `3d87007` (C) | `37332978513` push, `37332982983` PR | success |
 | `71713d8` (D) | `37341797764` push, `37341805281` PR | success (5/5 jobs each) |
 | `a0bf760` (E) | `37347628455` push, `37347637493` PR | success (5/5 jobs each) |
-| this docs head | recorded in the PR #7 Phase 8.3 comment after push | run ids never written before the runs exist |
+| `ee7cffb` (docs head at Phase 8.3 report time) | `37351312365` push, `37351316976` PR — recorded in the PR #7 Phase 8.3 comment | success (5/5 jobs each); run ids were written only after the runs existed |
 
 ## 11. Secret scan
 
@@ -163,11 +167,11 @@ passwords): **no matches**. Clean-room diff-check: clean.
 | Q2 | New branches drag Arena-only ancestry? | **NO** | entire chain is linear off `f7f8513` with **0 merge commits** (`rev-list --merges`); level refs are plain ancestors of the shared line |
 | Q3 | Phase 8.1 range identifiable? | **YES** | exactly `3d87007..71713d8` = 5 commits `db173a4 f2699d3 8df4f24 02431af 71713d8` |
 | Q4 | Phase 8.2 range identifiable? | **YES** | exactly `71713d8..a0bf760` = 5 commits `c2e8226 0fed91f 1f4769a 71f8d2f a0bf760` |
-| Q5 | Any new branch modifies `main`? | **NO** | no Phase 8.3 integration ref was created or moved; the fixed arena branch was legitimately advanced `a0bf760`→`ee7cffb` by two documentation-only commits; `origin/main` untouched at `7b30a56…` |
+| Q5 | Any new branch modifies `main`? | **NO** | no required Phase 8.3 integration ref was created or moved; the fixed arena branch was legitimately advanced past `a0bf760` by documentation-only commits (tail `a0bf760 → 7ead35e → ee7cffb → 73be996 → 78c3cad`, then `4257f33` and later documentation-only commits); `origin/main` untouched at `7b30a56…` |
 | Q6 | Force-push required? | **NO** | recipe only publishes new refs pointing at existing commits (fast-forwardable, never rewritten) |
 | Q7 | Final candidate passes CI from its own SHA? | **YES** | `a0bf760…`: runs `37347628455` + `37347637493`, success 5/5 jobs each |
 | Q8 | Final candidate clean-room tested? | **YES** | §9 (fresh clone + fresh venv + exact CI commands) |
-| Q9 | PR #7 remains available as historical evidence? | **YES** | historical implementation lineage not rewritten or modified; two Phase 8.3 documentation-only commits appended to the session branch + commentary |
+| Q9 | PR #7 remains available as historical evidence? | **YES** | PR #7 open and unmerged; historical implementation lineage not rewritten or modified; documentation-only commits (four through the pre-repair head `78c3cad`, then `4257f33` and later documentation commits) + commentary appended to the session branch |
 | Q10 | Phase 8.1/8.2 invariants preserved by the stack? | **YES** | levels D/E are the exact verified commits; batteries pass at `71713d8` (545) and `a0bf760` (559) incl. all shim/CAS/execution-authority tests |
 
 ## 14. Known limitations
@@ -191,9 +195,11 @@ passwords): **no matches**. Clean-room diff-check: clean.
   stack has been specified and verified from the verified historical
   work, while PR #7's historical implementation lineage remains
   un-rewritten as historical/reference material.”** Not “PR #7 has
-  been cleaned up.” (Issue B correction, Phase 8.3.1: PR #7 was not
-  left byte-for-byte unchanged — two documentation-only commits and
-  commentary were appended; its implementation history was not
+  been cleaned up.” (Issue B correction, Phase 8.3.1 final repair: PR
+  #7 was not left byte-for-byte unchanged — documentation-only commits
+  were appended (tail through the pre-repair head `78c3cad`: four
+  commits after `a0bf760`, then `4257f33` and this corrective commit)
+  and commentary was added; its implementation history was not
   rewritten.) Semantic equivalence of
   the recipe's published refs to the verified heads holds by
   construction (identical commits) and by test (§8), but the published

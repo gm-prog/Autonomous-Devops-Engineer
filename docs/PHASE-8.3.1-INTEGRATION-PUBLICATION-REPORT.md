@@ -12,10 +12,17 @@ published from this environment. The precise blocker is stated in
 
 ## 1. Starting state (observed)
 
-- Session branch `arena/01a0cf63-autonomous-devops-engineer` at
-  `78c3cad2b61120502433defa0bf9fdba2bc74fd6` (= `a0bf760` Phase 8.2
-  implementation lineage + 2 Phase 8.3 documentation-only commits;
-  103 reachable commits; Phase 8.2 lineage through `a0bf760` = 99).
+- Session branch `arena/01a0cf63-autonomous-devops-engineer` verified
+  at `78c3cad186aac0fd02ce8418a57ccdc36ad0e877` (pre-repair evidence
+  head; = `a0bf760` Phase 8.2 implementation lineage + four
+  documentation-only commits `7ead35e` → `ee7cffb` → `73be996` →
+  `78c3cad`; `git rev-list --count 78c3cad` = 103,
+  `count(a0bf760)` = 99, `count(a0bf760..78c3cad)` = 4 — all
+  independently verified). The other agent's documentation-only commit
+  `4257f33` (child of `78c3cad`, reachable count 104) was fetched and
+  fast-forwarded locally (work preserved), and this report's corrective
+  documentation commit follows it; the arena branch is advanced only
+  by documentation/evidence commits.
 - `main` = `7b30a56d2bfd06798c0a90023acd1c6bd5cd3420` (12 reachable).
 - Workspace clone was found **re-shallowed** by the narrow workspace
   fetch refspec (main+arena only); it was unshallowed again before any
@@ -117,7 +124,7 @@ files, +5404/−392).
 | `3d87007` (L3) | `37332978513` (push), `37332982983` (PR) | success — **5/5 jobs each** (head SHA verified `3d87007db82f…`) |
 | `71713d8` (L4) | `37341797764` (push), `37341805281` (PR) | success — **5/5 jobs each** |
 | `a0bf760` (L5) | `37347628455` (push), `37347637493` (PR) | success — **5/5 jobs each** |
-| `78c3cad…` (docs head, this push) | recorded in the PR #7 Phase 8.3.1 comment after the run exists | never manufactured before execution |
+| `78c3cad` (docs head at publication-report time) | `37356800268` (push), `37356807943` (PR) | success — **5/5 jobs each** (head_sha verified `78c3cad186aac0fd02ce8418a57ccdc36ad0e877`; recorded in the PR #7 comment) |
 
 Job names required by §13 (Incident/RCA/remediation, Compose, Backend,
 Platform smoke, API gateway) are all present and successful for every
@@ -135,15 +142,27 @@ Applied as minimal factual edits (no unrelated wording touched):
   created/moved; the fixed arena branch was legitimately advanced
   `a0bf760`→`78c3cad` by four documentation-only commits. (B) “PR #7 …
   unchanged” → implementation lineage through `a0bf760` (99 commits)
-  preserved without rewrite; current evidence branch `78c3cad` = 101.
+  preserved without rewrite; evidence head at that correction
+  `78c3cad` = 103 reachable commits (verified).
 - `docs/PHASE-8.3-INTEGRATION-MAP.md` §4.1: added commit-count
   precision note (99 never describes the current branch).
 - `docs/PHASE-8.3-IMPLEMENTATION-REPORT.md` §1: 99-commit figure
-  qualified as the Phase 8.2 lineage/recon point; current branch = 103.
+  qualified as the Phase 8.2 lineage/recon point; branch total at the
+  correction head `78c3cad` = 103 reachable commits.
 - §13 Q5 and Q9 rows: wording corrected per Issue A/B.
 - §14 statement of record: “PR #7 remains unchanged” → lineage
-  un-rewritten; explicit note that two docs commits + commentary were
-  appended.
+  un-rewritten; explicit note that documentation-only commits +
+  commentary were appended.
+- Phase 8.3.1 final evidence repair (this corrective commit): stale
+  current-head language (`ee7cffb` as current, “= 101”, “two
+  documentation-only commits”) replaced across all three documents;
+  complete tail recorded as `a0bf760 → 7ead35e → ee7cffb → 73be996 →
+  78c3cad` with verified counts (4 commits beyond `a0bf760`;
+  `78c3cad` = 103 reachable); `78c3cad` labeled pre-repair evidence
+  head; current head = this documentation-only commit (child of
+  `4257f33`); the corrupted full SHA introduced by `4257f33` (the
+  `78c3cad` prefix spliced with the `ee7cffb` tail) corrected to the
+  verified `78c3cad186aac0fd02ce8418a57ccdc36ad0e877`.
 - Prior evidence files (`PHASE-8.3-INTEGRATION-MAP.md`,
   `PHASE-8.3-IMPLEMENTATION-REPORT.md`, `PHASE-8.2-IMPLEMENTATION-REPORT.md`)
   preserved — only the corrections above.

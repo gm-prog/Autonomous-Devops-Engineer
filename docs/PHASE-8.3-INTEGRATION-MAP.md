@@ -31,11 +31,17 @@ the first runtime-restoration commit), `dev/remediation-pr-orchestration-v1`
 Snapshot commit (common base of everything): **`f7f851393b331585e05b1d9bfa4c8965ab94cd5e`**
 (“Created using Colab”, 10 reachable commits).
 
-Commit-count precision (§16, Phase 8.3.1): the PR #7 row records the
-recon-time head `a0bf760` (Phase 8.2 historical implementation lineage =
-99 reachable commits). The current Phase 8.3 evidence branch head is
-`ee7cffb` = 101 reachable commits — the same 99-commit lineage plus two
-documentation-only commits. “99” never describes the current branch.
+Commit-count precision (§16, Phase 8.3.1 final repair): the PR #7 row
+records the recon-time head `a0bf760` (Phase 8.2 historical
+implementation lineage = 99 reachable commits, independently verified
+with `git rev-list --count`). The pre-repair Phase 8.3.1 evidence head
+was `78c3cad` = 103 reachable commits (= 99 + four documentation-only
+commits `7ead35e`, `ee7cffb`, `73be996`, `78c3cad`; verified
+`count(a0bf760..78c3cad)` = 4), subsequently advanced by further
+documentation-only commits (`4257f33`, then this corrective commit) on
+the fixed arena session branch. `ee7cffb` (101) and `73be996` (102)
+are historical intermediate documentation heads only — neither is the
+current head. “99” never describes the current branch.
 
 ## B. Actual ancestry (§4.2)
 
@@ -227,18 +233,26 @@ values match exactly (49 / 256+109 / 71+42; 559 at `a0bf760`).
 
 - `main` unchanged (`origin/main` = `7b30a56…`, untouched — recon only).
 - PR #1/#2/#4/#5/#6 not modified (no head, base, body, or state
-  changes). PR #7's historical implementation lineage was not rewritten
-  or modified; Phase 8.3 appended two documentation-only commits to the
-  fixed session branch (`a0bf760` → `ee7cffb`) and added commentary.
+  changes). PR #7 remains open and unmerged; its implementation history
+  was not rewritten, while documentation/evidence commits were appended
+  to the arena branch — documentation tail after the Phase 8.2 head:
+  `a0bf760 → 7ead35e → ee7cffb → 73be996 → 78c3cad` (four
+  documentation-only commits; `78c3cad` = pre-repair evidence head,
+  `count(a0bf760..78c3cad)` = 4), continued by `4257f33` and this
+  corrective documentation commit.
 - No force-push; no historical commit rewritten; no ref deleted.
 - Recon operations used: `fetch`, `merge-base`, `rev-list`, `ls-tree`,
   `merge-tree` (dry-run), detached checkouts in throwaway clones, and
-  test runs. No new Phase 8.3 integration ref was created or moved by
-  this phase; the fixed arena branch was legitimately advanced from
-  `a0bf760` to `ee7cffb` by two documentation-only commits (Issue A
-  correction, Phase 8.3.1).
+  test runs. No required Phase 8.3 integration ref was created or
+  moved; the fixed arena branch was legitimately advanced past
+  `a0bf760` by documentation-only commits (`7ead35e`, `ee7cffb`,
+  `73be996`, `78c3cad`, `4257f33`, and this corrective commit) — no
+  implementation commit was added or rewritten (Issue A correction,
+  Phase 8.3.1 final repair).
 - PR #7's historical implementation lineage (through `a0bf760` = 99
-  reachable commits) was preserved without rewrite; the current Phase
-  8.3 evidence branch is `ee7cffb` = 101 reachable commits (the 99 +
-  two documentation-only commits — Issue B/§16 correction, Phase
-  8.3.1).
+  reachable commits) was preserved without rewrite; the current
+  evidence/documentation head is this corrective commit on the arena
+  branch (child of `4257f33`), following the pre-repair head
+  `78c3cad` (= 99 + four documentation-only commits = 103 reachable,
+  verified). `ee7cffb` is a historical intermediate head only (Issue
+  B/§16 correction, Phase 8.3.1 final repair).
