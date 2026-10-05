@@ -23,130 +23,130 @@ SessionLocal = sessionmaker(bind=engine)
 
 @celery_app.task(name="tasks.analyze_repository_task")
 def analyze_repository_task(repo_id: int):
-    logger.info(f"Starting async Repository Analysis task for ID: {repo_id}")
+    """Run repository intelligence and AI artifact generation without exposing credentials."""
+    import json
+
     db = SessionLocal()
     try:
         repo = db.query(Repository).filter(Repository.id == repo_id).first()
         if not repo:
-            logger.error(f"Repository not found in DB: Error ID {repo_id}")
+            logger.error("Repository not found: %s", repo_id)
             return
-        
-        # Simulated 5-second intense source analysis
-        time.sleep(1)
-        repo.dockerfile = f"""# Multi-Stage Build Pipeline targetting {repo.framework} 
-FROM python:3.12-alpine as builder
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt --target /dependencies
 
-FROM python:3.12-alpine
-WORKDIR /app
-COPY --from=builder /dependencies /usr/local/lib/python3.12/site-packages
-COPY . .
-EXPOSE 8080
-USER 10001
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
-"""
-        
-        repo.k8s_yaml = f"""apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {repo.name}-deployment
-  labels:
-    app: {repo.name}
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: {repo.name}
-  template:
-    metadata:
-      labels:
-        app: {repo.name}
-    spec:
-      containers:
-      - name: app
-        image: devops-registry/{repo.name}:latest
-        ports:
-        - containerPort: 8080
-        resources:
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
-          requests:
-            cpu: "200m"
-            memory: "256Mi"
-"""
-        
-        repo.terraform_tf = f"""module "ecs_service" {{
-  source  = "terraform-aws-modules/ecs/aws"
-  version = "~> 5.0"
+        repo.status = "Analyzing"
+        db.commit()
 
-  name = "{repo.name}-cluster"
+        repo_service_url = os.getenv("REPO_SERVICE_URL", "http://repo-service:8010")
+        agent_service_url = os.getenv("AGENT_SERVICE_URL", "http://agent-service:8020")
 
-  fargate_capacity_providers = {{
-    FARGATE = {{
-      default_capacity_provider_strategy = {{
-        weight = 100
-      }}
-    }}
-  }}
-}}
-"""
-        
-        repo.pipeline_yaml = f"""name: CI/CD Pipeline
-on: [push]
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Set up Qemu
-      uses: docker/setup-qemu-action@v2
-    - name: Push Container
-      run: |
-        docker build -t devops-registry/{repo.name}:latest .
-        docker push devops-registry/{repo.name}:v1.0.0
-"""
-        
+        analysis_response = requests.post(
+            f"{repo_service_url}/api/internal/analyze",
+            json={"name": repo.name, "url": repo.url},
+            timeout=180,
+        )
+        analysis_response.raise_for_status()
+        analysis = analysis_response.json()
+
+        # Keep the catalog fields synchronized with observed source, not user-entered guesses.
+        tech = analysis.get("tech_stack", {})
+        repo.technology = tech.get("primary_language", repo.technology)
+        frameworks = tech.get("frameworks", [])
+        repo.framework = ", ".join(frameworks) if frameworks else repo.framework
+
+        ai_response = requests.post(
+            f"{agent_service_url}/api/internal/generate-iac",
+            json={"repository": analysis},
+            timeout=180,
+        )
+        ai_response.raise_for_status()
+        artifacts = ai_response.json()
+
+        required = ("dockerfile", "k8s_yaml", "terraform_tf", "pipeline_yaml", "analysis_report")
+        missing = [key for key in required if not artifacts.get(key)]
+        if missing:
+            raise ValueError(f"Agent response missing required artifacts: {', '.join(missing)}")
+
+        repo.dockerfile = artifacts["dockerfile"]
+        repo.k8s_yaml = artifacts["k8s_yaml"]
+        repo.terraform_tf = artifacts["terraform_tf"]
+        repo.pipeline_yaml = artifacts["pipeline_yaml"]
+        repo.analysis_report = (
+            f"Repository intelligence: {analysis.get('total_files', 0)} bounded source files inspected. "
+            f"Recent commits: {len(analysis.get('recent_commits', []))}. "
+            f"{artifacts['analysis_report']}"
+        )
         repo.status = "Generated"
         db.commit()
-        logger.info(f"Asynchronous code-gen completed successfully for {repo.name}")
-        
-    except Exception as e:
-        logger.error(f"Error during repository evaluation task: {e}")
+        logger.info("Real repository analysis completed for %s", repo.name)
+
+    except Exception as exc:
+        db.rollback()
+        repo = db.query(Repository).filter(Repository.id == repo_id).first()
+        if repo:
+            repo.status = "Failed"
+            repo.analysis_report = f"Repository analysis failed: {type(exc).__name__}"
+            db.commit()
+        logger.exception("Repository analysis failed for %s", repo_id)
     finally:
         db.close()
 
 @celery_app.task(name="tasks.deploy_application_task")
 def deploy_application_task(repo_id: int):
-    logger.info(f"Starting async Infrastructure deployment for Repository ID: {repo_id}")
+    """Run the deployment engine dry-run; never reports a deployment without verified execution."""
     db = SessionLocal()
     try:
         repo = db.query(Repository).filter(Repository.id == repo_id).first()
         if not repo:
+            logger.error("Repository not found: %s", repo_id)
             return
-        
-        # Simulate deployment stage ticks with logs
-        stages = [
-            "Initiating connection to AWS Kubernetes Cluster control-plane VPC...",
-            "Validating Terraform secrets configuration variables...",
-            "Applying Terraform state blueprints to provision target infrastructure...",
-            "Pushing compiled application container stages to cloud registry...",
-            "Scheduling replica sets in EKS cluster namespace...",
-            "Attaching target group metrics register nodes to Prometheus endpoint...",
-            "Running network verification endpoint calls for stable handshake...",
-            "SUCCESS: Autonomous Deployment Completed!"
-        ]
-        
-        for stage in stages:
-            logger.info(f"[{repo.name}] {stage}")
-            time.sleep(0.5)
 
-        repo.status = "Deployed"
+        repo.status = "Validating"
         db.commit()
-    except Exception as e:
-        logger.error(f"Deployment runner error: {e}")
+
+        deployment_service_url = os.getenv("DEPLOYMENT_SERVICE_URL", "http://deployment-service:8030")
+        payload = {
+            "repository_id": repo.id,
+            "repository_name": repo.name,
+            "dockerfile": repo.dockerfile or "",
+            "k8s_yaml": repo.k8s_yaml or "",
+            "terraform_tf": repo.terraform_tf or "",
+            "pipeline_yaml": repo.pipeline_yaml or "",
+        }
+
+        response = requests.post(
+            f"{deployment_service_url}/api/internal/deployments/dry-run",
+            json=payload,
+            timeout=360,
+        )
+        response.raise_for_status()
+        result = response.json()
+        state = result.get("state", "UNKNOWN")
+
+        if state == "DRY_RUN_PASSED":
+            repo.status = "DryRunPassed"
+        elif state == "VALIDATION_FAILED":
+            repo.status = "ValidationFailed"
+        elif state == "DRY_RUN_FAILED":
+            repo.status = "DryRunFailed"
+        else:
+            repo.status = "DeploymentBlocked"
+        repo.analysis_report = (
+            (repo.analysis_report or "")
+            + "\nDeployment Engine v1: "
+            + state
+            + "\n"
+            + "\n".join(result.get("logs", []))
+        )
+        db.commit()
+        logger.info("Deployment dry-run for %s finished in state %s", repo.name, state)
+    except Exception as exc:
+        db.rollback()
+        repo = db.query(Repository).filter(Repository.id == repo_id).first()
+        if repo:
+            repo.status = "DeploymentFailed"
+            repo.analysis_report = (repo.analysis_report or "") + f"\nDeployment engine failed: {type(exc).__name__}"
+            db.commit()
+        logger.exception("Deployment dry-run failed for %s", repo_id)
     finally:
         db.close()
 

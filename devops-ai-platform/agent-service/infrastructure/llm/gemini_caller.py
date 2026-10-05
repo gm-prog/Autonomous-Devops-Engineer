@@ -3,7 +3,7 @@ import requests
 import logging
 import time
 from typing import Dict, Any, List
-from ...domain.remote_llm_interface import RemoteLLMInterface
+from domain.remote_llm_interface import RemoteLLMInterface
 
 logger = logging.getLogger("GeminiCallerAdapter")
 
@@ -84,8 +84,8 @@ class GeminiCallerAdapter(RemoteLLMInterface):
             logger.warning("[OFFLINE_BYPASS] No valid Gemini API Key detected. Engaging simulator fallback...")
             return "REMEDIATION RECOMMENDATION: Add secure thread pools and close idle SQLAlchemy connections using context managers."
 
-        model_name = "gemini-3.5-flash"
-        endpoint = f"{self.base_url}/{model_name}:generateContent?key={self.api_key}"
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+        endpoint = f"{self.base_url}/{model_name}:generateContent"
         
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -98,7 +98,7 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
         for attempt in range(max_retries):
             try:
-                response = requests.post(endpoint, json=payload, timeout=30)
+                response = requests.post(endpoint, json=payload, headers={"x-goog-api-key": self.api_key}, timeout=30)
                 
                 # Check HTTP Response Statuses
                 if response.status_code == 401 or response.status_code == 403:
