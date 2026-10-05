@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 
+import json
 import logging
 from datetime import datetime
 
@@ -8,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from incident_service.application.dependencies import get_incident_repository
 from incident_service.application.failures import (
+    IncidentConcurrencyConflict,
     IncidentNotFound,
     InvalidRcaResult,
     ProposalLifecycleConflict,
@@ -24,7 +26,14 @@ from incident_service.application.services.operational_analytics_service import 
     OperationalAnalyticsService,
 )
 from incident_service.application.services.proposal_generation_service import (
+    BLOCKED_VALIDATION_FAILED,
     ProposalGenerationService,
+    _proposal_id,
+    classify_proposal_risk,
+    compute_proposal_hash,
+)
+from incident_service.application.services.proposal_execution_policy import (
+    rca_root_cause,
 )
 from incident_service.application.services.rca_evidence_pack import RcaEvidencePackBuilder
 from incident_service.application.services.hotfix_validation_service import HotfixValidationService
@@ -39,6 +48,7 @@ from incident_service.application.services.remediation_workspace_service import 
 from incident_service.application.services.remediation_target_binding import (
     RemediationTargetBindingError,
     authorize_remediation_target,
+    resolve_authoritative_deployment_target,
 )
 from incident_service.infrastructure.source_provider.github_pr_client import GitHubPRClient
 from incident_service.infrastructure.sandbox.container_validation_sandbox import (
@@ -242,7 +252,17 @@ def investigate_root_cause(
         incident.mark_root_cause_found()
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    repository.save_incident(incident)
+    try:
+        repository.save_incident(incident)
+    except IncidentConcurrencyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incident_concurrency_conflict",
+                "incident_id": exc.incident_id,
+                "expected_version": exc.expected_version,
+            },
+        ) from exc
 
     return {
         "incident_id": incident.id,
@@ -257,13 +277,32 @@ def create_remediation(
     request: RemediationRequest,
     repository: IncidentRepositoryPort = Depends(get_incident_repository),
 ):
+    """Phase 8.1 compatibility shim: canonical proposal intake ONLY.
+
+    The route validates the legacy request, resolves the trusted target
+    from this incident's DEPLOYED evidence, constructs the canonical
+    ``HotfixProposal`` (deterministic validation + canonical hash) and
+    persists it as ``PROPOSED`` — then STOPS. No orchestrator, no Git,
+    no GitHub, no PR, no deployment. Approval and execution remain the
+    canonical ``/proposal/approve`` → ``/proposal/execute`` path.
+
+    Legacy fields ``base_branch`` / ``pr_title`` / ``pr_body`` are
+    accepted for request compatibility and IGNORED — they are never
+    execution authorization. ``validation_profile`` maps deterministically
+    into the proposal's ``validation_plan``. The request's
+    ``repository_slug`` / ``source_sha`` are candidates only: they must
+    match the authoritative evidence pair or the call is rejected 403.
+    """
+    from incident_service.application.failures import (
+        IncidentConcurrencyConflict,
+    )
+
     incident = repository.get_incident_by_id(incident_id.strip())
     if incident is None:
         raise HTTPException(status_code=404, detail="Incident not found")
 
-    # Authorization boundary: the requested repository + source SHA must be
-    # provably bound to this incident's own deployment evidence, otherwise the
-    # endpoint is an arbitrary GitHub write primitive (403 before any work).
+    # Authorization boundary: requested repository + source SHA must be
+    # provably bound to this incident's own deployment evidence.
     try:
         authorize_remediation_target(
             incident=incident,
@@ -273,59 +312,146 @@ def create_remediation(
     except RemediationTargetBindingError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
+    # Canonical precondition (Phase 8): executable proposals attach only
+    # from RootCauseFound/RemediationProposed — the shim never invents an
+    # RCA to get there, and the approval-time hash recompute depends on
+    # persisted RCA evidence. Checked AFTER authorization so untrusted
+    # targets always fail 403 first.
+    if incident.status not in {"RootCauseFound", "RemediationProposed"}:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incident_not_ready_for_proposal",
+                "incident_status": incident.status,
+                "next_step": (
+                    "run POST /incidents/"
+                    f"{incident_id}/rca first; proposals attach only after "
+                    "RootCauseFound"
+                ),
+            },
+        )
+
+    target = resolve_authoritative_deployment_target(incident)
+    if target is None:
+        # authorize() just proved a record exists — defensive fail-closed.
+        raise HTTPException(
+            status_code=403,
+            detail="authoritative deployment target is not resolvable",
+        )
+    root_cause = rca_root_cause(incident)
+    if root_cause is None:
+        # Approval/execution recompute the hash from persisted RCA —
+        # an RCA-less PROPOSED proposal would be unreproducible → reject.
+        raise HTTPException(
+            status_code=409,
+            detail="RCA evidence is missing; proposal hash would not be reproducible",
+        )
+
+    evidence_refs = [str(target["evidence_id"]), f"rca-{incident.id}"]
+    validation_plan = [f"validation_profile:{request.validation_profile}"]
+    trusted_sha = str(target["source_sha"]).strip().lower()
+    trusted_repository = str(target["repository_name"])
+
     proposal = HotfixProposal(
-        id=f"remediation-{incident.id}",
+        id=_proposal_id(incident.id),
+        incident_id=incident.id,
         target_filepath=request.target_filepath,
         diff_patch_payload=request.patch,
-        source_sha=request.source_sha.strip().lower(),
+        source_sha=trusted_sha,
+        repository=trusted_repository,
+        evidence_refs=evidence_refs,
+        validation_plan=validation_plan,
     )
-    safe, violations = HotfixValidationService().validate_patch(
-        proposal,
-        request.confidence_score,
-    )
-    if not safe or not proposal.apply_verification_pass():
-        raise HTTPException(
-            status_code=422,
-            detail={"message": "remediation patch failed safety validation", "violations": violations},
-        )
 
-    # Construct the remediation pipeline only now: authorization and patch
-    # safety have passed, so an unauthorized request never instantiates the
-    # orchestrator (no workspace, no GitHub client, nothing to publish).
-    orchestrator = get_remediation_orchestrator()
+    safe, violations = HotfixValidationService().validate_patch(
+        proposal, request.confidence_score
+    )
+    patch_ok = bool(safe) and proposal.apply_verification_pass()
+    proposal.status = "PROPOSED" if patch_ok else "BLOCKED"
+    proposal.blocked_reason = "" if patch_ok else BLOCKED_VALIDATION_FAILED
+    proposal.risk_class = classify_proposal_risk(
+        confidence=request.confidence_score,
+        uncertainty=[],
+        contributing_factors=[],
+        incident_severity=incident.severity,
+        ai_suggested=None,
+        validation_ok=patch_ok,
+        violations=() if patch_ok else list(violations),
+    )
+    proposal.proposal_hash = compute_proposal_hash(
+        incident_id=incident.id,
+        root_cause=root_cause,
+        evidence_refs=evidence_refs,
+        repository=trusted_repository,
+        source_sha=trusted_sha,
+        file_paths=[proposal.target_filepath],
+        patch=proposal.diff_patch_payload,
+        validation_plan=validation_plan,
+        risk_class=proposal.risk_class,
+    )
 
     try:
-        result = orchestrator.execute(
-            incident_id=incident.id,
-            proposal=proposal,
-            repository_slug=request.repository_slug,
-            base_branch=request.base_branch,
-            validation_profile=request.validation_profile,
-            pr_title=request.pr_title,
-            pr_body=request.pr_body,
-        )
+        if patch_ok:
+            incident.upsert_remediation_proposal(proposal)
+        else:
+            incident.attach_blocked_proposal(proposal)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except RemediationOrchestrationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # Phase 8/8.1 lifecycle guard: APPROVED/EXECUTING/PR_CREATED
+        # proposals are never reset by a legacy regeneration → 409.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        repository.save_incident(incident)
+    except IncidentConcurrencyConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incident_concurrency_conflict",
+                "incident_id": exc.incident_id,
+                "expected_version": exc.expected_version,
+            },
+        ) from exc
 
-    incident.attach_remediation_proposal(proposal)
-    repository.save_incident(incident)
+    logger.info(
+        json.dumps(
+            {
+                "event": "remediation.compatibility_shim",
+                "incident_id": incident.id,
+                "proposal_id": proposal.id,
+                "proposal_status": proposal.status,
+                "incident_status": incident.status,
+                "proposal_hash": proposal.proposal_hash,
+            }
+        )
+    )
+
+    if not patch_ok:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "remediation patch failed safety validation",
+                "violations": violations,
+                "proposal_id": proposal.id,
+                "status": "BLOCKED",
+            },
+        )
+
     return {
-        "incident_id": result.incident_id,
-        "proposal_id": result.proposal_id,
-        "status": incident.status,
-        "source_sha": result.source_sha,
-        "branch": result.branch_name,
-        "commit_sha": result.commit_sha,
-        "pull_request_url": result.pull_request_url,
-        "validation": {
-            "passed": result.validation_result.passed,
-            "steps": [
-                {"name": step.name, "passed": step.passed, "exit_code": step.exit_code}
-                for step in result.validation_result.steps
-            ],
-        },
+        "incident_id": incident.id,
+        "proposal_id": proposal.id,
+        "proposal_hash": proposal.proposal_hash,
+        "status": proposal.status,
+        "incident_status": incident.status,
+        "repository": proposal.repository,
+        "source_sha": proposal.source_sha,
+        "target_filepath": proposal.target_filepath,
+        "risk_class": proposal.risk_class,
+        "compatibility_shim": True,
+        "executed": False,
+        "next_step": (
+            "approve the exact proposal_hash via POST "
+            f"/incidents/{incident.id}/proposal/approve, then execute via "
+            f"POST /incidents/{incident.id}/proposal/execute"
+        ),
     }
 
 
@@ -380,6 +506,16 @@ def generate_remediation_proposal(
         # Phase 8 §4: APPROVED/EXECUTING/PR_CREATED proposals are never
         # reset to PROPOSED by regeneration — explicit 409, no coercion.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IncidentConcurrencyConflict as exc:
+        # Phase 8.1: stale aggregate write — truthful 409, nothing saved.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incident_concurrency_conflict",
+                "incident_id": exc.incident_id,
+                "expected_version": exc.expected_version,
+            },
+        ) from exc
     except ProposalPersistenceFailed as exc:
         raise HTTPException(
             status_code=503,
@@ -461,6 +597,7 @@ def approve_proposal(
     """
     from incident_service.application.failures import (
         ApprovalPolicyError,
+        IncidentConcurrencyConflict,
         ProposalIntegrityError,
         ProposalNotFoundError,
         ProposalStaleError,
@@ -474,6 +611,16 @@ def approve_proposal(
             proposal_hash=request.proposal_hash,
             approved_by=request.approved_by,
         )
+    except IncidentConcurrencyConflict as exc:
+        # Phase 8.1: another writer won the aggregate race — truthful 409.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incident_concurrency_conflict",
+                "incident_id": exc.incident_id,
+                "expected_version": exc.expected_version,
+            },
+        ) from exc
     except ProposalNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ApprovalPolicyError as exc:
@@ -503,6 +650,7 @@ def execute_proposal(
         ApprovalPolicyError,
         ExecutionLeaseUnavailable,
         ExistingPullRequestConflict,
+        IncidentConcurrencyConflict,
         ProposalAlreadyExecutingError,
         ProposalExecutionFailedError,
         ProposalIntegrityError,
@@ -540,6 +688,17 @@ def execute_proposal(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (ProposalNotApprovedError, ProposalAlreadyExecutingError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IncidentConcurrencyConflict as exc:
+        # Phase 8.1: durable aggregate changed under this execution
+        # attempt — reload and decide; nothing is silently forced.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "incident_concurrency_conflict",
+                "incident_id": exc.incident_id,
+                "expected_version": exc.expected_version,
+            },
+        ) from exc
     except (
         ExecutionLeaseUnavailable,
         RemoteBranchConflict,
