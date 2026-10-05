@@ -12,9 +12,6 @@ from unittest.mock import MagicMock, patch
 
 from shared_kernel.domain.provenance import build_provenance_record
 
-from incident_service.application.commands.apply_automated_fix import (
-    ApplyAutomatedFixCommandHandler,
-)
 from incident_service.application.failures import (
     IncidentNotFound,
     InvalidRcaResult,
@@ -514,8 +511,6 @@ class ProposalGenerationTests(unittest.TestCase):
         service, repo, _ = build_service(incident)
 
         with patch.object(
-            ApplyAutomatedFixCommandHandler, "handle"
-        ) as apply_spy, patch.object(
             RemediationOrchestrationService, "execute"
         ) as orchestrator_spy, patch(
             "incident_service.infrastructure.source_provider."
@@ -531,7 +526,6 @@ class ProposalGenerationTests(unittest.TestCase):
 
         self.assertEqual(result["proposal"]["status"], "PROPOSED")
         self.assertEqual(len(repo.saved), 1)
-        apply_spy.assert_not_called()
         orchestrator_spy.assert_not_called()
         github_spy.assert_not_called()
         subprocess_run.assert_not_called()

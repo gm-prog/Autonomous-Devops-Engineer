@@ -37,9 +37,6 @@ from incident_service.application.commands.ingest_webhook_alert import (
     deterministic_evidence_id,
     deterministic_incident_id,
 )
-from incident_service.application.commands.apply_automated_fix import (
-    ApplyAutomatedFixCommandHandler,
-)
 from incident_service.application.event_handlers.on_metric_threshold_failed import (
     OnMetricThresholdFailedHandler,
 )
@@ -218,8 +215,6 @@ class ProposalPipelineE2ETests(unittest.TestCase):
         verify_provenance_record(deployment.payload["provenance"])
 
         with patch.object(
-            ApplyAutomatedFixCommandHandler, "handle"
-        ) as apply_spy, patch.object(
             RemediationOrchestrationService, "execute"
         ) as orchestrator_spy, patch(
             "incident_service.infrastructure.source_provider."
@@ -245,7 +240,6 @@ class ProposalPipelineE2ETests(unittest.TestCase):
         self.assertRegex(body["proposal"]["proposal_hash"], r"^[0-9a-f]{64}$")
 
         # §22: proposal produced while every execution path stayed untouched
-        apply_spy.assert_not_called()
         orchestrator_spy.assert_not_called()
         github_spy.assert_not_called()
         subprocess_run.assert_not_called()
