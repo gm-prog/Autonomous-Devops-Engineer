@@ -7,7 +7,16 @@ class IncidentRepositoryPort(ABC):
     """Port interface locking database logic from application transaction workflows."""
     @abstractmethod
     def save_incident(self, incident: IncidentAggregate) -> None:
-        pass
+        """Persist the aggregate under optimistic concurrency (Phase 8.1).
+
+        The aggregate carries the durable ``version`` it was loaded at.
+        Implementations MUST use the database write predicate as the
+        authoritative freshness gate (``UPDATE ... WHERE id AND
+        version``) and raise ``IncidentConcurrencyConflict`` when zero
+        rows match — a stale write is rejected, never silently applied,
+        and there is no force/bypass flag for ordinary paths.
+        Successful saves advance ``incident.version`` exactly once.
+        """
 
     @abstractmethod
     def get_incident_by_id(self, id: str) -> Optional[IncidentAggregate]:
