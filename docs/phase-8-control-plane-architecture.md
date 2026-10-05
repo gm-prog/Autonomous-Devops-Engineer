@@ -82,13 +82,40 @@ Why a shim is required at all: today the route
 
 That is a second destructive path capable of bypassing approval (§1/§3).
 
-**Shim contract (Phase 8 work):** the route keeps its request shape, keeps
-404/403/422 semantics, but instead of executing it **creates the canonical
-persisted proposal** (validated, hashed, `status=PROPOSED`, incident promoted
-to `RemediationProposed`) and returns the proposal identity plus the required
-next steps (approve exact hash → execute). No Git/GitHub side effect may occur
-on this route afterwards. Existing route tests are updated to complete the
-canonical journey (approve → execute) — the bypass is closed, not preserved.
+**Shim contract — IMPLEMENTED (Phase 8.1).** The route keeps its request
+shape and its 404/403/422 semantics, but instead of executing it now
+**creates the canonical persisted proposal** and stops there:
+
+```text
+POST /v1/incidents/{id}/remediation
+  → 404 unknown incident
+  → 403 evidence-binding authorize (orchestrator provider NEVER constructed)
+  → 409 incident not ready for proposal (must be RootCauseFound/RemediationProposed,
+        with persisted rca_result evidence — the shim never invents an RCA)
+  → 422 validation BLOCKED (persisted first, status BLOCKED)
+  → 200 {incident_id, proposal_id, proposal_hash, status: PROPOSED,
+          incident_status: RemediationProposed, repository, source_sha
+          (trusted, from evidence), target_filepath, risk_class,
+          compatibility_shim: true, executed: false, next_step}
+```
+
+Legacy fields (`base_branch`, `pr_title`, `pr_body`, `validation_profile`)
+are accepted for request compatibility and are **never authoritative**:
+repository/SHA come only from the incident's DEPLOYED evidence via
+`resolve_authoritative_deployment_target`; the proposal is hashed with the
+canonical `compute_proposal_hash`; validation runs through the existing
+`HotfixValidationService` (no duplicated validation logic). The handler
+contains no clone/checkout/apply/commit/push/branch/PR/deploy code and
+never calls `get_remediation_orchestrator()` — proven by spy tests in
+`incident_service/presentation/rest/test_remediation_authorization.py`
+(§3.8 tests 1/2/3/4/6, §35 self-approval, §36 param abuse) and
+`tests/test_control_plane_e2e.py` / `tests/test_deployment_to_remediation_e2e.py`
+(shim behavior at the gateway and over the full HTTP deployment chain).
+Repeated calls converge on the single logical proposal
+`proposal-{incident_id}` (no second proposal, no second PR).
+Existing route tests were updated to assert PROPOSED + zero side effects —
+the bypass is closed, not preserved. Canonical journey after the shim:
+approve exact hash → execute (both tested through the real services).
 
 ## State machines (as-is, formalized)
 
@@ -127,10 +154,10 @@ As-is deltas to implement in Phase 8 (currently **implemented** partially):
 | Required transition | As-is | Phase 8 action |
 | --- | --- | --- |
 | `Raised → Triage` | implemented (`move_to_triage`, silent no-op elsewhere) | keep + reject illegal calls |
-| `Triage → Investigating` | **missing** (no code sets `Investigating`; the RCA endpoint jumps `Triage → RootCauseFound` in one call) | add explicit transition + wire RCA flow through it |
+| `Triage → Investigating` | **implemented** (Phase 8: explicit `begin_investigation`, wired through the RCA endpoint `controllers.py:251` and proposal generation) | covered by lifecycle tests |
 | `… → RootCauseFound` | implemented (guards `Triage`/`Investigating`) | unchanged |
 | `RootCauseFound → RemediationProposed` | implemented on verified proposal attach; BLOCKED proposals never promote | unchanged |
-| `RemediationProposed → RemediationPRCreated` | **missing** (execution never promotes the incident) | add guarded transition on PR_CREATED persistence |
+| `RemediationProposed → RemediationPRCreated` | **implemented** (Phase 8: guarded `mark_remediation_pr_created` inside the same compare-and-set transaction as PR_CREATED persistence — `finish_execution_lease`) | covered by execution + Phase 8.1 §11 tests |
 | invalid transitions | some raise `ValueError`, some silently no-op | make rejection explicit and tested (§40 matrix) |
 
 `RemediationVerified` (pre-existing extra state used by
@@ -171,7 +198,38 @@ carries only `incident_id`, `proposal_id`, `proposal_hash`).
 Durable (SQLAlchemy, restart-safe): incidents, evidence, proposals (JSON on
 incident row with per-proposal mapping), proposal hashes, statuses, approval
 identity/timestamps, PR URL, execution timestamps, execution claims/leases
-(`execution_claims` table).
+(`execution_claims` table), and — since Phase 8.1 — the aggregate
+**`version`** column (`INTEGER NOT NULL DEFAULT 0`) used as the durable
+optimistic-concurrency revision of the incident row.
+
+## Concurrency model (Phase 8.1 — IMPLEMENTED, tested locally)
+
+Full treatment: [`docs/phase-8-concurrency-model.md`](phase-8-concurrency-model.md).
+Summary:
+
+- every `devops_incidents` write is gated by
+  `UPDATE … WHERE id = :id AND version = :expected` with a rowcount
+  check (the correctness gate is the **SQL predicate**, evaluated by the
+  database — no SELECT-compare-UPDATE, no N+1, no client-side guessing);
+- creation persists `version = 0`; each successful update advances it by
+  exactly one inside the same transaction as the business write; failed
+  or rejected writes change nothing (no partial evidence/proposal rows);
+- stale writers receive typed `IncidentConcurrencyConflict` → HTTP
+  `409 {"error": "incident_concurrency_conflict", …}` — never a silent
+  `200`, never an auto-reload-retry, no `force` flag;
+- schema evolution is idempotent (`ALTER TABLE … ADD COLUMN version …`
+  only when missing; tables never dropped/recreated; existing
+  proposals/evidence/claims preserved) and covered by migration tests
+  (fresh / legacy upgrade / rerun);
+- execution lease/claim CAS and the atomic terminal transaction
+  (PR_CREATED + incident promotion + claim FREE + evidence, one
+  transaction) are preserved; the lease predicate does not include
+  `version`, so the two CAS layers do not fight;
+- delivery semantics remain **at-least-once + idempotency + CAS +
+  lease + reconciliation + fail-closed**. The word "exactly-once" is
+  never used for delivery or execution; the only "exactly once" claims
+  are about version increments per successful transaction, which the
+  tests assert.
 
 Process-local (known limitations, to be confirmed in the report): in-process
 locks (`threading`) as a *secondary* guard alongside durable claims; any
@@ -196,7 +254,9 @@ each at the smallest fitting level (§39).
 
 ## Gap register (work items for this phase)
 
-1. `/remediation` shim conversion (close the approval bypass) + tests.
+1. ~~`/remediation` shim conversion (close the approval bypass) + tests.~~
+   **IMPLEMENTED (Phase 8.1)** — see the shim contract in §B and the
+   concurrency/audit notes below; spy-proven zero execution side effects.
 2. Incident lifecycle: `Investigating` entry, `RemediationPRCreated` promotion,
    explicit rejection of illegal transitions + §40 matrix tests.
 3. Milestone E2E (§28) and blocked-path E2E (§29) as single deterministic tests.
