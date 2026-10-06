@@ -11,6 +11,11 @@ services:
     image: ${E2E_QDRANT_IMAGE:?E2E_QDRANT_IMAGE must be a name@sha256:<64hex> reference}
 
   agent-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./agent_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
     environment:
       - E2E_DETERMINISTIC_RCA=true
 
@@ -52,3 +57,34 @@ services:
       # bind source the sandbox requests exists on the daemon host.
       # Dedicated single directory only — never all of /tmp.
       - /tmp/ares-e2e-workspaces:/tmp/ares-e2e-workspaces
+
+  # Phase 8.4.2-D §6.2: every production Dockerfile that the E2E
+  # workflow would otherwise build is redirected to an E2E-specific
+  # digest-controlled Dockerfile. Production Dockerfiles stay
+  # tag-based by design and are NOT built by this workflow.
+  api-gateway:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./api_gateway/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+  repo-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./repo_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+  monitoring-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./monitoring_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+  incident-event-worker:
+    build:
+      context: ./devops-ai-platform
+      # reuse the incident E2E image (same source tree; compose `command`
+      # selects the worker entrypoint at runtime)
+      dockerfile: ./incident_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}

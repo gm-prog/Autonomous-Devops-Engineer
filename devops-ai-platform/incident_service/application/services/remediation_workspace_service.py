@@ -446,10 +446,20 @@ class RemediationWorkspaceService:
                 "Git command arguments must not contain NUL bytes"
             )
 
+        # Phase 8.4.2-D §11 (P2): the raw OAuth token is never needed by
+        # a child git process — authentication travels exclusively via
+        # GIT_CONFIG_* http.extraHeader supplied in ``extra_env`` for
+        # remote operations. Strip it from EVERY child environment so no
+        # unrelated git command can inherit raw token material.
         env = {
             key: value
             for key, value in os.environ.items()
-            if key not in {"GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+            if key not in {
+                "GIT_SSH_COMMAND",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+                "GITHUB_OAUTH_TOKEN",
+            }
         }
         env["GIT_TERMINAL_PROMPT"] = "0"
         if extra_env:

@@ -1041,7 +1041,8 @@ class Harness:
         overall = H.classify_gate([{"result": s.result()} for s in self.stages])
         if overall == H.PASS:
             overall = H.PASS
-        H.finalize_manifest(self.manifest, overall)
+        # Phase 8.4.2-D §9: a live PASS must carry complete provenance.
+        H.finalize_execution_manifest(self.manifest, overall)
         H.dump_json(os.path.join(ARTIFACTS, "e2e-manifest.json"), self.manifest)
         lines = ["# E2E golden path summary", "",
                  f"Result: **{overall}**", "", "| Stage | Result |", "| --- | --- |"]

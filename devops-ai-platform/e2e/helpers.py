@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 SCHEMA = "ares.e2e.golden-path/1"
 
@@ -39,6 +39,84 @@ _SECRET_PATTERNS: Sequence[re.Pattern[str]] = (
                r"(?!\[REDACTED-NON-SECRET\])\S+"),
     re.compile(r"x-access-token:[^@\s]+@"),
 )
+
+
+_PIN_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._/:-]*$")
+_PIN_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PIN_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def parse_pinned_images(text: str) -> List[Tuple[str, str, str]]:
+    """Parse pinned-images.txt strictly (Phase 8.4.2-D §5).
+
+    Every non-comment entry must be ``<name> <sha256:64hex> <ENV_KEY>``.
+    A pin of anything else — the retired sentinel value, a malformed
+    digest, a missing column, an unknown key — raises ``ValueError``
+    (fail-closed; there is no tag fallback).
+    """
+    entries: List[Tuple[str, str, str]] = []
+    seen_keys: set = set()
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            raise ValueError(
+                f"pin line {lineno}: expected 3 columns, got {len(parts)}"
+            )
+        name, pin, key = parts
+        if not _PIN_NAME_PATTERN.fullmatch(name) or "@" in name:
+            raise ValueError(f"pin line {lineno}: bad image name {name!r}")
+        if not _PIN_DIGEST_PATTERN.fullmatch(pin):
+            raise ValueError(
+                f"pin line {lineno}: pin must be sha256:<64hex>, got {pin!r}"
+            )
+        if not _PIN_KEY_PATTERN.fullmatch(key):
+            raise ValueError(f"pin line {lineno}: bad env key {key!r}")
+        if key in seen_keys:
+            raise ValueError(f"pin line {lineno}: duplicate env key {key!r}")
+        seen_keys.add(key)
+        entries.append((name, pin, key))
+    if not entries:
+        raise ValueError("pinned-images.txt contains no entries")
+    return entries
+
+
+# Fields a live PASS execution must carry as non-empty scalars
+# (Phase 8.4.2-D §7/§9). NOT_VERIFIED/BLOCKED manifests may omit them.
+EXECUTION_PROVENANCE_FIELDS: Tuple[str, ...] = (
+    "source_sha",
+    "fixture_seed_sha",
+    "workspace_root",
+    "registry_image_digest",
+    "kind_node_image_digest",
+    "base_images",
+    "built_image_digests",
+    "sandbox_image_digest",
+)
+
+
+def finalize_execution_manifest(manifest: Dict[str, Any], result: str) -> Dict[str, Any]:
+    """Live-execution finalization gate (Phase 8.4.2-D §9).
+
+    A PASS result is REJECTED (downgraded to FAIL with an auditable
+    ``provenance_rejection`` reason) when any required provenance field
+    is empty. NOT_VERIFIED/BLOCKED/FAIL results remain representable so
+    preflight and never-started runs keep working.
+    """
+    if result == PASS:
+        missing = [
+            field
+            for field in EXECUTION_PROVENANCE_FIELDS
+            if not str(manifest.get(field) or "").strip()
+        ]
+        if missing:
+            result = FAIL
+            manifest["provenance_rejection"] = (
+                "PASS rejected: empty provenance fields: " + ",".join(missing)
+            )
+    return finalize_manifest(manifest, result)
 
 
 def validate_sha40(value: Any) -> bool:

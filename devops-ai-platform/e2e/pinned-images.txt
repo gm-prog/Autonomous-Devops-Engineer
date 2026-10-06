@@ -1,15 +1,16 @@
-# Immutable build inputs (Phase 8.4.2-C §9).
-# format: <source-name> <digest-ref-or-UNRESOLVED> <exported-env-key>
-# The workflow resolves UNRESOLVED entries to their authoritative manifest
-# digests from the registry at dispatch time, pulls everything BY DIGEST,
-# and exports the resolved refs under the given env keys (never invents
-# digests; never builds from tags). The env key is validated against a
-# strict [A-Z0-9_] pattern before export. Source names live ONLY here so
-# the workflow text contains no bare image tags.
-# ORDER-SENSITIVE? no — the key column is authoritative.
-python:3.11-slim UNRESOLVED E2E_PYTHON_BASE_IMAGE
-postgres:15-alpine UNRESOLVED E2E_POSTGRES_IMAGE
-redis:7-alpine UNRESOLVED E2E_REDIS_IMAGE
-qdrant/qdrant:v1.12.4 UNRESOLVED E2E_QDRANT_IMAGE
-registry:2 UNRESOLVED REGISTRY_IMAGE
-kindest/node:v1.31.4 UNRESOLVED NODE_IMAGE
+# Immutable build inputs (Phase 8.4.2-D §5) — repository-controlled pins.
+# format: <source-name> <sha256:manifest-digest> <exported-env-key>
+#
+# Digests are the authoritative tag-manifest (index) digests obtained from
+# the Docker Hub Hub API tag lookup (https://hub.docker.com/v2/repositories/
+# <namespace>/<name>/tags/<tag>, top-level "digest" + "media_type" fields)
+# fetched 2026-10-06; kindest/node:v1.31.4's list digest additionally
+# matches the value published by the kind project. The workflow pulls ONLY
+# name@sha256:<64hex> from this file — there is no dispatch-time tag
+# resolution and no fallback. Updating a pin requires a reviewed commit.
+python:3.11-slim sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce E2E_PYTHON_BASE_IMAGE
+postgres:15-alpine sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81 E2E_POSTGRES_IMAGE
+redis:7-alpine sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 E2E_REDIS_IMAGE
+qdrant/qdrant:v1.12.4 sha256:241edb9d7778327516ef218f8c74e1bd61b5ea42cd4f193cb8d0896199705636 E2E_QDRANT_IMAGE
+registry:2 sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373 REGISTRY_IMAGE
+kindest/node:v1.31.4 sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30 NODE_IMAGE
