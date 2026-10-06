@@ -121,8 +121,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker version --format 'docker server {{.Server.Version}}'
-          docker buildx version
+          EV=/tmp/e1-evidence.txt
+          : > "$EV"
+          {
+            docker version --format 'docker server {{.Server.Version}}'
+            docker buildx version
+          } | tee -a "$EV"
           # the SAME committed digest the golden-path harness consumes
           PINS=devops-ai-platform/e2e/pinned-images.txt
           BASE="$(PYTHONPATH=devops-ai-platform python3 -m e2e.image_pins "$PINS" --refs \
@@ -131,21 +135,24 @@ jobs:
             | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[0-9a-f]{64}$' || {
             echo "::error::committed base pin is not digest-addressed: ${BASE}"
             exit 1; }
-          echo "committed BASE_IMAGE = ${BASE}"
+          echo "committed BASE_IMAGE = ${BASE}" | tee -a "$EV"
           # (static) one shared definition of the contract: no Compose-only
           # `:?`/`?` form, no default, no fallback, no second base source,
           # pinned parser directives. Real BuildKit proves the syntax below.
-          PYTHONPATH=devops-ai-platform python3 -m e2e.build_surfaces --validate
+          PYTHONPATH=devops-ai-platform python3 -m e2e.build_surfaces --validate \
+            | tee -a "$EV"
           FAILURES=0
           CHECKED=0
           while read -r DF CTX <&3; do
             [ -n "${DF:-}" ] || continue
             CHECKED=$((CHECKED + 1))
             echo "::group::${DF}"
+            POS=fail
+            NEG=fail
             # (A) a valid digest build argument must pass real BuildKit
             if docker buildx build --check \
                  --build-arg BASE_IMAGE="$BASE" -f "$DF" "$CTX"; then
-              echo "positive check OK: ${DF}"
+              POS=pass
             else
               echo "::error file=${DF}::BuildKit rejected the Dockerfile with a valid digest BASE_IMAGE"
               FAILURES=$((FAILURES + 1))
@@ -156,15 +163,18 @@ jobs:
               echo "::error file=${DF}::built without BASE_IMAGE — a default or fallback exists"
               FAILURES=$((FAILURES + 1))
             else
-              echo "negative check OK (missing BASE_IMAGE rejected): ${DF}"
+              NEG=rejected
+              NEG_MSG="$(grep -aoiE 'base name[^"]{0,80}|ERROR: [^"]{0,90}' /tmp/e1-neg.log | head -n 1 || true)"
+              [ -n "${NEG_SAMPLE:-}" ] || NEG_SAMPLE="$NEG_MSG"
               tail -n 3 /tmp/e1-neg.log
             fi
+            echo "${DF}: digest-arg=${POS} no-arg=${NEG}" | tee -a "$EV"
             echo "::endgroup::"
           done 3< <(PYTHONPATH=devops-ai-platform python3 -m e2e.build_surfaces --plan)
           # (C) live mutation probe: the historical Phase 8.4.2-D form must
           # still be rejected by this BuildKit, so the gate above cannot
           # pass merely because the parser got more permissive.
-          echo "::group::mutation probe — historical \${BASE_IMAGE:?…} form"
+          echo "::group::mutation probe — historical required-value form in FROM"
           MUT="$(mktemp -d)"
           {
             head -n 1 devops-ai-platform/e2e/sandbox/Dockerfile
@@ -178,11 +188,18 @@ jobs:
             echo "::error::BuildKit ACCEPTED the unsupported \${BASE_IMAGE:?…} form — regression gate assumption broken"
             FAILURES=$((FAILURES + 1))
           else
-            echo "mutation probe rejected as required:"
-            tail -n 5 "$MUT/out.log"
+            cat "$MUT/out.log"
+            MUT_MSG="$(grep -aoiE 'ERROR: [^"]{0,120}|unsupported modifier[^"]{0,60}' "$MUT/out.log" | head -n 1 || true)"
+            echo "mutation probe rejected: ${MUT_MSG}" | tee -a "$EV"
           fi
           rm -rf "$MUT"
           echo "::endgroup::"
-          echo "E2E Dockerfiles checked: ${CHECKED}; failures: ${FAILURES}"
+          echo "negative-check sample: ${NEG_SAMPLE:-none}" | tee -a "$EV"
+          echo "surfaces checked=${CHECKED} failures=${FAILURES}" | tee -a "$EV"
           [ "$CHECKED" -eq 8 ] || { echo "::error::expected 8 E2E build surfaces"; exit 1; }
           [ "$FAILURES" -eq 0 ] || exit 1
+          # publish the evidence where it survives log retention and is
+          # readable through the API (job logs are not)
+          cat "$EV" >> "$GITHUB_STEP_SUMMARY"
+          MSG="$(python3 -c "import sys; print(open(sys.argv[1]).read().replace('%','%25').replace('\r','%0D').replace('\n','%0A'))" "$EV")"
+          echo "::notice title=E2E Dockerfile BuildKit contract::${MSG}"
