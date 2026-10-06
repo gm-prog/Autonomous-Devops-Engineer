@@ -151,7 +151,8 @@ jobs:
           # live only in that file, so this workflow text holds no image tag.
           PYTHONPATH=devops-ai-platform python3 -m e2e.image_pins "$PINS" --refs \
             > /tmp/e2e-image-refs.txt
-          while read -r KEY REF; do
+          # fd 3 keeps the pin list out of the loop body's stdin
+          while read -r KEY REF <&3; do
             [ -n "${KEY:-}" ] || continue
             printf '%s' "$REF" \
               | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$' || {
@@ -166,7 +167,7 @@ jobs:
             echo "${KEY}=${REF}" >> "$GITHUB_ENV"
             printf '%s %s\n' "$KEY" "$REF" \
               >> "$E2E_ARTIFACT_DIR/image-provenance-inputs.txt"
-          done < /tmp/e2e-image-refs.txt
+          done 3< /tmp/e2e-image-refs.txt
           # §7: manifest provenance for the external inputs (registry, kind
           # node, base images) comes from the SAME committed pins and is
           # exported here — upstream of the driver, never patched afterwards.
