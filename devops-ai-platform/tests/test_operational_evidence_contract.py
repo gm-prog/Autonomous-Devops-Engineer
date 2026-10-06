@@ -400,9 +400,21 @@ class TestCorrelationRules:
         )
 
     def test_rule5_repository_commit_binding(self):
+        """R5 binds only when the commit carries an explicit matching scope.
+
+        A bare commit has no environment, and R7 refuses to bind evidence of
+        unknown environment to an explicitly scoped anchor. The caller must
+        therefore assert which deployed scope the commit relates to before
+        the weaker repository+commit rule becomes available.
+
+        The commit here is attributed to a sibling service in the same
+        monorepo and the same environment, so the stronger service+scope
+        rule (R4) does not apply and R5 is what actually binds it.
+        """
         commit = GitHubEvidenceSource().collect(
             repository=REPO, commit_sha=SHA_A, observed_at=T0 - timedelta(days=2),
             collected_at=T0, message="fix: tune pool",
+            service_name="payments", environment="production",
         )[0]
         incident = IncidentEvidenceSource().collect(
             incident_id="inc-900", service_name="checkout", environment="production",
@@ -432,6 +444,73 @@ class TestCorrelationRules:
         assert pack.summary["binding_rules"][commit.evidence_id] == (
             "R5-repository-commit-binding"
         )
+
+    def _repo_commit_anchor(self, incident_id: str):
+        """An incident anchor that references a repository and commit."""
+        incident = IncidentEvidenceSource().collect(
+            incident_id=incident_id, service_name="checkout",
+            environment="production", observed_at=T0, collected_at=T0,
+        )[0]
+        return EvidenceItem(
+            observation_type=incident.observation_type,
+            provenance=incident.provenance, observed_at=incident.observed_at,
+            collected_at=incident.collected_at,
+            service_identity=incident.service_identity, incident_id=incident_id,
+            correlation_keys=incident.correlation_keys + (
+                CorrelationKey(
+                    key_type=CorrelationKeyType.REPOSITORY,
+                    value=RepositoryIdentity.parse(REPO).qualified_name,
+                    source=SourceType.INCIDENT_SERVICE,
+                ),
+                CorrelationKey(
+                    key_type=CorrelationKeyType.COMMIT_SHA, value=SHA_A,
+                    source=SourceType.INCIDENT_SERVICE,
+                ),
+            ),
+            payload=dict(incident.payload),
+        )
+
+    def test_rule5_does_not_fire_for_a_commit_of_unknown_environment(self):
+        """The exact regression the environment correction introduced.
+
+        A commit collected without an asserted scope must stay unbound: an
+        unknown environment is not evidence of being production.
+        """
+        bare_commit = GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=SHA_A, observed_at=T0 - timedelta(days=2),
+            collected_at=T0, message="fix: tune pool",
+        )[0]
+        assert bare_commit.environment is None
+        anchor = self._repo_commit_anchor("inc-901")
+        pack = OperationalCorrelationEngine().correlate(
+            incident_id="inc-901", evidence_items=[bare_commit, anchor],
+            generated_at=T0,
+        )
+        assert bare_commit.evidence_id not in pack.summary["binding_rules"]
+        # retained as evidence, simply not correlated
+        assert bare_commit.evidence_id in {i.evidence_id for i in pack.evidence_items}
+
+    def test_rule5_never_crosses_an_environment_boundary(self):
+        staging_commit = GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=SHA_A, observed_at=T0 - timedelta(days=2),
+            collected_at=T0, message="fix: tune pool",
+            service_name="payments", environment="staging",
+        )[0]
+        anchor = self._repo_commit_anchor("inc-902")
+        pack = OperationalCorrelationEngine().correlate(
+            incident_id="inc-902", evidence_items=[staging_commit, anchor],
+            generated_at=T0,
+        )
+        assert staging_commit.evidence_id not in pack.summary["binding_rules"]
+
+    def test_git_evidence_rejects_half_a_service_identity(self):
+        for kwargs in ({"service_name": "checkout"}, {"environment": "production"}):
+            with pytest.raises(EvidenceError) as exc:
+                GitHubEvidenceSource().collect(
+                    repository=REPO, commit_sha=SHA_A, observed_at=T0,
+                    collected_at=T0, **kwargs
+                )
+            assert exc.value.code is EvidenceErrorCode.INVALID_IDENTITY
 
     def test_rule6_temporal_fallback_is_labelled_and_never_causal(self):
         incident = IncidentEvidenceSource().collect(

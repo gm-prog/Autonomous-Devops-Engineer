@@ -388,8 +388,39 @@ class GitHubEvidenceSource(EvidenceSourceAdapter):
         workflow_run_id: Optional[str] = None,
         message: Optional[str] = None,
         incident_id: Optional[str] = None,
+        service_name: Optional[str] = None,
+        environment: Optional[str] = None,
     ) -> Sequence[EvidenceItem]:
+        """Normalize one Git/GitHub object.
+
+        A commit is not, by itself, scoped to a runtime environment: the same
+        SHA can be running in staging and production at once, or nowhere at
+        all. ``service_name``/``environment`` are therefore optional, and the
+        caller supplies them only when it can actually assert which deployed
+        scope the object relates to.
+
+        That assertion matters, because the correlation engine refuses to
+        bind evidence of unknown environment to an explicitly scoped anchor
+        (R7). Git evidence collected without an environment stays available
+        in the pack and correlates on exact identity, but it will not reach
+        the weaker repository+commit rule — which is the intended
+        fail-closed behaviour, not an oversight.
+
+        Supplying only one half of the service identity is rejected rather
+        than half-applied.
+        """
         repo_identity = RepositoryIdentity.parse(repository)
+        if (service_name is None) != (environment is None):
+            raise EvidenceError(
+                EvidenceErrorCode.INVALID_IDENTITY,
+                "service_name and environment must be supplied together: a "
+                "service identity without an environment cannot be scoped",
+            )
+        service = (
+            self._service(service_name, environment)
+            if service_name is not None
+            else None
+        )
         observation = (
             ObservationType.GIT_COMMIT
             if event_type == "commit"
@@ -419,6 +450,7 @@ class GitHubEvidenceSource(EvidenceSourceAdapter):
             ),
             observed_at=observed_at,
             collected_at=collected_at,
+            service_identity=service,
             incident_id=incident_id,
             correlation_keys=self._keys(
                 (
@@ -426,6 +458,12 @@ class GitHubEvidenceSource(EvidenceSourceAdapter):
                     (CorrelationKeyType.COMMIT_SHA, commit_sha),
                     (CorrelationKeyType.WORKFLOW_RUN_ID, workflow_run_id),
                     (CorrelationKeyType.INCIDENT_ID, incident_id),
+                    (CorrelationKeyType.SERVICE_NAME, service_name),
+                    (CorrelationKeyType.ENVIRONMENT, environment),
+                    (
+                        CorrelationKeyType.SERVICE_SCOPE,
+                        service.scope if service is not None else None,
+                    ),
                 )
             ),
             payload=payload,
