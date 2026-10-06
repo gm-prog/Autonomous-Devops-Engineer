@@ -351,7 +351,7 @@ sandbox run and the manifest remain **NOT VERIFIED**.
 | # | Mutation | Required outcome | Observed |
 |---|---|---|---|
 | **A** | Workflow absent from default branch | `WORKFLOW_PUBLICATION_FAILURE` | **CONFIRMED LIVE** — this is the current state: dispatch → HTTP 404 (§7) |
-| **B** | `E2E_JWT_SECRET` missing | blocked pre-execution | **CONFIRMED** — workflow step 2 exits 1 with `protected e2e-staging secrets are not provisioned`, before toolchain install, build and kind; `golden_path.preflight()` independently returns `BLOCKED` |
+| **B** | `E2E_JWT_SECRET` availability | blocked pre-execution when withheld | **STATIC GUARD BEHAVIOR CONFIRMED** — when the required secret is withheld in the workflow/preflight mutation, the secret gate exits 1 before toolchain install, build and kind; `golden_path.preflight()` independently returns `BLOCKED`. This proves the fail-closed guard behavior only; it does **not** prove the GitHub environment secret is absent or establish live E2E execution |
 | **C** | Mutable tag in pins | hard fail pre-build | **CONFIRMED — 7/7 variants rejected** by `parse_pinned_images`: mutable tag, `UNRESOLVED` sentinel, truncated digest, `latest`, dropped pin column, removed required key, duplicate env key |
 | **D** | Malformed `fixture_seed_sha` | preflight failure | **CONFIRMED** — `validate_sha40` rejects empty, non-hex, 39-char, 41-char, uppercase and `g…`; accepts only 40 lowercase hex. Workflow re-checks with `grep -Eq '^[0-9a-f]{40}$'` |
 | **E** | Blanked provenance field | manifest FAIL | **CONFIRMED — all 8 fields** (`source_sha`, `fixture_seed_sha`, `workspace_root`, `registry_image_digest`, `kind_node_image_digest`, `base_images`, `built_image_digests`, `sandbox_image_digest`) individually downgrade PASS→FAIL with `provenance_rejection` set |
@@ -383,7 +383,7 @@ spellings is rejected; `gm-prog/ares-e2e-fixture` is accepted.
 | 7 | The available credential is an App installation token that cannot create dispatch events | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
 | 8 | `main` is **divergent** from this line (common ancestor `f7f8513`; at the audited head `a6032808`, head ahead 121, `main` ahead 2 — historical figures, see §15 for live state); whether the platform supersedes `main`'s prototype is a repository-policy decision | `INTEGRATION_FAILURE` (deliberately not auto-resolved) | repository owner |
 
-Blockers 1–7 must all clear before a first live run is even attemptable, in that order.
+Blockers 1–7 must all clear before a first live run is even attemptable, in that order. The static secret-gate result in §10 is a behavior test, not evidence that the corresponding GitHub secret is absent.
 
 ---
 
