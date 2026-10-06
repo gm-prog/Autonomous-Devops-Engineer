@@ -616,6 +616,16 @@ def test_secret_absence_is_never_asserted_without_secret_visibility():
                 f"secret absence asserted without visibility into secrets: {line[:160]}"
             )
     assert "NOT INDEPENDENTLY VERIFIABLE" in text
+    # The static secret-gate mutation proves fail-closed behavior only; it must
+    # never be narrated as proof that the GitHub environment secret is absent.
+    for secret in ("E2E_FIXTURE_GITHUB_TOKEN", "E2E_JWT_SECRET"):
+        for line in text.splitlines():
+            if secret not in line:
+                continue
+            low = line.lower()
+            assert "confirmed" not in low or "static" in low or "not independently verifiable" in low, (
+                f"{secret} must not be described as live secret-state evidence"
+            )
 
 
 def test_valid_historical_figures_are_retained_not_scrubbed():
