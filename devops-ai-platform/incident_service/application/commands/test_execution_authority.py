@@ -677,7 +677,13 @@ class RepositoryExecutionBoundaryAuditTests(unittest.TestCase):
             "incident_service/infrastructure/sandbox/"
             "container_validation_sandbox.py",
             "deployment_service/application/services/kubectl_runner.py",
-            "deployment_service/application/services/terraform_runner.py",
+            # Phase 8.5-A moved Terraform execution authority out of
+            # terraform_runner.py (which now orchestrates only, through the
+            # sandbox port) and into this trusted host-side adapter, whose
+            # subprocess calls launch the docker CLI -- never terraform, and
+            # never untrusted input -- to run Terraform inside the sandbox.
+            "deployment_service/infrastructure/sandbox/"
+            "container_terraform_sandbox.py",
             "repo_service/infrastructure/git/git_ssh_client.py",
         },
     }

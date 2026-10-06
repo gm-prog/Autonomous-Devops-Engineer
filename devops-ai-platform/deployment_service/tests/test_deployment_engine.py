@@ -67,7 +67,11 @@ class FakeStore:
 class FakeTerraform:
     def run_plan(self, iac_dir, execution=False, plan_output_path=None):
         return {"status": "PASS", "execution": execution, "plan": {"stdout": "plan-ok"}, "plan_file_hash": "a" * 64 if execution else ""}
-    def apply_plan(self, iac_dir, plan_output_path): return {"status": "PASS", "stdout": "apply-ok"}
+    def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash=""):
+        # Phase 8.5-A: the engine now re-verifies the saved plan's hash at
+        # the apply boundary; record it so tests can assert the binding.
+        self.applied_with_hash = expected_plan_file_hash
+        return {"status": "PASS", "stdout": "apply-ok"}
 
 
 class FakeKubectl:

@@ -102,6 +102,11 @@ class DeploymentEngine:
             "repository_name": repository_name or "",
             "source_revision": source_revision or {},
             "terraform": {"status": terraform_result.get("status"), "stdout": terraform_result.get("plan", {}).get("stdout", "")},
+            # Phase 8.5-A: the execution trust boundary is part of plan
+            # identity. The same artifact planned under a materially
+            # different sandbox policy must not silently reuse an earlier
+            # approval identity.
+            "sandbox_policy_identity": (terraform_result.get("sandbox") or {}).get("sandbox_policy_identity", ""),
             "kubernetes": {"status": kubernetes_result.get("status"), "stdout": kubernetes_result.get("stdout", "")},
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -134,6 +139,21 @@ class DeploymentEngine:
         Path(paths["dockerfile"]).write_text(payload.get("dockerfile", ""), encoding="utf-8")
         Path(paths["pipeline"]).write_text(payload.get("pipeline_yaml", ""), encoding="utf-8")
         return paths
+
+    @staticmethod
+    def _new_workspace(prefix: str) -> str:
+        """Create the ephemeral execution workspace.
+
+        When DEPLOYMENT_WORKSPACE_ROOT is configured, the workspace is
+        created BENEATH it so the sandbox's containment check can succeed;
+        the sandbox independently re-verifies containment and fails closed
+        if the directory is anywhere else.
+        """
+        root = os.getenv("DEPLOYMENT_WORKSPACE_ROOT", "").strip()
+        if root:
+            Path(root).mkdir(parents=True, exist_ok=True)
+            return tempfile.mkdtemp(prefix=prefix, dir=root)
+        return tempfile.mkdtemp(prefix=prefix)
 
     def create_dry_run(self, payload: Dict[str, Any]) -> DeploymentRun:
         source_revision = self._validated_source_revision(payload.get("source_revision"))
@@ -175,7 +195,7 @@ class DeploymentEngine:
         run.add_log("DRY_RUNNING: executing local Terraform plan and Kubernetes client-side dry-run.")
         self.store.save(run)
 
-        temp_dir = tempfile.mkdtemp(prefix=f"devops-deploy-{run.id}-")
+        temp_dir = self._new_workspace(f"devops-deploy-{run.id}-")
         try:
             paths = self._write_iac(effective_payload, temp_dir)
             run.terraform_plan = self.terraform.run_plan(temp_dir, execution=False)
@@ -246,7 +266,11 @@ class DeploymentEngine:
                 plan = self.terraform.run_plan(str(rollback_dir), execution=True, plan_output_path=str(plan_path))
                 results.append({
                     "component": "terraform",
-                    "result": plan if plan.get("status") != "PASS" else self.terraform.apply_plan(str(rollback_dir), str(plan_path)),
+                    "result": plan if plan.get("status") != "PASS" else self.terraform.apply_plan(
+                        str(rollback_dir),
+                        str(plan_path),
+                        expected_plan_file_hash=plan.get("plan_file_hash", ""),
+                    ),
                 })
 
         failed = [r for r in results if (r.get("result") or {}).get("status") != "PASS"]
@@ -284,7 +308,7 @@ class DeploymentEngine:
         if not self.store.acquire_lock(run.id):
             raise DeploymentActionError("Deployment is already executing.")
 
-        temp_dir = tempfile.mkdtemp(prefix=f"devops-exec-{run.id}-")
+        temp_dir = self._new_workspace(f"devops-exec-{run.id}-")
         deployment_names = self._deployment_names(effective_payload.get("k8s_yaml", ""))
         try:
             run.move(DeploymentState.DEPLOYING)
@@ -299,7 +323,11 @@ class DeploymentEngine:
                 self.store.save(run)
                 return run
 
-            terraform_apply = self.terraform.apply_plan(temp_dir, paths["terraform_plan"])
+            terraform_apply = self.terraform.apply_plan(
+                temp_dir,
+                paths["terraform_plan"],
+                expected_plan_file_hash=terraform_plan.get("plan_file_hash", ""),
+            )
             run.execution["terraform_apply"] = terraform_apply
             run.execution["terraform_applied"] = terraform_apply.get("status") == "PASS"
             if not run.execution["terraform_applied"]:
