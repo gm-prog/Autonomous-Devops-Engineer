@@ -185,6 +185,15 @@ def validate_e2e_signal(evidence_pack: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("evidence pack contains ambiguous scenario signals")
 
     signal = matches[0]
+    # Operator semantics belong to the scenario contract (§47): the
+    # monitoring producer emits ">"; a contradictory operator (e.g. "<")
+    # can never justify the deterministic conclusion even when the raw
+    # numbers happen to satisfy value > threshold.
+    operator = signal.get("operator")
+    if not isinstance(operator, str) or operator.strip() != ">":
+        raise ValueError(
+            "evidence operator does not match the scenario breach direction"
+        )
     value = _finite_float(signal.get("value"), "observed value")
     threshold = _finite_float(signal.get("threshold"), "danger threshold")
 

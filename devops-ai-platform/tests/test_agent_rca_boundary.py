@@ -204,6 +204,14 @@ class SemanticBreachValidationTests(unittest.TestCase):
     def test_non_breach_value_below_threshold_fails_closed(self):
         self._assert_rejected(_pack_with(value=85.0), "below")
 
+    def test_contradictory_operator_fails_closed(self):
+        # §47: value > threshold alone is insufficient — the recorded
+        # operator must be the scenario's ">" breach direction.
+        self._assert_rejected(_pack_with(operator="<"), "operator-lt")
+        self._assert_rejected(_pack_with(operator=">="), "operator-gte")
+        self._assert_rejected(_pack_with(operator=None), "operator-none")
+        self._assert_rejected(_pack_with(operator=1), "operator-int")
+
     def test_wrong_service_fails_closed(self):
         self._assert_rejected(_pack_with(service="billing-service"), "service")
 

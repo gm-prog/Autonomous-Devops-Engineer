@@ -199,6 +199,13 @@ class RemediationValidationRunner:
         sandbox: "ValidationSandboxPort",
         profiles: Mapping[str, Sequence[ValidationStep]] | None = None,
     ):
+        # `profiles=` exists for unit tests only. The production wiring
+        # (presentation/rest/controllers.py remediation orchestrator
+        # factory) constructs the runner WITHOUT this argument, so live
+        # executions are restricted to the code-owned `_DEFAULT_PROFILES`
+        # above; profile *selection* is a single environment value that
+        # must name an allowlisted profile or execution fails closed with
+        # UnknownValidationProfileError (Phase 8.4.2 §48).
         if sandbox is None:
             raise ValueError(
                 "validation sandbox is required; host execution fallback is "
