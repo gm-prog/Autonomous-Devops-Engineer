@@ -28,6 +28,10 @@ COMPOSE_E2E = REPO_ROOT / "docker-compose.e2e.yml"
 DOCKERFILES = (
     PLATFORM / "deployment_service" / "Dockerfile.e2e",
     PLATFORM / "incident_service" / "Dockerfile.e2e",
+    PLATFORM / "api_gateway" / "Dockerfile.e2e",
+    PLATFORM / "repo_service" / "Dockerfile.e2e",
+    PLATFORM / "agent_service" / "Dockerfile.e2e",
+    PLATFORM / "monitoring_service" / "Dockerfile.e2e",
     PLATFORM / "e2e" / "workload" / "Dockerfile",
 )
 PINNED_FILE = PLATFORM / "e2e" / "pinned-images.txt"
@@ -432,14 +436,27 @@ class TestImmutability:
 
     def test_compose_requires_digest_pinned_refs(self):
         text = COMPOSE_E2E.read_text()
-        assert text.count("${E2E_PYTHON_BASE_IMAGE:?") == 2
+        assert text.count("${E2E_PYTHON_BASE_IMAGE:?") == 7
         assert text.count("${E2E_POSTGRES_IMAGE:?") == 1
         assert text.count("${E2E_REDIS_IMAGE:?") == 1
         assert text.count("${E2E_QDRANT_IMAGE:?") == 1
         assert ":-postgres" not in text and ":-redis" not in text
 
     def test_pinned_file_has_no_invented_digests(self):
-        seen_keys = 0
+        """§5.2/§10.1 — authoritative sha256:<64hex> pins only.
+
+        The retired sentinel is now REJECTED outright (no conditional
+        allowance), as is any malformed/missing pin: fail-closed.
+        """
+        expected_names = {
+            "python:3.11-slim",
+            "postgres:15-alpine",
+            "redis:7-alpine",
+            "qdrant/qdrant:v1.12.4",
+            "registry:2",
+            "kindest/node:v1.31.4",
+        }
+        seen: dict[str, str] = {}
         for line in PINNED_FILE.read_text().splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -448,24 +465,47 @@ class TestImmutability:
             assert len(parts) == 3, line
             name, pin, key = parts
             assert "@" not in name, name
+            assert re.fullmatch(r"[a-z0-9][a-z0-9._/:-]*", name), name
             assert re.fullmatch(r"[A-Z][A-Z0-9_]*", key), key
-            if pin != "UNRESOLVED":
-                assert re.fullmatch(r"sha256:[0-9a-f]{64}", pin), pin
-            seen_keys += 1
-        assert seen_keys == 6
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", pin), pin
+            assert name not in seen, name
+            seen[name] = pin
+        assert set(seen) == expected_names, sorted(seen)
+        assert len(seen) == 6
+        assert "UNRESOLVED" not in PINNED_FILE.read_text()
 
     def test_workflow_resolves_inputs_from_pinned_file_only(self):
-        step = _step(_workflow_doc(), "Resolve immutable build inputs")
+        """§5.2/§10.2 — strict committed-pin consumption, no fallback.
+
+        The workflow must: read the committed file, verify the pin
+        grammar fail-closed, pull name@sha256:<64hex>, inspect it by the
+        same digest ref, and record it. There is no pull of the bare
+        name, no dispatch-time resolution branch, and no fallback.
+        """
+        step = _step(_workflow_doc(), "Load immutable image pins")
         run = step["run"]
         assert "pinned-images.txt" in run
         assert 'echo "${KEY}=${REF}" >> "$GITHUB_ENV"' in run
+        # strict format verification (fail-closed grammar)
+        assert "grep -Eq '^sha256:[0-9a-f]{64}$'" in run
+        # pull + inspect ONLY by the digest-bearing ref
+        assert 'docker pull -q "$REF"' in run
+        assert 'docker image inspect "$REF"' in run
+        # recorded for the provenance artifact (exactly six inputs)
+        assert "image-provenance-inputs.txt" in run
+        assert "-eq 6" in run
+        # forbidden semantics: no bare-name pull, no resolution branch
+        assert 'docker pull -q "$NAME"' not in run
+        assert 'if [ "$PIN"' not in run
+        assert "docker inspect --format" not in run  # resolve-time inspect
+        text = _workflow_text()
+        assert "UNRESOLVED" not in text  # token eliminated from workflow
         # no image source name appears anywhere in the workflow text
         pinned_names = [
             ln.split()[0]
             for ln in PINNED_FILE.read_text().splitlines()
             if ln.strip() and not ln.startswith("#")
         ]
-        text = _workflow_text()
         for name in pinned_names:
             assert name not in text, name
 
@@ -759,7 +799,7 @@ class TestWorkflowStaticValidation:
             "Validate untrusted identifiers",
             "Install pinned toolchain",
             "Compose config validation",
-            "Resolve immutable build inputs",
+            "Load immutable image pins",
             "Configure registry (own network)",
             "Build immutable E2E images",
             "Publish workload image",
@@ -781,3 +821,429 @@ class TestWorkflowStaticValidation:
             assert match is not None, prefix
             indexes.append(match)
         assert indexes == sorted(indexes), list(zip(required_order, indexes))
+
+
+# ==========================================================================
+# Phase 8.4.2-D §10 — provenance closure additions (new tests; the 78
+# pre-existing corrective tests above are kept and updated, never removed)
+# ==========================================================================
+
+
+class TestProvenanceClosure:
+    def test_pin_grammar_parser_rejects_sentinel_and_malformed(self):
+        from e2e.helpers import parse_pinned_images
+
+        entries = parse_pinned_images(PINNED_FILE.read_text())
+        assert len(entries) == 6
+        good = "sha256:" + "a" * 64
+        bad_cases = {
+            "sentinel pin": f"x UNRESOLVED KEY\n",
+            "short digest": f"python:3.11-slim sha256:{'a' * 63} E2E_X",
+            "missing prefix": f"python:3.11-slim {'a' * 64} E2E_X",
+            "uppercase hex": f"python:3.11-slim sha256:{'A' * 64} E2E_X",
+            "missing columns": "python:3.11-slim",
+            "missing key": f"python:3.11-slim {good}",
+            "bad key": f"python:3.11-slim {good} e2e_x",
+            "bad name": f"Python:3.11-slim {good} E2E_X",
+            "no entries": "# only comments\n",
+            "duplicate key": (
+                f"python:3.11-slim {good} E2E_X\n"
+                f"redis:7-alpine {'sha256:' + 'b' * 64} E2E_X\n"
+                f"registry:2 {'sha256:' + 'c' * 64} E2E_X\n"
+                f"registry:3 {'sha256:' + 'd' * 64} E2E_X\n"
+                f"registry:4 {'sha256:' + 'e' * 64} E2E_X\n"
+                f"registry:5 {'sha256:' + 'f' * 64} E2E_X\n"
+                f"registry:6 {good} E2E_X"
+            ),
+        }
+        for label, payload in bad_cases.items():
+            with pytest.raises(ValueError, match="pin line|no entries"):
+                parse_pinned_images(payload), label
+
+    def test_workflow_loads_pins_strictly_with_no_fallback(self):
+        step = _step(_workflow_doc(), "Load immutable image pins")
+        run = step["run"]
+        assert "grep -Eq '^sha256:[0-9a-f]{64}$'" in run
+        assert 'docker pull -q "$REF"' in run
+        assert 'docker image inspect "$REF"' in run
+        assert 'docker pull -q "$NAME"' not in run
+        assert 'if [ "$PIN"' not in run
+        text = _workflow_text()
+        assert "UNRESOLVED" not in text
+
+    def test_manifest_provenance_exports_assigned_before_driver(self):
+        doc = _workflow_doc()
+        names = [s.get("name", "") for s in _steps(doc)]
+        resolve_i = next(
+            i for i, n in enumerate(names) if n.startswith("Load immutable image pins")
+        )
+        build_i = next(
+            i for i, n in enumerate(names) if n.startswith("Build immutable E2E images")
+        )
+        driver_i = next(
+            i
+            for i, n in enumerate(names)
+            if n.startswith("Execute golden path driver")
+        )
+        assert resolve_i < driver_i
+        assert build_i < driver_i
+        resolve_run = _step(doc, "Load immutable image pins")["run"]
+        build_run = _step(doc, "Build immutable E2E images")["run"]
+        # actual assignments (not comments) written to GITHUB_ENV
+        assert '} >> "$GITHUB_ENV"' in resolve_run  # group redirect
+        for assignment in (
+            'echo "E2E_REGISTRY_DIGEST=${REGISTRY_IMAGE}"',
+            'echo "E2E_KIND_NODE_DIGEST=${NODE_IMAGE}"',
+            'echo "E2E_BASE_IMAGES=${BASE_IMAGES_PROVENANCE}"',
+        ):
+            assert assignment in resolve_run, assignment
+        # deterministic scalar KEY=VALUE;KEY=... representation
+        assert resolve_run.count('BASE_IMAGES_PROVENANCE="E2E_PYTHON_BASE_IMAGE=') == 1
+        for fragment in (
+            ";E2E_POSTGRES_IMAGE=",
+            ";E2E_REDIS_IMAGE=",
+            ";E2E_QDRANT_IMAGE=",
+            ";REGISTRY_IMAGE=",
+            ";NODE_IMAGE=",
+        ):
+            assert fragment in resolve_run, fragment
+        assert '} >> "$GITHUB_ENV"' in build_run
+        assert 'echo "E2E_BUILT_IMAGE_DIGESTS=${BUILT_PROVENANCE}"' in build_run
+        assert (
+            'BUILT_PROVENANCE="E2E_WORKLOAD_IMAGE=${WORKLOAD_DIGEST}'
+            ';REMEDIATION_SANDBOX_IMAGE=${SANDBOX_DIGEST}"' in build_run
+        )
+        # built digests proven from real post-push RepoDigests (fail-closed)
+        assert "grep -Eq '@sha256:[0-9a-f]{64}$'" in build_run
+        assert "{{index .RepoDigests 0}}" in build_run
+
+    def test_driver_maps_provenance_env_into_manifest_and_gate(
+        self, tmp_path, monkeypatch
+    ):
+        """§10.5 — behavioral: driver env -> manifest, then PASS gate."""
+        import importlib
+
+        env = {
+            "E2E_JWT_SECRET": "unit-test-secret-not-a-real-token",
+            "E2E_SOURCE_SHA": "a" * 40,
+            "E2E_FIXTURE_SEED_SHA": "b" * 40,
+            "E2E_WORKSPACES_ROOT": str(tmp_path / "ws"),
+            "E2E_ARTIFACT_DIR": str(tmp_path / "artifacts"),
+            "E2E_REGISTRY_DIGEST": "registry:2@sha256:" + "1" * 64,
+            "E2E_KIND_NODE_DIGEST": "kindest/node:v1.31.4@sha256:" + "2" * 64,
+            "E2E_BASE_IMAGES": "E2E_PYTHON_BASE_IMAGE=base@sha256:" + "3" * 64,
+            "E2E_BUILT_IMAGE_DIGESTS": (
+                "E2E_WORKLOAD_IMAGE=kind-registry:5000/ares-e2e-workload"
+                "@sha256:" + "4" * 64 + ";REMEDIATION_SANDBOX_IMAGE="
+                "kind-registry:5000/ares-e2e-sandbox@sha256:" + "5" * 64
+            ),
+            "E2E_SANDBOX_DIGEST": "kind-registry:5000/ares-e2e-sandbox"
+            "@sha256:" + "6" * 64,
+        }
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        import e2e.golden_path as driver
+
+        driver = importlib.reload(driver)  # module constants read the env
+        harness = driver.Harness()  # offline: makedirs + mint_token only
+        manifest = harness.manifest
+        assert manifest["registry_image_digest"] == env["E2E_REGISTRY_DIGEST"]
+        assert manifest["kind_node_image_digest"] == env["E2E_KIND_NODE_DIGEST"]
+        assert manifest["base_images"] == env["E2E_BASE_IMAGES"]
+        assert manifest["built_image_digests"] == env["E2E_BUILT_IMAGE_DIGESTS"]
+        assert manifest["source_sha"] == env["E2E_SOURCE_SHA"]
+        assert manifest["fixture_seed_sha"] == env["E2E_FIXTURE_SEED_SHA"]
+        assert manifest["workspace_root"] == env["E2E_WORKSPACES_ROOT"]
+        assert manifest["sandbox_image_digest"] == env["E2E_SANDBOX_DIGEST"]
+
+        from e2e.helpers import FAIL, NOT_VERIFIED, PASS, finalize_execution_manifest
+
+        # PASS with populated provenance is accepted
+        accepted = dict(manifest)
+        finalize_execution_manifest(accepted, PASS)
+        assert accepted["result"] == PASS
+        # PASS with one emptied field is REJECTED (no false claim from empty)
+        rejected = dict(manifest)
+        rejected["built_image_digests"] = ""
+        finalize_execution_manifest(rejected, PASS)
+        assert rejected["result"] == FAIL
+        assert "built_image_digests" in rejected["provenance_rejection"]
+        # NOT_VERIFIED stays representable without provenance
+        never_ran = {"schema": "ares.e2e.golden-path/1", "result": NOT_VERIFIED}
+        finalize_execution_manifest(never_ran, NOT_VERIFIED)
+        assert never_ran["result"] == NOT_VERIFIED
+        assert "provenance_rejection" not in never_ran
+
+    def test_finalize_rejects_every_missing_required_field(self):
+        from e2e.helpers import (
+            EXECUTION_PROVENANCE_FIELDS,
+            FAIL,
+            PASS,
+            finalize_execution_manifest,
+        )
+
+        complete = {"schema": "ares.e2e.golden-path/1"}
+        for field in EXECUTION_PROVENANCE_FIELDS:
+            complete[field] = f"{field}-value"
+        for field in EXECUTION_PROVENANCE_FIELDS:
+            manifest = dict(complete)
+            manifest[field] = ""
+            finalize_execution_manifest(manifest, PASS)
+            assert manifest["result"] == FAIL, field
+            assert field in manifest["provenance_rejection"], field
+
+    def test_e2e_build_surfaces_are_all_narrow_e2e_dockerfiles(self):
+        """§6.2 — narrowest mechanism: every E2E-built surface is an
+        E2E-specific Dockerfile; production files stay tag-based (by
+        design) and are never part of the E2E build."""
+        import yaml
+
+        base_doc = yaml.safe_load(
+            (PLATFORM / "docker-compose.yml").read_text()
+        )
+        over_doc = yaml.safe_load(COMPOSE_E2E.read_text())
+        base_builds = {
+            name: cfg["build"]
+            for name, cfg in base_doc["services"].items()
+            if isinstance(cfg, dict) and cfg.get("build")
+        }
+        assert set(base_builds) <= set(over_doc["services"]), sorted(base_builds)
+        assert len(base_builds) == 7, sorted(base_builds)
+        for name in sorted(base_builds):
+            override = over_doc["services"][name]["build"]
+            dockerfile = override["dockerfile"]
+            assert dockerfile.endswith(".e2e"), (name, dockerfile)
+            path = PLATFORM / dockerfile.removeprefix("./")
+            assert path.is_file(), path
+            assert "ARG BASE_IMAGE\n" in path.read_text(), path
+            assert "FROM ${BASE_IMAGE:?" in path.read_text(), path
+            args = override.get("args", {})
+            assert "${E2E_PYTHON_BASE_IMAGE:?" in args.get("BASE_IMAGE", ""), name
+            # production file remains tag-based by design (not digest-pinned,
+            # and not built by the E2E workflow after this override)
+            prod_rel = base_builds[name].get("dockerfile", "")
+            prod_path = PLATFORM / prod_rel.removeprefix("./")
+            prod_text = prod_path.read_text()
+            from_lines = [
+                ln for ln in prod_text.splitlines() if ln.startswith("FROM ")
+            ]
+            assert from_lines, prod_path
+            for ln in from_lines:
+                assert "@sha256:" not in ln, (prod_path, ln)
+                assert "${" not in ln, (prod_path, ln)
+
+
+# ==========================================================================
+# Phase 8.4.2-D §11 — P2 credential hygiene (focused tests)
+# ==========================================================================
+
+
+class TestCredentialHygiene:
+    @staticmethod
+    def _service(tmp_path, monkeypatch):
+        from incident_service.application.services.remediation_workspace_service import (
+            RemediationWorkspaceService,
+        )
+
+        monkeypatch.setenv("REMEDIATION_WORKSPACE_ROOT", str(tmp_path))
+        return RemediationWorkspaceService(workspace_root=str(tmp_path))
+
+    @staticmethod
+    def _capture_run(monkeypatch, module):
+        captured: dict = {}
+
+        def fake_run(args, **kwargs):
+            captured.clear()
+            captured.update(kwargs.get("env") or {})
+
+            class _Result:
+                stdout = "ok\n"
+                returncode = 0
+
+            return _Result()
+
+        monkeypatch.setattr(module.subprocess, "run", fake_run)
+        return captured
+
+    def test_run_git_never_inherits_raw_oauth_token(
+        self, tmp_path, monkeypatch
+    ):
+        import incident_service.application.services.remediation_workspace_service as rws
+
+        monkeypatch.setenv("GITHUB_OAUTH_TOKEN", "ghp_child_env_must_not_see_this")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/should-be-ignored")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
+        svc = self._service(tmp_path, monkeypatch)
+        captured = self._capture_run(monkeypatch, rws)
+        result = svc._run_git(
+            ["git", "rev-parse", "--is-inside-work-tree"], cwd=tmp_path
+        )
+        assert "GITHUB_OAUTH_TOKEN" not in captured
+        assert "GIT_CONFIG_GLOBAL" not in captured
+        assert captured["GIT_TERMINAL_PROMPT"] == "0"
+        assert captured["UNRELATED_VAR"] == "kept"
+        assert result.stdout == "ok\n"
+
+    def test_git_auth_uses_config_header_without_token_env(
+        self, tmp_path, monkeypatch
+    ):
+        """§11 — auth via GIT_CONFIG_* http.extraHeader only; the raw
+        token value never enters the child environment or argv."""
+        import incident_service.application.services.remediation_workspace_service as rws
+
+        monkeypatch.setenv("GITHUB_OAUTH_TOKEN", "ghp_child_env_must_not_see_this")
+        svc = self._service(tmp_path, monkeypatch)
+        captured = self._capture_run(monkeypatch, rws)
+        header_value = "AUTHORIZATION: basic base64-fixture-header"
+        svc._run_git(
+            ["git", "ls-remote", "https://github.example.invalid/owner/repo.git"],
+            cwd=tmp_path,
+            extra_env={
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": header_value,
+            },
+        )
+        assert captured["GIT_CONFIG_COUNT"] == "1"
+        assert captured["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+        assert captured["GIT_CONFIG_VALUE_0"] == header_value
+        assert "GITHUB_OAUTH_TOKEN" not in captured
+        assert "ghp_child_env_must_not_see_this" not in captured.values()
+
+
+# ==========================================================================
+# Phase 8.4.2-D §16 — nine-point deterministic provenance audit
+# (runs entirely offline: no Docker, no kind, no GitHub calls)
+# ==========================================================================
+
+
+class TestDeterministicProvenanceAudit:
+    def test_point1_committed_pins_are_authoritative_64hex(self):
+        from e2e.helpers import parse_pinned_images
+
+        entries = parse_pinned_images(PINNED_FILE.read_text())
+        assert len(entries) == 6
+        for name, pin, key in entries:
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", pin), (name, pin)
+            assert re.fullmatch(r"[A-Z][A-Z0-9_]*", key), key
+
+    def test_point2_sentinel_token_absent_from_execution_surfaces(self):
+        assert "UNRESOLVED" not in _workflow_text()
+        assert "UNRESOLVED" not in PINNED_FILE.read_text()
+        assert "UNRESOLVED" not in COMPOSE_E2E.read_text()
+
+    def test_point3_all_four_exports_exist_before_driver(self):
+        doc = _workflow_doc()
+        names = [s.get("name", "") for s in _steps(doc)]
+        driver_i = next(
+            i
+            for i, n in enumerate(names)
+            if n.startswith("Execute golden path driver")
+        )
+        resolve_i = next(
+            i for i, n in enumerate(names) if n.startswith("Load immutable image pins")
+        )
+        build_i = next(
+            i for i, n in enumerate(names) if n.startswith("Build immutable E2E images")
+        )
+        resolve_run = _step(doc, "Load immutable image pins")["run"]
+        build_run = _step(doc, "Build immutable E2E images")["run"]
+        assert resolve_i < driver_i and build_i < driver_i
+        assert "E2E_REGISTRY_DIGEST=" in resolve_run
+        assert "E2E_KIND_NODE_DIGEST=" in resolve_run
+        assert "E2E_BASE_IMAGES=" in resolve_run
+        assert "E2E_BUILT_IMAGE_DIGESTS=" in build_run
+
+    def test_point4_driver_reads_all_four_manifest_env_vars(self):
+        text = DRIVER.read_text()
+        for needle in (
+            'registry_image_digest=os.environ.get("E2E_REGISTRY_DIGEST"',
+            'kind_node_image_digest=os.environ.get("E2E_KIND_NODE_DIGEST"',
+            'base_images=os.environ.get("E2E_BASE_IMAGES"',
+            'built_image_digests=os.environ.get("E2E_BUILT_IMAGE_DIGESTS"',
+            'sandbox_image_digest=os.environ.get("E2E_SANDBOX_DIGEST"',
+            'source_sha=os.environ.get("E2E_SOURCE_SHA"',
+            "fixture_seed_sha=FIXTURE_SEED_SHA",
+            "workspace_root=WORKSPACES_ROOT",
+        ):
+            assert needle in text, needle
+
+    def test_point5_pass_finalization_gate_is_wired_and_enforced(self):
+        from e2e.helpers import FAIL, PASS, finalize_execution_manifest
+
+        assert "H.finalize_execution_manifest(self.manifest, overall)" in DRIVER.read_text()
+        # wired gate: PASS + empty provenance cannot survive
+        manifest = {"schema": "ares.e2e.golden-path/1"}
+        finalize_execution_manifest(manifest, PASS)
+        assert manifest["result"] == FAIL
+        assert "provenance_rejection" in manifest
+
+    def test_point6_every_e2e_built_surface_uses_e2e_dockerfile(self):
+        import yaml
+
+        base_doc = yaml.safe_load((PLATFORM / "docker-compose.yml").read_text())
+        over_raw = COMPOSE_E2E.read_text()
+        over_doc = yaml.safe_load(over_raw)
+        # no duplicate service keys (last-wins would silently drop
+        # environment overrides merged alongside build overrides)
+        svc_keys = re.findall(r"(?m)^  ([a-z][a-z0-9_-]*):$", over_raw)
+        assert len(svc_keys) == len(set(svc_keys)), svc_keys
+        build_services = [
+            name
+            for name, cfg in base_doc["services"].items()
+            if isinstance(cfg, dict) and cfg.get("build")
+        ]
+        assert len(build_services) == 7, sorted(build_services)
+        for name in sorted(build_services):
+            dockerfile = over_doc["services"][name]["build"]["dockerfile"]
+            assert dockerfile.endswith(".e2e"), (name, dockerfile)
+            assert (PLATFORM / dockerfile.removeprefix("./")).is_file()
+
+    def test_point7_p2_token_scrub_is_present_and_header_auth_preserved(self):
+        src = WORKSPACE_SERVICE.read_text()
+        body = src[src.index("def _run_git") : src.index("def _cleanup_path")]
+        # raw token filtered from the child env...
+        assert '"GITHUB_OAUTH_TOKEN"' in body
+        # ...while GIT_CONFIG_* header auth remains the only mechanism
+        assert "GIT_CONFIG_VALUE_0" not in body  # (header values come from callers)
+        assert "GIT_CONFIG_COUNT" in src
+        assert "http.extraHeader" in src
+
+    def test_point8_sandbox_contract_tokens_untouched(self):
+        sandbox = (
+            PLATFORM
+            / "incident_service"
+            / "application"
+            / "services"
+            / "validation_sandbox.py"
+        ).read_text()
+        for needle in (
+            '"--pull"',
+            '"never"',
+            '"--read-only"',
+            '"--cap-drop"',
+            "no-new-privileges:true",
+            'network_mode: str = "none"',
+        ):
+            assert needle in sandbox, needle
+        text = _workflow_text()
+        for needle in (
+            "--network none --read-only --cap-drop ALL",
+            "--security-opt no-new-privileges",
+            '-v "$SRC:/workspace:ro"',
+        ):
+            assert needle in text, needle
+
+    def test_point9_secrets_step_scoped_and_upload_gated(self):
+        doc = _workflow_doc()
+        job = doc["jobs"]["golden-path"]
+        assert not any(
+            "secrets." in str(v) for v in job.get("env", {}).values()
+        )
+        for step in job["steps"]:
+            if "secrets." in yaml.safe_dump(step):
+                assert step.get("env"), step.get("name")
+        upload = next(
+            s for s in job["steps"] if str(s.get("name", "")).startswith("Upload")
+        )
+        assert "steps.secretscan.outcome == 'success'" in str(upload["if"])
