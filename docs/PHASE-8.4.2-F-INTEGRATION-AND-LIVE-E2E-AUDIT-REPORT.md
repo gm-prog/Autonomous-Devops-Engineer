@@ -9,7 +9,7 @@ Audit date: 2026-10-06. All evidence below was produced at the heads named with 
 
 | Dimension | Status |
 |---|---|
-| **INTEGRATION** | **PASS** — a clean, surgical slice exists and is published as **PR #13** (49 files, 29 linear commits) onto `integration/phase-8.2-v1`, a true ancestor of this work |
+| **INTEGRATION** | **PASS** — a clean, surgical slice exists and is published as **PR #13** (50 files, 30 linear commits) onto `integration/phase-8.2-v1`, a true ancestor of this work |
 | **CI** | **PASS** at the exact final head — push run `37480885467` and `pull_request` run `37480896669`, 5/5 jobs each |
 | **DEFAULT-BRANCH WORKFLOW PUBLICATION** | **BLOCKED** — `e2e-golden-path.yml` is absent from the default branch; the workflow is not registered and cannot be dispatched |
 | **LIVE E2E** | **BLOCKED / NOT VERIFIED** — the golden path has never executed; no run id exists |
@@ -58,11 +58,11 @@ not inferred:
 | Measurement | `base = main` | `base = integration/phase-8.2-v1` |
 |---|---|---|
 | merge-base with this work | **none** | `a0bf7600` (true ancestor) |
-| files changed | **380** | **49** |
-| line delta | **+57,455 / −765** | **+9,230 / −5** |
+| files changed | **381** | **50** |
+| line delta | **+57,949 / −765** | **+9,633 / −5** |
 | files *deleted from the base* | **19** | 0 |
 | unrelated files modified | **17** (Android app, `backend/`, `mcp/`, `monitoring/`, `README`, `.gitignore`) | 0 |
-| commits | 128 | 29 |
+| commits | 129 | 30 |
 
 `main` carries an older hyphenated prototype (`devops-ai-platform/api-gateway/`,
 `incident-service/`, … 72 files) and **no `.github/workflows/` directory at all**.
@@ -75,7 +75,7 @@ unrelated history") and §28 ("no unrelated feature enters the clean branch").
 
 **PR #13** — `arena/b6307a50-autonomous-devops-engineer` → `integration/phase-8.2-v1`.
 
-- 49 files, +9,230 / −5, 29 commits, **0 merge commits**
+- 50 files, +9,633 / −5, 30 commits, **0 merge commits** (this report is the 50th file)
 - `git diff A...B` and `git diff A..B` return the identical file set (the base is a
   true ancestor, so the PR diff has no merge-base distortion)
 - continues the repository's own stacked chain: `#8 → #9 → #10 → #11 → #13`
@@ -119,11 +119,11 @@ Column "on `main`" was checked with `git ls-tree -r main -- <path>`.
 | 13 | Tests (7) | `tests/test_e2e_{corrective,harness,validation_profile}.py`, `tests/test_{agent_rca_boundary,deployment_evidence_route,deterministic_proposal_path}.py`, `api_gateway/tests/test_incident_control_plane_routes.py` | **ABSENT** | this slice |
 | 14 | Phase documentation | 6 × `docs/PHASE-8.*.md` | **ABSENT** | this slice |
 
-**Closure result: 0 of 49 required files exist on `main`.** Relative to `main` the
+**Closure result: 0 of the 49 required implementation files exist on `main`.** Relative to `main` the
 closure additionally pulls in the six service packages that the Dockerfiles copy as
 build context (`COPY . /app` over `devops-ai-platform/`), i.e. a further ~292 files
 that `main` has never carried. Relative to `integration/phase-8.2-v1` the closure is
-exactly the 49 files above and nothing else.
+exactly the 49 files above and nothing else (plus this report, committed after them).
 
 **§8 strategy outcome:** Strategy A (`cherry-pick -x`) was unnecessary and Strategy C
 (bounded merge) unsafe against `main`. The slice is the natural linear range
@@ -183,6 +183,10 @@ mutation probe rejected: ERROR: dockerfile parse error on line 3: FROM requires 
 negative-check sample: ERROR: base name (${BASE_IMAGE}) should not be blank
 surfaces checked=8 failures=0
 ```
+
+The docs-only commit that adds this report was verified separately at head
+`c678cd0`: push `37481797888` and `pull_request` runs `37481808638` / `37481809860`,
+5/5 jobs each, BuildKit gate step 5 success `14:46:44Z → 14:46:51Z`.
 
 **Local §18 matrix at the final head** (venv Python 3.11, no Docker, no secrets):
 
@@ -328,9 +332,9 @@ No, and that is disclosed in §3.3 with both reasons. No synthetic equivalent wa
 off as it.
 
 **Q3. Is the slice actually minimal, or just asserted to be?**
-Measured: 49 files / +9,230 −5 against `integration/phase-8.2-v1`, versus 380 files /
-+57,455 −765 against `main`. Both numbers come from `git diff --stat` and are corroborated
-by GitHub's own counts on PR #13 and PR #12.
+Measured: 50 files / +9,633 −5 against `integration/phase-8.2-v1`, versus 381 files /
++57,949 −765 against `main`. Both numbers come from `git diff --stat` and are corroborated
+by GitHub's own counts on PR #13 (50) and PR #12 (381).
 
 **Q4. Could the slice have been even smaller?**
 The six `docs/PHASE-8.*.md` files are not needed to execute the golden path. They were
@@ -393,7 +397,7 @@ The correct reading is `NOT VERIFIED`, not "expected to pass".
 
 **MERGE-READY (integration chain) + LIVE-E2E-BLOCKED.**
 
-- **MERGE-READY:** PR #13 is a clean, minimal, reviewable 49-file slice onto a true
+- **MERGE-READY:** PR #13 is a clean, minimal, reviewable 50-file slice onto a true
   ancestor, green in CI at its exact head, with every Phase 8.4.2 invariant re-verified.
   It is the correct vehicle for landing Phase 8.4.2 — not PR #12.
 - **LIVE-E2E-BLOCKED:** the first live golden-path run cannot be attempted until §11
