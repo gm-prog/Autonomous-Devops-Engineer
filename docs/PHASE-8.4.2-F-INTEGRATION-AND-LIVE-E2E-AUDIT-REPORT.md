@@ -59,10 +59,10 @@ not inferred:
 |---|---|---|
 | merge-base with this work | **none** | `a0bf7600` (true ancestor) |
 | files changed | **381** | **50** |
-| line delta | **+57,949 / −765** | **+9,633 / −5** |
+| line delta | **+57,953 / −765** | **+9,637 / −5** |
 | files *deleted from the base* | **19** | 0 |
 | unrelated files modified | **17** (Android app, `backend/`, `mcp/`, `monitoring/`, `README`, `.gitignore`) | 0 |
-| commits | 129 | 30 |
+| commits | 130 | 31 |
 
 `main` carries an older hyphenated prototype (`devops-ai-platform/api-gateway/`,
 `incident-service/`, … 72 files) and **no `.github/workflows/` directory at all**.
@@ -75,14 +75,14 @@ unrelated history") and §28 ("no unrelated feature enters the clean branch").
 
 **PR #13** — `arena/b6307a50-autonomous-devops-engineer` → `integration/phase-8.2-v1`.
 
-- 50 files, +9,633 / −5, 30 commits, **0 merge commits** (this report is the 50th file)
+- 50 files, +9,637 / −5, 31 commits, **0 merge commits** (this report is the 50th file)
 - `git diff A...B` and `git diff A..B` return the identical file set (the base is a
   true ancestor, so the PR diff has no merge-base distortion)
 - continues the repository's own stacked chain: `#8 → #9 → #10 → #11 → #13`
 
 Nothing was created, rewritten or force-pushed: no new branch, no rebase, no history
 rewrite, `main` untouched, all six integration refs byte-identical to §2, and
-**PR #12 was not merged, retargeted or modified** (it remains OPEN at 380 files).
+**PR #12 was not merged, retargeted or modified** (it remains OPEN against `main`, 381 files, `mergedAt: never`).
 
 ### 3.3 Disclosed conflict with §4.2
 
@@ -132,6 +132,9 @@ exactly the 49 files above and nothing else (plus this report, committed after t
 ---
 
 ## 5. Diff / scope audit
+
+> Line counts in this report are measured at head `96ee094`; the commit that
+> records these corrections adds a few further lines to this file alone.
 
 **Phase 8.4.2-F changed exactly 4 files in 2 commits** (`b08fbb0`, `c69c28d`):
 
@@ -332,8 +335,8 @@ No, and that is disclosed in §3.3 with both reasons. No synthetic equivalent wa
 off as it.
 
 **Q3. Is the slice actually minimal, or just asserted to be?**
-Measured: 50 files / +9,633 −5 against `integration/phase-8.2-v1`, versus 381 files /
-+57,949 −765 against `main`. Both numbers come from `git diff --stat` and are corroborated
+Measured: 50 files / +9,637 −5 against `integration/phase-8.2-v1`, versus 381 files /
++57,953 −765 against `main`. Both numbers come from `git diff --stat` and are corroborated
 by GitHub's own counts on PR #13 (50) and PR #12 (381).
 
 **Q4. Could the slice have been even smaller?**
@@ -347,7 +350,7 @@ No. `integration/phase-8.2-v1` is a true ancestor (`git merge-base --is-ancestor
 the range has 0 merge commits, and three-dot and two-dot diffs are identical.
 
 **Q6. Was PR #12 merged, retargeted, closed or used as a shortcut?**
-No. It is still OPEN at `main`, 380 files, 100 commits, `mergedAt: never`. PR #13 is a
+No. It is still OPEN at `main`, 381 files, `mergedAt: never`. PR #13 is a
 separate PR from the same head to a different base — a supported GitHub operation that
 mutates neither #12 nor the base ref.
 
