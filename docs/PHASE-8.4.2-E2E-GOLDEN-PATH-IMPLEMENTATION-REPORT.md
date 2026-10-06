@@ -137,7 +137,12 @@ NOT_VERIFIED} only after observed assertions (never on speculation).
 - Sandbox host-execution fallback: unchanged (none); validation profile
   allowlist unchanged; gateway authorization, provenance and hash
   machinery untouched (diff audit: 8.4.2 touches only harness files,
-  two E2E Dockerfiles, one operator assertion + one comment).
+  two E2E Dockerfiles, one operator assertion + one comment; Phase
+  8.4.2-D later added four service-level `Dockerfile.e2e` + one worker
+  override so the workflow builds **seven digest-controlled E2E
+  build surfaces** total — see §6.2 table in the 8.4.2-D section
+  below; production Dockerfiles remain tag-based by design and are
+  never E2E-built).
 
 ## Cleanup
 
@@ -250,11 +255,18 @@ start point: previous head `75943a743eef15a5b7c42cd6862cffe27750dd0e`.
    of the two step-scoped secrets.
 2. Pinned toolchain installs (terraform/kubectl checksum-verified, kind
    via sumdb-verified module install).
-3. Compose config validation runs with valid-format digest placeholders.
-4. **Resolve immutable build inputs**: source names are read from
-   committed `e2e/pinned-images.txt`; every entry resolves to an
-   authoritative `name@sha256:<64hex>`, is pulled by digest, and is
-   exported/recorded — the workflow text contains no bare image tags.
+3. Compose config validation runs with non-digest interpolation
+   placeholders (never pulled, never built; real values come from the
+   committed pins step).
+4. **Load immutable image pins (committed digests)**: the workflow
+   reads committed `e2e/pinned-images.txt`
+   (`<source-name> <sha256:64hex> <env-key>`), verifies the pin
+   grammar fail-closed, pulls and inspects ONLY
+   `name@sha256:<64hex>`, and records each ref to
+   `image-provenance-inputs.txt` + `$GITHUB_ENV` — there is **no
+   dispatch-time tag resolution, no fallback, and no bare-tag pull**
+   (Phase 8.4.2-D §5; the workflow text contains no bare image tags
+   and no sentinel token).
 5. **Registry ordering (P0-1)**: registry container starts on its own
    `e2e-registry-net` first; kind is created after it; only then is the
    registry connected to the `kind` network, TCP reachability is proven
@@ -289,7 +301,7 @@ start point: previous head `75943a743eef15a5b7c42cd6862cffe27750dd0e`.
 | P0-2 | No dedicated host-visible workspace root; sandbox would bind-create an absent dir | Job env `E2E_WORKSPACES_ROOT`; compose mounts `/tmp/ares-e2e-workspaces` at the same path host+container; `RemediationWorkspaceService(workspace_root=…)` requires absolute+existing root, mkdtemp under it, cleanup refuses outside; `build_run_plan` (root mode) requires mount source to exist beneath `REMEDIATION_WORKSPACE_ROOT` and fails closed; §6 live visibility/RO proof step added | `TestHostVisibleWorkspace` (7 tests); existing sandbox suites (559-module CI set) unmodified and green |
 | P0-3 | Fixture acquisition unauthenticated/prefix-cleanup mismatch | Root-mode `prepare()` fails closed without `GITHUB_OAUTH_TOKEN`; clone+fetch carry the token via per-process `GIT_CONFIG_*` `http.extraHeader`; URL/argv never contain credentials; workflow proves private-then-authenticated fetch via stdin pipe | `TestAuthenticatedFixtureClone` (6 tests) + live workflow proof (NOT VERIFIED) |
 | P1-4 | Weak race oracle (`successes >= 0`), no order guarantees | `classify_execution_outcomes()` requires exactly two outcomes, exactly one winner ∈ {200,502,504} and exactly one 409, zero invalid; driver assertion strict; **[200,502,504] winner semantics = relay-timeout-with-continuation** (gateway 10 s relay while durable execution proceeds; verified via read endpoints/DB/remote, never via the timed-out response) | `TestConcurrencyOracle`: PASS `[200,409] [409,200] [502,409] [409,502] [504,409] [409,504]`; FAIL `[200,200] [502,502] [504,504] [409,409] [200,500] [404,409] [] [200] [200,409,409]` |
-| P1-5 | Floating build inputs (`python:3.11-slim` bare in workflow/Dockerfiles; bare `resolve <tag>` step) | `pinned-images.txt` (source, pin, env key) resolves authoritative digests at dispatch and pulls by digest; Dockerfiles/compose use `ARG/…:?` fail-closed refs; static tests reject `python:3.11-slim`/`python:latest`/`python@invalid` in workflow+compose+Dockerfiles and require `@sha256:<64hex>` everywhere | `TestImmutability` (8 tests); sandbox digest enforcement untouched |
+| P1-5 | Floating build inputs (`python:3.11-slim` bare in workflow/Dockerfiles; bare `resolve <tag>` step) | **Closed in 8.4.2-D:** `pinned-images.txt` holds the six AUTHORITATIVE committed digests (`<source-name> <sha256:64hex> <env-key>`); the workflow fail-closed verifies the grammar, pulls/inspects `name@sha256:<64hex>` only, and records to `image-provenance-inputs.txt` + `$GITHUB_ENV` — no dispatch-time resolution, no fallback, no sentinel; Dockerfiles/compose use `ARG/…:?` fail-closed refs; static tests reject any non-`sha256:<64hex>` pin (sentinel/malformed/missing) and reject `python:3.11-slim`/`python:latest`/`python@invalid` in workflow+compose+Dockerfiles | `TestImmutability` (parametrized over all seven E2E Dockerfiles) + `TestProvenanceClosure` + `TestDeterministicProvenanceAudit` points 1–2; sandbox digest enforcement untouched |
 | P1-6 | Secrets job-global; `compose config` rendered live secrets into artifacts; upload unconditional | Secrets moved to step `env:` (validate/boot/prove/execute/driver/cleanup only); diagnostics rendered by `render_compose_config()` from a sanitized env (placeholder `[REDACTED-NON-SECRET]`, which the scanner now explicitly exempts while still matching real values); recursive scan is a separate step with `id: secretscan`; upload `if: … && steps.secretscan.outcome == 'success'` | `TestSecretStaging` (8 tests incl. injected-fixture-secret fails scan → upload gated) |
 | 7 | Replay used fixed `time.sleep(6)` as proof | Bounded `wait_until("replay-consumed", …)` over observable state: group `last-delivered-id` ≥ replayed id AND `XPENDING` empty for that id; deadline+interval+structured timeout diagnostics; no `time.sleep` anywhere in the replay path | `TestReplayPolling` (3 tests) |
 | 8 | Docs under-counted the integration refs (five-refs phrasing) | Six integration refs listed — **6 audited / 0 modified**: `4bd799b3`, `3d87007d`, `71713d83`, `a0bf7600`, `1184eb67`, `d1961e43` | `test_docs_list_six_integration_refs` |
@@ -356,7 +368,7 @@ locally (no Docker runtime in this environment).
 | --- | --- | --- | --- |
 | `incident_service/…/remediation_workspace_service.py` | Constructor `workspace_root` param (default ← `REMEDIATION_WORKSPACE_ROOT` env, else legacy system-tmp); root-mode clones authenticate + clean only under root | P0-2/P0-3; production default (env unset) byte-equivalent to previous behaviour | corrective tests + existing workspace-service suite (signature update `fake_git(…, **kwargs)` only) |
 | `incident_service/…/validation_sandbox.py` | Root-mode guard: mount source must exist and lie beneath `REMEDIATION_WORKSPACE_ROOT` | P0-2 fail-closed; guard inactive when env unset (unit contexts) | corrective + existing sandbox suites (35-module set) |
-| `deployment_service/Dockerfile.e2e`, `incident_service/Dockerfile.e2e` | `ARG BASE_IMAGE` + fail-closed `FROM` | P1-5 immutability (E2E-only Dockerfiles; production Dockerfiles untouched) | `TestImmutability` |
+| E2E build surfaces — `deployment_service/Dockerfile.e2e`, `incident_service/Dockerfile.e2e`, `api_gateway/Dockerfile.e2e`, `repo_service/Dockerfile.e2e`, `agent_service/Dockerfile.e2e`, `monitoring_service/Dockerfile.e2e`, `e2e/workload/Dockerfile` (seven files; the worker reuses `incident_service/Dockerfile.e2e` via compose override) | `ARG BASE_IMAGE` + fail-closed `FROM ${BASE_IMAGE:?…}` (the four service `.e2e` files added in 8.4.2-D) | P1-5 immutability + §6.2 narrowest mechanism: every surface the E2E workflow builds is E2E-specific and digest-controlled; production Dockerfiles stay tag-based by design and are never E2E-built | `TestImmutability` (parametrized over all seven) + `TestProvenanceClosure::test_e2e_build_surfaces_are_all_narrow_e2e_dockerfiles` |
 | `e2e/*`, workflow, `docker-compose.e2e.yml` | harness-only | scope | test files below |
 
 No other production file changed; `main`, integration refs and PRs
@@ -366,7 +378,7 @@ No other production file changed; `main`, integration refs and PRs
 
 | Scope (cwd) | Command | Result |
 | --- | --- | --- |
-| `devops-ai-platform` | `pytest tests/ deployment_service/tests` (CI scope) | **403 passed + 131 subtests** (325 baseline + 78 new corrective) |
+| `devops-ai-platform` | `pytest tests/ deployment_service/tests` (CI scope) | **428 passed + 131 subtests** (325 baseline + 103 corrective: the original 78 kept/updated + 25 added in 8.4.2-D incl. parametrization growth) |
 | `devops-ai-platform` | CI incident job command (`python -m unittest` with the 35 enumerated modules) | **Ran 559 — OK (3 skipped)** |
 | `devops-ai-platform` | `python -m unittest discover -s incident_service -p 'test_*.py' -t .` (superset) | Ran 553 — OK (3 skipped) |
 | `devops-ai-platform` | `compileall incident_service api_gateway` + `pytest api_gateway/tests` (CI scope) | **79 passed + 60 subtests** |
@@ -436,17 +448,23 @@ IDs, stage results — all **scalars** (`validate_manifest` enforces
    **One root** (`E2E_WORKSPACES_ROOT`, compose-mounted at the identical
    path), absent root/mount source fails closed, `_cleanup_path`
    refuses anything outside the root (test raises), no host fallback.
-3. **Git auth** — token in URL/config/argv/logs/artifacts? **No**:
-   stdin→env `GIT_CONFIG_*` only; tests assert token absence from argv,
-   URLs, `.git/config` and workflow command lines; live proof step
-   (NOT VERIFIED).
+3. **Git auth** — token in URL/config/argv/logs/artifacts/child
+   env? **No**: auth travels only via per-process `GIT_CONFIG_*`
+   `http.extraHeader`; since 8.4.2-D §11 (P2) `_run_git` also scrubs
+   `GITHUB_OAUTH_TOKEN` from EVERY child git environment (raw token
+   never inherited); tests assert token absence from argv, URLs,
+   `.git/config`, child env and workflow command lines; live proof
+   step (NOT VERIFIED).
 4. **Concurrency** — does the oracle accept two winners/zero winners?
    **No**: exactly-one-winner + exactly-one-409 + terminal `PR_CREATED`
    or FAIL (15 patterns asserted).
 5. **Immutability** — any floating tag left? **None** in
-   workflow/compose/Dockerfiles (static tests); digests resolved at
-   dispatch from committed source names and recorded; sandbox digest
-   enforcement untouched.
+   workflow/compose/Dockerfiles (static tests); the six inputs are
+   committed SHA-256 manifest digests pulled by
+   `name@sha256:<64hex>` only — **no dispatch-time resolution and no
+   fallback** (8.4.2-D §5) — and recorded to
+   `image-provenance-inputs.txt`; sandbox digest enforcement
+   untouched.
 6. **Secrets** — can a secret enter artifact staging? **Not via the
    primary path** (sanitized render; scanner exemption is limited to
    the literal placeholder) and the backstop scan **gates upload**
@@ -490,3 +508,151 @@ Commits: `be19a4e` (fix(e2e)) → `3c729cb` (docs(e2e)) → `8bbee50`
 LIVE E2E: NOT VERIFIED — these runs execute the CI suites only; the
 golden-path workflow remains dispatch-only and not on the default
 branch, so no golden-path execution exists.
+
+# Phase 8.4.2-D — provenance & manifest auditability closure (2026-10-06)
+
+HARNESS: CORRECTIVE REPAIRS IMPLEMENTED + CI-VALIDATED (per-item below)
+LIVE E2E: NOT VERIFIED — the golden path has still never executed; the
+workflow is dispatch-only and not on the default branch.
+
+## P1-5 — immutable image pins (committed, authoritative)
+
+`devops-ai-platform/e2e/pinned-images.txt` now carries exactly six
+entries of the form `<source-name> <sha256:64hex> <env-key>`; every
+pin is the authoritative tag-manifest (index) digest obtained via the
+Docker Hub Hub API tag lookup (`hub.docker.com/v2/repositories/
+<repo>/tags/<tag>`, top-level `digest` + `media_type`) fetched
+2026-10-06; the kindest/node list digest additionally matches the
+value published by the kind project. No digest was invented; none was
+unavailable, so no stop condition fired.
+
+| Source name | Committed digest | Env key |
+| --- | --- | --- |
+| `python:3.11-slim` | `sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce` | `E2E_PYTHON_BASE_IMAGE` |
+| `postgres:15-alpine` | `sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81` | `E2E_POSTGRES_IMAGE` |
+| `redis:7-alpine` | `sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499` | `E2E_REDIS_IMAGE` |
+| `qdrant/qdrant:v1.12.4` | `sha256:241edb9d7778327516ef218f8c74e1bd61b5ea42cd4f193cb8d0896199705636` | `E2E_QDRANT_IMAGE` |
+| `registry:2` | `sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373` | `REGISTRY_IMAGE` |
+| `kindest/node:v1.31.4` | `sha256:2cb39f7295fe7eafee0842b1052a599a4fb0f8bcf3f83d96c7f4864c357c6c30` | `NODE_IMAGE` |
+
+Workflow `Load immutable image pins (committed digests, §9)` step:
+validates env-key grammar `^[A-Z][A-Z0-9_]*$` and image-name grammar,
+verifies each pin against `^sha256:[0-9a-f]{64}$` (anything else —
+sentinel, malformed, missing column — aborts the job), pulls and
+`docker image inspect`s ONLY `name@sha256:<64hex>`, writes each
+`KEY=REF` to `$GITHUB_ENV` **and**
+`$E2E_ARTIFACT_DIR/image-provenance-inputs.txt` (exactly six lines),
+then exports the three manifest inputs below. The workflow text
+contains **no image source name, no bare-tag pull, no resolution
+branch, and no sentinel token** (tests enforce all four).
+
+## P1 manifest provenance — exported upstream of the driver
+
+Assigned **before** `Execute golden path driver` (source of truth
+upstream of the driver; nothing is patched afterwards):
+
+- `E2E_REGISTRY_DIGEST=<registry:2@sha256:…>` and
+  `E2E_KIND_NODE_DIGEST=<kindest/node:v1.31.4@sha256:…>` (pins step).
+- `E2E_BASE_IMAGES` — deterministic scalar
+  `KEY=value;KEY=value;…` over the six inputs (pins step).
+- `E2E_BUILT_IMAGE_DIGESTS` —
+  `E2E_WORKLOAD_IMAGE=<name@sha256:…>;REMEDIATION_SANDBOX_IMAGE=<name@sha256:…>`
+  from actual post-push `RepoDigests` (build step), each fail-closed
+  verified against `@sha256:<64hex>` before export.
+
+The driver's manifest constructor already reads all four env vars
+plus `E2E_SOURCE_SHA`/`E2E_FIXTURE_SEED_SHA`/`E2E_WORKSPACES_ROOT`/
+`E2E_SANDBOX_DIGEST`. New gate: `finalize_execution_manifest()`
+(execution path only) **downgrades PASS → FAIL** with an auditable
+`provenance_rejection` reason when any required field
+(`source_sha`, `fixture_seed_sha`, `workspace_root`,
+`registry_image_digest`, `kind_node_image_digest`, `base_images`,
+`built_image_digests`, `sandbox_image_digest`) is empty;
+NOT_VERIFIED/BLOCKED preflight paths keep plain `finalize_manifest`,
+and dummy unit manifests remain schema-valid without live provenance.
+
+## §6.2 — E2E-built production Dockerfiles eliminated (narrowest fix)
+
+Every surface the workflow builds is digest-controlled — the seven
+compose services below plus the workload image:
+
+| Compose service | E2E Dockerfile (built) | Base reference |
+| --- | --- | --- |
+| `deployment-service` | `deployment_service/Dockerfile.e2e` | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| `incident-service` | `incident_service/Dockerfile.e2e` | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| `api-gateway` | `api_gateway/Dockerfile.e2e` (new in 8.4.2-D) | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| `repo-service` | `repo_service/Dockerfile.e2e` (new) | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| `agent-service` | `agent_service/Dockerfile.e2e` (new) | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| `monitoring-service` | `monitoring_service/Dockerfile.e2e` (new) | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| `incident-event-worker` | `incident_service/Dockerfile.e2e` (override, new) | `${E2E_PYTHON_BASE_IMAGE:?}` |
+| workload push | `e2e/workload/Dockerfile` | `${E2E_PYTHON_BASE_IMAGE:?}` |
+
+Production Dockerfiles (`api_gateway/Dockerfile`,
+`repo_service/Dockerfile`, `agent_service/Dockerfile`,
+`monitoring_service/Dockerfile`, `deployment_service/Dockerfile`,
+`incident_service/Dockerfile`) remain **tag-based by design** and are
+never part of the E2E build; only the surfaces above are
+digest-controlled.
+
+## P2 — raw OAuth token never inherited by child git
+
+`RemediationWorkspaceService._run_git` now strips
+`GITHUB_OAUTH_TOKEN` (alongside the existing `GIT_CONFIG_GLOBAL` /
+`GIT_CONFIG_SYSTEM` / `GIT_SSH_COMMAND` exclusions) from every child
+environment; authentication continues exclusively via caller-supplied
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0=http.extraHeader`/
+`GIT_CONFIG_VALUE_0`. Two focused tests
+(`TestCredentialHygiene`) capture the real child env: token absent,
+header present, unrelated env preserved. No auth redesign.
+
+## Tests (this phase)
+
+- `devops-ai-platform` CI scope: **428 passed + 131 subtests**
+  (all 78 prior corrective tests kept — two expectations updated, none
+  deleted — plus 25 new: `TestProvenanceClosure` (6),
+  `TestCredentialHygiene` (2), `TestDeterministicProvenanceAudit`
+  (9 points, Docker-free), parametrization growth over the seven
+  E2E Dockerfiles).
+- Incident CI 35-module unittest: **Ran 559 — OK (3 skipped)**;
+  gateway **79 passed + 60 subtests**; backend **49 passed**;
+  harness **24 passed + 7 subtests** (unmodified).
+- Workflow static validation: YAML parse OK; `bash -n` on all 15
+  `run:` blocks OK; dispatch-only trigger; `permissions: contents:
+  read`; both actions full-SHA-pinned; no sentinel token anywhere in
+  workflow/pin-file/override.
+- Offline resolve-step simulation (stub `docker`, real script): rc=0;
+  six digest-only pulls + six digest-only inspects; six-line
+  provenance artifact; nine `$GITHUB_ENV` lines (6 pins + 3 manifest
+  exports); `E2E_BASE_IMAGES` contains six `@sha256:` refs;
+  tightening the grammar check to 63 hex made the step fail closed
+  (non-zero).
+- `git diff --check`: clean.
+
+## CI run-ID discipline (disclaimer)
+
+Every run ID cited in this report (including the
+corrective-hardening evidence above) is an **ordinary `ci.yml` run**
+(push or pull_request pattern) executing the CI suites. They are
+**not** `E2E Golden Path (staging)` dispatches — no golden-path run
+exists (**LIVE E2E: NOT VERIFIED**), and ordinary CI run IDs must
+never be relabeled as golden-path evidence. The run IDs for the
+8.4.2-D head itself cannot appear inside the commit that defines that
+head (self-reference); they are recorded with full job-level detail
+in the Phase 8.4.2-D final audit response, which is the evidence
+document of record for this phase.
+
+## Remaining blockers (8.4.2-D)
+
+1. Workflow not on the default branch → no dispatch possible
+   (**LIVE E2E: NOT VERIFIED**).
+2. Fixture repo + `E2E_JWT_SECRET` / `E2E_FIXTURE_GITHUB_TOKEN`
+   still unprovisioned (§57 stop honored — all-powerful token NOT
+   wired).
+3. No Docker/kind/terraform locally → container-level proofs are
+   static/unit-level until a real dispatch executes them.
+
+Vocabulary discipline: PASS only for checks that actually ran; every
+container/GitHub-dependent property is NOT VERIFIED; no
+production-readiness, exactly-once, staging-success, or
+"all build inputs are immutable at runtime" claim beyond the
+committed-digest facts stated above.
