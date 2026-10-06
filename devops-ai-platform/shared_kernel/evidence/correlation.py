@@ -271,10 +271,14 @@ class OperationalCorrelationEngine:
         """Return the highest-precedence rule binding ``item`` to the anchor."""
         # R7 environment binding is a *gate*, not a rule: cross-environment
         # evidence never correlates on weaker-than-exact identity.
+        # Weaker correlation is safe only when both sides carry the same
+        # explicit environment. An unknown environment must not be treated as
+        # compatible with production/staging, or it could bypass the isolation
+        # boundary via repository/commit or temporal fallback.
         same_environment = (
-            anchor.environment is None
-            or item.environment is None
-            or anchor.environment == item.environment
+            anchor.environment is not None
+            and item.environment is not None
+            and anchor.environment == item.environment
         )
 
         if item.incident_id == incident_id:
