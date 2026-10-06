@@ -41,6 +41,7 @@ from .model import (
     EvidenceStrength,
     EVIDENCE_SCHEMA_VERSION,
     ObservationType,
+    ScopeAuthority,
     SourceReference,
     SourceType,
 )
@@ -140,6 +141,9 @@ def rehydrate_item(data: Mapping[str, Any]) -> EvidenceItem:
             artifact_digest=provenance_data.get("artifact_digest"),
             query=provenance_data.get("query"),
             query_hash=provenance_data.get("query_hash"),
+            service_scope_authority=_rehydrate_authority(
+                provenance_data.get("service_scope_authority")
+            ),
         )
         service = _rehydrate_service(data.get("service_identity"))
         return EvidenceItem(
@@ -156,6 +160,13 @@ def rehydrate_item(data: Mapping[str, Any]) -> EvidenceItem:
                     key_type=CorrelationKeyType(key["key_type"]),
                     value=key["value"],
                     source=SourceType(key["source"]),
+                    # Serialization omits the authority when it is
+                    # SOURCE_NATIVE, so an absent field means source-native -
+                    # which is also what evidence captured before the
+                    # authority extension should rehydrate as.
+                    authority=ScopeAuthority(
+                        key.get("authority", ScopeAuthority.SOURCE_NATIVE.value)
+                    ),
                 )
                 for key in data.get("correlation_keys", ())
             ),
@@ -179,6 +190,23 @@ def rehydrate_item(data: Mapping[str, Any]) -> EvidenceItem:
             EvidenceErrorCode.INVALID_EVIDENCE,
             f"captured evidence item is not valid: {exc}",
         ) from exc
+
+
+def _rehydrate_authority(value: Any) -> Optional[ScopeAuthority]:
+    """Restore an optional scope authority from its serialized form.
+
+    Absence carries meaning at the provenance level: it records that no
+    caller asserted the deployed scope, which is not the same claim as
+    "the source system asserted it". It therefore rehydrates as ``None``
+    rather than being promoted to ``SOURCE_NATIVE``.
+
+    An unrecognized value raises ``ValueError``, which ``rehydrate_item``
+    converts into the structured ``INVALID_EVIDENCE`` error - never coerced
+    to a default.
+    """
+    if value is None:
+        return None
+    return ScopeAuthority(value)
 
 
 def _rehydrate_repository(data: Any) -> Optional[RepositoryIdentity]:

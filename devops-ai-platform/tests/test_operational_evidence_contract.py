@@ -1552,3 +1552,290 @@ class TestDocumentationInvariants:
         doc = self._doc()
         assert FROZEN_COHERENT_PACK_HASH in doc
         assert FROZEN_CONFLICTING_PACK_HASH in doc
+
+
+class TestScopedGitHubReplayRoundTrip:
+    """Caller-asserted scope must survive capture and replay intact.
+
+    The pre-existing replay fixtures are entirely source-native, so they
+    never exercised the authority path. These tests do, end to end:
+    collect -> to_dict -> capture_inputs -> replay_capture ->
+    rehydrate_item.
+    """
+
+    @staticmethod
+    def _scoped_commit(sha: str = SHA_A):
+        return GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=sha, observed_at=T0, collected_at=T0,
+            message="hotfix", service_name="payments",
+            environment="production",
+        )[0]
+
+    @staticmethod
+    def _authorities(item):
+        return {key.key_type.value: key.authority for key in item.correlation_keys}
+
+    def test_scoped_github_item_is_caller_asserted_before_capture(self):
+        item = self._scoped_commit()
+        assert (
+            item.provenance.service_scope_authority
+            is ScopeAuthority.CALLER_ASSERTED
+        )
+        authorities = self._authorities(item)
+        # the caller asserted the deployed scope
+        for key_type in ("service.name", "environment", "service.scope"):
+            assert authorities[key_type] is ScopeAuthority.CALLER_ASSERTED, key_type
+        # GitHub itself asserted these
+        for key_type in ("repository", "commit_sha"):
+            assert authorities[key_type] is ScopeAuthority.SOURCE_NATIVE, key_type
+
+    def test_scoped_github_item_survives_rehydration_unchanged(self):
+        item = self._scoped_commit()
+        replayed = rehydrate_item(item.to_dict())
+
+        assert (
+            replayed.provenance.service_scope_authority
+            is ScopeAuthority.CALLER_ASSERTED
+        )
+        assert self._authorities(replayed) == self._authorities(item)
+        assert replayed.content_hash == item.content_hash
+        assert replayed.evidence_id == item.evidence_id
+        assert replayed.to_dict() == item.to_dict()
+
+    def test_scoped_github_item_survives_a_full_capture_replay(self):
+        item = self._scoped_commit()
+        anchor = IncidentEvidenceSource().collect(
+            incident_id="inc-rt-1", service_name="checkout",
+            environment="production", observed_at=T0, collected_at=T0,
+        )[0]
+        bundle = capture_inputs(
+            incident_id="inc-rt-1", evidence_items=[anchor, item],
+            policy=DEFAULT_POLICY, generated_at=T0,
+        )
+        pack = replay_capture(bundle)
+
+        replayed = next(
+            i for i in pack.evidence_items if i.evidence_id == item.evidence_id
+        )
+        assert (
+            replayed.provenance.service_scope_authority
+            is ScopeAuthority.CALLER_ASSERTED
+        )
+        assert self._authorities(replayed) == self._authorities(item)
+        assert replayed.content_hash == item.content_hash
+        assert replayed.to_dict() == item.to_dict()
+
+    def test_bare_github_item_round_trips_as_unasserted(self):
+        bare = GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=SHA_B, observed_at=T0,
+            collected_at=T0, message="chore",
+        )[0]
+        replayed = rehydrate_item(bare.to_dict())
+
+        assert bare.provenance.service_scope_authority is None
+        assert replayed.provenance.service_scope_authority is None
+        assert replayed.service_identity is None
+        assert {k.authority for k in replayed.correlation_keys} == {
+            ScopeAuthority.SOURCE_NATIVE
+        }
+        assert replayed.to_dict() == bare.to_dict()
+
+    def test_a_key_serialized_without_authority_rehydrates_source_native(self):
+        """Backward compatibility with evidence captured before the field."""
+        item = self._scoped_commit()
+        data = item.to_dict()
+        for key in data["correlation_keys"]:
+            key.pop("authority", None)
+        # the hash no longer matches, so drop the derived fields and check
+        # only the rehydration default itself
+        data.pop("evidence_id", None)
+        data.pop("content_hash", None)
+        data["provenance"].pop("service_scope_authority", None)
+        data.pop("service_identity", None)
+
+        replayed = rehydrate_item(data)
+        assert {k.authority for k in replayed.correlation_keys} == {
+            ScopeAuthority.SOURCE_NATIVE
+        }
+        assert replayed.provenance.service_scope_authority is None
+
+
+class TestScopedGitHubPackReplay:
+    """A scoped commit must reach R5 and replay with its semantics intact."""
+
+    def _pack(self):
+        anchor = IncidentEvidenceSource().collect(
+            incident_id="inc-rt-2", service_name="checkout",
+            environment="production", observed_at=T0, collected_at=T0,
+        )[0]
+        anchor = EvidenceItem(
+            observation_type=anchor.observation_type,
+            provenance=anchor.provenance, observed_at=anchor.observed_at,
+            collected_at=anchor.collected_at,
+            service_identity=anchor.service_identity,
+            incident_id="inc-rt-2",
+            correlation_keys=anchor.correlation_keys + (
+                CorrelationKey(
+                    key_type=CorrelationKeyType.REPOSITORY,
+                    value=RepositoryIdentity.parse(REPO).qualified_name,
+                    source=SourceType.INCIDENT_SERVICE,
+                ),
+                CorrelationKey(
+                    key_type=CorrelationKeyType.COMMIT_SHA, value=SHA_A,
+                    source=SourceType.INCIDENT_SERVICE,
+                ),
+            ),
+            payload=dict(anchor.payload), status=anchor.status,
+            strength=anchor.strength,
+        )
+        # sibling service so R4 cannot outrank R5
+        commit = GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=SHA_A, observed_at=T0,
+            collected_at=T0, message="hotfix", service_name="payments",
+            environment="production",
+        )[0]
+        return anchor, commit
+
+    def test_scoped_commit_binds_by_r5_and_replays_identically(self):
+        anchor, commit = self._pack()
+        engine = OperationalCorrelationEngine(policy=DEFAULT_POLICY)
+        original = engine.correlate(
+            incident_id="inc-rt-2", evidence_items=[anchor, commit],
+            generated_at=T0,
+        )
+        assert original.summary["binding_rules"][commit.evidence_id] == (
+            "R5-repository-commit-binding"
+        )
+
+        bundle = capture_inputs(
+            incident_id="inc-rt-2", evidence_items=[anchor, commit],
+            policy=DEFAULT_POLICY, generated_at=T0,
+        )
+        replayed_pack = replay_capture(bundle)
+
+        assert replayed_pack.pack_hash == original.pack_hash
+        assert replayed_pack.summary["binding_rules"][commit.evidence_id] == (
+            "R5-repository-commit-binding"
+        )
+
+        # a matching pack hash is not sufficient: the semantics must survive
+        replayed = next(
+            i for i in replayed_pack.evidence_items if i.evidence_id == commit.evidence_id
+        )
+        assert (
+            replayed.provenance.service_scope_authority
+            is ScopeAuthority.CALLER_ASSERTED
+        )
+        authorities = {k.key_type.value: k.authority for k in replayed.correlation_keys}
+        assert authorities["service.name"] is ScopeAuthority.CALLER_ASSERTED
+        assert authorities["environment"] is ScopeAuthority.CALLER_ASSERTED
+        assert authorities["service.scope"] is ScopeAuthority.CALLER_ASSERTED
+        assert authorities["repository"] is ScopeAuthority.SOURCE_NATIVE
+        assert authorities["commit_sha"] is ScopeAuthority.SOURCE_NATIVE
+
+    def test_scoped_commit_still_cannot_cross_environments(self):
+        """Supplying a scope grants eligibility, never an exemption."""
+        anchor, _ = self._pack()
+        staging_commit = GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=SHA_A, observed_at=T0,
+            collected_at=T0, message="hotfix", service_name="payments",
+            environment="staging",
+        )[0]
+        engine = OperationalCorrelationEngine(policy=DEFAULT_POLICY)
+        pack = engine.correlate(
+            incident_id="inc-rt-2", evidence_items=[anchor, staging_commit],
+            generated_at=T0,
+        )
+        assert staging_commit.evidence_id not in pack.summary["binding_rules"]
+        # retained, never discarded
+        assert staging_commit.evidence_id in {i.evidence_id for i in pack.evidence_items}
+
+
+class TestAuthorityTamperDetection:
+    """Authority is integrity-covered; rewriting it cannot be silent."""
+
+    @staticmethod
+    def _scoped():
+        return GitHubEvidenceSource().collect(
+            repository=REPO, commit_sha=SHA_A, observed_at=T0,
+            collected_at=T0, message="hotfix", service_name="payments",
+            environment="production",
+        )[0]
+
+    def test_downgrading_provenance_authority_changes_identity(self):
+        item = self._scoped()
+        downgraded = EvidenceProvenance(
+            source_system=item.provenance.source_system,
+            source_reference=item.provenance.source_reference,
+            retrieved_at=item.provenance.retrieved_at,
+            source_api_version=item.provenance.source_api_version,
+            repository=item.provenance.repository,
+            commit_sha=item.provenance.commit_sha,
+            service_scope_authority=ScopeAuthority.SOURCE_NATIVE,
+        )
+        rebuilt = EvidenceItem(
+            observation_type=item.observation_type, provenance=downgraded,
+            observed_at=item.observed_at, collected_at=item.collected_at,
+            service_identity=item.service_identity,
+            correlation_keys=item.correlation_keys,
+            payload=dict(item.payload), status=item.status,
+            strength=item.strength,
+        )
+        assert rebuilt.content_hash != item.content_hash
+        assert rebuilt.evidence_id != item.evidence_id
+
+    def test_downgrading_a_key_authority_changes_identity(self):
+        item = self._scoped()
+        rewritten = tuple(
+            CorrelationKey(
+                key_type=k.key_type, value=k.value, source=k.source,
+                authority=ScopeAuthority.SOURCE_NATIVE,
+            )
+            for k in item.correlation_keys
+        )
+        rebuilt = EvidenceItem(
+            observation_type=item.observation_type, provenance=item.provenance,
+            observed_at=item.observed_at, collected_at=item.collected_at,
+            service_identity=item.service_identity,
+            correlation_keys=rewritten, payload=dict(item.payload),
+            status=item.status, strength=item.strength,
+        )
+        assert rebuilt.content_hash != item.content_hash
+
+    def test_tampering_with_a_captured_authority_is_rejected(self):
+        """Keeping the original id while rewriting authority must fail."""
+        item = self._scoped()
+        data = item.to_dict()
+        data["provenance"]["service_scope_authority"] = (
+            ScopeAuthority.SOURCE_NATIVE.value
+        )
+        with pytest.raises(EvidenceError) as exc:
+            rehydrate_item(data)
+        assert exc.value.code is EvidenceErrorCode.INVALID_EVIDENCE
+
+    def test_tampering_with_a_captured_key_authority_is_rejected(self):
+        item = self._scoped()
+        data = item.to_dict()
+        for key in data["correlation_keys"]:
+            key.pop("authority", None)
+        with pytest.raises(EvidenceError) as exc:
+            rehydrate_item(data)
+        assert exc.value.code is EvidenceErrorCode.INVALID_EVIDENCE
+
+    @pytest.mark.parametrize("bogus", ["TRUST_ME", "source_native", "", "null"])
+    def test_invalid_authority_values_are_rejected(self, bogus):
+        item = self._scoped()
+        data = item.to_dict()
+        data["provenance"]["service_scope_authority"] = bogus
+        with pytest.raises(EvidenceError) as exc:
+            rehydrate_item(data)
+        assert exc.value.code is EvidenceErrorCode.INVALID_EVIDENCE
+
+    @pytest.mark.parametrize("bogus", ["TRUST_ME", "caller_asserted", 7])
+    def test_invalid_key_authority_values_are_rejected(self, bogus):
+        item = self._scoped()
+        data = item.to_dict()
+        data["correlation_keys"][0]["authority"] = bogus
+        with pytest.raises(EvidenceError) as exc:
+            rehydrate_item(data)
+        assert exc.value.code is EvidenceErrorCode.INVALID_EVIDENCE
