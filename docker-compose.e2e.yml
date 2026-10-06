@@ -1,0 +1,44 @@
+# Phase 8.4.2 — E2E-only override. Never part of the default contract:
+#   docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml up -d
+# Image refs are digest-resolved by the harness before `up` (§8); the
+# defaults below only exist so `compose config` validation can run.
+services:
+  postgres:
+    image: ${E2E_POSTGRES_IMAGE:-postgres:15-alpine}
+  redis:
+    image: ${E2E_REDIS_IMAGE:-redis:7-alpine}
+  qdrant:
+    image: ${E2E_QDRANT_IMAGE:-qdrant/qdrant:v1.12.4}
+
+  agent-service:
+    environment:
+      - E2E_DETERMINISTIC_RCA=true
+
+  deployment-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./deployment_service/Dockerfile.e2e
+    environment:
+      - DEPLOYMENT_EXECUTION_ENABLED=true
+      - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
+      - DEPLOYMENT_KUBECONFIG_PATH=/etc/deployment/kubeconfig
+      - DEPLOYMENT_ALLOWED_NAMESPACES=devops-production-namespace
+      - HEALTHCHECK_ALLOWED_HOSTS=${E2E_HEALTHCHECK_ALLOWED_HOSTS:-}
+    volumes:
+      - ${E2E_KUBECONFIG_HOST_PATH:-/tmp/ares-e2e-kubeconfig}:/etc/deployment/kubeconfig:ro
+
+  incident-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./incident_service/Dockerfile.e2e
+    environment:
+      - REMEDIATION_SANDBOX_IMAGE=${REMEDIATION_SANDBOX_IMAGE:?E2E requires a digest-pinned sandbox image}
+      - REMEDIATION_VALIDATION_PROFILE=e2e_fixture
+      - REMEDIATION_PROPOSAL_TTL_SECONDS=${REMEDIATION_PROPOSAL_TTL_SECONDS:-600}
+      - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
+      - GITHUB_DEFAULT_BASE_BRANCH=main
+    volumes:
+      # Sandbox runs as sibling containers of this service; there is no
+      # host-process fallback (Phase 6.2.2) — docker.sock is the only
+      # execution channel and the profile/argv remain code-owned.
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -1,0 +1,18 @@
+# Phase 8.4.2 — E2E-only incident-service image.
+# Adds exactly what the real remediation path needs at runtime:
+#   git   — workspace clone/checkout/commit/push (RemediationWorkspace*)
+#   docker CLI — sibling-container validation sandbox via the mounted
+#                socket (there is NO host-execution fallback, 6.2.2).
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git docker.io \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /platform
+COPY requirements.txt /platform/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /platform
+
+EXPOSE 8050
+CMD ["uvicorn", "incident_service.main:app", "--host", "0.0.0.0", "--port", "8050"]
