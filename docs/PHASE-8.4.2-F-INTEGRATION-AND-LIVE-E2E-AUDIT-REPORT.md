@@ -16,9 +16,10 @@ Audit date: 2026-10-06. All evidence below was produced at the heads named with 
 >
 > **Audited head:** `a6032808186e8bbf8bebd7efc0c85a41eee4df4e`. Every topology figure in
 > §§1–14 describes **that immutable head** and is pinned in the facts record. Commits made
-> after it (F.1, F.1.1) necessarily move both PRs' live counters, so live state is kept in
-> a separate layer: **§15** and the PR #13 description. A historical figure must never be
-> read as a live one, or the reverse.
+> after it (F.1, F.1.1, F.1.1.1) necessarily move both PRs' live counters, so live state is
+> kept in a separate layer. **GitHub's PR API and the PR #13 description are authoritative
+> for current values**; §15 holds only a dated, deliberately frozen snapshot. A historical
+> figure must never be read as a live one, or the reverse.
 
 ---
 
@@ -29,7 +30,7 @@ Audit date: 2026-10-06. All evidence below was produced at the heads named with 
 | **INTEGRATION** | **PASS** — a clean, surgical slice exists and is published as **PR #13** (50 files, +9,640 / −5, **32 linear commits, 0 merge commits**) onto `integration/phase-8.2-v1`, a true ancestor of this work |
 | **CI** | **PASS** — at the audited head `a6032808`: push `37482389727`, `pull_request` `37482396569` / `37482399004`, 5/5 jobs each. Later heads are recorded in §15 |
 | **DEFAULT-BRANCH WORKFLOW PUBLICATION** | **BLOCKED** — `e2e-golden-path.yml` is absent from the default branch; the workflow is not registered and cannot be dispatched |
-| **LIVE E2E** | **BLOCKED / NOT VERIFIED** — the golden path has never executed; no run id exists |
+| **LIVE E2E** | **BLOCKED / NOT VERIFIED** — no golden-path execution is evidenced by the GitHub API access available here; no run id is observable |
 
 The §4.2 instruction to cut a branch named `phase-8.4.2-f-live-e2e-integration` from
 `main` was **not executed**, for two independent reasons documented in §3. The
@@ -98,7 +99,8 @@ existed. All figures measured at the audited head `a6032808` in a full clone:
 
 > The 381-file / +57,956 / −765 column is the **historical `main → a6032808` comparison**,
 > i.e. the PR #12 topology *at the audited head*. It is *not* the PR #13 integration slice,
-> and it is *not* PR #12's live size today (§15). It must never be quoted as either.
+> and it is *not* PR #12's live size today — for that, query GitHub (§15 holds only a
+> frozen snapshot). It must never be quoted as either.
 
 `main`'s tree carries an older hyphenated prototype (`devops-ai-platform/api-gateway/`,
 `incident-service/`, … 72 files) and **no `.github/workflows/` directory at all**.
@@ -123,9 +125,10 @@ absence of a common ancestor.
 Nothing was created, rewritten or force-pushed: no new branch, no rebase, no history
 rewrite, `main` untouched, all six integration refs byte-identical to §2, and
 **PR #12 was not merged, retargeted or modified**: it remains OPEN against `main` and
-unmerged. (Its *live* file/line counters move whenever this shared head branch moves —
-see §15. The 381-file figure elsewhere in this report belongs to the historical
-`main → a6032808` comparison, not to PR #12 today.)
+unmerged. (Its *live* file/line counters move whenever this shared head branch moves, so
+GitHub is authoritative for them; §15 records a frozen snapshot. The 381-file figure
+elsewhere in this report belongs to the historical `main → a6032808` comparison, not to
+PR #12 today.)
 
 ### 3.3 Disclosed conflict with §4.2
 
@@ -178,8 +181,9 @@ exactly the 49 files above and nothing else (plus this report, committed after t
 
 > Counts in this section are measured at the **historical audited head `a6032808`** and
 > are machine-verified by `scripts/audit_phase_8_4_2_f.py` against
-> `docs/phase-8.4.2-f-audit-facts.json`. F.1 and F.1.1 commits land on top of that head;
-> live counters are in §15.
+> `docs/phase-8.4.2-f-audit-facts.json`. F.1, F.1.1 and F.1.1.1 commits land on top of that
+> head; a frozen snapshot of the live counters is in §15, and GitHub is authoritative for
+> current values.
 
 **Phase 8.4.2-F changed exactly 4 files in 2 commits** (`b08fbb0`, `c69c28d`), plus
 documentation commits recording this report; **Phase 8.4.2-F.1** then changed only audit
@@ -295,7 +299,7 @@ exist, and this report does not treat it as such.
 
 | # | Prerequisite | Status | Evidence and its limits |
 |---|---|---|---|
-| 8.1 | `e2e-staging` environment | **NOT PROVISIONED (as visible to this credential)** | `gh api .../environments` → HTTP 200, `{"total_count":0,"environments":[]}`. The call succeeded, so no environment is visible; this credential's scope over environment configuration is not independently confirmable, so this is recorded as *not visible*, not as proof of non-existence |
+| 8.1 | `e2e-staging` environment | **NOT VISIBLE TO THIS CREDENTIAL** | `gh api .../environments` → HTTP 200, `{"total_count":0,"environments":[]}`. The call succeeded, so no environment is visible; this credential's scope over environment configuration is not independently confirmable, so this is recorded as *not visible*, not as proof of non-existence |
 | 8.2 | `E2E_JWT_SECRET` | **NOT INDEPENDENTLY VERIFIABLE** | environment secrets cannot be enumerated with the available API surface. No environment is visible to hold it (8.1), but its presence or absence was not directly observed |
 | 8.3 | `E2E_FIXTURE_GITHUB_TOKEN` | **NOT INDEPENDENTLY VERIFIABLE** | as 8.2 |
 | 8.4 | `gm-prog/ares-e2e-fixture` | **NOT VISIBLE** | `gh api repos/gm-prog/ares-e2e-fixture` → HTTP 404. A 404 does not distinguish "does not exist" from "exists privately and is not shared with this installation". Either way it is unusable from here |
@@ -315,9 +319,10 @@ outcome is an external blocker, not a workaround.
 
 **None. LIVE E2E: NOT VERIFIED.**
 
-No run id, no job ids, no head SHA, no workflow-file SHA, no seed SHA, no manifest —
-because the workflow has never executed (§7). Nothing in this report infers execution
-from CI colour, YAML validity, `buildx --check` success or a previous report.
+No run id, no job ids, no head SHA, no workflow-file SHA, no seed SHA, no manifest — no
+execution of the workflow is evidenced by the GitHub API access available here, and the
+workflow is not even registered on the default branch (§7). Nothing in this report infers
+execution from CI colour, YAML validity, `buildx --check` success or a previous report.
 
 What *is* proven about the live path is strictly its static contract: the BuildKit gate
 (§6) proves the eight Dockerfiles build-plan correctly with the committed digest and are
@@ -372,7 +377,7 @@ spellings is rejected; `gm-prog/ares-e2e-fixture` is accepted.
 | 1 | `e2e-golden-path.yml` is not on the default branch → not dispatchable | `WORKFLOW_PUBLICATION_FAILURE` | repository owner: land the chain `#8 → #9 → #10 → #11 → #13` (or publish the workflow to `main` by whatever policy applies) |
 | 2 | no `e2e-staging` environment is visible to the available credential | `ENVIRONMENT_PREREQUISITE_FAILURE` | repository owner |
 | 3 | `E2E_JWT_SECRET` not confirmable (environment secrets are not enumerable here) | `ENVIRONMENT_PREREQUISITE_FAILURE` | repository owner |
-| 4 | `E2E_FIXTURE_GITHUB_TOKEN` not provisioned; an agent cannot mint a PAT | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
+| 4 | `E2E_FIXTURE_GITHUB_TOKEN` **not independently verifiable with the available credentials** (repository and environment secrets are not enumerable here); an agent cannot mint a PAT | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
 | 5 | `gm-prog/ares-e2e-fixture` is not reachable (HTTP 404 — absent, or private and not shared with this installation). It must be **private** and must never be the production repo | `FIXTURE_REPOSITORY_FAILURE` | repository owner |
 | 6 | No 40-hex seed commit can be named for `fixture_seed_sha` | `FIXTURE_REPOSITORY_FAILURE` | follows from #5 |
 | 7 | The available credential is an App installation token that cannot create dispatch events | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
@@ -398,7 +403,8 @@ against `integration/phase-8.2-v1`, versus **381 files / +57,956 / −765** agai
 — the latter being the historical `main → a6032808` comparison, i.e. the PR #12 topology
 *at that head*. Both come from `git diff --numstat` in a full clone, agree with the GitHub
 compare API, matched both PRs' counters at that head, and are re-derived by the audit
-guard. Live PR counters have moved since (§15); the audited-head record has not.
+guard. Live PR counters have moved since — §15 holds a frozen snapshot and GitHub is
+authoritative for current values; the audited-head record has not moved at all.
 
 **Q4. Could the slice have been even smaller?**
 The six `docs/PHASE-8.*.md` files are not needed to execute the golden path. They were
@@ -413,7 +419,8 @@ identical. "Unrelated" here means *unrelated content*, not unrelated histories �
 `main` comparison also has a common ancestor (§3.1).
 
 **Q6. Was PR #12 merged, retargeted, closed or used as a shortcut?**
-No. It is still OPEN against `main` and unmerged; its live counters are in §15. PR #13 is a
+No. It is still OPEN against `main` and unmerged; a frozen snapshot of its live counters is
+in §15, with GitHub authoritative for current values. PR #13 is a
 separate PR from the same head to a different base — a supported GitHub operation that
 mutates neither #12 nor the base ref.
 
@@ -455,7 +462,8 @@ requires presence on the **default branch**, i.e. blockers 1–3 and 5 in §11.
 **Q14. If every prerequisite were provisioned tomorrow, would the run pass?**
 Unknown, and this report does not predict it. Everything beyond the static contract —
 real image builds, registry/kind, compose readiness, the authenticated private fixture,
-the remediation path, the sandbox run, manifest completeness — has never executed once.
+the remediation path, the sandbox run, manifest completeness — is unevidenced; no execution
+of any of it is observable with the access available here.
 The correct reading is `NOT VERIFIED`, not "expected to pass".
 
 ---
@@ -525,21 +533,31 @@ own PR counters.
 `docs/phase-8.4.2-f-audit-facts.json` pins both endpoints to **immutable commit SHAs**,
 so the two comparisons stay reproducible after any branch moves.
 
-### 14.4 Residual limitation, stated plainly
+### 14.4 Shallow checkouts, and how CI now forecloses them
 
-GitHub Actions checks out shallow by default (`fetch-depth: 1`). The guard therefore
-**skips** rather than passes when run from such a checkout
-(`test_committed_audit_record_matches_this_repository`). Enforcing it in CI requires
-`fetch-depth: 0` on a job, which is a CI-configuration change outside this task's scope.
-Until then the guard is enforced locally and by review, and it is incapable of returning
-a *wrong* answer — only a refusal.
+GitHub Actions checks out shallow by default (`fetch-depth: 1`), and from such a checkout
+`test_committed_audit_record_matches_this_repository` **skips** rather than passes.
+
+That gap is now closed. The dedicated **`Phase 8.4.2-F audit truth`** job in
+`.github/workflows/ci.yml` performs a full-history checkout (`actions/checkout@v4` with
+`fetch-depth: 0`), so the repository-level audit verification **executes instead of being
+skipped**. The job also asserts `git rev-parse --is-shallow-repository` is `false`, asserts
+that every commit the record pins is present, runs the guard (requiring `PASS` and exit 0),
+and then parses its own JUnit report to prove the test was *executed and passed* — failing
+closed if it was skipped, failed or never collected, so a skip can never be reported as a
+pass. Evidence is published to the step summary and as a job annotation on every exit path,
+including failure. The other CI jobs keep their default shallow checkout; only this job
+needs full history.
+
+Independently of CI, the guard cannot return a *wrong* answer on a shallow clone: it
+refuses (exit 2) rather than guessing.
 
 **LIVE E2E: NOT VERIFIED** — unchanged by this correction. Fixing the audit record
 changes what is *claimed*, never what was *executed*.
 
 ---
 
-## 15. Current live state (dynamic layer — not the audit record)
+## 15. Pre-final live-state snapshot (dynamic layer — not the audit record)
 
 Three different questions are answered by three different evidence layers. They must
 never be collapsed:
@@ -550,10 +568,12 @@ never be collapsed:
 | Live metadata | *What is true right now?* | GitHub PR API / `git` at the current head | **changes with every push** |
 | CI verification | *Was the record actually checked against a complete history?* | the `Phase 8.4.2-F audit truth` CI job | per-run |
 
-### 15.1 Live snapshot
+### 15.1 Snapshot measured before the final closure commits
 
-Measured at head **`588076fdbf175939185daae4c65283d1d450f278`** on 2026-10-06, at the
-end of Phase 8.4.2-F.1.1. Local `git` and the GitHub PR API agree digit for digit:
+Measured at head **`588076fdbf175939185daae4c65283d1d450f278`** on 2026-10-06, *before*
+the final closure commits of Phase 8.4.2-F.1.1 and F.1.1.1 were written. **This is a
+point-in-time snapshot, not a claim about the current head.** At the instant of
+measurement, local `git` and the GitHub PR API agreed digit for digit:
 
 | Live counter (dynamic — measured at the head above, **not** audit facts) | PR #13 | PR #12 |
 |---|---|---|
@@ -565,12 +585,12 @@ end of Phase 8.4.2-F.1.1. Local `git` and the GitHub PR API agree digit for digi
 | changed files | 53 | 384 |
 | additions / deletions | +10,779 / −5 | +59,095 / −765 |
 
-> **These counters are dynamic.** Both PRs share the same head branch, so every commit
-> moves them — including the commit that records this very table, which adds exactly one
-> commit to each count (35 → 36 and 124 → 125) and changes no additional file. That
-> self-reference is why a committed document can never be the authority on live state:
-> the numbers above are a dated measurement, not audit facts. For authoritative current
-> values, query
+> **These counters are dynamic, and this table is deliberately frozen.** Both PRs share
+> the same head branch, so every later commit moves them — including the commit that
+> published this table, which superseded it on arrival. That self-reference is exactly why
+> a committed document can never be the authority on live state, and why this snapshot is
+> *not* chased on every push: doing so would restart the loop indefinitely. **Live GitHub
+> PR metadata is authoritative for current values**, not this table. Query
 > GitHub (`gh api repos/gm-prog/Autonomous-Devops-Engineer/pulls/13`) or read the PR #13
 > description, which is refreshed at the final head. **Do not copy these numbers into
 > `docs/phase-8.4.2-f-audit-facts.json`** — that record intentionally stays pinned to
@@ -598,5 +618,6 @@ an immutable SHA and never refreshed.
 GitHub refs API after every push in this phase. No ref moved as a side effect of any
 audit work.
 
-**LIVE E2E: NOT VERIFIED** — unchanged. No documentation or CI commit can alter that:
-it requires a real golden-path execution, which has never occurred.
+**LIVE E2E: NOT VERIFIED** — unchanged. No documentation or CI commit can alter that: it
+requires a real golden-path execution, and no such execution is independently evidenced by
+the GitHub API access available here.

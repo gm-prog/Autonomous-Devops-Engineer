@@ -482,13 +482,17 @@ def test_audited_head_is_never_called_the_current_head():
 
 
 def test_report_separates_historical_and_live_layers():
-    """C. — a dedicated live section must exist and warn about mutability."""
+    """C. — a dedicated live-state layer must exist and warn about mutability.
+
+    F.1.1.1 renamed the section to a snapshot, so this pins the section
+    number and its semantics rather than the old title.
+    """
     text = REPORT.read_text()
-    assert "Current live state" in text
-    assert "dynamic" in text.lower()
-    head = text.split("Current live state", 1)[1]
-    assert "PR #13" in head and "PR #12" in head
-    assert AUDITED_HEAD not in head.split("15.2")[0], (
+    assert "## 15." in text
+    body = text.split("## 15.", 1)[1]
+    assert "dynamic" in body.lower()
+    assert "PR #13" in body and "PR #12" in body
+    assert AUDITED_HEAD not in body.split("15.2")[0], (
         "the live snapshot must not be reported at the audited head"
     )
 
@@ -551,3 +555,96 @@ def test_ci_defines_a_full_history_audit_job():
     )
     assert ci.get("permissions") == {"contents": "read"}
     assert "pull_request_target" not in str(ci.get(True) or ci.get("on"))
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-F.1.1.1: evidence hygiene - claims must match what was observed
+# --------------------------------------------------------------------------
+
+def test_full_history_ci_is_not_described_as_future_work():
+    """D. — the fetch-depth: 0 job exists, so no paragraph may defer it."""
+    text = REPORT.read_text()
+    deferrals = ("outside this task", "out of scope", "future work",
+                 "not yet implemented", "would require a ci-configuration change")
+    for para in _paragraphs(text):
+        if "fetch-depth" not in para:
+            continue
+        low = para.lower()
+        for phrase in deferrals:
+            assert phrase not in low, (
+                f"full-history CI is implemented but described as deferred: {phrase!r}"
+            )
+    # and the implemented job must be described positively
+    assert "fetch-depth: 0" in text
+    assert "audit truth" in text.lower()
+    assert "executes instead of being" in text, (
+        "the report must state that the repository-level test now executes"
+    )
+
+
+def test_live_execution_claims_are_epistemically_bounded():
+    """E. — absence of evidence is not evidence of absence."""
+    import re
+    text = REPORT.read_text()
+    for pattern in (
+        r"(?:golden[- ]path|workflow|execution|it)\s+has never (?:executed|run|occurred)",
+        r"never taken place",
+        r"has never executed once",
+        r"no (?:live )?run has ever",
+    ):
+        assert not re.search(pattern, text, re.I), (
+            f"absolute historical-absence claim without complete workflow history: {pattern}"
+        )
+    # the bounded formulation and the status itself must both survive
+    assert "LIVE E2E: NOT VERIFIED" in text
+    assert "evidenced" in text.lower(), (
+        "live-E2E claims must be phrased in terms of available evidence"
+    )
+
+
+def test_secret_absence_is_never_asserted_without_secret_visibility():
+    """F. — repository/environment secrets are not enumerable here."""
+    text = REPORT.read_text()
+    claims = ("is missing", "does not exist", "is absent", "not provisioned",
+              "no fixture token", "token missing")
+    for line in text.splitlines():
+        if "E2E_FIXTURE_GITHUB_TOKEN" not in line:
+            continue
+        low = line.lower()
+        for claim in claims:
+            assert claim not in low, (
+                f"secret absence asserted without visibility into secrets: {line[:160]}"
+            )
+    assert "NOT INDEPENDENTLY VERIFIABLE" in text
+
+
+def test_valid_historical_figures_are_retained_not_scrubbed():
+    """G. — labelled history must stay; over-zealous cleanup is also a failure."""
+    text = REPORT.read_text()
+    assert "381" in text and "57,956" in text and "765" in text, (
+        "the historical main -> a6032808 figures must not be deleted"
+    )
+    labelled = [
+        para for para in _paragraphs(text)
+        if _quotes_historical_figure(para) and "a6032808" in para
+    ]
+    assert labelled, (
+        "at least one block must bind 381 / +57,956 to the audited head a6032808"
+    )
+
+
+def test_live_state_section_is_marked_as_a_snapshot_not_current_truth():
+    """§6 — the report may not claim to hold current live state."""
+    text = REPORT.read_text()
+    assert "## 15." in text
+    heading = next(l for l in text.splitlines() if l.startswith("## 15."))
+    assert "snapshot" in heading.lower(), (
+        f"section 15 must present itself as a snapshot, got: {heading}"
+    )
+    body = text.split("## 15.", 1)[1]
+    assert "588076fdbf175939185daae4c65283d1d450f278" in body, (
+        "the snapshot must name the exact SHA it was measured at"
+    )
+    assert "authoritative" in body.lower(), (
+        "the snapshot must defer to GitHub for current values"
+    )
