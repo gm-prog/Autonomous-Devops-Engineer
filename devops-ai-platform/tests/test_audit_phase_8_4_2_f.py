@@ -388,6 +388,166 @@ def test_report_keeps_live_e2e_not_verified():
 def test_report_labels_the_main_comparison_as_pr12_topology():
     """381 files is the main comparison and must never read as the PR #13 slice."""
     text = REPORT.read_text()
-    assert "PR #12 topology" in text or "PR #12's\ntopology" in text
-    marker = "The 381-file / +57,956 / −765 column is the **`main` comparison"
+    assert "PR #12 topology" in text
+    marker = "The 381-file / +57,956 / −765 column is the **historical `main → a6032808` comparison**"
     assert marker in text, "the large comparison must be explicitly attributed"
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-F.1.1: historical figures may never masquerade as live ones
+# --------------------------------------------------------------------------
+
+#: Figures that belong exclusively to the historical ``main -> a6032808``
+#: comparison. Any paragraph quoting one must say so.
+HISTORICAL_MAIN_FIGURES = (r"\b381\b", r"57,956")
+
+#: Any of these in the same paragraph marks the figures as historical.
+HISTORICAL_MARKERS = (
+    "a6032808", "historical", "audited head", "at that head", "audit record",
+)
+
+AUDITED_HEAD = "a6032808186e8bbf8bebd7efc0c85a41eee4df4e"
+
+
+def _paragraphs(text):
+    import re
+    return [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+
+def _quotes_historical_figure(paragraph: str) -> bool:
+    """True when the text quotes 381 / 57,956 as a *figure*.
+
+    Matching is anchored so a digit run inside a commit SHA (for example
+    ``…c381417deff…``) is never mistaken for the file count.
+    """
+    import re
+    return any(re.search(fig, paragraph) for fig in HISTORICAL_MAIN_FIGURES)
+
+
+def test_historical_main_figures_always_carry_a_historical_qualifier():
+    """A. and B. — 381 / +57,956 may never appear as a current-state claim."""
+    offenders = []
+    for para in _paragraphs(REPORT.read_text()):
+        if not _quotes_historical_figure(para):
+            continue
+        if not any(marker in para.lower() for marker in HISTORICAL_MARKERS):
+            offenders.append(para.strip()[:160])
+    assert not offenders, (
+        "historical main-comparison figures used without a historical "
+        f"qualifier: {offenders}"
+    )
+
+
+def test_pr12_is_never_described_as_currently_being_that_size():
+    """A. — 'PR #12 ... 381 files' as a live claim is the exact F.1.1 defect."""
+    import re
+    text = REPORT.read_text()
+    for para in _paragraphs(text):
+        if "PR #12" not in para:
+            continue
+        if not _quotes_historical_figure(para):
+            continue
+        assert any(m in para.lower() for m in HISTORICAL_MARKERS), (
+            f"PR #12 quoted with historical figures and no qualifier: {para[:200]}"
+        )
+    # the specific phrasings that were wrong before F.1.1
+    for banned in (
+        "it remains OPEN against `main`, 381 files",
+        "It is still OPEN against `main`, 381 files",
+    ):
+        assert banned not in text, f"stale live claim about PR #12: {banned!r}"
+
+
+def test_report_explicitly_attributes_the_large_comparison():
+    """B. — the attribution sentinel must survive future edits."""
+    text = REPORT.read_text()
+    assert "historical `main → a6032808` comparison" in text, (
+        "the 381/+57,956/−765 comparison must stay explicitly attributed to "
+        "main -> a6032808"
+    )
+
+
+def test_audited_head_is_never_called_the_current_head():
+    """C. — after F.1.1 the live head is not the audited head."""
+    import re
+    text = REPORT.read_text()
+    for pattern in (
+        r"current head[^.\n]{0,24}a6032808",
+        r"head\s*=\s*`?a6032808",
+        r"a6032808[^.\n]{0,24}is the (?:current|live) head",
+    ):
+        assert not re.search(pattern, text, re.I), (
+            f"audited head presented as the live head: {pattern}"
+        )
+
+
+def test_report_separates_historical_and_live_layers():
+    """C. — a dedicated live section must exist and warn about mutability."""
+    text = REPORT.read_text()
+    assert "Current live state" in text
+    assert "dynamic" in text.lower()
+    head = text.split("Current live state", 1)[1]
+    assert "PR #13" in head and "PR #12" in head
+    assert AUDITED_HEAD not in head.split("15.2")[0], (
+        "the live snapshot must not be reported at the audited head"
+    )
+
+
+def test_live_e2e_stays_not_verified_in_both_layers():
+    """D. — a documentation commit may never upgrade the E2E status."""
+    import re
+    text = REPORT.read_text()
+    assert not re.search(r"LIVE E2E:\s*PASS", text)
+    assert text.count("LIVE E2E: NOT VERIFIED") >= 2, (
+        "both the historical and the live layer must state NOT VERIFIED"
+    )
+
+
+def test_facts_record_stays_pinned_to_the_historical_audited_head():
+    """§8/§14 — the record must not be refreshed to a newer head."""
+    record = json.loads(FACTS.read_text())
+    assert record["audited_head"] == AUDITED_HEAD
+    for entry in record["comparisons"]:
+        assert entry["head"] == AUDITED_HEAD
+    slice_entry = next(
+        e for e in record["comparisons"] if e["name"] == "focused-integration-slice"
+    )
+    assert slice_entry["expected"] == {
+        "merge_base": "a0bf7600a25f2821fc61a8fcf3fba9c408667826",
+        "ahead": 32, "behind": 0, "changed_files": 50,
+        "additions": 9640, "deletions": 5, "merge_commits": 0,
+    }
+    main_entry = next(
+        e for e in record["comparisons"] if e["name"] == "main-divergence"
+    )
+    assert main_entry["expected"] == {
+        "merge_base": "f7f851393b331585e05b1d9bfa4c8965ab94cd5e",
+        "ahead": 121, "behind": 2, "changed_files": 381,
+        "additions": 57956, "deletions": 765, "merge_commits": 0,
+    }
+
+
+def test_ci_defines_a_full_history_audit_job():
+    """§9/§10 — the guard must actually execute in CI, not skip."""
+    import yaml
+    ci = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    jobs = ci["jobs"]
+    audit = next(
+        (j for j in jobs.values() if "audit truth" in str(j.get("name", "")).lower()),
+        None,
+    )
+    assert audit is not None, "ci.yml must define a dedicated audit-truth job"
+
+    checkout = next(
+        s for s in audit["steps"] if str(s.get("uses", "")).startswith("actions/checkout")
+    )
+    assert checkout.get("with", {}).get("fetch-depth") == 0, (
+        "the audit job must check out the full history (fetch-depth: 0)"
+    )
+    script = "\n".join(s.get("run", "") for s in audit["steps"])
+    assert "scripts/audit_phase_8_4_2_f.py" in script
+    assert "test_committed_audit_record_matches_this_repository" in script, (
+        "the job must assert the repository-level test actually executed"
+    )
+    assert ci.get("permissions") == {"contents": "read"}
+    assert "pull_request_target" not in str(ci.get(True) or ci.get("on"))

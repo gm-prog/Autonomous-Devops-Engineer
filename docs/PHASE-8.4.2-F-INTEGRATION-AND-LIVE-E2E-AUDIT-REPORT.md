@@ -14,9 +14,11 @@ Audit date: 2026-10-06. All evidence below was produced at the heads named with 
 > The *conclusion* (do not base the slice on `main`) is unchanged; the *reason* is now
 > stated correctly: `main` is **divergent and unsuitable**, not unrelated.
 >
-> **Audited head:** `a6032808186e8bbf8bebd7efc0c85a41eee4df4e`. Figures in current-state
-> tables describe that head. Commits after it are F.1 audit-truth corrections, which
-> necessarily add to PR #13's live counters; PR #13's description carries the live values.
+> **Audited head:** `a6032808186e8bbf8bebd7efc0c85a41eee4df4e`. Every topology figure in
+> §§1–14 describes **that immutable head** and is pinned in the facts record. Commits made
+> after it (F.1, F.1.1) necessarily move both PRs' live counters, so live state is kept in
+> a separate layer: **§15** and the PR #13 description. A historical figure must never be
+> read as a live one, or the reverse.
 
 ---
 
@@ -25,7 +27,7 @@ Audit date: 2026-10-06. All evidence below was produced at the heads named with 
 | Dimension | Status |
 |---|---|
 | **INTEGRATION** | **PASS** — a clean, surgical slice exists and is published as **PR #13** (50 files, +9,640 / −5, **32 linear commits, 0 merge commits**) onto `integration/phase-8.2-v1`, a true ancestor of this work |
-| **CI** | **PASS** at the audited head `a6032808` — push `37482389727`, `pull_request` `37482396569` and `37482399004`, 5/5 jobs each |
+| **CI** | **PASS** — at the audited head `a6032808`: push `37482389727`, `pull_request` `37482396569` / `37482399004`, 5/5 jobs each. Later heads are recorded in §15 |
 | **DEFAULT-BRANCH WORKFLOW PUBLICATION** | **BLOCKED** — `e2e-golden-path.yml` is absent from the default branch; the workflow is not registered and cannot be dispatched |
 | **LIVE E2E** | **BLOCKED / NOT VERIFIED** — the golden path has never executed; no run id exists |
 
@@ -82,7 +84,7 @@ ancestor — it diverged — which is a different statement from having no ances
 `main` **shares history with this line** and then diverged, long before the platform
 existed. All figures measured at the audited head `a6032808` in a full clone:
 
-| Measurement | `base = main` (PR #12 topology) | `base = integration/phase-8.2-v1` (PR #13 topology) |
+| Measurement (historical, at audited head `a6032808`) | `base = main` (PR #12 topology *at that head*) | `base = integration/phase-8.2-v1` (PR #13 topology *at that head*) |
 |---|---|---|
 | merge-base with this work | **`f7f851393b331585e05b1d9bfa4c8965ab94cd5e`** (exists) | `a0bf7600a25f2821fc61a8fcf3fba9c408667826` (= the base itself) |
 | relationship | **diverged** | **ahead only** |
@@ -94,8 +96,9 @@ existed. All figures measured at the audited head `a6032808` in a full clone:
 | files *deleted from the base* | **19** | 0 |
 | unrelated files modified | **17** (Android app, `backend/`, `mcp/`, `monitoring/`, `README`, `.gitignore`) | 0 |
 
-> The 381-file / +57,956 / −765 column is the **`main` comparison, i.e. PR #12's
-> topology**. It is *not* the PR #13 integration slice and must never be quoted as such.
+> The 381-file / +57,956 / −765 column is the **historical `main → a6032808` comparison**,
+> i.e. the PR #12 topology *at the audited head*. It is *not* the PR #13 integration slice,
+> and it is *not* PR #12's live size today (§15). It must never be quoted as either.
 
 `main`'s tree carries an older hyphenated prototype (`devops-ai-platform/api-gateway/`,
 `incident-service/`, … 72 files) and **no `.github/workflows/` directory at all**.
@@ -119,7 +122,10 @@ absence of a common ancestor.
 
 Nothing was created, rewritten or force-pushed: no new branch, no rebase, no history
 rewrite, `main` untouched, all six integration refs byte-identical to §2, and
-**PR #12 was not merged, retargeted or modified** (it remains OPEN against `main`, 381 files, `mergedAt: never`).
+**PR #12 was not merged, retargeted or modified**: it remains OPEN against `main` and
+unmerged. (Its *live* file/line counters move whenever this shared head branch moves —
+see §15. The 381-file figure elsewhere in this report belongs to the historical
+`main → a6032808` comparison, not to PR #12 today.)
 
 ### 3.3 Disclosed conflict with §4.2
 
@@ -170,10 +176,10 @@ exactly the 49 files above and nothing else (plus this report, committed after t
 
 ## 5. Diff / scope audit
 
-> Counts in current-state tables are measured at the audited head `a6032808` and are
-> machine-verified by `scripts/audit_phase_8_4_2_f.py` against
-> `docs/phase-8.4.2-f-audit-facts.json`. Phase 8.4.2-F.1 commits land on top of that
-> head; see §14.
+> Counts in this section are measured at the **historical audited head `a6032808`** and
+> are machine-verified by `scripts/audit_phase_8_4_2_f.py` against
+> `docs/phase-8.4.2-f-audit-facts.json`. F.1 and F.1.1 commits land on top of that head;
+> live counters are in §15.
 
 **Phase 8.4.2-F changed exactly 4 files in 2 commits** (`b08fbb0`, `c69c28d`), plus
 documentation commits recording this report; **Phase 8.4.2-F.1** then changed only audit
@@ -370,7 +376,7 @@ spellings is rejected; `gm-prog/ares-e2e-fixture` is accepted.
 | 5 | `gm-prog/ares-e2e-fixture` is not reachable (HTTP 404 — absent, or private and not shared with this installation). It must be **private** and must never be the production repo | `FIXTURE_REPOSITORY_FAILURE` | repository owner |
 | 6 | No 40-hex seed commit can be named for `fixture_seed_sha` | `FIXTURE_REPOSITORY_FAILURE` | follows from #5 |
 | 7 | The available credential is an App installation token that cannot create dispatch events | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
-| 8 | `main` is **divergent** from this line (common ancestor `f7f8513`; head ahead 121, `main` ahead 2); whether the platform supersedes `main`'s prototype is a repository-policy decision | `INTEGRATION_FAILURE` (deliberately not auto-resolved) | repository owner |
+| 8 | `main` is **divergent** from this line (common ancestor `f7f8513`; at the audited head `a6032808`, head ahead 121, `main` ahead 2 — historical figures, see §15 for live state); whether the platform supersedes `main`'s prototype is a repository-policy decision | `INTEGRATION_FAILURE` (deliberately not auto-resolved) | repository owner |
 
 Blockers 1–7 must all clear before a first live run is even attemptable, in that order.
 
@@ -387,11 +393,12 @@ No, and that is disclosed in §3.3 with both reasons. No synthetic equivalent wa
 off as it.
 
 **Q3. Is the slice actually minimal, or just asserted to be?**
-Measured at `a6032808`: **50 files / +9,640 / −5 / 32 commits** against
-`integration/phase-8.2-v1`, versus **381 files / +57,956 / −765** against `main` (the
-PR #12 topology). Both come from `git diff --numstat` in a full clone, agree with the
-GitHub compare API, agree with GitHub's own PR counters (#13 → 50 files, +9,640, −5,
-32 commits; #12 → 381 files, +57,956, −765) and are re-derived by the audit guard.
+Measured **at the audited head `a6032808`**: **50 files / +9,640 / −5 / 32 commits**
+against `integration/phase-8.2-v1`, versus **381 files / +57,956 / −765** against `main`
+— the latter being the historical `main → a6032808` comparison, i.e. the PR #12 topology
+*at that head*. Both come from `git diff --numstat` in a full clone, agree with the GitHub
+compare API, matched both PRs' counters at that head, and are re-derived by the audit
+guard. Live PR counters have moved since (§15); the audited-head record has not.
 
 **Q4. Could the slice have been even smaller?**
 The six `docs/PHASE-8.*.md` files are not needed to execute the golden path. They were
@@ -406,7 +413,7 @@ identical. "Unrelated" here means *unrelated content*, not unrelated histories �
 `main` comparison also has a common ancestor (§3.1).
 
 **Q6. Was PR #12 merged, retargeted, closed or used as a shortcut?**
-No. It is still OPEN against `main`, 381 files / +57,956 / −765, `mergedAt: never`. PR #13 is a
+No. It is still OPEN against `main` and unmerged; its live counters are in §15. PR #13 is a
 separate PR from the same head to a different base — a supported GitHub operation that
 mutates neither #12 nor the base ref.
 
@@ -487,7 +494,7 @@ Two further defects were found in the same sweep and corrected:
 * the local branch ref had been left pointing at `7b30a56d` while the pushed branch was
   at `a6032808` — corrected with a local `git reset --hard` to the pushed head (no
   force-push, no remote change);
-* figures from the `main` comparison (381 files / +57,956 / −765) sat close enough to
+* figures from the historical `main → a6032808` comparison (381 files / +57,956 / −765) sat close enough to
   the PR #13 discussion to be misread as the integration slice.
 
 ### 14.2 Corrected facts
@@ -495,7 +502,7 @@ Two further defects were found in the same sweep and corrected:
 | Comparison | merge-base | ahead | behind | files | additions | deletions | merges |
 |---|---|---|---|---|---|---|---|
 | `integration/phase-8.2-v1` → `a6032808` (**PR #13**) | `a0bf7600…` | 32 | 0 | 50 | 9,640 | 5 | 0 |
-| `main` → `a6032808` (**PR #12** topology) | `f7f85139…` | 121 | 2 | 381 | 57,956 | 765 | 0 |
+| `main` → `a6032808` (historical **PR #12** topology at that head) | `f7f85139…` | 121 | 2 | 381 | 57,956 | 765 | 0 |
 
 Verified three ways: local `git` in a full clone, the GitHub compare API, and GitHub's
 own PR counters.
@@ -529,3 +536,58 @@ a *wrong* answer — only a refusal.
 
 **LIVE E2E: NOT VERIFIED** — unchanged by this correction. Fixing the audit record
 changes what is *claimed*, never what was *executed*.
+
+---
+
+## 15. Current live state (dynamic layer — not the audit record)
+
+Three different questions are answered by three different evidence layers. They must
+never be collapsed:
+
+| Layer | Question | Source of truth | Mutability |
+|---|---|---|---|
+| Historical audit | *What was true at audited head `a6032808`?* | `docs/phase-8.4.2-f-audit-facts.json` + §§1–14 | **immutable** |
+| Live metadata | *What is true right now?* | GitHub PR API / `git` at the current head | **changes with every push** |
+| CI verification | *Was the record actually checked against a complete history?* | the `Phase 8.4.2-F audit truth` CI job | per-run |
+
+### 15.1 Live snapshot
+
+Measured at head **`6e9118a43fe65c9b00d79c381417deff13aee59b`** (the parent of the
+Phase 8.4.2-F.1.1 commit), 2026-10-06:
+
+| Live counter (dynamic — measured at the head above, **not** audit facts) | PR #13 | PR #12 |
+|---|---|---|
+| state | OPEN, not merged, not draft | OPEN, not merged |
+| base | `integration/phase-8.2-v1` (`a0bf7600…`) | `main` |
+| head ref | `arena/b6307a50-autonomous-devops-engineer` | `arena/b6307a50-autonomous-devops-engineer` |
+| commits | 33 | 122 |
+| changed files | 53 | 384 |
+| additions / deletions | +10,467 / −5 | +58,783 / −765 |
+
+> **These counters are dynamic.** Both PRs share the same head branch, so every commit —
+> including the F.1.1 commit that adds this very section — moves them. They are recorded
+> here as a dated snapshot, not as audit facts. For authoritative current values, query
+> GitHub (`gh api repos/gm-prog/Autonomous-Devops-Engineer/pulls/13`) or read the PR #13
+> description, which is refreshed at the final head. **Do not copy these numbers into
+> `docs/phase-8.4.2-f-audit-facts.json`** — that record intentionally stays pinned to
+> `a6032808` so the Phase-F audit remains reproducible after branches move.
+
+### 15.2 How to re-derive any of it
+
+```bash
+git fetch --unshallow 2>/dev/null || true          # topology needs full history
+python scripts/audit_phase_8_4_2_f.py              # historical record -> PASS / FAIL
+python scripts/audit_phase_8_4_2_f.py \
+  --base integration/phase-8.2-v1 --head HEAD      # live measurement, asserts nothing
+gh api repos/gm-prog/Autonomous-Devops-Engineer/pulls/13 \
+  --jq '{state,merged,base:.base.ref,head:.head.sha,commits,changed_files,additions,deletions}'
+```
+
+### 15.3 What did not move
+
+`main` and all six `integration/*` refs are byte-identical to §2 — verified against the
+GitHub refs API after every push in this phase. No ref moved as a side effect of any
+audit work.
+
+**LIVE E2E: NOT VERIFIED** — unchanged. No documentation or CI commit can alter that:
+it requires a real golden-path execution, which has never occurred.
