@@ -216,61 +216,80 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: pip install pytest
+      - run: pip install pytest pyyaml
       - name: Verify the committed audit record against the full history
         run: |
           set -euo pipefail
           EV="$(mktemp)"
+          # job logs are not readable through the API on this installation, so
+          # the evidence is published as a step summary + annotation on every
+          # exit path, success or failure
+          publish() {
+            rc=$?
+            cat "$EV" >> "$GITHUB_STEP_SUMMARY" || true
+            MSG="$(python3 -c "import sys; print(open(sys.argv[1]).read().replace('%','%25').replace('\r','%0D').replace('\n','%0A'))" "$EV" 2>/dev/null || echo "no evidence captured")"
+            if [ "$rc" -eq 0 ]; then
+              echo "::notice title=Phase 8.4.2-F audit truth::${MSG}"
+            else
+              echo "::error title=Phase 8.4.2-F audit truth FAILED::${MSG}"
+            fi
+            exit "$rc"
+          }
+          trap publish EXIT
+
           SHALLOW="$(git rev-parse --is-shallow-repository)"
           echo "shallow repository: ${SHALLOW}" | tee -a "$EV"
-          if [ "$SHALLOW" != "false" ]; then
-            echo "::error::audit job requires full history (fetch-depth: 0)"
-            exit 1
-          fi
-          # every commit the record pins must be present, or the record test
-          # would skip itself and prove nothing
-          python - <<'PY' | tee -a "$EV"
+          [ "$SHALLOW" = "false" ] || { echo "full history required" | tee -a "$EV"; exit 1; }
+
+          # every commit the record pins must be present, or the repository
+          # level test would skip itself and prove nothing
+          python - <<'PYCHK' | tee -a "$EV"
           import json, subprocess, sys
           rec = json.load(open("docs/phase-8.4.2-f-audit-facts.json"))
-          missing = []
-          for entry in rec["comparisons"]:
-              for ref in (entry["base"], entry["head"]):
-                  if subprocess.run(["git", "cat-file", "-e", ref + "^{commit}"],
-                                    capture_output=True).returncode:
-                      missing.append(ref)
+          missing = [r for e in rec["comparisons"] for r in (e["base"], e["head"])
+                     if subprocess.run(["git", "cat-file", "-e", r + "^{commit}"],
+                                       capture_output=True).returncode]
           print("audited head:", rec["audited_head"])
           print("pinned commits present:", "yes" if not missing else "NO: " + ",".join(missing))
           sys.exit(1 if missing else 0)
-          PY
-          # 1. the guard itself must exit 0 and report PASS
+          PYCHK
+
+          # 1. the guard must exit 0 and report PASS
           python scripts/audit_phase_8_4_2_f.py > guard.json
           RESULT="$(python -c "import json;print(json.load(open('guard.json'))['result'])")"
           echo "audit guard: ${RESULT} (exit 0)" | tee -a "$EV"
-          [ "$RESULT" = "PASS" ] || { echo "::error::audit guard returned ${RESULT}"; exit 1; }
-          # 2. the repository-level test must EXECUTE here, never skip
+          [ "$RESULT" = "PASS" ] || exit 1
+
+          # 2. the repository level test must EXECUTE here, never skip
+          set +e
           python -m pytest devops-ai-platform/tests/test_audit_phase_8_4_2_f.py \
             -q --junitxml=audit-junit.xml
-          python - <<'PY' | tee -a "$EV"
-          import xml.etree.ElementTree as ET, sys
+          PYTEST_RC=$?
+          set -e
+          echo "pytest exit code: ${PYTEST_RC}" | tee -a "$EV"
+          python - <<'PYJUNIT' | tee -a "$EV"
+          import os, sys, xml.etree.ElementTree as ET
           TARGET = "test_committed_audit_record_matches_this_repository"
-          root = ET.parse("audit-junit.xml").getroot()
-          cases = list(root.iter("testcase"))
+          if not os.path.exists("audit-junit.xml"):
+              print("junit report missing - pytest did not run to completion")
+              sys.exit(1)
+          cases = list(ET.parse("audit-junit.xml").getroot().iter("testcase"))
           hits = [c for c in cases if c.get("name") == TARGET]
           if len(hits) != 1:
-              print(f"::error::{TARGET} was not collected"); sys.exit(1)
+              print(f"{TARGET}: NOT COLLECTED"); sys.exit(1)
           case = hits[0]
-          state = ("skipped" if case.findall("skipped")
-                   else "failed" if case.findall("failure") or case.findall("error")
-                   else "passed")
+          state = ("SKIPPED" if case.findall("skipped")
+                   else "FAILED" if case.findall("failure") or case.findall("error")
+                   else "PASSED")
           skipped = sorted(c.get("name") for c in cases if c.findall("skipped"))
-          print(f"tests collected={len(cases)} skipped={len(skipped)}")
-          print(f"{TARGET}: EXECUTED and {state.upper()}")
+          failed = sorted(c.get("name") for c in cases
+                          if c.findall("failure") or c.findall("error"))
+          print(f"tests collected={len(cases)} failed={len(failed)} skipped={len(skipped)}")
+          print(f"{TARGET}: EXECUTED and {state}")
           if skipped:
               print("skipped tests: " + ", ".join(skipped))
-          if state != "passed":
-              print(f"::error::{TARGET} was {state} - the audit record was not verified")
-              sys.exit(1)
-          PY
-          cat "$EV" >> "$GITHUB_STEP_SUMMARY"
-          MSG="$(python3 -c "import sys; print(open(sys.argv[1]).read().replace('%','%25').replace('\r','%0D').replace('\n','%0A'))" "$EV")"
-          echo "::notice title=Phase 8.4.2-F audit truth::${MSG}"
+          if failed:
+              print("failed tests: " + ", ".join(failed))
+          sys.exit(0 if state == "PASSED" and not failed else 1)
+          PYJUNIT
+          [ "$PYTEST_RC" -eq 0 ] || exit 1
