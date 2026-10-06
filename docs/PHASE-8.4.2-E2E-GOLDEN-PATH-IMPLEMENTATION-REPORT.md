@@ -762,3 +762,205 @@ nothing about the golden path having run.
    environment.
 3. No Docker/kind/terraform in this environment → all container-level
    claims above remain static/unit-level until a real dispatch runs.
+
+# Phase 8.4.2-E1 corrective closure — Dockerfile build contract (2026-10-06)
+
+## Executive result
+
+```text
+E2E DOCKERFILE BUILD CONTRACT: VERIFIED (real BuildKit, ordinary CI)
+FULL E2E IMAGE BUILD:          NOT VERIFIED
+E2E GOLDEN PATH:               LIVE E2E: NOT VERIFIED
+PRODUCTION DOCKERFILE CONTRACT: UNCHANGED (tag-based by design)
+```
+
+This subsection supersedes one claim of the 8.4.2-D section above: the
+seven digest-controlled E2E build surfaces were **not buildable as
+written**. They were digest-*governed* (compose + pins + workflow were
+correct) but each `Dockerfile.e2e` used a variable form the Dockerfile
+parser does not implement, so the first real `compose build` of a live
+dispatch would have failed. Ordinary CI could not see it, because
+ordinary CI never built those files.
+
+## Historical defect
+
+```dockerfile
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+```
+
+`${VAR:?error}` is **Compose interpolation**. The Dockerfile reference
+documents only `${VAR}`, `${VAR:-word}`, `${VAR-word}`, `${VAR:+word}`
+and `${VAR+word}` for environment replacement (pattern operators such
+as `${VAR#…}` exist only in the pre-release `dockerfile-upstream:master`
+syntax). `:?` is in neither list, so the token is not a modifier and the
+braces do not group: `FROM` then sees a multi-word argument.
+
+Observed, not inferred — BuildKit's verdict on that exact line, from the
+CI mutation probe:
+
+```text
+ERROR: dockerfile parse error on line 3: FROM requires either one or three arguments
+```
+
+## Corrected contract
+
+```dockerfile
+# syntax=docker/dockerfile:1@sha256:4edf897a…fe99e
+# check=skip=InvalidDefaultArgInFrom;error=true
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+```
+
+| Layer | Responsibility | Form used |
+| --- | --- | --- |
+| `e2e/pinned-images.txt` | committed identity of every external input | `sha256:<64hex>` |
+| `e2e/image_pins.py` | pins → `<KEY> <repo@sha256:…>` | fail-closed parser |
+| workflow (`$GITHUB_ENV`) | publishes `E2E_PYTHON_BASE_IMAGE` | digest ref only |
+| `docker-compose.e2e.yml` | **requires** the variable | `${E2E_PYTHON_BASE_IMAGE:?…}` — valid in Compose |
+| Dockerfile | consumes the build argument | `ARG BASE_IMAGE` + `FROM ${BASE_IMAGE}` |
+
+The required-value check stays in Compose, where `:?` is a documented
+interpolation operator. The Dockerfile keeps the only form its own
+parser accepts. Those are two different languages and the repository
+now treats them as such.
+
+Fail-closed is not provided by a Dockerfile message string; it is the
+combination of (1) Compose refusing to interpolate an unset variable,
+(2) the workflow validating `repository@sha256:<64hex>` before building,
+and (3) BuildKit refusing a blank base name:
+
+```text
+ERROR: base name (${BASE_IMAGE}) should not be blank
+```
+
+Two parser directives carry the rest of the contract. The frontend is
+pinned **by digest** — a floating `docker/dockerfile:1` would reintroduce
+the mutable-input class 8.4.2-D closed, and would let a newly published
+check rule change the gate's meaning without a commit.
+`InvalidDefaultArgInFrom` asserts that a build must succeed with no
+`--build-arg`; that is the exact opposite of this contract, so it is
+skipped **by name** (never `skip=all`) while `error=true` promotes every
+other check to a build failure.
+
+## Build surfaces (eight, one inventory)
+
+`devops-ai-platform/e2e/build_surfaces.py` is now the single
+authoritative list; the Compose override, the CI gate and the tests all
+read it, so a new build surface cannot be covered in one place and
+missed in another.
+
+| # | Dockerfile | Compose surface(s) | Build context |
+| --- | --- | --- | --- |
+| 1 | `api_gateway/Dockerfile.e2e` | api-gateway | `devops-ai-platform` |
+| 2 | `repo_service/Dockerfile.e2e` | repo-service | `devops-ai-platform` |
+| 3 | `agent_service/Dockerfile.e2e` | agent-service | `devops-ai-platform` |
+| 4 | `deployment_service/Dockerfile.e2e` | deployment-service | `devops-ai-platform` |
+| 5 | `monitoring_service/Dockerfile.e2e` | monitoring-service | `devops-ai-platform` |
+| 6 | `incident_service/Dockerfile.e2e` | incident-service, incident-event-worker | `devops-ai-platform` |
+| 7 | `e2e/workload/Dockerfile` | — (fixture workload image) | `e2e/workload` |
+| 8 | `e2e/sandbox/Dockerfile` | — (remediation validation sandbox) | `e2e/sandbox` |
+
+Surface 8 was previously generated inline by the workflow with a
+`printf` into `/tmp`. It carried the same defective form and could not be
+gated, so it is now a committed file with identical instructions
+(`ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}` / `USER nobody`) built from its
+own small context. The sandbox **runtime** boundary is untouched:
+`--pull never`, `--network none`, `--read-only`, `--cap-drop ALL`,
+`--security-opt no-new-privileges`, non-root, single `:ro` workspace
+bind, all still enforced by `validation_sandbox.py`, which this phase
+does not modify.
+
+## CI regression gate (ordinary CI, no secrets)
+
+The `Compose validation` job of `.github/workflows/ci.yml` gained one
+step, `E2E Dockerfile build contract (BuildKit)`, which on every push
+and pull request:
+
+1. reads the **committed** `E2E_PYTHON_BASE_IMAGE` digest through
+   `e2e.image_pins --refs` and re-validates its shape;
+2. runs the shared static contract (`e2e.build_surfaces --validate`) —
+   no `:?`/`?` form, no default, no fallback, no second base source,
+   pinned parser directives;
+3. for each of the eight surfaces runs real
+   `docker buildx build --check --build-arg BASE_IMAGE=<digest>` (must
+   pass) and the same check **without** the argument (must fail);
+4. runs a live mutation probe that rebuilds the historical form and
+   requires BuildKit to reject it, so the gate cannot pass merely
+   because a future parser became more permissive;
+5. asserts the surface count and exits non-zero on any failure.
+
+No credential is used: the job references no `secrets.*`, and
+`E2E_FIXTURE_GITHUB_TOKEN`, `E2E_JWT_SECRET` and `GITHUB_OAUTH_TOKEN`
+appear nowhere in it. `BASE_IMAGE` is an image reference, not a secret.
+
+### Observed CI evidence (run 37475026224, head `12ab603`)
+
+```text
+docker server 28.0.4
+github.com/docker/buildx v0.37.1 0b265a9f62db554fa9aba6dd19e1bd5704bc7d8a
+committed BASE_IMAGE = python@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
+static contract OK for 8 E2E Dockerfiles
+…/api_gateway/Dockerfile.e2e:         digest-arg=pass no-arg=rejected
+…/repo_service/Dockerfile.e2e:        digest-arg=pass no-arg=rejected
+…/agent_service/Dockerfile.e2e:       digest-arg=pass no-arg=rejected
+…/deployment_service/Dockerfile.e2e:  digest-arg=pass no-arg=rejected
+…/monitoring_service/Dockerfile.e2e:  digest-arg=pass no-arg=rejected
+…/incident_service/Dockerfile.e2e:    digest-arg=pass no-arg=rejected
+…/e2e/workload/Dockerfile:            digest-arg=pass no-arg=rejected
+…/e2e/sandbox/Dockerfile:             digest-arg=pass no-arg=rejected
+mutation probe rejected: ERROR: dockerfile parse error on line 3: FROM requires either one or three arguments
+negative-check sample: ERROR: base name (${BASE_IMAGE}) should not be blank
+surfaces checked=8 failures=0
+```
+
+## What `--check` does and does not prove
+
+`docker buildx build --check` validates the Dockerfile and the build
+configuration and reports violations instead of executing build steps.
+It therefore proves **syntax and build-contract**, not that the images
+assemble:
+
+| Claim | Status |
+| --- | --- |
+| E2E Dockerfile build contract (syntax, arg wiring, fail-closed) | VERIFIED in ordinary CI |
+| Full E2E image build (pip install, Terraform/kubectl layers, …) | NOT VERIFIED — only a real build does that |
+| Golden-path E2E (stack, kind, remediation, evidence) | **LIVE E2E: NOT VERIFIED** |
+| Production Dockerfile contract | UNCHANGED — still `FROM python:3.11-slim`, still never built by the E2E stack |
+
+## Provenance and pins — unchanged by this phase
+
+`pinned-images.txt` still carries exactly six committed `sha256:<64hex>`
+digests; no pin value was refreshed, no sentinel returned, no
+dispatch-time tag resolution exists, and the only `docker pull` in the
+workflow pulls `"$REF"` (a digest reference). `E2E_REGISTRY_DIGEST`,
+`E2E_KIND_NODE_DIGEST` and `E2E_BASE_IMAGES` are still exported by the
+pins step (index 4), `E2E_BUILT_IMAGE_DIGESTS` by the build step (index
+6), both before the driver step (index 12), and
+`finalize_execution_manifest()` still downgrades a live PASS with empty
+required provenance to FAIL via `provenance_rejection`.
+
+## Tests (executed)
+
+| Scope (cwd) | Command | Result |
+| --- | --- | --- |
+| `devops-ai-platform` | `pytest tests/test_e2e_corrective.py` | 203 passed (138 kept + 65 new) |
+| `devops-ai-platform` | `pytest tests/test_e2e_harness.py` | 31 passed + 18 subtests |
+| `devops-ai-platform` | `pytest tests/ deployment_service/tests` | 535 passed + 142 subtests |
+| `devops-ai-platform` | `python -m unittest` ×35 incident modules | Ran 559 — OK (3 skipped) |
+| `devops-ai-platform` | `compileall` + `pytest api_gateway/tests` | 79 passed + 60 subtests |
+| `backend` | `pytest tests/` | 49 passed |
+| repo root | `git diff --check`; YAML parse + `bash -n` (both workflows) | clean / 0 failures |
+
+Mutation proof: restoring the pre-E1 Dockerfiles and workflows from
+`d97d667` makes the static validator exit 1 on every surface and fails
+**49** of the new tests; the corrected tree passes 203. The live half of
+the same proof runs inside the CI gate on every push.
+
+## Vocabulary discipline (this section)
+
+Claimed: the E2E Dockerfile build contract is verified by real BuildKit
+in ordinary CI. Not claimed: that the E2E images build end to end, that
+staging ran, that the golden path executed, or that production image
+provenance is immutable — production Dockerfiles remain tag-based by
+design and unbuilt by the E2E stack.

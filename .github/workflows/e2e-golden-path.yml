@@ -126,7 +126,7 @@ jobs:
           docker compose version
           export JWT_SECRET=ci-gateway-secret
           # valid-format digest placeholders so config interpolation passes;
-          # real digests are resolved from pinned-images.txt at dispatch (§9).
+          # real digests come from the committed pinned-images.txt (§5).
           export E2E_PYTHON_BASE_IMAGE="python@sha256:$(printf 'a%.0s' {1..64})"
           export E2E_POSTGRES_IMAGE="postgres@sha256:$(printf 'b%.0s' {1..64})"
           export E2E_REDIS_IMAGE="redis@sha256:$(printf 'c%.0s' {1..64})"
