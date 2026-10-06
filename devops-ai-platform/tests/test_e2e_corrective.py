@@ -29,22 +29,6 @@ PLATFORM = REPO_ROOT / "devops-ai-platform"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e-golden-path.yml"
 COMPOSE_E2E = REPO_ROOT / "docker-compose.e2e.yml"
 COMPOSE_BASE = PLATFORM / "docker-compose.yml"
-DOCKERFILES = (
-    PLATFORM / "deployment_service" / "Dockerfile.e2e",
-    PLATFORM / "incident_service" / "Dockerfile.e2e",
-    PLATFORM / "e2e" / "workload" / "Dockerfile",
-)
-#: §6.2 — compose services the golden-path `compose build` actually builds,
-#: mapped to the E2E-only Dockerfile that must own each build surface.
-E2E_BUILD_SURFACES = {
-    "api-gateway": "./api_gateway/Dockerfile.e2e",
-    "repo-service": "./repo_service/Dockerfile.e2e",
-    "agent-service": "./agent_service/Dockerfile.e2e",
-    "deployment-service": "./deployment_service/Dockerfile.e2e",
-    "monitoring-service": "./monitoring_service/Dockerfile.e2e",
-    "incident-service": "./incident_service/Dockerfile.e2e",
-    "incident-event-worker": "./incident_service/Dockerfile.e2e",
-}
 PRODUCTION_DOCKERFILES = (
     PLATFORM / "api_gateway" / "Dockerfile",
     PLATFORM / "repo_service" / "Dockerfile",
@@ -72,8 +56,17 @@ DRIVER_STEP = "Execute golden path driver"
 
 sys.path.insert(0, str(PLATFORM))
 
+from e2e import build_surfaces as BS  # noqa: E402
 from e2e import helpers as H  # noqa: E402
 from e2e import image_pins  # noqa: E402
+
+#: §6.2/§10 — the single authoritative inventory lives in
+#: ``e2e.build_surfaces``; these names are derived from it so a new build
+#: surface cannot be covered here while being missed by the CI gate (or
+#: the other way round).
+E2E_BUILD_SURFACES = dict(BS.E2E_BUILD_SURFACES)
+#: every distinct E2E Dockerfile, as absolute paths
+DOCKERFILES = tuple(REPO_ROOT / path for path in BS.dockerfiles())
 
 
 def _workflow_text() -> str:
@@ -524,10 +517,13 @@ class TestImmutability:
             assert re.fullmatch(r"[0-9a-f]{64}", digest), f"{path}: {digest}"
 
     def test_dockerfiles_fail_closed_without_digest_base(self):
+        """Phase 8.4.2-E1: supported syntax, no default, no fallback."""
         for path in DOCKERFILES:
             text = path.read_text()
             assert "ARG BASE_IMAGE\n" in text, path
-            assert "FROM ${BASE_IMAGE:?" in text, path
+            assert re.search(r"^FROM \$\{BASE_IMAGE\}$", text, re.M), path
+            for form in BS.FORBIDDEN_BASE_IMAGE_FORMS:
+                assert form not in text, f"{path}: {form}"
 
     def test_compose_requires_digest_pinned_refs(self):
         text = COMPOSE_E2E.read_text()
@@ -1158,12 +1154,14 @@ class TestE2EBuildSurfaces:
             path = PLATFORM / dockerfile.lstrip("./")
             text = path.read_text()
             assert "ARG BASE_IMAGE\n" in text, path
-            assert "FROM ${BASE_IMAGE:?" in text, path
+            assert re.search(r"^FROM \$\{BASE_IMAGE\}$", text, re.M), path
             assert not re.search(r"^FROM\s+[a-z0-9]+:", text, re.M), path
             seen.add(path)
+        assert seen <= set(DOCKERFILES)
         for path in DOCKERFILES:
             text = path.read_text()
-            assert "ARG BASE_IMAGE\n" in text and "FROM ${BASE_IMAGE:?" in text
+            assert "ARG BASE_IMAGE\n" in text, path
+            assert re.search(r"^FROM \$\{BASE_IMAGE\}$", text, re.M), path
 
     def test_production_dockerfiles_stay_tag_based_and_unbuilt_by_e2e(self):
         override = yaml.safe_load(COMPOSE_E2E.read_text())
@@ -1479,3 +1477,213 @@ class TestProvenanceAudit:
         assert not re.search(r"LIVE E2E:\s*PASS", text)
         assert not re.search(r"golden[- ]path(?: workflow)?[^.\n]{0,40}executed "
                              r"successfully", text, re.I)
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-E1: Dockerfile build contract (supported syntax + CI gate)
+# --------------------------------------------------------------------------
+
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+#: the exact historical form this phase closed — kept as a fixture so the
+#: regression is expressed as a contract, never committed to a Dockerfile
+HISTORICAL_DEFECT = "FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}"
+
+
+def _ci_gate_step():
+    doc = yaml.safe_load(CI_WORKFLOW.read_text())
+    for step in doc["jobs"]["compose"]["steps"]:
+        if "BuildKit" in (step.get("name") or ""):
+            return step
+    raise AssertionError("ci.yml has no BuildKit Dockerfile contract step")
+
+
+class TestDockerfileBuildContract:
+    """§11/§12 — supported Dockerfile syntax, proven statically here and
+    by real BuildKit in CI."""
+
+    def test_authoritative_inventory_is_the_only_list(self):
+        assert len(BS.E2E_DOCKERFILES) == 8
+        assert len(set(BS.dockerfiles())) == 8
+        for dockerfile, context in BS.E2E_DOCKERFILES:
+            assert (REPO_ROOT / dockerfile).is_file(), dockerfile
+            assert (REPO_ROOT / context).is_dir(), context
+        # the six compose surfaces resolve into the same inventory
+        for relative in set(BS.E2E_BUILD_SURFACES.values()):
+            path = f"{BS.PLATFORM_DIR}/{relative.lstrip('./')}"
+            assert path in BS.dockerfiles(), path
+
+    @pytest.mark.parametrize("dockerfile", BS.dockerfiles())
+    def test_every_e2e_dockerfile_satisfies_the_static_contract(self, dockerfile):
+        text = (REPO_ROOT / dockerfile).read_text()
+        assert BS.validate_dockerfile_text(text) == []
+
+    @pytest.mark.parametrize("dockerfile", BS.dockerfiles())
+    def test_supported_arg_from_pairing(self, dockerfile):
+        text = (REPO_ROOT / dockerfile).read_text()
+        assert "\nARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n" in text, dockerfile
+
+    @pytest.mark.parametrize("dockerfile", BS.dockerfiles())
+    def test_no_unsupported_or_mutable_base_image_form(self, dockerfile):
+        text = (REPO_ROOT / dockerfile).read_text()
+        for form in BS.FORBIDDEN_BASE_IMAGE_FORMS:
+            assert form not in text, f"{dockerfile}: {form}"
+        # the only FROM is the digest-fed one — no tag, no second stage base
+        froms = re.findall(r"^FROM\s+(.+)$", text, re.M)
+        assert froms == ["${BASE_IMAGE}"], f"{dockerfile}: {froms}"
+
+    @pytest.mark.parametrize("dockerfile", BS.dockerfiles())
+    def test_parser_directives_are_pinned_and_first(self, dockerfile):
+        lines = (REPO_ROOT / dockerfile).read_text().splitlines()
+        assert lines[0] == BS.SYNTAX_DIRECTIVE, dockerfile
+        assert lines[1] == BS.CHECK_DIRECTIVE, dockerfile
+        # a floating frontend would reintroduce a mutable build input
+        assert re.fullmatch(
+            r"# syntax=docker/dockerfile:1@sha256:[0-9a-f]{64}", lines[0]
+        ), dockerfile
+        # only the one rule that contradicts "no default" may be skipped
+        assert "skip=all" not in lines[1]
+        assert lines[1].startswith("# check=skip=InvalidDefaultArgInFrom;error=true")
+
+    def test_one_frontend_digest_across_every_surface(self):
+        digests = {
+            (REPO_ROOT / path).read_text().splitlines()[0]
+            for path in BS.dockerfiles()
+        }
+        assert digests == {BS.SYNTAX_DIRECTIVE}
+
+    def test_compose_keeps_required_value_interpolation(self):
+        """`:?` is valid in Compose — that is where the requirement lives."""
+        override = yaml.safe_load(COMPOSE_E2E.read_text())
+        for service in BS.E2E_BUILD_SURFACES:
+            arg = override["services"][service]["build"]["args"]["BASE_IMAGE"]
+            assert arg.startswith("${E2E_PYTHON_BASE_IMAGE:?"), service
+        assert COMPOSE_E2E.read_text().count("${E2E_PYTHON_BASE_IMAGE:?") == len(
+            BS.E2E_BUILD_SURFACES
+        )
+
+    def test_the_two_languages_are_not_mixed_up(self):
+        """Compose keeps `:?`; no Dockerfile may carry it."""
+        assert "${E2E_PYTHON_BASE_IMAGE:?" in COMPOSE_E2E.read_text()
+        for path in BS.dockerfiles():
+            assert ":?" not in (REPO_ROOT / path).read_text(), path
+
+    # --- §12 regression against the exact historical implementation ------
+
+    def test_historical_defective_form_is_rejected_by_the_contract(self):
+        text = "\n".join(BS.REQUIRED_HEADER) + f"\nARG BASE_IMAGE\n{HISTORICAL_DEFECT}\n"
+        problems = BS.validate_dockerfile_text(text)
+        assert problems, "the pre-E1 Dockerfile form must not be acceptable"
+        assert any("${BASE_IMAGE:?" in p for p in problems)
+
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE?required}\n",
+            "ARG BASE_IMAGE=python:3.11-slim\nFROM ${BASE_IMAGE}\n",
+            "ARG BASE_IMAGE\nFROM ${BASE_IMAGE:-python:3.11-slim}\n",
+            "FROM python:3.11-slim\n",
+            "ARG BASE_IMAGE\nFROM python@sha256:" + "0" * 64 + "\n",
+        ],
+        ids=["bare-question", "mutable-default", "tag-fallback", "tag-from", "second-base"],
+    )
+    def test_mutable_or_unsupported_mutations_are_rejected(self, mutation):
+        text = "\n".join(BS.REQUIRED_HEADER) + "\n" + mutation
+        assert BS.validate_dockerfile_text(text), mutation
+
+    def test_corrected_form_is_accepted(self):
+        text = "\n".join(BS.REQUIRED_HEADER) + "\nARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n"
+        assert BS.validate_dockerfile_text(text) == []
+
+    def test_no_dockerfile_still_carries_the_historical_form(self):
+        for path in (*BS.dockerfiles(), "docker-compose.e2e.yml"):
+            text = (REPO_ROOT / path).read_text()
+            assert HISTORICAL_DEFECT not in text, path
+        assert HISTORICAL_DEFECT not in WORKFLOW.read_text()
+
+
+class TestCIDockerfileGate:
+    """§9 — ordinary CI must execute the real BuildKit contract."""
+
+    def test_ci_runs_on_push_and_pull_request(self):
+        doc = yaml.safe_load(CI_WORKFLOW.read_text())
+        triggers = doc[True] if True in doc else doc["on"]
+        assert "pull_request" in triggers
+        assert "arena/**" in triggers["push"]["branches"]
+        assert "main" in triggers["push"]["branches"]
+
+    def test_gate_lives_in_the_compose_job_and_uses_real_buildkit(self):
+        run = _ci_gate_step()["run"]
+        assert "docker buildx build --check" in run
+        # positive: the committed digest is passed as the build argument
+        assert '--build-arg BASE_IMAGE="$BASE" -f "$DF" "$CTX"' in run
+        # negative: the same file is checked with no build argument
+        assert 'docker buildx build --check -f "$DF" "$CTX"' in run
+        assert "a default or fallback exists" in run
+
+    def test_gate_consumes_the_committed_pin_not_a_tag(self):
+        run = _ci_gate_step()["run"]
+        assert "e2e.image_pins" in run and "pinned-images.txt" in run
+        assert 'E2E_PYTHON_BASE_IMAGE' in run
+        assert "^[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[0-9a-f]{64}$" in run
+        assert "python:3.11-slim" not in run
+
+    def test_gate_iterates_the_authoritative_inventory(self):
+        run = _ci_gate_step()["run"]
+        assert "e2e.build_surfaces --plan" in run
+        assert "e2e.build_surfaces --validate" in run
+        # every surface must be reached, and the count is asserted in-job
+        assert f'[ "$CHECKED" -eq {len(BS.E2E_DOCKERFILES)} ]' in run
+
+    def test_gate_runs_a_live_mutation_probe(self):
+        run = _ci_gate_step()["run"]
+        assert "mutation probe" in run
+        assert "FROM ${BASE_IMAGE:?" in run
+        assert "regression gate assumption broken" in run
+
+    def test_gate_is_a_gate_not_a_warning(self):
+        step = _ci_gate_step()
+        assert step.get("continue-on-error") in (None, False)
+        assert "set -euo pipefail" in step["run"]
+        assert '[ "$FAILURES" -eq 0 ] || exit 1' in step["run"]
+
+    def test_gate_needs_no_credentials(self):
+        doc = yaml.safe_load(CI_WORKFLOW.read_text())
+        compose_job = doc["jobs"]["compose"]
+        text = yaml.safe_dump(compose_job)
+        for forbidden in (
+            "secrets.",
+            "E2E_FIXTURE_GITHUB_TOKEN",
+            "E2E_JWT_SECRET",
+            "GITHUB_OAUTH_TOKEN",
+        ):
+            assert forbidden not in text, forbidden
+        assert doc["permissions"] == {"contents": "read"}
+
+    def test_gate_does_not_execute_the_golden_path(self):
+        run = _ci_gate_step()["run"]
+        for forbidden in ("golden_path", "kind create", "docker compose up", "docker push"):
+            assert forbidden not in run, forbidden
+
+
+class TestSandboxSurfaceIsCommitted:
+    """The sandbox image is a build surface like any other (§10)."""
+
+    SANDBOX = REPO_ROOT / "devops-ai-platform" / "e2e" / "sandbox" / "Dockerfile"
+
+    def test_workflow_builds_the_committed_sandbox_dockerfile(self):
+        text = WORKFLOW.read_text()
+        assert "-f devops-ai-platform/e2e/sandbox/Dockerfile" in text
+        assert "/tmp/sandbox.Dockerfile" not in text
+        assert "printf 'ARG BASE_IMAGE" not in text
+
+    def test_sandbox_dockerfile_is_in_the_authoritative_inventory(self):
+        assert "devops-ai-platform/e2e/sandbox/Dockerfile" in BS.dockerfiles()
+        assert BS.validate_dockerfile_text(self.SANDBOX.read_text()) == []
+
+    def test_sandbox_image_still_runs_as_non_root_and_carries_nothing_else(self):
+        instructions = [
+            line
+            for line in self.SANDBOX.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        assert instructions == ["ARG BASE_IMAGE", "FROM ${BASE_IMAGE}", "USER nobody"]
