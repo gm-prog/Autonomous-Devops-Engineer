@@ -1,0 +1,45 @@
+# Phase 8.4.2 — E2E-only deployment-service image (§6).
+# Production Dockerfile untouched: this variant adds exactly the pinned
+# Terraform + kubectl toolchain the zero-cloud/kind execution path needs,
+# with official checksum verification on every download.
+# Immutable build input (§9): BASE_IMAGE must be name@sha256:<64hex>.
+# No tag default is allowed — a missing/non-digest reference fails
+# the build (tests/test_e2e_corrective.py static checks).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+
+ARG TERRAFORM_VERSION=1.9.8
+ARG KUBECTL_VERSION=v1.31.4
+ARG TARGETARCH=amd64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Terraform: official release + official SHA256SUMS, verified (§6).
+RUN set -eu; \
+    base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"; \
+    curl -fsSLo /tmp/tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
+    curl -fsSLo /tmp/tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
+    (cd /tmp && grep "terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip" tf.sums | sha256sum -c -); \
+    unzip -o /tmp/tf.zip -d /usr/local/bin terraform; \
+    chmod 0755 /usr/local/bin/terraform; \
+    rm -f /tmp/tf.zip /tmp/tf.sums; \
+    terraform version
+
+# kubectl: official release + official .sha256, verified (§6).
+RUN set -eu; \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl"; \
+    curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256"; \
+    (cd /usr/local/bin && sha256sum -c /tmp/kubectl.sha256); \
+    chmod 0755 /usr/local/bin/kubectl; \
+    rm -f /tmp/kubectl.sha256; \
+    kubectl version --client
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
+
+EXPOSE 8030
+CMD ["sh", "-c", "celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info & exec uvicorn deployment_service.main:app --host 0.0.0.0 --port 8030"]

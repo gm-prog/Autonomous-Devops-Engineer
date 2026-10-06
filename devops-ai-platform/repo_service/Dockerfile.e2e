@@ -1,0 +1,20 @@
+# E2E build surface (Phase 8.4.2-D §6): the golden-path workflow builds
+# THIS file, not the tag-based production Dockerfile (which remains
+# tag-based by design and is never part of the E2E build). The base is
+# digest-controlled: no tag default exists, so an unpinned base fails
+# the build (tests/test_e2e_corrective.py static checks).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+# DevOps.AI Operator Platform - repo_service
+# Build context: devops-ai-platform/  (see docker-compose.yml)
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+
+EXPOSE 8010
+
+CMD ["uvicorn", "repo_service.main:app", "--host", "0.0.0.0", "--port", "8010"]

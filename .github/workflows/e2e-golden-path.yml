@@ -1,0 +1,550 @@
+# Phase 8.4.2 — Full CI-Venue Golden Path (protected staging E2E).
+#
+# Security posture (§43/§54, audited §17):
+#   * workflow_dispatch ONLY — no pull_request_target, no pull_request,
+#     no automatic deployment triggers;
+#   * permissions: contents: read (nothing else is granted); job
+#     `environment: e2e-staging` gates every secret exposure;
+#   * every third-party action pinned to a full commit SHA;
+#   * secrets are STEP-SCOPED (Phase 8.4.2-C §10): no `env:` entry of
+#     the JOB references `secrets.*`; each step names exactly the
+#     secrets it needs in its own `env:` — steps without one cannot see
+#     any secret value. Compose diagnostics are rendered from a
+#     SANITIZED environment (never the live values); the recursive scan
+#     step is an independent backstop and GATES artifact upload;
+#   * GitHub context values that reach shell are validated by format
+#     checks (repo slug / 40-hex SHA) before use, all variables are
+#     quoted, shell blocks run under `set -euo pipefail`.
+#
+# Execution-order guarantees (§5, Phase 8.4.2-C): the local registry is
+# created FIRST on its own dedicated network (`e2e-registry-net`) with
+# NO dependency on any post-kind resource; only AFTER `kind create
+# cluster` does the harness connect it to the kind network
+# (`docker network connect kind kind-registry`) and prove TCP reachability
+# plus an actual image pull from the kind node.
+#
+# Concurrency wording (§12, Phase 8.4.2-C): `cancel-in-progress: false`
+# ONLY prevents cancellation of a running execution. GitHub does not
+# document FIFO or any stronger ordering for the run queued in the
+# group; no stronger queue guarantee is claimed here.
+name: E2E Golden Path (staging)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fixture_seed_sha:
+        description: "Immutable seed commit SHA (40-hex) of the disposable fixture repository"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# cancel-in-progress:false prevents cancellation of the RUNNING job only;
+# queued-run ordering is not a guarantee (see header, §12).
+concurrency:
+  group: e2e-golden-path
+  cancel-in-progress: false
+
+jobs:
+  golden-path:
+    name: Golden path (protected staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment: e2e-staging
+    env:
+      E2E_SOURCE_SHA: "${{ github.sha }}"
+      E2E_RUN_ID: "${{ github.run_id }}"
+      E2E_FIXTURE_REPOSITORY: "gm-prog/ares-e2e-fixture"
+      E2E_FIXTURE_SEED_SHA: "${{ inputs.fixture_seed_sha }}"
+      REMEDIATION_PROPOSAL_TTL_SECONDS: "600"
+      E2E_PROJECT: "ares-e2e"
+      E2E_COMPOSE_FILE: "devops-ai-platform/docker-compose.yml,docker-compose.e2e.yml"
+      E2E_KUBECONFIG_HOST_PATH: "/tmp/ares-e2e-kubeconfig"
+      E2E_ARTIFACT_DIR: "${{ github.workspace }}/e2e-artifacts"
+      E2E_TERRAFORM_VERSION: "1.9.8"
+      E2E_KUBECTL_VERSION: "v1.31.4"
+      E2E_KIND_VERSION: "v0.26.0"
+      GATEWAY_URL: "http://localhost:8000"
+      E2E_SANDBOX_IMAGE_BAD: "localhost:5001/ares-e2e-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      # §6: ONE dedicated host-visible workspace root, mounted at the
+      # same absolute path on the runner and inside incident-service.
+      E2E_WORKSPACES_ROOT: "/tmp/ares-e2e-workspaces"
+
+    steps:
+      - name: Checkout (SHA-pinned action)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate untrusted identifiers (slug / SHA formats)
+        shell: bash
+        env:
+          E2E_JWT_SECRET: ${{ secrets.E2E_JWT_SECRET }}
+          E2E_FIXTURE_GITHUB_TOKEN: ${{ secrets.E2E_FIXTURE_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${E2E_FIXTURE_REPOSITORY}" in
+            [A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*) ;;
+            *) echo "::error::fixture repository slug invalid"; exit 1;;
+          esac
+          if ! printf '%s' "${E2E_FIXTURE_SEED_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::fixture_seed_sha must be 40 lowercase hex chars"; exit 1
+          fi
+          if ! printf '%s' "${E2E_SOURCE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::E2E_SOURCE_SHA invalid"; exit 1
+          fi
+          if [ -z "${E2E_JWT_SECRET}" ] || [ -z "${E2E_FIXTURE_GITHUB_TOKEN}" ]; then
+            echo "::error::protected e2e-staging secrets are not provisioned"; exit 1
+          fi
+
+      - name: Install pinned toolchain (checksum-verified)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Terraform — official release, official SHA256SUMS (§6)
+          base="https://releases.hashicorp.com/terraform/${E2E_TERRAFORM_VERSION}"
+          curl -fsSLo /tmp/tf.zip "${base}/terraform_${E2E_TERRAFORM_VERSION}_linux_amd64.zip"
+          curl -fsSLo /tmp/tf.sums "${base}/terraform_${E2E_TERRAFORM_VERSION}_SHA256SUMS"
+          (cd /tmp && grep "terraform_${E2E_TERRAFORM_VERSION}_linux_amd64.zip" tf.sums | sha256sum -c -)
+          sudo unzip -o /tmp/tf.zip -d /usr/local/bin terraform
+          # kubectl — official release, official .sha256 (§6)
+          curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${E2E_KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${E2E_KUBECTL_VERSION}/bin/linux/amd64/kubectl.sha256"
+          (cd /tmp && sha256sum -c kubectl.sha256)
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          # kind — go module install @ pinned version (sumdb-verified, §9)
+          go install "sigs.k8s.io/kind@${E2E_KIND_VERSION}"
+          sudo install -m 0755 "$(go env GOPATH)/bin/kind" /usr/local/bin/kind
+          terraform version | head -1
+          kubectl version --client
+          kind version
+          python3 -m pip install --quiet --disable-pip-version-check -r devops-ai-platform/requirements.txt
+
+      - name: Compose config validation (base + E2E override)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose version
+          export JWT_SECRET=ci-gateway-secret
+          # interpolation-only placeholders (never pulled, never built);
+          # the real immutable inputs come from the committed pins step (§9).
+          export E2E_PYTHON_BASE_IMAGE=config-validation-placeholder
+          export E2E_POSTGRES_IMAGE=config-validation-placeholder
+          export E2E_REDIS_IMAGE=config-validation-placeholder
+          export E2E_QDRANT_IMAGE=config-validation-placeholder
+          export REMEDIATION_SANDBOX_IMAGE=config-validation-placeholder
+          docker compose -f devops-ai-platform/docker-compose.yml config >/dev/null
+          docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml config > /tmp/compose-config.txt
+          echo "compose config OK ($(wc -l < /tmp/compose-config.txt) lines)"
+
+      - name: Load immutable image pins (committed digests, §9)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$E2E_ARTIFACT_DIR"
+          # Phase 8.4.2-D §5: consume the committed authoritative
+          # name@sha256 pins ONLY. There is no tag-based lookup, no
+          # dispatch-time resolution, and no fallback: a missing or
+          # malformed digest fails the job (tests/test_e2e_corrective.py
+          # enforces both the file and this step's semantics).
+          PROV="$E2E_ARTIFACT_DIR/image-provenance-inputs.txt"
+          : > "$PROV"
+          while read -r NAME PIN KEY; do
+            case "$NAME" in ''|\#*) continue ;; esac
+            printf '%s' "$KEY" | grep -Eq '^[A-Z][A-Z0-9_]*$' || {
+              echo "::error::bad env key '$KEY' in pinned-images.txt"; exit 1; }
+            printf '%s' "$NAME" | grep -Eq '^[a-z0-9][a-z0-9._/:-]*$' || {
+              echo "::error::bad image name '$NAME' in pinned-images.txt"; exit 1; }
+            printf '%s' "$PIN" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+              echo "::error::pin for $NAME is not sha256:<64hex> — no fallback"; exit 1; }
+            REF="${NAME}@${PIN}"
+            docker pull -q "$REF" >/dev/null || {
+              echo "::error::digest pull failed: $REF"; exit 1; }
+            docker image inspect "$REF" >/dev/null || {
+              echo "::error::digest not present after pull: $REF"; exit 1; }
+            echo "${KEY}=${REF}" >> "$GITHUB_ENV"
+            echo "${KEY}=${REF}" >> "$PROV"
+            echo "${KEY}: ${REF}" >> "$E2E_ARTIFACT_DIR/docker-inspect-digests.txt"
+          done < devops-ai-platform/e2e/pinned-images.txt
+          # committed contract: exactly six pinned inputs
+          test "$(grep -c '^[A-Z]' "$PROV")" -eq 6 || {
+            echo "::error::expected exactly six pinned image inputs"; exit 1; }
+          # expose the six values for the manifest-provenance exports below
+          set -a; . "$PROV"; set +a
+          # §7: manifest-ready provenance exported BEFORE the driver runs;
+          # deterministic scalar KEY=VALUE;KEY=... representation.
+          BASE_IMAGES_PROVENANCE="E2E_PYTHON_BASE_IMAGE=${E2E_PYTHON_BASE_IMAGE};E2E_POSTGRES_IMAGE=${E2E_POSTGRES_IMAGE};E2E_REDIS_IMAGE=${E2E_REDIS_IMAGE};E2E_QDRANT_IMAGE=${E2E_QDRANT_IMAGE};REGISTRY_IMAGE=${REGISTRY_IMAGE};NODE_IMAGE=${NODE_IMAGE}"
+          {
+            echo "E2E_REGISTRY_DIGEST=${REGISTRY_IMAGE}"
+            echo "E2E_KIND_NODE_DIGEST=${NODE_IMAGE}"
+            echo "E2E_BASE_IMAGES=${BASE_IMAGES_PROVENANCE}"
+          } >> "$GITHUB_ENV"
+          {
+            echo "E2E_REGISTRY_DIGEST=${REGISTRY_IMAGE}"
+            echo "E2E_KIND_NODE_DIGEST=${NODE_IMAGE}"
+            echo "E2E_BASE_IMAGES=${BASE_IMAGES_PROVENANCE}"
+          } >> "$E2E_ARTIFACT_DIR/manifest-provenance-env.txt"
+
+      - name: Configure registry (own network), kind, connect, prove (§5)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$E2E_ARTIFACT_DIR"
+          # §5: registry FIRST on its own deterministic network — no step
+          # here assumes the kind network pre-exists.
+          docker network create e2e-registry-net >/dev/null 2>&1 || true
+          docker rm -f kind-registry >/dev/null 2>&1 || true
+          docker run -d --restart=always --name kind-registry \
+            -p 127.0.0.1:5001:5000 \
+            --network e2e-registry-net --network-alias kind-registry \
+            "${REGISTRY_IMAGE}"
+          docker ps --filter name=kind-registry \
+            --format '{{.ID}}|{{.Image}}|{{.Networks}}' \
+            | tee "$E2E_ARTIFACT_DIR/registry-state.txt"
+          # kind AFTER the registry exists…
+          kind create cluster --name ares-e2e \
+            --image "$NODE_IMAGE" \
+            --config devops-ai-platform/e2e/kind-config.yaml \
+            --wait 180s | tee "$E2E_ARTIFACT_DIR/kind-create.txt"
+          # …and only NOW connect the registry to the kind network.
+          docker network connect kind kind-registry
+          docker network inspect e2e-registry-net \
+            --format 'e2e-registry-net containers: {{range .Containers}}{{.Name}} {{end}}' \
+            | tee "$E2E_ARTIFACT_DIR/registry-networks-preconnect.txt"
+          docker network inspect kind \
+            --format 'kind containers: {{range .Containers}}{{.Name}} {{end}}' \
+            | tee "$E2E_ARTIFACT_DIR/registry-networks-postconnect.txt"
+          # prove reachability FROM the kind node (TCP level)
+          docker exec ares-e2e-control-plane bash -c \
+            'timeout 5 bash -c "</dev/tcp/kind-registry/5000" && echo TCP-OK' \
+            | tee "$E2E_ARTIFACT_DIR/kind-registry-connectivity.txt"
+          docker inspect kind-registry \
+            --format 'image={{.Image}} networks={{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' \
+            | tee -a "$E2E_ARTIFACT_DIR/registry-state.txt"
+          kind get nodes --name ares-e2e | tee "$E2E_ARTIFACT_DIR/kind-nodes.txt"
+          KUBECONFIG_FILE="$HOME/.kube/kind-ares-e2e"
+          kind get kubeconfig --name ares-e2e > "$KUBECONFIG_FILE"
+          # in-cluster variant: reachable from the compose network (§11)
+          python3 - "$KUBECONFIG_FILE" "$E2E_KUBECONFIG_HOST_PATH" <<'PY'
+          import json, sys, yaml
+          src, dst = sys.argv[1], sys.argv[2]
+          with open(src) as fh:
+              cfg = yaml.safe_load(fh)
+          cfg["clusters"][0]["cluster"]["server"] = "https://ares-e2e-control-plane:6443"
+          with open(dst, "w") as fh:
+              yaml.safe_dump(cfg, fh)
+          PY
+          kubectl --kubeconfig "$KUBECONFIG_FILE" wait --for=condition=Ready node --all --timeout=180s
+          kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace devops-production-namespace --dry-run=client -o yaml | kubectl --kubeconfig "$KUBECONFIG_FILE" apply -f -
+          kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace devops-production-namespace
+
+      - name: Build immutable E2E images (application + sandbox/workload, §9)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # valid-format placeholders so `compose config` interpolation
+          # passes during build (JWT guard is build-time only here); the
+          # real sandbox digest is exported after the pushes below.
+          export JWT_SECRET=ci-gateway-build-placeholder
+          export REMEDIATION_SANDBOX_IMAGE="${E2E_SANDBOX_IMAGE_BAD}"
+          docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml build
+          # workload image for the fixture k8s Deployment (§13)
+          docker build --build-arg BASE_IMAGE="$E2E_PYTHON_BASE_IMAGE" \
+            -t "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}" \
+            devops-ai-platform/e2e/workload
+          # sandbox image (digest-pinned base via ARG, §9; pushed to the
+          # private registry so its tag@digest is content-addressed)
+          printf 'ARG BASE_IMAGE\nFROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}\nUSER nobody\n' > /tmp/sandbox.Dockerfile
+          docker build --build-arg BASE_IMAGE="$E2E_PYTHON_BASE_IMAGE" \
+            -t "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}" -f /tmp/sandbox.Dockerfile /tmp
+          docker push -q "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}"
+          docker push -q "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}"
+          WORKLOAD_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}")"
+          SANDBOX_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}")"
+          # §8 Step E: prove these are REAL digest-bearing references
+          # (post-push RepoDigests), never mutable tag names.
+          printf '%s' "$WORKLOAD_DIGEST" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
+            echo "::error::workload image has no registry digest: $WORKLOAD_DIGEST"; exit 1; }
+          printf '%s' "$SANDBOX_DIGEST" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
+            echo "::error::sandbox image has no registry digest: $SANDBOX_DIGEST"; exit 1; }
+          printf '%s\n%s\n' "$WORKLOAD_DIGEST" "$SANDBOX_DIGEST" >> "$E2E_ARTIFACT_DIR/docker-inspect-digests.txt"
+          # §7.4: manifest-ready built-image provenance exported BEFORE
+          # the driver runs (deterministic KEY=VALUE;KEY=... scalar).
+          BUILT_PROVENANCE="E2E_WORKLOAD_IMAGE=${WORKLOAD_DIGEST};REMEDIATION_SANDBOX_IMAGE=${SANDBOX_DIGEST}"
+          {
+            echo "E2E_WORKLOAD_IMAGE=${WORKLOAD_DIGEST}"
+            echo "REMEDIATION_SANDBOX_IMAGE=${SANDBOX_DIGEST}"
+            echo "E2E_SANDBOX_DIGEST=${SANDBOX_DIGEST}"
+            echo "E2E_BUILT_IMAGE_DIGESTS=${BUILT_PROVENANCE}"
+          } >> "$GITHUB_ENV"
+          {
+            echo "E2E_BUILT_IMAGE_DIGESTS=${BUILT_PROVENANCE}"
+          } >> "$E2E_ARTIFACT_DIR/manifest-provenance-env.txt"
+          docker images --digests | tee "$E2E_ARTIFACT_DIR/docker-images.txt"
+
+      - name: Publish workload image to private registry and prove pull from kind (§5)
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUBECONFIG_FILE="$HOME/.kube/kind-ares-e2e"
+          # an actual image PULL by the kind node: the fixture Deployment's
+          # readiness requires pulling the pushed digest.
+          sed "s|WORKLOAD_IMAGE_REF|${E2E_WORKLOAD_IMAGE}|g" \
+            devops-ai-platform/e2e/fixtures/k8s-deployment.yaml \
+            | kubectl --kubeconfig "$KUBECONFIG_FILE" apply -f -
+          kubectl --kubeconfig "$KUBECONFIG_FILE" wait --for=condition=Ready pod/checkout-service \
+            --timeout=300s | tee "$E2E_ARTIFACT_DIR/kind-image-pull-proof.txt"
+          kubectl --kubeconfig "$KUBECONFIG_FILE" get pod checkout-service -o wide \
+            | tee -a "$E2E_ARTIFACT_DIR/kind-image-pull-proof.txt"
+          printf 'workload-push: %s\n' "$E2E_WORKLOAD_IMAGE" \
+            | tee "$E2E_ARTIFACT_DIR/workload-push.txt"
+          # fresh state for the driver
+          kubectl --kubeconfig "$KUBECONFIG_FILE" delete pod checkout-service --wait=true --timeout=120s
+
+      - name: Create host-visible remediation workspace root (§6)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ONE dedicated directory, visible to the runner, incident-service
+          # (identical bind at the same absolute path), the Docker daemon,
+          # and therefore the sandbox bind source — never all of /tmp.
+          rm -rf "$E2E_WORKSPACES_ROOT"
+          mkdir -p "$E2E_WORKSPACES_ROOT"
+          test -d "$E2E_WORKSPACES_ROOT"
+          {
+            echo "root=$E2E_WORKSPACES_ROOT"
+            stat -c 'mode=%a owner=%U' "$E2E_WORKSPACES_ROOT"
+          } | tee "$E2E_ARTIFACT_DIR/workspace-root.txt"
+
+      - name: Boot compose stack + explicit readiness (no sleep-proof)
+        shell: bash
+        env:
+          # boot-time only: real values for container runtime env (§10)
+          JWT_SECRET: ${{ secrets.E2E_JWT_SECRET }}
+          E2E_FIXTURE_GITHUB_TOKEN: ${{ secrets.E2E_FIXTURE_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker compose -p "$E2E_PROJECT" \
+            -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml up -d
+          # deployment-service container reaches the kind API over the shared
+          # compose network by container name (never 127.0.0.1, §11)
+          docker network connect ares-e2e_default ares-e2e-control-plane
+          # §10 primary control: diagnostics rendered from a SANITIZED env —
+          # secret values never enter the artifact staging tree (backstop:
+          # the scan step below gates upload).
+          PYTHONPATH=devops-ai-platform python3 - <<'PY'
+          import os
+          from e2e.compose_diagnostics import render_compose_config
+          out = os.path.join(os.environ["E2E_ARTIFACT_DIR"], "compose-config.txt")
+          render_compose_config(
+              ["docker", "compose", "-p", os.environ["E2E_PROJECT"],
+               "-f", "devops-ai-platform/docker-compose.yml",
+               "-f", "docker-compose.e2e.yml", "config"],
+              out,
+          )
+          print("rendered sanitized diagnostics to", out)
+          PY
+          PYTHONPATH=devops-ai-platform python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, "devops-ai-platform")
+          import subprocess
+          from e2e.readiness import docker_exec_ok, http_ok, wait_until
+          wait_until("postgres", docker_exec_ok(
+              "devops_postgres", ["pg_isready", "-U", "postgres"]), timeout=180)
+          wait_until("redis", docker_exec_ok(
+              "devops_redis", ["redis-cli", "PING"]), timeout=120)
+          wait_until("qdrant", docker_exec_ok(
+              "devops_agent_service", ["python", "-c",
+              "import urllib.request as u;print(u.urlopen('http://qdrant:6333/healthz',timeout=3).status)"]),
+              timeout=120)
+          wait_until("api-gateway", http_ok("http://localhost:8000/health"), timeout=180)
+          for name, url in (("agent", "http://localhost:8020/health"),
+                            ("deployment", "http://localhost:8030/health"),
+                            ("monitoring", "http://localhost:8040/health"),
+                            ("incident", "http://localhost:8050/health")):
+              container = {"agent": "devops_agent_service",
+                           "deployment": "devops_celery_worker",
+                           "monitoring": "devops_monitoring_service",
+                           "incident": "devops_incident_service"}[name]
+              wait_until(name, docker_exec_ok(container, [
+                  "python", "-c",
+                  f"import urllib.request as u;print(u.urlopen('{url}',timeout=3).status)"]),
+                  timeout=180)
+          def worker_group():
+              p = subprocess.run(
+                  ["docker", "exec", "devops_redis", "redis-cli",
+                   "XINFO", "GROUPS", "devops:events"],
+                  capture_output=True, text=True, timeout=10)
+              out = p.stdout or ""
+              return "incident-service" in out, f"groups={out[:120]!r}"
+          wait_until("incident-event-worker group", worker_group, timeout=180)
+          print("all readiness probes passed")
+          PY
+          # in-cluster kubectl proof FROM the deployment-service container (§11)
+          docker exec devops_celery_worker kubectl \
+            --kubeconfig /etc/deployment/kubeconfig get nodes
+
+      - name: Prove host-visible workspace == sandbox /workspace (live, §6)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROOF_FILE="e2e-visibility-proof-${E2E_RUN_ID}.txt"
+          # 1) a file created inside the platform's remediation workspace…
+          docker exec devops_incident_service sh -c \
+            "echo golden-path-visibility > \"\$REMEDIATION_WORKSPACE_ROOT/$PROOF_FILE\""
+          # 2) …must be visible at the SAME absolute path on the runner host
+          #    (the daemon host, where the sandbox bind source lives)…
+          SRC=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/tmp/ares-e2e-workspaces"}}{{.Source}}{{end}}{{end}}' devops_incident_service)
+          test -n "$SRC"
+          test -f "$SRC/$PROOF_FILE"
+          HOST_SHA=$(sha256sum "$SRC/$PROOF_FILE" | cut -d' ' -f1)
+          # 3) …and readable READ-ONLY at /workspace inside the REAL sandbox
+          #    image with exactly one :ro bind — no mocked Docker client.
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "$SRC:/workspace:ro" \
+            "$REMEDIATION_SANDBOX_IMAGE" \
+            sh -c "set -eu; test -f /workspace/$PROOF_FILE;
+                   SHA=\$(sha256sum /workspace/$PROOF_FILE | cut -d' ' -f1);
+                   test \"\$SHA\" = '$HOST_SHA';
+                   if touch /workspace/w 2>/dev/null; then echo 'RW ESCAPE'; exit 1; fi;
+                   echo sandbox-ro-ok"
+          CONT_SHA=$(docker exec devops_incident_service sha256sum \
+            "/tmp/ares-e2e-workspaces/$PROOF_FILE" | cut -d' ' -f1)
+          test "$HOST_SHA" = "$CONT_SHA"
+          {
+            echo "host=$HOST_SHA"
+            echo "container=$CONT_SHA"
+            echo "bind-source=$SRC"
+            echo "sandbox=/workspace (ro) verified"
+          } | tee "$E2E_ARTIFACT_DIR/workspace-visibility.txt"
+          rm -f "$SRC/$PROOF_FILE"
+
+      - name: Prove fixture repo is private and authenticated fetch works (§7)
+        shell: bash
+        env:
+          E2E_FIXTURE_GITHUB_TOKEN: ${{ secrets.E2E_FIXTURE_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 1) unauthenticated ls-remote must FAIL (repo is private).
+          if docker exec devops_incident_service git ls-remote \
+               "https://github.com/${E2E_FIXTURE_REPOSITORY}.git" >/dev/null 2>&1; then
+            echo "::error::fixture repo reachable without credentials"; exit 1
+          fi
+          echo "unauthenticated-fetch=denied" | tee "$E2E_ARTIFACT_DIR/git-auth-proof.txt"
+          # 2) authenticated ls-remote must SUCCEED using the Bearer
+          #    extraHeader mechanism. The token arrives on STDIN — never in
+          #    the command line, URL, .git/config, or any persisted file.
+          printf '%s' "$E2E_FIXTURE_GITHUB_TOKEN" | docker exec -i \
+            devops_incident_service sh -c '
+              read -r tok
+              GIT_TERMINAL_PROMPT=0 \
+              GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.extraHeader \
+              GIT_CONFIG_VALUE_0="Authorization: Bearer $tok" \
+              git ls-remote "https://github.com/'"${E2E_FIXTURE_REPOSITORY}"'.git" HEAD
+            ' | tee -a "$E2E_ARTIFACT_DIR/git-auth-proof.txt"
+          # output above contains only ref+sha (never the token).
+
+      - name: Execute golden path driver
+        shell: bash
+        env:
+          PYTHONPATH: devops-ai-platform
+          E2E_JWT_SECRET: ${{ secrets.E2E_JWT_SECRET }}
+          E2E_FIXTURE_GITHUB_TOKEN: ${{ secrets.E2E_FIXTURE_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 devops-ai-platform/e2e/golden_path.py
+
+      - name: Collect evidence artifacts (§40)
+        if: always()
+        shell: bash
+        env:
+          # valid-format placeholders for compose interpolation when the
+          # resolve/build steps failed early (collect never mutates state)
+          JWT_SECRET: ci-collect-placeholder
+          REMEDIATION_SANDBOX_IMAGE: localhost:5001/ares-e2e-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        run: |
+          set -euo pipefail
+          mkdir -p "$E2E_ARTIFACT_DIR"
+          docker compose -p "$E2E_PROJECT" \
+            -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml ps > "$E2E_ARTIFACT_DIR/compose-services.txt" 2>&1 || true
+          docker compose -p "$E2E_PROJECT" \
+            -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml logs --no-color > "$E2E_ARTIFACT_DIR/compose-logs.txt" 2>&1 || true
+          docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' > "$E2E_ARTIFACT_DIR/docker-images.txt" 2>/dev/null || true
+          terraform version > "$E2E_ARTIFACT_DIR/terraform-version.txt" 2>&1 || true
+          kubectl version --client > "$E2E_ARTIFACT_DIR/kubectl-version.txt" 2>&1 || true
+          kind version > "$E2E_ARTIFACT_DIR/kind-version.txt" 2>&1 || true
+          KC="$HOME/.kube/kind-ares-e2e"
+          kubectl --kubeconfig "$KC" get all -A > "$E2E_ARTIFACT_DIR/kubectl-get-all.txt" 2>&1 || true
+          kubectl --kubeconfig "$KC" get events -A --sort-by=.lastTimestamp > "$E2E_ARTIFACT_DIR/kubectl-events.txt" 2>&1 || true
+
+      - name: Secret scan backstop — gates upload (§10/§40)
+        id: secretscan
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # independent recursive scan of the staging tree; upload below
+          # runs ONLY if this succeeds (primary control = sanitized render).
+          PYTHONPATH=devops-ai-platform python3 -m e2e.compose_diagnostics "$E2E_ARTIFACT_DIR"
+
+      - name: Upload E2E artifacts (evidence bundle)
+        if: always() && steps.secretscan.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-golden-path-${{ github.run_id }}
+          path: e2e-artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup (local + remote, never touches production)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          E2E_FIXTURE_GITHUB_TOKEN: ${{ secrets.E2E_FIXTURE_GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          docker compose -p "$E2E_PROJECT" \
+            -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml down -v --remove-orphans || true
+          # host-visible workspace root: only the dedicated run-scoped dir
+          rm -rf "$E2E_WORKSPACES_ROOT" || true
+          kind delete cluster --name ares-e2e || true
+          docker rm -f kind-registry >/dev/null 2>&1 || true
+          docker network rm e2e-registry-net >/dev/null 2>&1 || true
+          rm -f "$E2E_KUBECONFIG_HOST_PATH" "$HOME/.kube/kind-ares-e2e" /tmp/sandbox.Dockerfile || true
+          # remote cleanup: only the run-created branch + PR on the FIXTURE repo
+          python3 - <<'PY' || true
+          import json, os, urllib.request
+          root = os.environ.get("E2E_ARTIFACT_DIR", "")
+          token = os.environ["E2E_FIXTURE_GITHUB_TOKEN"]
+          repo = os.environ["E2E_FIXTURE_REPOSITORY"]
+          path = os.path.join(root, "e2e-manifest.json")
+          if not os.path.exists(path):
+              raise SystemExit(0)
+          manifest = json.load(open(path))
+          branch = manifest.get("remediation_branch") or ""
+          if not branch.startswith("automation/remediation/"):
+              raise SystemExit(0)  # refuse anything outside the remediation scope
+          if "/" in repo and repo.split("/")[0] != "gm-prog" or repo == "gm-prog/Autonomous-Devops-Engineer":
+              raise SystemExit(0)  # fixture-only cleanup; production never touched
+          base = f"https://api.github.com/repos/{repo}"
+          def call(method, url, payload=None):
+              req = urllib.request.Request(url, method=method,
+                  data=json.dumps(payload).encode() if payload else None,
+                  headers={"Authorization": f"Bearer {token}",
+                           "Accept": "application/vnd.github+json",
+                           "User-Agent": "ares-e2e-cleanup"})
+              try:
+                  urllib.request.urlopen(req, timeout=20)
+              except Exception as exc:
+                  print(f"cleanup {method} {url}: {exc}")
+          prs = json.load(urllib.request.urlopen(urllib.request.Request(
+              f"{base}/pulls?state=all&head={repo}:{branch}",
+              headers={"Authorization": f"Bearer {token}",
+                       "Accept": "application/vnd.github+json"}), timeout=20))
+          for pr in prs:
+              call("PATCH", f"{base}/pulls/{pr['number']}", {"state": "closed"})
+          call("DELETE", f"{base}/git/refs/heads/{branch}")
+          print("remote fixture cleanup attempted")
+          PY

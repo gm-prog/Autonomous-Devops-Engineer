@@ -1,0 +1,83 @@
+# Remediation patch 05 - see README.md in this directory
+# Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
+# Apply from the repository root:  git apply 05-backend-root-metrics.patch
+
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -1,7 +1,9 @@
+ import os
+ import logging
+-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
++from fastapi import FastAPI, Depends, HTTPException, Request, status, BackgroundTasks
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.responses import Response
++from prometheus_client import Counter, generate_latest
+ from pydantic import BaseModel, HttpUrl
+ from typing import List, Optional
+ import redis
+@@ -31,6 +33,21 @@
+     allow_headers=["*"],
+ )
+ 
++# --- PROMETHEUS METRICS ---
++API_REQUESTS = Counter(
++    "devops_api_requests_total",
++    "Total API requests processed by the operator gateway",
++    ["method", "path"],
++)
++
++@app.middleware("http")
++async def count_requests(request: Request, call_next):
++    response = await call_next(request)
++    route = request.scope.get("route")
++    path = route.path if route is not None else request.url.path
++    API_REQUESTS.labels(method=request.method, path=path).inc()
++    return response
++
+ # --- DATABASE & DATA LAYER SETUP ---
+ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@db:5432/devops_prod")
+ engine = create_engine(DATABASE_URL)
+@@ -89,13 +106,18 @@
+     except Exception as e:
+         logger.warning(f"PostgreSQL not yet fully online. DB connection bypassed: {e}")
+ 
+-    # Set up Qdrant Vector Collection for Operational Knowledge retrieval
++    # Set up Qdrant Vector Collection for Operational Knowledge retrieval.
++    # Create-if-missing only: the previous recreate_collection call destroyed
++    # any stored vectors on every restart.
+     try:
+-        qdrant.recreate_collection(
+-            collection_name="devops_knowledge_base",
+-            vectors_config=qmodels.VectorParams(size=1536, distance=qmodels.Distance.COSINE),
+-        )
+-        logger.info("Initialized Qdrant Collection base successfully.")
++        if qdrant.collection_exists("devops_knowledge_base"):
++            logger.info("Qdrant collection already present - preserving stored data.")
++        else:
++            qdrant.recreate_collection(
++                collection_name="devops_knowledge_base",
++                vectors_config=qmodels.VectorParams(size=1536, distance=qmodels.Distance.COSINE),
++            )
++            logger.info("Initialized Qdrant Collection base successfully.")
+     except Exception as e:
+         logger.warning(f"Qdrant integration skipped or offline: {e}")
+ 
+@@ -142,6 +164,11 @@
+ 
+ # --- API ENDPOINTS ---
+ 
++@app.get("/metrics")
++def metrics():
++    """Prometheus scrape target (monitoring/prometheus.yml -> api:8000)."""
++    return Response(content=generate_latest(), media_type="text/plain; version=0.0.4")
++
+ @app.get("/health")
+ def health_check():
+     return {
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -7,3 +7,4 @@
+ requests>=2.31.0
+ celery>=5.3.0
+ pydantic>=2.0.0
++prometheus-client>=0.17.0
