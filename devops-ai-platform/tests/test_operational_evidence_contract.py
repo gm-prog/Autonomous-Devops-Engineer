@@ -501,6 +501,38 @@ class TestCorrelationRules:
         assert staging_metric.evidence_id not in pack.summary["binding_rules"]
         assert sorted(pack.summary["environments"]) == ["production", "staging"]
 
+    def test_unknown_environment_never_weakly_binds_to_explicit_environment(self):
+        incident = IncidentEvidenceSource().collect(
+            incident_id="inc-env-unknown", service_name="checkout",
+            environment="production", observed_at=T0, collected_at=T0,
+        )[0]
+        # Simulate a source whose record lacks environment identity. It must
+        # not enter repository/commit or temporal fallback merely because the
+        # known side is production.
+        unknown_env = MonitoringEvidenceSource().collect(
+            observation_type=ObservationType.METRIC, service_name="checkout",
+            environment="production", observed_at=T0 + timedelta(minutes=4),
+            collected_at=T0 + timedelta(minutes=4),
+            metric_name="cpu", metric_value=0.4,
+        )[0]
+        object.__setattr__(
+            unknown_env, "service_identity",
+            None,
+        )
+        object.__setattr__(
+            unknown_env, "correlation_keys",
+            tuple(
+                key for key in unknown_env.correlation_keys
+                if key.key_type is not CorrelationKeyType.ENVIRONMENT
+            ),
+        )
+        pack = OperationalCorrelationEngine().correlate(
+            incident_id="inc-env-unknown",
+            evidence_items=[incident, unknown_env],
+            generated_at=T0,
+        )
+        assert unknown_env.evidence_id not in pack.summary["binding_rules"]
+
     def test_cross_service_collision_does_not_bind_by_name_alone(self):
         incident = IncidentEvidenceSource().collect(
             incident_id="inc-800", service_name="checkout", environment="production",
