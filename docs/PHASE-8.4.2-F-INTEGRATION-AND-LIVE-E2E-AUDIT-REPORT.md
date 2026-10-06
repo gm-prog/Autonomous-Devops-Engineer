@@ -552,21 +552,25 @@ never be collapsed:
 
 ### 15.1 Live snapshot
 
-Measured at head **`6e9118a43fe65c9b00d79c381417deff13aee59b`** (the parent of the
-Phase 8.4.2-F.1.1 commit), 2026-10-06:
+Measured at head **`588076fdbf175939185daae4c65283d1d450f278`** on 2026-10-06, at the
+end of Phase 8.4.2-F.1.1. Local `git` and the GitHub PR API agree digit for digit:
 
 | Live counter (dynamic — measured at the head above, **not** audit facts) | PR #13 | PR #12 |
 |---|---|---|
 | state | OPEN, not merged, not draft | OPEN, not merged |
 | base | `integration/phase-8.2-v1` (`a0bf7600…`) | `main` |
 | head ref | `arena/b6307a50-autonomous-devops-engineer` | `arena/b6307a50-autonomous-devops-engineer` |
-| commits | 33 | 122 |
+| merge-base | `a0bf7600…` (= the base itself) | `f7f851393b331585e05b1d9bfa4c8965ab94cd5e` |
+| commits | 35 | 124 |
 | changed files | 53 | 384 |
-| additions / deletions | +10,467 / −5 | +58,783 / −765 |
+| additions / deletions | +10,779 / −5 | +59,095 / −765 |
 
-> **These counters are dynamic.** Both PRs share the same head branch, so every commit —
-> including the F.1.1 commit that adds this very section — moves them. They are recorded
-> here as a dated snapshot, not as audit facts. For authoritative current values, query
+> **These counters are dynamic.** Both PRs share the same head branch, so every commit
+> moves them — including the commit that records this very table, which adds exactly one
+> commit to each count (35 → 36 and 124 → 125) and changes no additional file. That
+> self-reference is why a committed document can never be the authority on live state:
+> the numbers above are a dated measurement, not audit facts. For authoritative current
+> values, query
 > GitHub (`gh api repos/gm-prog/Autonomous-Devops-Engineer/pulls/13`) or read the PR #13
 > description, which is refreshed at the final head. **Do not copy these numbers into
 > `docs/phase-8.4.2-f-audit-facts.json`** — that record intentionally stays pinned to
@@ -582,6 +586,11 @@ python scripts/audit_phase_8_4_2_f.py \
 gh api repos/gm-prog/Autonomous-Devops-Engineer/pulls/13 \
   --jq '{state,merged,base:.base.ref,head:.head.sha,commits,changed_files,additions,deletions}'
 ```
+
+Note how the `main` comparison now reads **384 files / +59,095 / −765**, not the
+**381 files / +57,956 / −765** recorded at the audited head `a6032808`. Both are correct;
+they describe different heads. That drift is precisely why the audit record is pinned to
+an immutable SHA and never refreshed.
 
 ### 15.3 What did not move
 
