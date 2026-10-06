@@ -136,57 +136,69 @@ jobs:
           docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml config > /tmp/compose-config.txt
           echo "compose config OK ($(wc -l < /tmp/compose-config.txt) lines)"
 
-      - name: Resolve immutable build inputs (no floating tags, §9)
+      - name: Load immutable image pins (committed digests, §5)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$E2E_ARTIFACT_DIR"
-          # Source names live in the committed pinned-images.txt so this
-          # workflow text contains NO bare image tags (static check in
-          # tests/test_e2e_corrective.py). A pin of UNRESOLVED is resolved
-          # to the authoritative manifest digest from the registry at
-          # dispatch time, then everything is pulled BY DIGEST; digests are
-          # never invented.
-          while read -r NAME PIN KEY; do
-            case "$NAME" in ''|\#*) continue ;; esac
-            # strict whitelist: env keys are [A-Z0-9_] only (no injection)
-            printf '%s' "$KEY" | grep -Eq '^[A-Z][A-Z0-9_]*$' || {
-              echo "::error::bad env key '$KEY' in pinned-images.txt"; exit 1; }
-            if [ "$PIN" = "UNRESOLVED" ]; then
-              docker pull -q "$NAME" >/dev/null
-              REF="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$NAME" \
-                | grep -E '@sha256:[0-9a-f]{64}$' | head -1)"
-            else
-              case "$PIN" in sha256:[0-9a-f]*)
-                REF="${NAME}@${PIN}" ;;
-              *) echo "::error::bad pin '$PIN' for $NAME"; exit 1 ;;
-              esac
-              docker pull -q "$REF" >/dev/null
-            fi
-            printf '%s' "$REF" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
-              echo "::error::digest resolve failed for $NAME"; exit 1; }
+          PINS=devops-ai-platform/e2e/pinned-images.txt
+          # Phase 8.4.2-D §5: the committed file carries the IMMUTABLE
+          # digest of every external input. `e2e.image_pins` fails closed on
+          # any entry that is not "<source> sha256:<64hex> <ENV_KEY>" and
+          # emits "<KEY> <repository@sha256:…>" pairs. There is NO sentinel,
+          # NO dispatch-time tag lookup and NO fallback: the same commit can
+          # never consume a different external image tomorrow. Source names
+          # live only in that file, so this workflow text holds no image tag.
+          PYTHONPATH=devops-ai-platform python3 -m e2e.image_pins "$PINS" --refs \
+            > /tmp/e2e-image-refs.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            printf '%s' "$REF" \
+              | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$' || {
+              echo "::error::pin parser returned a non-digest reference for ${KEY}"
+              exit 1; }
+            # pull and inspect EXACTLY the committed digest reference
+            docker pull -q "$REF" >/dev/null
+            docker image inspect "$REF" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+              | grep -Fxq "$REF" || {
+              echo "::error::daemon did not confirm ${KEY} as ${REF}"; exit 1; }
             echo "${KEY}=${REF}" >> "$GITHUB_ENV"
-            echo "${KEY}: ${REF}" >> "$E2E_ARTIFACT_DIR/docker-inspect-digests.txt"
-          done < devops-ai-platform/e2e/pinned-images.txt
-          # belt: the six resolved refs must all be digest-pinned
+            printf '%s %s\n' "$KEY" "$REF" \
+              >> "$E2E_ARTIFACT_DIR/image-provenance-inputs.txt"
+          done < /tmp/e2e-image-refs.txt
+          # §7: manifest provenance for the external inputs (registry, kind
+          # node, base images) comes from the SAME committed pins and is
+          # exported here — upstream of the driver, never patched afterwards.
+          PYTHONPATH=devops-ai-platform python3 -m e2e.image_pins "$PINS" --exports \
+            > /tmp/e2e-provenance-exports.txt
+          cat /tmp/e2e-provenance-exports.txt >> "$GITHUB_ENV"
+          cp /tmp/e2e-provenance-exports.txt \
+            "$E2E_ARTIFACT_DIR/manifest-provenance-env.txt"
           python3 - <<'PY'
           import os
           import re
           import sys
-          pat = re.compile(r"@sha256:[0-9a-f]{64}$")
+          pat = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$")
           keys = ("E2E_PYTHON_BASE_IMAGE", "E2E_POSTGRES_IMAGE",
                   "E2E_REDIS_IMAGE", "E2E_QDRANT_IMAGE", "REGISTRY_IMAGE",
                   "NODE_IMAGE")
-          # values were exported to GITHUB_ENV, not this process; re-read file
-          lines = open(os.path.join(os.environ["E2E_ARTIFACT_DIR"],
-                                    "docker-inspect-digests.txt")).read().splitlines()
-          got = dict(line.split(": ", 1) for line in lines if ": " in line)
-          bad = [k for k in keys if not pat.search(got.get(k, ""))]
+          root = os.environ["E2E_ARTIFACT_DIR"]
+          rows = [line.split() for line in
+                  open(os.path.join(root, "image-provenance-inputs.txt"),
+                       encoding="utf-8").read().splitlines() if line.strip()]
+          got = {key: ref for key, ref in rows}
+          bad = [k for k in keys if not pat.fullmatch(got.get(k, ""))]
           if bad:
-              print(f"::error::missing or non-digest-pinned inputs: {bad}")
-              sys.exit(1)
-          print("all build inputs digest-pinned")
+              sys.exit(f"::error::missing or non-digest-pinned inputs: {bad}")
+          env = open(os.environ["GITHUB_ENV"], encoding="utf-8").read()
+          for var in ("E2E_REGISTRY_DIGEST", "E2E_KIND_NODE_DIGEST",
+                      "E2E_BASE_IMAGES"):
+              if not re.search(rf"^{var}=\S+$", env, re.M):
+                  sys.exit(f"::error::{var} was not exported for the driver")
+          print("six immutable inputs loaded; external provenance exported")
           PY
+          cat "$E2E_ARTIFACT_DIR/image-provenance-inputs.txt"
 
       - name: Configure registry (own network), kind, connect, prove (§5)
         shell: bash
@@ -262,14 +274,44 @@ jobs:
             -t "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}" -f /tmp/sandbox.Dockerfile /tmp
           docker push -q "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}"
           docker push -q "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}"
+          # §7.4: built-image provenance comes from the REAL post-push
+          # RepoDigests of the daemon — never from the run-scoped tag.
           WORKLOAD_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}")"
           SANDBOX_DIGEST="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}")"
+          for REF in "$WORKLOAD_DIGEST" "$SANDBOX_DIGEST"; do
+            printf '%s' "$REF" \
+              | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$' || {
+              echo "::error::built image is not digest-addressed: ${REF}"; exit 1; }
+          done
           printf '%s\n%s\n' "$WORKLOAD_DIGEST" "$SANDBOX_DIGEST" >> "$E2E_ARTIFACT_DIR/docker-inspect-digests.txt"
+          BUILT="E2E_WORKLOAD_IMAGE=${WORKLOAD_DIGEST};REMEDIATION_SANDBOX_IMAGE=${SANDBOX_DIGEST}"
           {
             echo "E2E_WORKLOAD_IMAGE=${WORKLOAD_DIGEST}"
             echo "REMEDIATION_SANDBOX_IMAGE=${SANDBOX_DIGEST}"
             echo "E2E_SANDBOX_DIGEST=${SANDBOX_DIGEST}"
+            echo "E2E_BUILT_IMAGE_DIGESTS=${BUILT}"
           } >> "$GITHUB_ENV"
+          {
+            printf 'E2E_WORKLOAD_IMAGE %s\n' "$WORKLOAD_DIGEST"
+            printf 'REMEDIATION_SANDBOX_IMAGE %s\n' "$SANDBOX_DIGEST"
+          } > "$E2E_ARTIFACT_DIR/image-provenance-built.txt"
+          echo "E2E_BUILT_IMAGE_DIGESTS=${BUILT}" \
+            >> "$E2E_ARTIFACT_DIR/manifest-provenance-env.txt"
+          # fail closed BEFORE the driver: all four manifest provenance
+          # variables must exist with real values (§7.5/§9).
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          required = ("E2E_REGISTRY_DIGEST", "E2E_KIND_NODE_DIGEST",
+                      "E2E_BASE_IMAGES", "E2E_BUILT_IMAGE_DIGESTS")
+          env = open(os.environ["GITHUB_ENV"], encoding="utf-8").read()
+          missing = [v for v in required if not re.search(rf"^{v}=\S+$", env, re.M)]
+          if missing:
+              sys.exit(f"::error::manifest provenance not exported: {missing}")
+          print("manifest provenance exported before the driver: "
+                + ", ".join(required))
+          PY
           docker images --digests | tee "$E2E_ARTIFACT_DIR/docker-images.txt"
 
       - name: Publish workload image to private registry and prove pull from kind (§5)

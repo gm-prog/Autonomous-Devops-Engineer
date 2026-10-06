@@ -446,10 +446,21 @@ class RemediationWorkspaceService:
                 "Git command arguments must not contain NUL bytes"
             )
 
+        # Phase 8.4.2-D P2: the raw credential is NEVER inherited by a Git
+        # child process. Commands that need authentication receive it as an
+        # explicit per-call `extra_env` (`GIT_CONFIG_*` http.extraHeader);
+        # commands that do not (checkout / rev-parse / switch / status) run
+        # with no token material in their environment at all.
         env = {
             key: value
             for key, value in os.environ.items()
-            if key not in {"GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+            if key
+            not in {
+                "GIT_SSH_COMMAND",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+                "GITHUB_OAUTH_TOKEN",
+            }
         }
         env["GIT_TERMINAL_PROMPT"] = "0"
         if extra_env:

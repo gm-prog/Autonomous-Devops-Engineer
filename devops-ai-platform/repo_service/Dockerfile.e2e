@@ -1,0 +1,21 @@
+# Phase 8.4.2-D — E2E-only repo_service image (§6.2).
+# Byte-equivalent to ./repo_service/Dockerfile except for the base image: the
+# golden-path compose build MUST consume a content-addressed base, so the
+# production file stays tag-based (and unbuilt by the E2E workflow) while
+# this variant is digest-controlled.
+# Immutable build input (§5): BASE_IMAGE must be name@sha256:<64hex>.
+# No tag default is allowed — a missing/non-digest reference fails
+# the build (tests/test_e2e_corrective.py static checks).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+
+EXPOSE 8010
+
+CMD ["uvicorn", "repo_service.main:app", "--host", "0.0.0.0", "--port", "8010"]

@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 SCHEMA = "ares.e2e.golden-path/1"
 
@@ -20,8 +20,58 @@ _REPO_SLUG = re.compile(
     r"/(?=[A-Za-z0-9_.-]*[A-Za-z0-9])[A-Za-z0-9_.-]+$"
 )
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
-_DIGEST_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[0-9a-f]{64}$")
+# A content-addressed image reference, optionally carrying a registry host
+# (and port) — e.g. ``python@sha256:…`` or
+# ``localhost:5001/ares-e2e-sandbox@sha256:…``. The port form is required:
+# the run-scoped workload/sandbox images live in the kind-local registry
+# (Phase 8.4.2-D audit finding D-1; the sandbox module's own
+# ``^[^@\s]+@sha256:[0-9a-f]{64}$`` guard already accepted it).
+_DIGEST_REF = re.compile(
+    r"^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::[0-9]{1,5})?/)?"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r"@sha256:[0-9a-f]{64}$"
+)
 _MANIFEST_KEY = re.compile(r"^[a-z_]+$")
+
+# --- committed immutable image pins (Phase 8.4.2-D §5) -------------------
+#: env keys the committed pin file MUST define — exactly these six.
+PINNED_IMAGE_KEYS: Sequence[str] = (
+    "E2E_PYTHON_BASE_IMAGE",
+    "E2E_POSTGRES_IMAGE",
+    "E2E_REDIS_IMAGE",
+    "E2E_QDRANT_IMAGE",
+    "REGISTRY_IMAGE",
+    "NODE_IMAGE",
+)
+#: the subset consumed as build bases / service images by the E2E stack.
+BASE_IMAGE_KEYS: Sequence[str] = (
+    "E2E_PYTHON_BASE_IMAGE",
+    "E2E_POSTGRES_IMAGE",
+    "E2E_REDIS_IMAGE",
+    "E2E_QDRANT_IMAGE",
+)
+REGISTRY_IMAGE_KEY = "REGISTRY_IMAGE"
+KIND_NODE_IMAGE_KEY = "NODE_IMAGE"
+
+_PIN_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_PIN_SOURCE = re.compile(
+    r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+    r":[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+_ENV_KEY = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+#: manifest fields that MUST carry a real value before a live execution is
+#: allowed to claim PASS (Phase 8.4.2-D §7/§9).
+REQUIRED_EXECUTION_PROVENANCE: Sequence[str] = (
+    "source_sha",
+    "fixture_seed_sha",
+    "workspace_root",
+    "registry_image_digest",
+    "kind_node_image_digest",
+    "base_images",
+    "built_image_digests",
+    "sandbox_image_digest",
+)
 
 PASS, FAIL, BLOCKED, NOT_VERIFIED = "PASS", "FAIL", "BLOCKED", "NOT_VERIFIED"
 
@@ -64,6 +114,150 @@ def extract_repo_digest(refs: Iterable[str]) -> str:
         if validate_digest_ref(str(ref).strip()):
             return str(ref).strip()
     return ""
+
+
+def canonical_digest_ref(name: str, digest: str) -> str:
+    """Build the canonical ``<repository>@sha256:<64hex>`` identity.
+
+    The tag of ``name`` is dropped on purpose: the digest IS the identity,
+    the tag column of the pin file only records where that digest was
+    observed. Raises ``ValueError`` when the result is not a valid
+    content-addressed reference (fail closed — never return a tag).
+    """
+    source = str(name or "").strip()
+    pin = str(digest or "").strip()
+    if not _PIN_DIGEST.fullmatch(pin):
+        raise ValueError(f"not an immutable sha256 digest: {pin!r}")
+    head, sep, tail = source.rpartition(":")
+    repository = head if (sep and "/" not in tail) else source
+    ref = f"{repository}@{pin}"
+    if not validate_digest_ref(ref):
+        raise ValueError(f"not a digest-addressed image reference: {ref!r}")
+    return ref
+
+
+def parse_pinned_images(text: str) -> List[Dict[str, str]]:
+    """Parse the committed immutable-pin file — fail closed (§5.2/§5.4).
+
+    Grammar, one record per non-comment line::
+
+        <source-name:tag> sha256:<64hex> <ENV_KEY>
+
+    ``ValueError`` is raised for ANY deviation: a missing digest, a
+    malformed digest, a mutable tag in the pin column (this explicitly
+    includes the retired ``UNRESOLVED`` sentinel, which is just another
+    non-digest value), a bad env key, a duplicate key or source, or a key
+    set that is not exactly :data:`PINNED_IMAGE_KEYS`. There is no
+    fallback and no compatibility mode.
+    """
+    records: List[Dict[str, str]] = []
+    seen_keys: Dict[str, int] = {}
+    seen_names: Dict[str, int] = {}
+    for lineno, raw in enumerate(str(text or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            raise ValueError(
+                f"line {lineno}: expected '<source> sha256:<64hex> <ENV_KEY>', "
+                f"got {line!r}"
+            )
+        name, pin, key = parts
+        if not _PIN_SOURCE.fullmatch(name):
+            raise ValueError(f"line {lineno}: invalid source image name {name!r}")
+        if not _PIN_DIGEST.fullmatch(pin):
+            raise ValueError(
+                f"line {lineno}: pin for {name!r} is not an immutable "
+                f"sha256:<64hex> digest: {pin!r}"
+            )
+        if not _ENV_KEY.fullmatch(key):
+            raise ValueError(f"line {lineno}: invalid env key {key!r}")
+        if key in seen_keys:
+            raise ValueError(
+                f"line {lineno}: duplicate env key {key!r} (first seen on line "
+                f"{seen_keys[key]})"
+            )
+        if name in seen_names:
+            raise ValueError(
+                f"line {lineno}: duplicate source image {name!r} (first seen on "
+                f"line {seen_names[name]})"
+            )
+        seen_keys[key] = lineno
+        seen_names[name] = lineno
+        records.append(
+            {
+                "name": name,
+                "digest": pin,
+                "key": key,
+                "ref": canonical_digest_ref(name, pin),
+            }
+        )
+    expected = sorted(PINNED_IMAGE_KEYS)
+    if sorted(seen_keys) != expected:
+        raise ValueError(
+            f"pin file must define exactly {expected}, got {sorted(seen_keys)}"
+        )
+    return records
+
+
+def format_scalar_mapping(mapping: Mapping[str, str]) -> str:
+    """Deterministic scalar encoding of a key→ref map (§7.3/§7.4).
+
+    ``KEY=value;KEY=value`` with keys sorted and no trailing separator —
+    the manifest schema forbids containers, so provenance maps travel as
+    one auditable, machine-parsable string. Values carrying ``;``, ``=``
+    or whitespace are rejected so the encoding stays unambiguous.
+    """
+    parts: List[str] = []
+    for key in sorted(mapping):
+        value = str(mapping[key] or "").strip()
+        if not _ENV_KEY.fullmatch(str(key)):
+            raise ValueError(f"invalid provenance key: {key!r}")
+        if not value:
+            raise ValueError(f"empty provenance value for {key}")
+        if any(ch in value for ch in ";=") or any(ch.isspace() for ch in value):
+            raise ValueError(f"unencodable provenance value for {key}: {value!r}")
+        parts.append(f"{key}={value}")
+    return ";".join(parts)
+
+
+def parse_scalar_mapping(text: str) -> Dict[str, str]:
+    """Inverse of :func:`format_scalar_mapping` (auditor/test helper)."""
+    out: Dict[str, str] = {}
+    for item in str(text or "").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        if not sep or not _ENV_KEY.fullmatch(key) or not value:
+            raise ValueError(f"malformed scalar mapping entry: {item!r}")
+        out[key] = value
+    return out
+
+
+def pin_provenance_exports(records: Sequence[Mapping[str, str]]) -> Dict[str, str]:
+    """Manifest-ready provenance derived from the committed pins (§7).
+
+    Returns the exact variables the driver reads for the external inputs:
+    ``E2E_REGISTRY_DIGEST``, ``E2E_KIND_NODE_DIGEST`` and the scalar
+    ``E2E_BASE_IMAGES`` map. Built (dynamic) images are exported later by
+    the build step from real ``RepoDigests``.
+    """
+    by_key = {str(r["key"]): str(r["ref"]) for r in records}
+    missing = [k for k in PINNED_IMAGE_KEYS if not by_key.get(k)]
+    if missing:
+        raise ValueError(f"missing immutable pins for: {missing}")
+    bad = [k for k, ref in by_key.items() if not validate_digest_ref(ref)]
+    if bad:
+        raise ValueError(f"non-digest references for: {sorted(bad)}")
+    return {
+        "E2E_REGISTRY_DIGEST": by_key[REGISTRY_IMAGE_KEY],
+        "E2E_KIND_NODE_DIGEST": by_key[KIND_NODE_IMAGE_KEY],
+        "E2E_BASE_IMAGES": format_scalar_mapping(
+            {k: by_key[k] for k in BASE_IMAGE_KEYS}
+        ),
+    }
 
 
 def image_digest_of(image_id: str) -> str:
@@ -124,6 +318,36 @@ def finalize_manifest(manifest: Dict[str, Any], result: str) -> Dict[str, Any]:
     if problems:
         raise ValueError("invalid manifest: " + "; ".join(problems))
     return manifest
+
+
+def missing_execution_provenance(manifest: Mapping[str, Any]) -> List[str]:
+    """Required provenance fields that are absent/empty (§9)."""
+    data = manifest if isinstance(manifest, Mapping) else {}
+    return [
+        field
+        for field in REQUIRED_EXECUTION_PROVENANCE
+        if not str(data.get(field, "") or "").strip()
+    ]
+
+
+def finalize_execution_manifest(manifest: Dict[str, Any], result: str) -> Dict[str, Any]:
+    """Finalize a manifest that describes a LIVE execution (§9).
+
+    Schema validity and live-execution provenance completeness are kept
+    separate on purpose: :func:`finalize_manifest` still accepts any
+    structurally valid manifest (preflight/local contexts legitimately
+    produce ``NOT_VERIFIED``/``BLOCKED`` manifests with no run behind
+    them), while this function refuses to let a *successful* run claim
+    PASS when a required provenance field is empty — the result is
+    downgraded to FAIL and the gap recorded in ``provenance_rejection``.
+    """
+    gaps = missing_execution_provenance(manifest)
+    if result == PASS and gaps:
+        manifest["provenance_rejection"] = (
+            "incomplete execution provenance: " + ",".join(gaps)
+        )
+        result = FAIL
+    return finalize_manifest(manifest, result)
 
 
 def secret_scan_text(text: str) -> List[str]:

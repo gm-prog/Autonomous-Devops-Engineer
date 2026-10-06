@@ -1039,9 +1039,12 @@ class Harness:
                                    "sandbox-failure", "RCA", "proposal",
                                    "deployment-evidence")])
         overall = H.classify_gate([{"result": s.result()} for s in self.stages])
-        if overall == H.PASS:
-            overall = H.PASS
-        H.finalize_manifest(self.manifest, overall)
+        # Phase 8.4.2-D §9: this is a LIVE execution manifest — a PASS may
+        # not be claimed while any required provenance field is empty. The
+        # finalizer downgrades such a run to FAIL and records the gap in
+        # `provenance_rejection`, so the exit code follows the manifest.
+        H.finalize_execution_manifest(self.manifest, overall)
+        overall = str(self.manifest["result"])
         H.dump_json(os.path.join(ARTIFACTS, "e2e-manifest.json"), self.manifest)
         lines = ["# E2E golden path summary", "",
                  f"Result: **{overall}**", "", "| Stage | Result |", "| --- | --- |"]
