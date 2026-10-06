@@ -181,6 +181,26 @@ class EvidenceStrength(str, Enum):
     CONFLICTING = "CONFLICTING"
 
 
+class ScopeAuthority(str, Enum):
+    """Who asserted a service/environment scope (§12, §15).
+
+    A Git commit is a fact GitHub can attest to; the deployed scope that
+    commit relates to is *not*. When a caller supplies the scope, the
+    evidence must say so rather than letting the assertion inherit the
+    credibility of the source system.
+
+    ``SOURCE_NATIVE``
+        the source system itself reported the scope (monitoring knows which
+        service emitted a metric; the deployment service knows its target).
+    ``CALLER_ASSERTED``
+        the collecting caller supplied the scope as context. The source
+        system never claimed it.
+    """
+
+    SOURCE_NATIVE = "SOURCE_NATIVE"
+    CALLER_ASSERTED = "CALLER_ASSERTED"
+
+
 class CorrelationKeyType(str, Enum):
     """Typed join keys (§12) — never flattened into one opaque string."""
 
@@ -358,6 +378,10 @@ class EvidenceProvenance:
     artifact_digest: Optional[str] = None
     query: Optional[str] = None
     query_hash: Optional[str] = None
+    #: Set only when the service/environment scope on the item did NOT come
+    #: from ``source_system``. ``None`` means no caller assertion was made:
+    #: either the item carries no scope, or the source reported it natively.
+    service_scope_authority: Optional["ScopeAuthority"] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_system, SourceType):
@@ -398,6 +422,13 @@ class EvidenceProvenance:
             object.__setattr__(self, "artifact_digest", text)
         if self.query is not None and self.query_hash is None:
             object.__setattr__(self, "query_hash", content_hash(self.query))
+        if self.service_scope_authority is not None and not isinstance(
+            self.service_scope_authority, ScopeAuthority
+        ):
+            raise EvidenceError(
+                EvidenceErrorCode.INVALID_PROVENANCE,
+                "service_scope_authority must be a ScopeAuthority member",
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -411,6 +442,15 @@ class EvidenceProvenance:
             "artifact_digest": self.artifact_digest,
             "query": self.query,
             "query_hash": self.query_hash,
+            # One uniform rule, matching the hash material: the authority
+            # claim is serialized only where a caller actually made it.
+            # Absence is not "unknown" - it means no caller assertion was
+            # made, so the scope (if any) is the source system's own.
+            **(
+                {"service_scope_authority": self.service_scope_authority.value}
+                if self.service_scope_authority is not None
+                else {}
+            ),
         }
 
 
@@ -429,8 +469,17 @@ class CorrelationKey:
     key_type: CorrelationKeyType
     value: str
     source: SourceType
+    #: Whether ``source`` actually asserted this key, or merely carried a
+    #: caller-supplied assertion. Serialized only when it is not the
+    #: default, so adding the field moved no existing hash.
+    authority: "ScopeAuthority" = ScopeAuthority.SOURCE_NATIVE
 
     def __post_init__(self) -> None:
+        if not isinstance(self.authority, ScopeAuthority):
+            raise EvidenceError(
+                EvidenceErrorCode.INVALID_CORRELATION_KEY,
+                "correlation key authority must be a ScopeAuthority member",
+            )
         if not isinstance(self.key_type, CorrelationKeyType):
             raise EvidenceError(
                 EvidenceErrorCode.INVALID_CORRELATION_KEY,
@@ -468,6 +517,13 @@ class CorrelationKey:
         return f"{self.key_type.value}={self.value}"
 
     def to_dict(self) -> Dict[str, Any]:
+        if self.authority is not ScopeAuthority.SOURCE_NATIVE:
+            return {
+                "key_type": self.key_type.value,
+                "value": self.value,
+                "source": self.source.value,
+                "authority": self.authority.value,
+            }
         return {
             "key_type": self.key_type.value,
             "value": self.value,
@@ -596,6 +652,16 @@ class EvidenceItem:
         )
         object.__setattr__(self, "payload", freeze(dict(payload)))
 
+        if (
+            self.provenance.service_scope_authority is not None
+            and self.service_identity is None
+        ):
+            raise EvidenceError(
+                EvidenceErrorCode.INVALID_PROVENANCE,
+                "service_scope_authority was declared but the item carries "
+                "no service identity to attribute",
+            )
+
         computed_hash = content_hash(self._content_material(payload))
         if self.content_hash and self.content_hash != computed_hash:
             raise EvidenceError(
@@ -657,6 +723,18 @@ class EvidenceItem:
                 "workflow_run_id": provenance.workflow_run_id,
                 "artifact_digest": provenance.artifact_digest,
                 "query_hash": provenance.query_hash,
+                # Present only when a caller asserted the scope. Existing
+                # evidence therefore hashes exactly as before this field
+                # existed, while the assertion itself is integrity-covered
+                # wherever it is actually made.
+                **(
+                    {
+                        "service_scope_authority":
+                            provenance.service_scope_authority.value
+                    }
+                    if provenance.service_scope_authority is not None
+                    else {}
+                ),
             },
         }
 

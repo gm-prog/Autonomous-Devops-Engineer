@@ -51,6 +51,7 @@ from .model import (
     ObservationType,
     RelationshipType,
     SourceReference,
+    ScopeAuthority,
     SourceType,
 )
 from .replay import CAPTURE_SCHEMA, capture_inputs, rehydrate_item, replay_capture
@@ -86,6 +87,7 @@ __all__ = [
     "RuntimeIdentity",
     "ServiceIdentity",
     "SourceReference",
+    "ScopeAuthority",
     "SourceType",
     "canonical_json",
     "capture_inputs",

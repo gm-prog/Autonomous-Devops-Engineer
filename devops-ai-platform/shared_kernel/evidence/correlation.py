@@ -23,7 +23,7 @@ What this engine will never do
 * infer ``CAUSED_BY`` from "it happened just before" — temporal edges are
   emitted as ``PRECEDED``/``CORRELATES_WITH`` with ``temporal=True``;
 * merge ``checkout@production`` with ``checkout@staging`` because the
-  service names match (§20 R7);
+  service names match (§20, the environment-isolation gate);
 * drop a contradictory observation to make the graph tidy (§22);
 * mutate an observation to mark it stale (§23) — freshness is reported
   separately, alongside the untouched item.
@@ -60,7 +60,34 @@ __all__ = [
 
 #: Bump this when correlation *semantics* change, so historical packs stay
 #: interpretable and a re-run difference is visible rather than silent (§25).
+#:
+#: FREEZE CRITERION. The rule above protects *persisted* packs. ``/1`` is
+#: still unreleased: the evidence module exists on no protected ref, the only
+#: repository implementation is in-memory and non-durable, and no pack has
+#: ever been stored under it. Semantic corrections made before that changes
+#: are pre-freeze hardening and stay within ``/1``.
+#:
+#: ``/1`` becomes frozen at the FIRST of:
+#:   * this module merging into ``main`` or any ``integration/*`` ref, or
+#:   * a durable ``EvidenceRepository`` implementation persisting a pack.
+#:
+#: After that point any change to correlation semantics requires ``/2`` plus
+#: consistently regenerated acceptance and replay fixtures. See
+#: ``TestCorrelationPolicyVersioning`` - the decision is pinned by test so it
+#: cannot quietly become ambiguous.
 CORRELATION_POLICY_VERSION = "devops.correlation-policy/1"
+
+#: Policy versions whose semantics THIS build actually implements. Replaying
+#: a captured bundle recorded under any other version is refused: the
+#: capture would otherwise be re-interpreted under rules it was never
+#: produced by, which is precisely the silent re-run difference the version
+#: exists to prevent.
+#:
+#: Constructing an engine with an experimental policy in-process stays
+#: allowed - that is a deliberate act by a caller who can see the result.
+#: A capture bundle is an artifact that outlives the code, so it is held to
+#: the stricter rule.
+SUPPORTED_CORRELATION_POLICY_VERSIONS = frozenset({CORRELATION_POLICY_VERSION})
 
 # Rule identifiers, surfaced on every relationship for auditability.
 RULE_INCIDENT_BINDING = "R1-incident-binding"
@@ -269,7 +296,8 @@ class OperationalCorrelationEngine:
         incident_id: str,
     ) -> Optional[str]:
         """Return the highest-precedence rule binding ``item`` to the anchor."""
-        # R7 environment binding is a *gate*, not a rule: cross-environment
+        # The environment-isolation gate is a *gate*, not an emitted rule:
+        # it never appears as a rule_id on a relationship. Cross-environment
         # evidence never correlates on weaker-than-exact identity.
         # Weaker correlation is safe only when both sides carry the same
         # explicit environment. An unknown environment must not be treated as

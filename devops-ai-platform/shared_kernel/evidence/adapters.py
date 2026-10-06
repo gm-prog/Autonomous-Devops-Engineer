@@ -30,6 +30,7 @@ from .identities import (
     ServiceIdentity,
 )
 from .model import (
+    ScopeAuthority,
     CorrelationKey,
     CorrelationKeyType,
     EvidenceError,
@@ -78,6 +79,7 @@ class EvidenceSourceAdapter(ABC):
         workflow_run_id: Optional[str] = None,
         artifact_digest: Optional[str] = None,
         query: Optional[str] = None,
+        service_scope_authority: Optional[ScopeAuthority] = None,
     ) -> EvidenceProvenance:
         return EvidenceProvenance(
             source_system=self.source_type,
@@ -91,9 +93,15 @@ class EvidenceSourceAdapter(ABC):
             workflow_run_id=workflow_run_id,
             artifact_digest=artifact_digest,
             query=query,
+            service_scope_authority=service_scope_authority,
         )
 
-    def _key(self, key_type: CorrelationKeyType, value: Any) -> Optional[CorrelationKey]:
+    def _key(
+        self,
+        key_type: CorrelationKeyType,
+        value: Any,
+        authority: ScopeAuthority = ScopeAuthority.SOURCE_NATIVE,
+    ) -> Optional[CorrelationKey]:
         """Build a correlation key, or ``None`` when the value is absent.
 
         Absent values produce no key at all — they are never turned into a
@@ -104,10 +112,17 @@ class EvidenceSourceAdapter(ABC):
         text = str(value).strip()
         if not text:
             return None
-        return CorrelationKey(key_type=key_type, value=text, source=self.source_type)
+        return CorrelationKey(
+            key_type=key_type, value=text, source=self.source_type,
+            authority=authority,
+        )
 
-    def _keys(self, pairs: Iterable[Tuple[CorrelationKeyType, Any]]) -> Tuple[CorrelationKey, ...]:
-        built = (self._key(key_type, value) for key_type, value in pairs)
+    def _keys(
+        self,
+        pairs: Iterable[Tuple[CorrelationKeyType, Any]],
+        authority: ScopeAuthority = ScopeAuthority.SOURCE_NATIVE,
+    ) -> Tuple[CorrelationKey, ...]:
+        built = (self._key(key_type, value, authority) for key_type, value in pairs)
         return tuple(key for key in built if key is not None)
 
     @staticmethod
@@ -401,7 +416,8 @@ class GitHubEvidenceSource(EvidenceSourceAdapter):
 
         That assertion matters, because the correlation engine refuses to
         bind evidence of unknown environment to an explicitly scoped anchor
-        (R7). Git evidence collected without an environment stays available
+        (the environment-isolation gate). Git evidence collected without an
+        environment stays available
         in the pack and correlates on exact identity, but it will not reach
         the weaker repository+commit rule — which is the intended
         fail-closed behaviour, not an oversight.
@@ -447,6 +463,12 @@ class GitHubEvidenceSource(EvidenceSourceAdapter):
                 repository=repo_identity,
                 commit_sha=commit_sha,
                 workflow_run_id=workflow_run_id,
+                # GitHub attests to the repository and the SHA. It never
+                # asserted which deployed scope they relate to, so the
+                # caller's assertion is recorded as such (§15).
+                service_scope_authority=(
+                    ScopeAuthority.CALLER_ASSERTED if service is not None else None
+                ),
             ),
             observed_at=observed_at,
             collected_at=collected_at,
@@ -458,13 +480,18 @@ class GitHubEvidenceSource(EvidenceSourceAdapter):
                     (CorrelationKeyType.COMMIT_SHA, commit_sha),
                     (CorrelationKeyType.WORKFLOW_RUN_ID, workflow_run_id),
                     (CorrelationKeyType.INCIDENT_ID, incident_id),
+                )
+            )
+            + self._keys(
+                (
                     (CorrelationKeyType.SERVICE_NAME, service_name),
                     (CorrelationKeyType.ENVIRONMENT, environment),
                     (
                         CorrelationKeyType.SERVICE_SCOPE,
                         service.scope if service is not None else None,
                     ),
-                )
+                ),
+                authority=ScopeAuthority.CALLER_ASSERTED,
             ),
             payload=payload,
             strength=EvidenceStrength.DIRECT,

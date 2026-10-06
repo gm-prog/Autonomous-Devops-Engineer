@@ -21,14 +21,14 @@ produce the same output, byte for byte, in any process, in any order.
 | Path | Lines | Role |
 | --- | ---: | --- |
 | `devops-ai-platform/shared_kernel/evidence/canonical.py` | 183 | canonical JSON, SHA-256, UTC rules |
-| `devops-ai-platform/shared_kernel/evidence/identities.py` | 379 | repository / service / runtime / deployment identity |
-| `devops-ai-platform/shared_kernel/evidence/model.py` | 914 | value objects, enums, limits, item, relationship, pack |
-| `devops-ai-platform/shared_kernel/evidence/correlation.py` | 562 | the deterministic correlation engine |
-| `devops-ai-platform/shared_kernel/evidence/adapters.py` | 573 | narrow source adapters (they never correlate) |
+| `devops-ai-platform/shared_kernel/evidence/identities.py` | 380 | repository / service / runtime / deployment identity |
+| `devops-ai-platform/shared_kernel/evidence/model.py` | 992 | value objects, enums, limits, item, relationship, pack |
+| `devops-ai-platform/shared_kernel/evidence/correlation.py` | 594 | the deterministic correlation engine |
+| `devops-ai-platform/shared_kernel/evidence/adapters.py` | 638 | narrow source adapters (they never correlate) |
 | `devops-ai-platform/shared_kernel/evidence/store.py` | 174 | write-once repository port + in-memory implementation |
-| `devops-ai-platform/shared_kernel/evidence/replay.py` | 308 | capture and offline replay |
+| `devops-ai-platform/shared_kernel/evidence/replay.py` | 319 | capture and offline replay |
 | `devops-ai-platform/api_gateway/routers/evidence.py` | 125 | three authenticated read-only endpoints |
-| `devops-ai-platform/tests/test_operational_evidence_contract.py` | 1084 | domain, correlation, replay, persistence, adversarial |
+| `devops-ai-platform/tests/test_operational_evidence_contract.py` | 1490 | domain, correlation, replay, persistence, adversarial |
 | `devops-ai-platform/api_gateway/tests/test_evidence_plane.py` | 208 | API reads, auth boundary, absence of mutation |
 | `devops-ai-platform/scripts/evidence_pack_fingerprint.py` | 138 | cross-process determinism fixture |
 | `devops-ai-platform/scripts/evidence_assert_conflict.py` | 49 | CI guard: conflicts must survive, not resolve |
@@ -87,6 +87,7 @@ Controlled vocabularies, all finite and closed:
 | `RelationshipType` (10) | CAUSED_BY, PRECEDED, DEPLOYED_AS, GENERATED_BY, OBSERVED_ON, CORRELATES_WITH, DERIVED_FROM, VALIDATES, CONTRADICTS, AFFECTS |
 | `CorrelationKeyType` (13) | incident_id, trace_id, span_id, request_id, deployment_id, workflow_run_id, commit_sha, repository, pod_uid, service.name, service.instance.id, environment, service.scope |
 | `SourceType` (8) | monitoring, incident_service, deployment_service, github, git, kubernetes, e2e, database |
+| `ScopeAuthority` (2) | SOURCE_NATIVE, CALLER_ASSERTED |
 | `EvidenceErrorCode` (12) | INVALID_EVIDENCE, INVALID_PROVENANCE, INVALID_CORRELATION_KEY, INVALID_IDENTITY, CONFLICTING_EVIDENCE, STALE_EVIDENCE, EVIDENCE_TOO_LARGE, EVIDENCE_NOT_FOUND, PACK_NOT_FOUND, SCHEMA_VERSION_UNSUPPORTED, CORRELATION_POLICY_UNSUPPORTED, IMMUTABLE_EVIDENCE |
 
 **Naming.** No field is called `data`, `info`, `metadata`, `context` or
@@ -121,12 +122,40 @@ that matches:
 | 2 | `R2-trace-binding` | shared `trace_id` / `request_id` | CORRELATES_WITH |
 | 3 | `R3-deployment-binding` | same `deployment_id` | DEPLOYED_AS / CORRELATES_WITH |
 | 4 | `R4-service-environment-binding` | canonical `service.scope` (`name@environment`) | CORRELATES_WITH |
-| 5 | `R5-repository-commit-binding` | repository + commit SHA | CORRELATES_WITH |
-| 6 | `R6-temporal-proximity` | bounded window, same environment | PRECEDED / CORRELATES_WITH, `temporal=True` |
+| 5 | `R5-repository-commit-binding` | repository + commit SHA, **both sides in the same explicit environment** | CORRELATES_WITH |
+| 6 | `R6-temporal-proximity` | bounded window, same explicit environment | PRECEDED / CORRELATES_WITH, `temporal=True` |
 
 Two supporting rules: `R3a-deployment-grouping` links telemetry to the
 deployment that emitted it (GENERATED_BY), and `C1-deployment-identity-conflict`
 detects contradictory claims.
+
+### The environment-isolation gate
+
+This is a **gate, not a rule**. It emits no relationship and never appears as
+a `rule_id`; it only decides whether the weaker rules R4, R5 and R6 may be
+considered at all. R1–R3 bind on exact identity (incident, trace/request,
+deployment) and are evaluated before the gate, so an exact match is never
+suppressed by it.
+
+The gate is fail-closed: weak correlation requires that **both** sides carry
+an explicit environment and that the two agree. An unknown environment is not
+evidence of being production.
+
+| Anchor environment | Evidence environment | R4 / R5 / R6 |
+| --- | --- | --- |
+| explicit `production` | explicit `production` | **eligible** |
+| explicit `production` | explicit `staging` | **blocked** |
+| explicit `production` | unknown | **blocked** |
+| unknown | unknown | **blocked** |
+
+Blocked never means discarded: the observation stays in the pack, simply
+uncorrelated, and `summary.environments` reports every environment present.
+
+The practical consequence for R5 is that a bare Git commit — which has no
+runtime environment of its own — does not reach the rule. A caller that can
+legitimately say which deployed scope a commit relates to supplies it
+explicitly, and that assertion is recorded as caller-asserted rather than
+being passed off as a GitHub fact (see *Scope authority*).
 
 Non-negotiables enforced in code and in tests:
 
@@ -136,7 +165,8 @@ Non-negotiables enforced in code and in tests:
   `CORRELATES_WITH` and the basis says *no ordering is claimed*.
 * **Environment never merges.** `checkout@production` and `checkout@staging`
   are different services. Staging evidence is retained in the pack and left
-  uncorrelated rather than quietly folded into a production incident.
+  uncorrelated rather than quietly folded into a production incident, and an
+  item of unknown environment is treated the same way.
 * **Every relationship is explained.** `basis` and `rule_id` are mandatory.
   There are no probabilistic confidence scores; strength is one of four typed
   values.
@@ -157,6 +187,63 @@ Complexity is kept linear by keyed indexes and a bounded window
 `max_bucket_pairs` cap of 10 000 — no all-pairs comparison.
 
 ---
+
+### Scope authority
+
+A source system is credible about the things it actually observes. GitHub can
+attest that commit `abc123` exists in a repository; it has no idea which
+deployed scope that commit relates to — the same SHA may be running in
+staging, in production, in both, or nowhere.
+
+`GitHubEvidenceSource.collect()` therefore accepts `service_name` and
+`environment` as **optional** arguments, and when a caller supplies them the
+evidence records that they are the caller's assertion, not GitHub's:
+
+| Vocabulary | Members |
+| --- | --- |
+| `ScopeAuthority` (2) | SOURCE_NATIVE, CALLER_ASSERTED |
+
+Two places carry it, because they answer different questions:
+
+* `provenance.service_scope_authority` — item level: *who asserted the scope
+  on this item.* Absent means no caller assertion was made (the item either
+  has no scope, or the source reported its own).
+* `CorrelationKey.authority` — key level: *who asserted this particular join
+  key.* On a scoped Git item the keys separate cleanly:
+
+  ```
+  repository      github:gm-prog/autonomous-devops-engineer   SOURCE_NATIVE
+  commit_sha      aaaaaaaa…                                   SOURCE_NATIVE
+  service.name    payments                                    CALLER_ASSERTED
+  environment     production                                  CALLER_ASSERTED
+  service.scope   payments@production                         CALLER_ASSERTED
+  ```
+
+A downstream reasoning layer can therefore tell a source-native Git fact from
+caller-supplied deployment context without guessing, and without the
+assertion inheriting GitHub's credibility.
+
+Three properties keep this honest:
+
+* **Supplying half an identity is rejected.** `service_name` without
+  `environment` (or the reverse) raises `INVALID_IDENTITY` rather than being
+  half-applied — an unscoped service identity would re-open the very gap the
+  isolation gate closes.
+* **An authority claim without a scope is rejected.** Declaring
+  `service_scope_authority` on an item carrying no service identity raises
+  `INVALID_PROVENANCE`.
+* **The claim is integrity-covered where it is made.** Changing
+  `CALLER_ASSERTED` to `SOURCE_NATIVE` changes the `content_hash` and
+  therefore the `evidence_id`.
+
+The authority is serialized **only where a caller actually asserted it** —
+both in `to_dict()` and in the hash material, under one uniform rule. Absence
+is canonical and unambiguous, which is why adding the field moved no existing
+hash: the frozen acceptance fixtures below still hold exactly.
+
+Supplying a scope does not bypass anything. It makes the item *eligible* for
+the environment-isolation gate, which then applies normally: a commit the
+caller scopes to `staging` still cannot correlate to a production incident.
 
 ## E. Integrity
 
@@ -220,6 +307,56 @@ items 6   status CONFLICTING   both SHAs preserved   replay matches: yes
 
 Both hashes are stable across `PYTHONHASHSEED` 0, 1 and 12345 in separate
 interpreter processes. CI re-checks this on every run.
+
+### Correlation-policy versioning: why these hashes are still `/1`
+
+The policy version exists so that **persisted** packs stay interpretable and
+a re-run difference is visible rather than silent. The environment-isolation
+gate changed correlation semantics, which raises a fair question: should that
+have produced `devops.correlation-policy/2`?
+
+The answer is **no — it is pre-freeze hardening inside an unreleased `/1`** —
+and the reasoning is recorded here because it must not later look like an
+oversight:
+
+* **Nothing was ever persisted under the older semantics.** The only
+  `EvidenceRepository` implementation is in-memory and non-durable, and there
+  is no ORM model or table for evidence. There is no historical pack to keep
+  interpretable.
+* **`/1` has never been published.** The evidence module is absent from
+  `main` and from all six `integration/*` refs (verified by API lookup, 404
+  on each); PR #13 is open and unmerged.
+* **No published hash was invalidated.** The acceptance fixtures hash
+  identically before and after the semantic change — verified by running the
+  fingerprint script in detached worktrees at `eea0220` and `9937e17`, and
+  independently visible in the CI annotations of both commits. The fixture
+  carries explicit matching environments, so the gate does not alter it.
+* **Bumping would have been pure churn.** The policy version is part of the
+  pack-hash material, so `/2` would move every documented hash while there is
+  no `/1` artifact anywhere to distinguish them from.
+
+**Freeze criterion.** `/1` is frozen at the first of:
+
+1. this module merging into `main` or any `integration/*` ref, or
+2. a durable `EvidenceRepository` implementation persisting a pack.
+
+After that, any change to correlation semantics requires `/2` **and**
+consistently regenerated acceptance and replay fixtures — regenerated by
+running `scripts/evidence_pack_fingerprint.py`, never by hand-editing a hash.
+
+This decision is enforced, not merely written down. `TestCorrelationPolicy
+Versioning` pins the version, pins both acceptance hashes as constants,
+asserts the freeze criterion is documented beside the constant, and proves
+that a version bump necessarily changes the pack hash — so a future bump can
+never be silent, and a future semantic change can never quietly keep `/1`.
+
+`SUPPORTED_CORRELATION_POLICY_VERSIONS` names the versions this build
+implements. Replaying a capture recorded under any other version is refused
+with `CORRELATION_POLICY_UNSUPPORTED` rather than being re-interpreted under
+rules it was never produced by. Constructing an engine with an experimental
+policy in-process remains allowed: that is a deliberate act whose result the
+caller can see, whereas a capture bundle is an artifact that outlives the
+code.
 
 ---
 

@@ -202,7 +202,8 @@ class ServiceIdentity:
 
     ``environment`` is part of the identity, not an attribute of it: a
     ``checkout`` in ``staging`` and a ``checkout`` in ``production`` are
-    different identities and must never correlate on name alone (§20 R7).
+    different identities and must never correlate on name alone (§20, the
+    environment-isolation gate).
     """
 
     name: str

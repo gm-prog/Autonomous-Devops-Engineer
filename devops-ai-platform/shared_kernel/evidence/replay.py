@@ -18,7 +18,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from .canonical import canonical_json, content_hash
-from .correlation import CorrelationPolicy, OperationalCorrelationEngine
+from .correlation import (
+    SUPPORTED_CORRELATION_POLICY_VERSIONS,
+    CorrelationPolicy,
+    OperationalCorrelationEngine,
+)
 from .identities import (
     DeploymentIdentity,
     RepositoryIdentity,
@@ -292,6 +296,13 @@ def replay_capture(bundle: Mapping[str, Any]) -> EvidencePack:
         raise EvidenceError(
             EvidenceErrorCode.CORRELATION_POLICY_UNSUPPORTED,
             "capture bundle does not name a correlation policy version",
+        )
+    if policy.version not in SUPPORTED_CORRELATION_POLICY_VERSIONS:
+        raise EvidenceError(
+            EvidenceErrorCode.CORRELATION_POLICY_UNSUPPORTED,
+            "capture bundle was produced under correlation policy "
+            f"{policy.version!r}, which this build does not implement",
+            supported=sorted(SUPPORTED_CORRELATION_POLICY_VERSIONS),
         )
 
     items = [rehydrate_item(data) for data in bundle.get("evidence_items", ())]
