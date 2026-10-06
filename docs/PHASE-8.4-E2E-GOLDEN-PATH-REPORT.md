@@ -114,9 +114,10 @@ Q22 (anything touched `main`?): **NO** — `main` verified `7b30a56d…` unchang
    provisioning, disposable GitHub fixture, and
    `.github/workflows/e2e-golden-path.yml` (§57–§61) are **not yet
    built** → the DoD's execution items remain open.
-3. Exact `e2e_fixture` assertion value must be coordinated with the
-   fixture file + generated patch when the harness lands (current step
-   asserts `src/service_config.py` structure).
+3. ~~Exact `e2e_fixture` assertion value must be coordinated with the
+   fixture file + generated patch when the harness lands~~ — closed by
+   Phase 8.4.1: the profile asserts the exact patched value against
+   `tests/fixtures/e2e_fixture_repo/` (see correction section below).
 4. `REMEDIATION_SANDBOX_IMAGE` has no default (env-only) — the E2E
    environment must pin it (§12).
 5. Unit/integration results above are **local + exact-head CI only** —
@@ -140,6 +141,61 @@ lease + reconciliation + fail-closed (never "exactly once"). The
 platform proves exact repository+SHA existence and artifact hashing —
 **not** cryptographic source-to-artifact derivation; this report makes
 no such claim (§67).
+
+## Phase 8.4.1 correction — deterministic RCA → proposal closure (2026-10-06)
+
+The 8.4 report's known limitation is now closed at unit/integration
+level: the deterministic adapter returned no `remediation_draft`, so
+`ProposalGenerationService` correctly blocked with `BLOCKED_NO_DRAFT`
+and the deterministic path could never reach an executable proposal.
+Implementation commit `32a262f`.
+
+### Proven after this task
+
+- deterministic RCA validates the real synthetic breach semantics
+  (fail-closed `validate_e2e_signal`: pack structure, timeline ids,
+  exactly one `checkout-service`/`cpu_percent` signal, numeric
+  observed value + configured danger threshold read from the pack,
+  `observed > threshold`) — wrong service, wrong metric, missing
+  numbers, missing signals, ambiguity and foreign ids all return 422;
+- deterministic RCA emits the controlled, code-owned remediation
+  draft (target `src/service_config.py`, exact single-file unified
+  diff `SERVICE_NAME = "checkout-service"` →
+  `"checkout-service-remediated"`, fixed validation plan, `LOW`);
+  the request can never supply repository/SHA/branch/command;
+- `parse_rca_result()` accepts the result — proven at parser level
+  (schema, evidence refs ⊆ incident evidence, draft validation), and
+  rejects foreign citation sets;
+- canonical `ProposalGenerationService.generate()` produces a
+  `PROPOSED`, verified proposal with repository and source SHA taken
+  exclusively from authoritative deployment evidence, deterministic
+  canonical hash (stable across equivalent evidence; sensitive to
+  patch/target/repository/SHA/risk/validation-plan/evidence-refs
+  mutations), incident reaching `RemediationProposed`;
+- fixture validation asserts the exact expected patched value
+  (AST-exact; initial value, substring lookalike and missing file all
+  fail) without Docker, plus a cross-service drift guard;
+- production RCA remains fail-closed (`E2E_DETERMINISTIC_RCA`
+  absent/false → 503); a valid RCA without a draft still blocks with
+  `BLOCKED_NO_DRAFT`; no secret material in deterministic outputs;
+- no production deployment or GitHub fixture was executed by this
+  task.
+
+Local battery (exact CI scopes): platform `300 passed + 124
+subtests`; incident 35-module `OK (559 tests, 3 skipped)`; gateway
+`79 passed + 60 subtests`; backend `49 passed`; `compileall` OK;
+`git diff --check` clean.
+
+### Still unproven (unchanged from §Stages)
+
+real container staging boot; kind cluster; real Terraform execution;
+real deployment → DEPLOYED; real monitoring → Redis → worker chain;
+real external API golden path; real sandbox execution in CI; real
+Git commit; real GitHub branch; real GitHub PR; external duplicate
+execution; external concurrency; external crash/recovery; database
+cross-check under full E2E.
+
+Phase 8.4 is NOT complete and no staging success is claimed.
 
 ## Next steps (in order)
 
