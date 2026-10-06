@@ -41,6 +41,7 @@ RUN_ID = os.environ.get("E2E_RUN_ID", "local")
 ARTIFACTS = os.environ.get("E2E_ARTIFACT_DIR", "/tmp/e2e-artifacts")
 TTL_SECONDS = float(os.environ.get("REMEDIATION_PROPOSAL_TTL_SECONDS", "600"))
 SANDBOX_GOOD = os.environ.get("REMEDIATION_SANDBOX_IMAGE", "")
+WORKSPACES_ROOT = os.environ.get("E2E_WORKSPACES_ROOT", "")
 SANDBOX_BAD = os.environ.get("E2E_SANDBOX_IMAGE_BAD", "")
 COMPOSE_PROJECT = os.environ.get("E2E_PROJECT", "ares-e2e")
 COMPOSE_FILES = os.environ.get(
@@ -107,6 +108,12 @@ class Harness:
             terraform_version=os.environ.get("E2E_TERRAFORM_VERSION", ""),
             kubectl_version=os.environ.get("E2E_KUBECTL_VERSION", ""),
             kind_version=os.environ.get("E2E_KIND_VERSION", ""),
+            fixture_seed_sha=FIXTURE_SEED_SHA,
+            workspace_root=WORKSPACES_ROOT,
+            registry_image_digest=os.environ.get("E2E_REGISTRY_DIGEST", ""),
+            kind_node_image_digest=os.environ.get("E2E_KIND_NODE_DIGEST", ""),
+            base_images=os.environ.get("E2E_BASE_IMAGES", ""),
+            built_image_digests=os.environ.get("E2E_BUILT_IMAGE_DIGESTS", ""),
         )
         self.marker = f"e2e-run-{RUN_ID}"
         self.api = requests.Session()
@@ -152,6 +159,10 @@ class Harness:
             problems.append("E2E_FIXTURE_GITHUB_TOKEN missing")
         if not H.validate_digest_ref(SANDBOX_GOOD):
             problems.append("REMEDIATION_SANDBOX_IMAGE is not digest-pinned")
+        if not WORKSPACES_ROOT or not WORKSPACES_ROOT.startswith("/"):
+            problems.append("E2E_WORKSPACES_ROOT missing or not absolute")
+        elif not os.path.isdir(WORKSPACES_ROOT):
+            problems.append("E2E_WORKSPACES_ROOT does not exist on the runner")
         if problems:
             for p in problems:
                 print(f"::error::preflight: {p}")
@@ -176,7 +187,8 @@ class Harness:
             return H.BLOCKED
         self.save("fixture-verification.json",
                   {"repository": FIXTURE_REPO, "seed_sha": FIXTURE_SEED_SHA,
-                   "seed_content_matches": True, "verified_at": _now()})
+                   "seed_content_matches": True,
+                   "workspaces_root": WORKSPACES_ROOT, "verified_at": _now()})
         return H.PASS
 
     # ------------------------------ stages ----------------------------- #
@@ -407,7 +419,25 @@ class Harness:
             argv += [key, str(value)]
         add = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         st.check("event replayed via real stream", 0, add.returncode, add.returncode == 0)
-        time.sleep(6)  # bounded settle window, then verify durable state
+        if add.returncode != 0:
+            return
+        replay_ids = [ln.strip() for ln in (add.stdout or "").splitlines() if ln.strip()]
+        stream_id = replay_ids[-1] if replay_ids else ""
+        st.check("replay produced a stream id", True,
+                 bool(stream_id) and "-" in stream_id,
+                 bool(stream_id) and "-" in stream_id)
+        # §11: bounded polling on OBSERVABLE consumer state (delivery id
+        # progression + ack convergence) — never a fixed sleep as proof.
+        from e2e.readiness import ReadinessTimeout, wait_until
+        try:
+            wait_until("replay-consumed",
+                       self._replay_consumer_probe(stream_id),
+                       timeout=120, interval=1.5)
+            st.check("replayed event delivered and acknowledged", True, True, True)
+        except ReadinessTimeout as exc:
+            st.check("replayed event delivered and acknowledged", True,
+                     str(exc)[:200], False)
+            return
         r = self.gw("GET", f"/v1/incidents/{self.incident_id}", self.operator)
         if r.status_code != 200:
             st.check("incident unchanged after replay", 200, r.status_code, False)
@@ -424,6 +454,33 @@ class Harness:
         correlated = [i for i in r.json() if self._correlates(i)]
         st.check("still exactly one incident for the breach", 1, len(correlated),
                  len(correlated) == 1)
+
+    def _replay_consumer_probe(self, stream_id: str):
+        def probe():
+            info = subprocess.run(
+                ["docker", "exec", "devops_redis", "redis-cli", "--json",
+                 "XINFO", "GROUPS", "devops:events"],
+                capture_output=True, text=True, timeout=15)
+            groups = json.loads(info.stdout or "[]")
+            group = next((g for g in groups
+                          if g.get("name") == "incident-service"), None)
+            if group is None:
+                return False, "consumer group missing"
+            last = str(group.get("last-delivered-id") or "")
+            delivered = _stream_id_ge(last, stream_id)
+            pending = subprocess.run(
+                ["docker", "exec", "devops_redis", "redis-cli", "--json",
+                 "XPENDING", "devops:events", "incident-service",
+                 stream_id, stream_id, "1"],
+                capture_output=True, text=True, timeout=15)
+            try:
+                pending_rows = json.loads(pending.stdout or "[]")
+            except json.JSONDecodeError:
+                pending_rows = ["?"]
+            settled = delivered and not pending_rows
+            return settled, (f"delivered={delivered} last={last} "
+                             f"pending_rows={len(pending_rows)}")
+        return probe
 
     def evidence(self) -> None:
         st = Stage("deployment-evidence")
@@ -718,7 +775,7 @@ class Harness:
             remote = self._remote_branch_state(state.get("branch_name")
                                                or self._planned_branch())
             st.check("no remote branch", None, remote, remote is None)
-            prs = self._fixture_prs()
+            prs = self._fixture_prs(branch="")
             st.check("no GitHub PR", 0, len(prs), len(prs) == 0)
         finally:
             os.environ["REMEDIATION_SANDBOX_IMAGE"] = SANDBOX_GOOD
@@ -726,7 +783,14 @@ class Harness:
             self._wait_incident_service(st, timeout=240)
 
     def _planned_branch(self) -> str:
-        return f"automation/remediation/e2e/{RUN_ID}"
+        # actual branch contract is incident/proposal-derived (8.4.2-C):
+        from incident_service.application.services.remediation_workspace_service import (
+            RemediationWorkspaceService,
+        )
+        return RemediationWorkspaceService.build_branch_name(
+            self.incident_id,
+            self.proposal.get("id") or f"proposal-{self.incident_id}",
+        )
 
     def _execute(self) -> requests.Response:
         state = self._proposal_state()
@@ -764,12 +828,12 @@ class Harness:
         self.save("execution-race-codes.json", {"codes": codes})
         state = self._poll_proposal_until("PR_CREATED", timeout=600)
         gate = H.classify_execution_outcomes(codes)
-        ok = gate["acceptable"] and state.get("status") == "PR_CREATED" and \
-            gate["successes"] >= 0 and any(c != 409 for c in codes) and \
-            not gate["invalid"] and state.get("status") == "PR_CREATED"
-        st.check("race: one winner + conflict, terminal PR_CREATED",
-                 "200/409/502/504 with final PR_CREATED",
-                 f"codes={codes} final={state.get('status')}", ok)
+        ok = bool(gate["acceptable"]) and state.get("status") == "PR_CREATED"
+        st.check("race: exactly one winner + one 409 conflict, terminal PR_CREATED",
+                 "winner in {200,502,504} + exactly one 409 + PR_CREATED",
+                 f"codes={codes} winners={gate['winners']} "
+                 f"conflicts={len(gate['conflicts'])} "
+                 f"invalid={gate['invalid']} final={state.get('status')}", ok)
         self.proposal = state
         self.commit_sha = state.get("commit_sha")
         self.branch_name = state.get("branch_name")
@@ -777,7 +841,7 @@ class Harness:
         st.check("single commit recorded", True,
                  bool(self.commit_sha) and len(str(self.commit_sha)) == 40,
                  bool(self.commit_sha) and len(str(self.commit_sha)) == 40)
-        prs = self._fixture_prs()
+        prs = self._fixture_prs(branch=self.branch_name)
         st.check("exactly one PR on fixture", 1, len(prs), len(prs) == 1)
 
         # §31 duplicate execution reconciles
@@ -787,8 +851,9 @@ class Harness:
         after = self._proposal_state()
         st.check("duplicate did not mint second commit", self.commit_sha,
                  after.get("commit_sha"), after.get("commit_sha") == self.commit_sha)
-        st.check("still exactly one PR", 1, len(self._fixture_prs()),
-                 len(self._fixture_prs()) == 1)
+        st.check("still exactly one PR", 1,
+                 len(self._fixture_prs(branch=self.branch_name)),
+                 len(self._fixture_prs(branch=self.branch_name)) == 1)
 
         # §36 remote branch tamper fails closed
         moved = self._force_remote_branch_to_seed()
@@ -815,9 +880,12 @@ class Harness:
             time.sleep(4)
         return last
 
-    def _fixture_prs(self) -> List[Dict[str, Any]]:
-        r = self.gh(f"/repos/{FIXTURE_REPO}/pulls",
-                    params={"state": "all", "head": f"{FIXTURE_REPO}:{self._planned_branch()}"})
+    def _fixture_prs(self, branch: Optional[str] = None) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {"state": "all"}
+        head = branch if branch is not None else getattr(self, "branch_name", "")
+        if head:
+            params["head"] = f"{FIXTURE_REPO}:{head}"
+        r = self.gh(f"/repos/{FIXTURE_REPO}/pulls", params=params)
         if r.status_code != 200:
             return []
         return r.json()
@@ -855,7 +923,7 @@ class Harness:
             files = [f.get("filename") for f in meta.get("files") or []]
             st.check("commit touches only src/service_config.py",
                      ["src/service_config.py"], files, files == ["src/service_config.py"])
-        prs = self._fixture_prs()
+        prs = self._fixture_prs(branch=self.branch_name)
         st.check("one PR discovered", 1, len(prs), len(prs) == 1)
         if prs:
             pr = prs[0]
@@ -981,6 +1049,17 @@ class Harness:
         with open(os.path.join(ARTIFACTS, "e2e-summary.md"), "w") as fh:
             fh.write("\n".join(lines) + "\n")
         return overall, 0 if overall == H.PASS else 1
+
+
+def _stream_id_ge(left: str, right: str) -> bool:
+    """Compare Redis stream ids (``<ms>-<seq>``) numerically."""
+    def parts(value: str):
+        head, _, tail = value.partition("-")
+        try:
+            return int(head), int(tail or 0)
+        except ValueError:
+            return -1, -1
+    return parts(left) >= parts(right)
 
 
 def _fixture(name: str) -> str:

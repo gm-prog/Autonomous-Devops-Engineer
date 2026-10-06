@@ -3,7 +3,11 @@
 #   git   — workspace clone/checkout/commit/push (RemediationWorkspace*)
 #   docker CLI — sibling-container validation sandbox via the mounted
 #                socket (there is NO host-execution fallback, 6.2.2).
-FROM python:3.11-slim
+# Immutable build input (§9): BASE_IMAGE must be name@sha256:<64hex>.
+# No tag default is allowed — a missing/non-digest reference fails
+# the build (tests/test_e2e_corrective.py static checks).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git docker.io \

@@ -4,11 +4,11 @@
 # defaults below only exist so `compose config` validation can run.
 services:
   postgres:
-    image: ${E2E_POSTGRES_IMAGE:-postgres:15-alpine}
+    image: ${E2E_POSTGRES_IMAGE:?E2E_POSTGRES_IMAGE must be a name@sha256:<64hex> reference}
   redis:
-    image: ${E2E_REDIS_IMAGE:-redis:7-alpine}
+    image: ${E2E_REDIS_IMAGE:?E2E_REDIS_IMAGE must be a name@sha256:<64hex> reference}
   qdrant:
-    image: ${E2E_QDRANT_IMAGE:-qdrant/qdrant:v1.12.4}
+    image: ${E2E_QDRANT_IMAGE:?E2E_QDRANT_IMAGE must be a name@sha256:<64hex> reference}
 
   agent-service:
     environment:
@@ -18,6 +18,8 @@ services:
     build:
       context: ./devops-ai-platform
       dockerfile: ./deployment_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
     environment:
       - DEPLOYMENT_EXECUTION_ENABLED=true
       - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
@@ -31,14 +33,22 @@ services:
     build:
       context: ./devops-ai-platform
       dockerfile: ./incident_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
     environment:
       - REMEDIATION_SANDBOX_IMAGE=${REMEDIATION_SANDBOX_IMAGE:?E2E requires a digest-pinned sandbox image}
       - REMEDIATION_VALIDATION_PROFILE=e2e_fixture
       - REMEDIATION_PROPOSAL_TTL_SECONDS=${REMEDIATION_PROPOSAL_TTL_SECONDS:-600}
       - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
       - GITHUB_DEFAULT_BASE_BRANCH=main
+      - REMEDIATION_WORKSPACE_ROOT=/tmp/ares-e2e-workspaces
     volumes:
       # Sandbox runs as sibling containers of this service; there is no
       # host-process fallback (Phase 6.2.2) — docker.sock is the only
       # execution channel and the profile/argv remain code-owned.
       - /var/run/docker.sock:/var/run/docker.sock
+      # §6 host-visible workspace root: mounted at the SAME absolute path
+      # on the runner host and inside this container, so the daemon-side
+      # bind source the sandbox requests exists on the daemon host.
+      # Dedicated single directory only — never all of /tmp.
+      - /tmp/ares-e2e-workspaces:/tmp/ares-e2e-workspaces

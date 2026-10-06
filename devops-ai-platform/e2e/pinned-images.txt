@@ -1,0 +1,15 @@
+# Immutable build inputs (Phase 8.4.2-C §9).
+# format: <source-name> <digest-ref-or-UNRESOLVED> <exported-env-key>
+# The workflow resolves UNRESOLVED entries to their authoritative manifest
+# digests from the registry at dispatch time, pulls everything BY DIGEST,
+# and exports the resolved refs under the given env keys (never invents
+# digests; never builds from tags). The env key is validated against a
+# strict [A-Z0-9_] pattern before export. Source names live ONLY here so
+# the workflow text contains no bare image tags.
+# ORDER-SENSITIVE? no — the key column is authoritative.
+python:3.11-slim UNRESOLVED E2E_PYTHON_BASE_IMAGE
+postgres:15-alpine UNRESOLVED E2E_POSTGRES_IMAGE
+redis:7-alpine UNRESOLVED E2E_REDIS_IMAGE
+qdrant/qdrant:v1.12.4 UNRESOLVED E2E_QDRANT_IMAGE
+registry:2 UNRESOLVED REGISTRY_IMAGE
+kindest/node:v1.31.4 UNRESOLVED NODE_IMAGE

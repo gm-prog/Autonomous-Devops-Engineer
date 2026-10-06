@@ -2,7 +2,11 @@
 # Production Dockerfile untouched: this variant adds exactly the pinned
 # Terraform + kubectl toolchain the zero-cloud/kind execution path needs,
 # with official checksum verification on every download.
-FROM python:3.11-slim
+# Immutable build input (§9): BASE_IMAGE must be name@sha256:<64hex>.
+# No tag default is allowed — a missing/non-digest reference fails
+# the build (tests/test_e2e_corrective.py static checks).
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
 
 ARG TERRAFORM_VERSION=1.9.8
 ARG KUBECTL_VERSION=v1.31.4

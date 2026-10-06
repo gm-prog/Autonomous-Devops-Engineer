@@ -31,8 +31,12 @@ _SECRET_PATTERNS: Sequence[re.Pattern[str]] = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
     re.compile(r"(?i)\bauthorization:\s*(bearer|token)\s+\S+"),
+    # the sanitized-render placeholder is not a secret (Phase 8.4.2-C §10:
+    # primary control substitutes [REDACTED-NON-SECRET]; the scan must not
+    # reject its own placeholder — injected REAL values still match).
     re.compile(r"(?i)(JWT_SECRET|GITHUB_OAUTH_TOKEN|E2E_FIXTURE_GITHUB_TOKEN|"
-               r"E2E_JWT_SECRET|GEMINI_API_KEY)\s*[=:]\s*\S+"),
+               r"E2E_JWT_SECRET|GEMINI_API_KEY)\s*[=:]\s*"
+               r"(?!\[REDACTED-NON-SECRET\])\S+"),
     re.compile(r"x-access-token:[^@\s]+@"),
 )
 
@@ -164,18 +168,29 @@ def redact(text: str) -> str:
 
 
 def classify_execution_outcomes(statuses: Sequence[int]) -> Dict[str, Any]:
-    """Concurrency-race oracle (§32): at least one winner-transport
-    (200, or relay-timeout 502/504 when the gateway gave up while the
-    real work continued), every other outcome an explicit 409 conflict,
-    and no unexplained failure code."""
-    winners = [s for s in statuses if s in (200, 502, 504)]
-    conflicts = [s for s in statuses if s == 409]
-    invalid = [s for s in statuses if s not in (200, 409, 502, 504)]
+    """Strict two-request race oracle (§8): exactly ONE winner-transport
+    (200, or relay-timeout 502/504 while the durable operation continues —
+    documented in the Phase 8.4.2 report) and exactly ONE 409 conflict,
+    zero invalid codes, exactly two outcomes. Order-independent.
+    [200,409]/[409,200]/[502,409]/[409,502]/[504,409] pass;
+    [200,200], [502,502], [504,504], [409,409], [200,500], [404,409],
+    [] all fail."""
+    observed = list(statuses)
+    winners = [s for s in observed if s in (200, 502, 504)]
+    conflicts = [s for s in observed if s == 409]
+    invalid = [s for s in observed if s not in (200, 409, 502, 504)]
+    acceptable = (
+        len(observed) == 2
+        and len(winners) == 1
+        and len(conflicts) == 1
+        and not invalid
+    )
     return {
+        "winners": winners,
+        "conflicts": conflicts,
         "successes": len(winners),
-        "conflicts": len(conflicts),
         "invalid": invalid,
-        "acceptable": bool(winners) and not invalid,
+        "acceptable": acceptable,
     }
 
 
