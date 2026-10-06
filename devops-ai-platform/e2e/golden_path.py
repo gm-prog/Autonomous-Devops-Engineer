@@ -151,6 +151,10 @@ class Harness:
         problems = []
         if not H.validate_repo_slug(FIXTURE_REPO):
             problems.append("E2E_FIXTURE_REPOSITORY is not owner/repo")
+        elif H.is_production_repository(FIXTURE_REPO):
+            problems.append(
+                "E2E_FIXTURE_REPOSITORY must not be the production repository"
+            )
         if not H.validate_sha40(FIXTURE_SEED_SHA):
             problems.append("E2E_FIXTURE_SEED_SHA is not 40-hex")
         if not JWT_SECRET:

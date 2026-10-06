@@ -86,6 +86,14 @@ jobs:
             [A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*) ;;
             *) echo "::error::fixture repository slug invalid"; exit 1;;
           esac
+          # §21-F: the harness pushes branches and opens PRs against the
+          # fixture, so the fixture must never resolve to production source.
+          FIXTURE_SLUG="$(printf '%s' "${E2E_FIXTURE_REPOSITORY}" \
+            | tr '[:upper:]' '[:lower:]' | sed 's#\.git$##; s#/*$##')"
+          if [ "${FIXTURE_SLUG}" = "gm-prog/autonomous-devops-engineer" ]; then
+            echo "::error::fixture repository must never be the production repository"
+            exit 1
+          fi
           if ! printf '%s' "${E2E_FIXTURE_SEED_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::error::fixture_seed_sha must be 40 lowercase hex chars"; exit 1
           fi

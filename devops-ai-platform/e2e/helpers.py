@@ -95,6 +95,26 @@ def validate_sha40(value: Any) -> bool:
     return isinstance(value, str) and bool(_SHA40.fullmatch(value))
 
 
+#: The production repository. The disposable golden-path fixture must never
+#: resolve to it: the harness pushes branches and opens PRs against the
+#: fixture, so pointing it here would let an E2E run mutate production
+#: source (Phase 8.4.2-F §21-F).
+PRODUCTION_REPOSITORY = "gm-prog/Autonomous-Devops-Engineer"
+
+
+def is_production_repository(value: Any) -> bool:
+    """True when ``value`` names the production repository (§21-F).
+
+    Comparison is deliberately permissive about shapes that denote the same
+    repository — surrounding whitespace, a trailing ``.git``, trailing
+    slashes and letter case — so the guard cannot be sidestepped by a
+    cosmetic variation of the slug.
+    """
+    slug = str(value or "").strip()
+    slug = slug[:-4] if slug.casefold().endswith(".git") else slug
+    return slug.strip("/").casefold() == PRODUCTION_REPOSITORY.casefold()
+
+
 def validate_repo_slug(value: Any) -> bool:
     return isinstance(value, str) and bool(_REPO_SLUG.fullmatch(value))
 
