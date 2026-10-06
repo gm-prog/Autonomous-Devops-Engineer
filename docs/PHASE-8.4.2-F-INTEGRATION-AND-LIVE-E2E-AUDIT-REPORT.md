@@ -3,14 +3,29 @@
 Clean integration slice and live golden-path E2E enablement.
 Audit date: 2026-10-06. All evidence below was produced at the heads named with it.
 
+> **Corrected by Phase 8.4.2-F.1 (audit truth).** The first issue of this report
+> claimed that `main` and this work had *no common ancestor*. **That claim was false.**
+> It was produced by auditing inside a **shallow clone**, where `main` is grafted to a
+> parentless commit, so `git merge-base` reported nothing and `git rev-list --count main`
+> reported 1. GitHub's compare API disagreed, and GitHub was right. Every topology
+> figure below has been recomputed in a full clone, cross-checked against the GitHub
+> compare API, recorded in `docs/phase-8.4.2-f-audit-facts.json` and is now machine-verified
+> by `scripts/audit_phase_8_4_2_f.py`, which refuses to run in a shallow clone.
+> The *conclusion* (do not base the slice on `main`) is unchanged; the *reason* is now
+> stated correctly: `main` is **divergent and unsuitable**, not unrelated.
+>
+> **Audited head:** `a6032808186e8bbf8bebd7efc0c85a41eee4df4e`. Figures in current-state
+> tables describe that head. Commits after it are F.1 audit-truth corrections, which
+> necessarily add to PR #13's live counters; PR #13's description carries the live values.
+
 ---
 
 ## 1. Executive status
 
 | Dimension | Status |
 |---|---|
-| **INTEGRATION** | **PASS** — a clean, surgical slice exists and is published as **PR #13** (50 files, 30 linear commits) onto `integration/phase-8.2-v1`, a true ancestor of this work |
-| **CI** | **PASS** at the exact final head — push run `37480885467` and `pull_request` run `37480896669`, 5/5 jobs each |
+| **INTEGRATION** | **PASS** — a clean, surgical slice exists and is published as **PR #13** (50 files, +9,640 / −5, **32 linear commits, 0 merge commits**) onto `integration/phase-8.2-v1`, a true ancestor of this work |
+| **CI** | **PASS** at the audited head `a6032808` — push `37482389727`, `pull_request` `37482396569` and `37482399004`, 5/5 jobs each |
 | **DEFAULT-BRANCH WORKFLOW PUBLICATION** | **BLOCKED** — `e2e-golden-path.yml` is absent from the default branch; the workflow is not registered and cannot be dispatched |
 | **LIVE E2E** | **BLOCKED / NOT VERIFIED** — the golden path has never executed; no run id exists |
 
@@ -36,46 +51,68 @@ substitute delivered is strictly safer and measurably smaller.
 > The task text spells the last ref `d1961e43ba21725daa4f294b369f72c0946fb6` (38 chars).
 > That is a transcription typo; the real 40-hex object is above and the prefix matches.
 
-**Topology facts that determined this phase:**
+**Topology facts that determined this phase** (full clone; identical to the GitHub
+compare API; machine-verified by the audit guard):
 
 ```
-git merge-base main HEAD        -> (empty: unrelated histories)
-git rev-list --count main       -> 1
-git rev-list --count HEAD       -> 128 (126 at phase start + 2 Phase-F commits)
+git merge-base main a6032808            -> f7f851393b331585e05b1d9bfa4c8965ab94cd5e
+git rev-list --count main..a6032808     -> 121      (head is ahead by 121)
+git rev-list --count a6032808..main     -> 2        (main is ahead by 2)
+GitHub compare main...a6032808          -> status: diverged
+git merge-base integration/phase-8.2-v1 a6032808
+                                        -> a0bf7600a25f2821fc61a8fcf3fba9c408667826
+git rev-list --count a0bf7600..a6032808 -> 32, of which 0 are merges
 ```
 
-All six integration refs **are ancestors** of this branch. `main` is not.
+A **common ancestor exists**: `f7f851393b331585e05b1d9bfa4c8965ab94cd5e`
+("Created using Colab", 2026-08-03). `main` and this line are **divergent**, not
+unrelated. `main` holds 2 commits that this line does not
+(`cbefdc8` "test(release): cover durable progressive gate state", `7b30a56`
+"revert accidental gate test file on main").
+
+All six integration refs **are ancestors** of this branch. `main` is **not** an
+ancestor — it diverged — which is a different statement from having no ancestor at all.
 
 ---
 
 ## 3. Clean integration branch
 
-### 3.1 Why `main` is not a usable base
+### 3.1 Why `main` is a divergent, unsuitable base
 
-`main` is a single squashed commit that predates the entire platform. Measured,
-not inferred:
+`main` **shares history with this line** and then diverged, long before the platform
+existed. All figures measured at the audited head `a6032808` in a full clone:
 
-| Measurement | `base = main` | `base = integration/phase-8.2-v1` |
+| Measurement | `base = main` (PR #12 topology) | `base = integration/phase-8.2-v1` (PR #13 topology) |
 |---|---|---|
-| merge-base with this work | **none** | `a0bf7600` (true ancestor) |
-| files changed | **381** | **50** |
-| line delta | **+57,953 / −765** | **+9,637 / −5** |
+| merge-base with this work | **`f7f851393b331585e05b1d9bfa4c8965ab94cd5e`** (exists) | `a0bf7600a25f2821fc61a8fcf3fba9c408667826` (= the base itself) |
+| relationship | **diverged** | **ahead only** |
+| head ahead by | **121** | **32** |
+| head behind by | **2** | **0** |
+| changed files (three-dot) | **381** | **50** |
+| line delta (three-dot) | **+57,956 / −765** | **+9,640 / −5** |
+| merge commits in range | 0 | 0 |
 | files *deleted from the base* | **19** | 0 |
 | unrelated files modified | **17** (Android app, `backend/`, `mcp/`, `monitoring/`, `README`, `.gitignore`) | 0 |
-| commits | 130 | 31 |
 
-`main` carries an older hyphenated prototype (`devops-ai-platform/api-gateway/`,
+> The 381-file / +57,956 / −765 column is the **`main` comparison, i.e. PR #12's
+> topology**. It is *not* the PR #13 integration slice and must never be quoted as such.
+
+`main`'s tree carries an older hyphenated prototype (`devops-ai-platform/api-gateway/`,
 `incident-service/`, … 72 files) and **no `.github/workflows/` directory at all**.
-A `main`-based "slice" would therefore be a whole-platform import that also deletes
-`main`'s own files — the opposite of a minimal integration slice, and a direct hit on
-stop condition §30 ("the closure cannot be established without importing large
-unrelated history") and §28 ("no unrelated feature enters the clean branch").
+Basing the slice there would therefore mean a whole-platform import that also deletes
+19 of `main`'s own files and modifies 17 unrelated ones — the opposite of a minimal
+integration slice, and a direct hit on stop condition §30 ("the closure cannot be
+established without importing large unrelated history") and §28 ("no unrelated feature
+enters the clean branch"). The disqualifying property is **divergence and scope**, not
+absence of a common ancestor.
 
 ### 3.2 What was delivered instead
 
 **PR #13** — `arena/b6307a50-autonomous-devops-engineer` → `integration/phase-8.2-v1`.
 
-- 50 files, +9,637 / −5, 31 commits, **0 merge commits** (this report is the 50th file)
+- 50 files, +9,640 / −5, **32 commits, 0 merge commits**, at the audited head `a6032808`
+  (this report is one of the 50 files, so later audit-truth commits raise PR #13's live
+  counters without changing the audited-head record)
 - `git diff A...B` and `git diff A..B` return the identical file set (the base is a
   true ancestor, so the PR diff has no merge-base distortion)
 - continues the repository's own stacked chain: `#8 → #9 → #10 → #11 → #13`
@@ -133,10 +170,14 @@ exactly the 49 files above and nothing else (plus this report, committed after t
 
 ## 5. Diff / scope audit
 
-> Line counts in this report are measured at head `96ee094`; the commit that
-> records these corrections adds a few further lines to this file alone.
+> Counts in current-state tables are measured at the audited head `a6032808` and are
+> machine-verified by `scripts/audit_phase_8_4_2_f.py` against
+> `docs/phase-8.4.2-f-audit-facts.json`. Phase 8.4.2-F.1 commits land on top of that
+> head; see §14.
 
-**Phase 8.4.2-F changed exactly 4 files in 2 commits** (`b08fbb0`, `c69c28d`):
+**Phase 8.4.2-F changed exactly 4 files in 2 commits** (`b08fbb0`, `c69c28d`), plus
+documentation commits recording this report; **Phase 8.4.2-F.1** then changed only audit
+artefacts (§14):
 
 ```
 .github/workflows/e2e-golden-path.yml      (§21-F deny-case inside existing step 2)
@@ -161,14 +202,21 @@ returns no problems for **8/8** surfaces; the four-line contract
 
 ---
 
-## 6. CI evidence (exact final head only)
+## 6. CI evidence (audited head)
 
-Head `c69c28d7d48dc8216567b534e5dd47e2480aba77`:
+Audited head `a6032808186e8bbf8bebd7efc0c85a41eee4df4e`:
 
 | Run | Event | Jobs | Conclusion |
 |---|---|---|---|
-| `37480885467` | `push` | 5/5 success | **success** |
-| `37480896669` | `pull_request` | 5/5 success | **success** |
+| `37482389727` | `push` | 5/5 success | **success** |
+| `37482396569` | `pull_request` | 5/5 success | **success** |
+| `37482399004` | `pull_request` | 5/5 success | **success** |
+
+BuildKit gate at this head: `Compose validation` step 5 **success**,
+`2026-10-06T14:51:06Z → 14:51:13Z`.
+
+*(Historical, superseded: the §21-F code head `c69c28d` was green at push `37480885467`
+and `pull_request` `37480896669`, 5/5 each. Retained only as history.)*
 
 Jobs: API gateway checks, Backend tests, Incident/RCA/remediation checks, Compose
 validation, Platform smoke tests.
@@ -235,15 +283,19 @@ the API stating the workflow does not exist, not a permissions artifact. The sub
 ## 8. External prerequisites
 
 Reported as status only; no value of any secret was read, printed or persisted.
+Statuses distinguish **proven absent** from **not visible to the available API surface** —
+a 404 or an empty list returned to one credential is not proof that a resource does not
+exist, and this report does not treat it as such.
 
-| # | Prerequisite | Status | Evidence |
+| # | Prerequisite | Status | Evidence and its limits |
 |---|---|---|---|
-| 8.1 | `e2e-staging` environment | **MISSING** | `gh api .../environments` → `{"total_count":0,"environments":[]}` — the repository has no environments at all |
-| 8.2 | `E2E_JWT_SECRET` | **MISSING** | cannot exist: no environment to scope it to |
-| 8.3 | `E2E_FIXTURE_GITHUB_TOKEN` | **MISSING** | as above |
-| 8.4 | `gm-prog/ares-e2e-fixture` | **MISSING / NOT INSPECTABLE** | `gh api repos/gm-prog/ares-e2e-fixture` → HTTP 404 |
-| 8.5 | Dispatch capability of the available credential | **ACCESS DENIED** | REST dispatch → 403 `Resource not accessible by integration`: this is a GitHub App installation token, which cannot create `workflow_dispatch` events even though repo metadata reports `admin: true` |
-| 8.6 | 40-hex immutable `fixture_seed_sha` | **NOT AVAILABLE** | no fixture repository exists, therefore no seed commit exists |
+| 8.1 | `e2e-staging` environment | **NOT PROVISIONED (as visible to this credential)** | `gh api .../environments` → HTTP 200, `{"total_count":0,"environments":[]}`. The call succeeded, so no environment is visible; this credential's scope over environment configuration is not independently confirmable, so this is recorded as *not visible*, not as proof of non-existence |
+| 8.2 | `E2E_JWT_SECRET` | **NOT INDEPENDENTLY VERIFIABLE** | environment secrets cannot be enumerated with the available API surface. No environment is visible to hold it (8.1), but its presence or absence was not directly observed |
+| 8.3 | `E2E_FIXTURE_GITHUB_TOKEN` | **NOT INDEPENDENTLY VERIFIABLE** | as 8.2 |
+| 8.4 | `gm-prog/ares-e2e-fixture` | **NOT VISIBLE** | `gh api repos/gm-prog/ares-e2e-fixture` → HTTP 404. A 404 does not distinguish "does not exist" from "exists privately and is not shared with this installation". Either way it is unusable from here |
+| 8.5 | Dispatch capability of the available credential | **ACCESS DENIED (proven)** | REST dispatch → HTTP 403 `Resource not accessible by integration`. A GitHub App installation token cannot create `workflow_dispatch` events, even though repo metadata reports `admin: true` |
+| 8.6 | 40-hex immutable `fixture_seed_sha` | **NOT AVAILABLE** | no usable fixture repository is reachable (8.4), so no seed commit can be named |
+| 8.7 | `e2e-golden-path.yml` present on the default branch | **ABSENT (proven)** | `gh api .../contents/.github/workflows/e2e-golden-path.yml?ref=main` → HTTP 404, and `gh api .../actions/workflows` → `total_count: 1`, only `.github/workflows/ci.yml` |
 
 **Why this was not "fixed" by the agent.** Provisioning would require minting a
 `E2E_FIXTURE_GITHUB_TOKEN`. An agent cannot mint a PAT, and the only alternative —
@@ -312,13 +364,13 @@ spellings is rejected; `gm-prog/ares-e2e-fixture` is accepted.
 | # | Blocker | Class (§17) | Owner |
 |---|---|---|---|
 | 1 | `e2e-golden-path.yml` is not on the default branch → not dispatchable | `WORKFLOW_PUBLICATION_FAILURE` | repository owner: land the chain `#8 → #9 → #10 → #11 → #13` (or publish the workflow to `main` by whatever policy applies) |
-| 2 | `e2e-staging` environment does not exist | `ENVIRONMENT_PREREQUISITE_FAILURE` | repository owner |
-| 3 | `E2E_JWT_SECRET` not provisioned | `ENVIRONMENT_PREREQUISITE_FAILURE` | repository owner |
+| 2 | no `e2e-staging` environment is visible to the available credential | `ENVIRONMENT_PREREQUISITE_FAILURE` | repository owner |
+| 3 | `E2E_JWT_SECRET` not confirmable (environment secrets are not enumerable here) | `ENVIRONMENT_PREREQUISITE_FAILURE` | repository owner |
 | 4 | `E2E_FIXTURE_GITHUB_TOKEN` not provisioned; an agent cannot mint a PAT | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
-| 5 | `gm-prog/ares-e2e-fixture` does not exist (must be **private**, must never be the production repo) | `FIXTURE_REPOSITORY_FAILURE` | repository owner |
-| 6 | No 40-hex seed commit to pass as `fixture_seed_sha` | `FIXTURE_REPOSITORY_FAILURE` | follows from #5 |
+| 5 | `gm-prog/ares-e2e-fixture` is not reachable (HTTP 404 — absent, or private and not shared with this installation). It must be **private** and must never be the production repo | `FIXTURE_REPOSITORY_FAILURE` | repository owner |
+| 6 | No 40-hex seed commit can be named for `fixture_seed_sha` | `FIXTURE_REPOSITORY_FAILURE` | follows from #5 |
 | 7 | The available credential is an App installation token that cannot create dispatch events | `CREDENTIAL_CAPABILITY_FAILURE` | human operator |
-| 8 | `main` and this work have no common ancestor; whether the platform supersedes `main`'s prototype is a repository-policy decision | `INTEGRATION_FAILURE` (deliberately not auto-resolved) | repository owner |
+| 8 | `main` is **divergent** from this line (common ancestor `f7f8513`; head ahead 121, `main` ahead 2); whether the platform supersedes `main`'s prototype is a repository-policy decision | `INTEGRATION_FAILURE` (deliberately not auto-resolved) | repository owner |
 
 Blockers 1–7 must all clear before a first live run is even attemptable, in that order.
 
@@ -327,17 +379,19 @@ Blockers 1–7 must all clear before a first live run is even attemptable, in th
 ## 12. Hostile audit — Q1–Q14
 
 **Q1. Is "CI is green" being passed off as "the golden path ran"?**
-No. §6 is scoped to CI at `c69c28d`; §9 states no live run exists. The two are never
-combined into a single claim.
+No. §6 is scoped to CI at the audited head `a6032808`; §9 states no live run exists.
+The two are never combined into a single claim.
 
 **Q2. Was the branch required by §4.2 created?**
 No, and that is disclosed in §3.3 with both reasons. No synthetic equivalent was passed
 off as it.
 
 **Q3. Is the slice actually minimal, or just asserted to be?**
-Measured: 50 files / +9,637 −5 against `integration/phase-8.2-v1`, versus 381 files /
-+57,953 −765 against `main`. Both numbers come from `git diff --stat` and are corroborated
-by GitHub's own counts on PR #13 (50) and PR #12 (381).
+Measured at `a6032808`: **50 files / +9,640 / −5 / 32 commits** against
+`integration/phase-8.2-v1`, versus **381 files / +57,956 / −765** against `main` (the
+PR #12 topology). Both come from `git diff --numstat` in a full clone, agree with the
+GitHub compare API, agree with GitHub's own PR counters (#13 → 50 files, +9,640, −5,
+32 commits; #12 → 381 files, +57,956, −765) and are re-derived by the audit guard.
 
 **Q4. Could the slice have been even smaller?**
 The six `docs/PHASE-8.*.md` files are not needed to execute the golden path. They were
@@ -345,12 +399,14 @@ retained because they are the audit trail for the same commits and removing them
 require rewriting history, which is prohibited. Every non-doc file is reachable from
 the workflow by the walk in §4.
 
-**Q5. Does PR #13 drag in unrelated history?**
-No. `integration/phase-8.2-v1` is a true ancestor (`git merge-base --is-ancestor` → true),
-the range has 0 merge commits, and three-dot and two-dot diffs are identical.
+**Q5. Does PR #13 drag in history unrelated to Phase 8.4.2?**
+No. `integration/phase-8.2-v1` is a true ancestor (`git merge-base --is-ancestor` → true;
+behind-count 0), the range has 0 merge commits, and three-dot and two-dot diffs are
+identical. "Unrelated" here means *unrelated content*, not unrelated histories — the
+`main` comparison also has a common ancestor (§3.1).
 
 **Q6. Was PR #12 merged, retargeted, closed or used as a shortcut?**
-No. It is still OPEN at `main`, 381 files, `mergedAt: never`. PR #13 is a
+No. It is still OPEN against `main`, 381 files / +57,956 / −765, `mergedAt: never`. PR #13 is a
 separate PR from the same head to a different base — a supported GitHub operation that
 mutates neither #12 nor the base ref.
 
@@ -382,7 +438,8 @@ Repo metadata says `admin: true`, but the same credential gets 403
 `Resource not accessible by integration` on dispatch — it is an App installation token, so
 the admin flag is not decisive. Regardless, `E2E_FIXTURE_GITHUB_TOKEN` requires minting a
 PAT, which an agent must not do, and embedding the session credential is prohibited.
-Provisioning was therefore not attempted.
+Provisioning was therefore not attempted, and the report does not claim to know whether
+the environment or fixture exist outside this credential's visibility (§8).
 
 **Q13. Does merging PR #13 make the golden path dispatchable?**
 No. It makes the workflow present on `integration/phase-8.2-v1` only. Dispatchability
@@ -408,3 +465,67 @@ The correct reading is `NOT VERIFIED`, not "expected to pass".
   commit with a complete manifest, the standing status is **LIVE E2E: NOT VERIFIED**.
 - **Not recommended:** merging PR #12, importing this work directly into `main`, or
   treating "CI green" or this report as evidence that the golden path works.
+
+---
+
+## 14. Phase 8.4.2-F.1 — audit-truth correction
+
+### 14.1 The defect
+
+The first issue of this report asserted, as a load-bearing fact, that `main` and this
+work had **no common ancestor**, and derived from it that `git merge-base main HEAD` was
+empty and `main` held exactly 1 commit.
+
+That was false. The audit had been performed inside a **shallow clone**: `.git/shallow`
+contained `7b30a56d…`, so `main` appeared parentless, `git rev-list --count main`
+returned 1, and `git merge-base` returned nothing. The GitHub compare API reported a
+merge base all along. Evidence wins: GitHub was right, the local measurement was an
+artefact, and the report was wrong.
+
+Two further defects were found in the same sweep and corrected:
+
+* the local branch ref had been left pointing at `7b30a56d` while the pushed branch was
+  at `a6032808` — corrected with a local `git reset --hard` to the pushed head (no
+  force-push, no remote change);
+* figures from the `main` comparison (381 files / +57,956 / −765) sat close enough to
+  the PR #13 discussion to be misread as the integration slice.
+
+### 14.2 Corrected facts
+
+| Comparison | merge-base | ahead | behind | files | additions | deletions | merges |
+|---|---|---|---|---|---|---|---|
+| `integration/phase-8.2-v1` → `a6032808` (**PR #13**) | `a0bf7600…` | 32 | 0 | 50 | 9,640 | 5 | 0 |
+| `main` → `a6032808` (**PR #12** topology) | `f7f85139…` | 121 | 2 | 381 | 57,956 | 765 | 0 |
+
+Verified three ways: local `git` in a full clone, the GitHub compare API, and GitHub's
+own PR counters.
+
+### 14.3 The drift guard
+
+`scripts/audit_phase_8_4_2_f.py` — stdlib-only, no credentials, no network, read-only.
+
+* **Inputs:** `--facts` (default `docs/phase-8.4.2-f-audit-facts.json`), `--repo`, or
+  `--base`/`--head` for ad-hoc measurement.
+* **Computes:** merge-base, ahead, behind, changed files, additions, deletions, merge
+  commits, binary-file count, and an explicit `unrelated_histories` boolean.
+* **Output:** deterministic JSON (sorted keys, two-space indent, trailing newline).
+* **Exit codes:** `0` PASS · `1` FAIL (a recorded fact does not match Git) · `2` UNUSABLE
+  (bad usage, missing ref, or a **shallow clone**).
+* **Refuses shallow clones** — the precise condition that produced the original false
+  claim is now a hard error rather than a wrong answer.
+* It never edits the record or the report. When they disagree, a human decides.
+
+`docs/phase-8.4.2-f-audit-facts.json` pins both endpoints to **immutable commit SHAs**,
+so the two comparisons stay reproducible after any branch moves.
+
+### 14.4 Residual limitation, stated plainly
+
+GitHub Actions checks out shallow by default (`fetch-depth: 1`). The guard therefore
+**skips** rather than passes when run from such a checkout
+(`test_committed_audit_record_matches_this_repository`). Enforcing it in CI requires
+`fetch-depth: 0` on a job, which is a CI-configuration change outside this task's scope.
+Until then the guard is enforced locally and by review, and it is incapable of returning
+a *wrong* answer — only a refusal.
+
+**LIVE E2E: NOT VERIFIED** — unchanged by this correction. Fixing the audit record
+changes what is *claimed*, never what was *executed*.
