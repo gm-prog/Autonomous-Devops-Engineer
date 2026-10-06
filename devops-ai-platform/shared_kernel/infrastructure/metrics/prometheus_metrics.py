@@ -30,6 +30,45 @@ if PROMETHEUS_AVAILABLE:
         ['service']
     )
 
+    # Phase 8.4.2-G.1: operational evidence substrate self-observability.
+    # Bounded label vocabularies only - never per-incident or per-evidence
+    # ids, which would make cardinality grow with traffic.
+    evidence_ingested = Counter(
+        'evidence_ingested_total',
+        'Normalized operational evidence items accepted by the evidence layer',
+        ['source_type', 'observation_type']
+    )
+
+    evidence_rejected = Counter(
+        'evidence_rejected_total',
+        'Observations rejected at the evidence boundary',
+        ['source_type', 'error_code']
+    )
+
+    evidence_conflict = Counter(
+        'evidence_conflict_total',
+        'Contradictory observations detected during correlation',
+        ['conflict_kind']
+    )
+
+    evidence_correlation = Counter(
+        'evidence_correlation_total',
+        'Relationships emitted by the deterministic correlation engine',
+        ['rule_id']
+    )
+
+    evidence_pack_generation = Counter(
+        'evidence_pack_generation_total',
+        'Evidence packs generated',
+        ['pack_status']
+    )
+
+    evidence_replay = Counter(
+        'evidence_replay_total',
+        'Evidence pack replays executed from captured input',
+        ['outcome']
+    )
+
     # Phase 6.3: operational analytics self-observability only — bounded
     # outcome vocabulary (ok | window_rejected); never per-incident labels.
     analytics_summary_requests = Counter(

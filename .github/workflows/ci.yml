@@ -293,3 +293,72 @@ jobs:
           sys.exit(0 if state == "PASSED" and not failed else 1)
           PYJUNIT
           [ "$PYTEST_RC" -eq 0 ] || exit 1
+
+  operational-evidence:
+    name: Phase 8.4.2-G.1 operational evidence contract
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: devops-ai-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements.txt
+      - run: pip install -r requirements.txt pytest pytest-subtests httpx
+      - name: Domain, correlation, replay, persistence, API and adversarial tests
+        env:
+          PYTHONPATH: .
+          # No vendor connector, no production credential, no live endpoint.
+          # The evidence layer is stdlib-only and every fixture is a literal;
+          # this secret is the same throwaway value the gateway job uses.
+          JWT_SECRET: ci-gateway-secret
+        run: |
+          set -euo pipefail
+          EV="$(mktemp)"
+          # Job logs are not readable through the API on this installation, so
+          # the evidence is published as a step summary + annotation on every
+          # exit path, success or failure (same pattern as audit-truth).
+          publish() {
+            rc=$?
+            cat "$EV" >> "$GITHUB_STEP_SUMMARY" || true
+            MSG="$(python3 -c "import sys; print(open(sys.argv[1]).read().replace('%','%25').replace('\r','%0D').replace('\n','%0A'))" "$EV" 2>/dev/null || echo "no evidence captured")"
+            if [ "$rc" -eq 0 ]; then
+              echo "::notice title=Phase 8.4.2-G.1 evidence contract::${MSG}"
+            else
+              echo "::error title=Phase 8.4.2-G.1 evidence contract FAILED::${MSG}"
+            fi
+            exit "$rc"
+          }
+          trap publish EXIT
+
+          set +e
+          python -m pytest tests/test_operational_evidence_contract.py \
+            api_gateway/tests/test_evidence_plane.py \
+            -q --junitxml=evidence-results.xml
+          PYTEST_RC=$?
+          set -e
+          echo "pytest exit: ${PYTEST_RC}" | tee -a "$EV"
+          python scripts/junit_summary.py evidence-results.xml | tee -a "$EV"
+
+          # Determinism has to hold ACROSS processes, not merely inside one
+          # pytest session: dict, set and string hashing are per interpreter.
+          HASHES=""
+          for seed in 0 1 12345; do
+            H="$(PYTHONHASHSEED="$seed" python scripts/evidence_pack_fingerprint.py)"
+            echo "PYTHONHASHSEED=${seed} pack_hash=${H}" | tee -a "$EV"
+            HASHES="${HASHES} ${H}"
+          done
+          UNIQUE="$(echo "$HASHES" | tr ' ' '\n' | grep -c . | tr -d ' ')"
+          DISTINCT="$(echo "$HASHES" | tr ' ' '\n' | grep . | sort -u | wc -l | tr -d ' ')"
+          echo "fingerprint runs: ${UNIQUE}, distinct hashes: ${DISTINCT}" | tee -a "$EV"
+          [ "$DISTINCT" = "1" ] || { echo "FAIL non-deterministic pack hash" | tee -a "$EV"; exit 1; }
+
+          # the conflicting-SHA variant must stay deterministic too, and must
+          # not silently resolve to one of the two claims
+          python scripts/evidence_pack_fingerprint.py --conflict --json > conflict.json
+          python scripts/evidence_assert_conflict.py conflict.json | tee -a "$EV"
+
+          [ "$PYTEST_RC" -eq 0 ] || exit 1
