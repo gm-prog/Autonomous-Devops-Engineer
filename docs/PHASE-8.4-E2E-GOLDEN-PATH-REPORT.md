@@ -199,6 +199,12 @@ Phase 8.4 is NOT complete and no staging success is claimed.
 
 ## Next steps (in order)
 
+> **Superseded in part by Phase 8.4.2** — the harness, compose
+> override, kind/terraform fixtures, workflow and hostile-path driver
+> now exist (see `docs/PHASE-8.4.2-E2E-GOLDEN-PATH-IMPLEMENTATION-REPORT.md`);
+> what remains is the protected-environment + fixture-repository
+> execution procedure recorded there.
+
 1. Build the §57 harness + `docker-compose.e2e.yml` (pinned images) with
    explicit readiness probes;
 2. Add `.github/workflows/e2e-golden-path.yml` (`workflow_dispatch`,
