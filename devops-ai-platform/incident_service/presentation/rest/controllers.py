@@ -19,6 +19,14 @@ from incident_service.application.failures import (
 )
 from incident_service.domain.repository_interface import IncidentRepositoryPort
 from incident_service.domain.entities.incident_evidence import IncidentEvidence
+from incident_service.application.commands.attach_deployment_evidence import (
+    AttachDeploymentEvidenceCommand,
+    AttachDeploymentEvidenceCommandHandler,
+)
+from incident_service.infrastructure.deployment.deployment_evidence_collector import (
+    DeploymentEvidenceCollector,
+    DeploymentEvidenceCollectorError,
+)
 from incident_service.domain.entities.hotfix_proposal import HotfixProposal
 from incident_service.infrastructure.agent.rca_client import RcaAgentClient, RcaAgentUnavailable
 from incident_service.application.services.operational_analytics_service import (
@@ -197,6 +205,132 @@ def get_incident(
     if not incident:
         raise HTTPException(status_code=404, detail="Incident not found")
     return _serialize_incident(incident)
+
+
+class DeploymentEvidenceRequest(BaseModel):
+    """Caller input is limited to the run reference (Phase 8.4 §4).
+
+    Repository, source SHA, state, provenance, artifact/plan hashes are
+    NEVER caller-supplied: the collector fetches them from the real
+    deployment service and the route fails closed on anything missing or
+    non-authoritative.
+    """
+
+    deployment_run_id: str = Field(min_length=1, max_length=200)
+
+
+class _PrevalidatedEvidenceCollector:
+    """Single-fetch adapter: the route collects and validates first, then
+    hands the exact validated evidence to the command handler so nothing
+    unpersisted can slip past the authority checks (and the deployment
+    service is only asked once)."""
+
+    def __init__(self, evidence: IncidentEvidence):
+        self._evidence = evidence
+
+    def collect(self, deployment_run_id: str) -> IncidentEvidence:
+        if deployment_run_id != self._evidence.payload.get("deployment_run_id"):
+            raise DeploymentEvidenceCollectorError(
+                "prevalidated evidence does not match the requested deployment run"
+            )
+        return self._evidence
+
+
+@router.post(
+    "/{incident_id}/deployment-evidence",
+    response_model=Dict[str, Any],
+)
+def attach_deployment_evidence(
+    incident_id: str,
+    request: DeploymentEvidenceRequest,
+    repository: IncidentRepositoryPort = Depends(get_incident_repository),
+):
+    """Collect and persist authoritative DEPLOYED evidence (Phase 8.4 §4).
+
+    Order of guarantees: the incident must exist first (404, no
+    downstream call), the deployment run must be retrievable from the
+    deployment service (404/502), and the returned record must be
+    authoritative — state ``DEPLOYED``, repository + exact source SHA
+    present, provenance present — before anything is persisted (422
+    otherwise). No caller-supplied evidence fields exist in the contract.
+    """
+    if repository.get_incident_by_id(incident_id) is None:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    try:
+        evidence = DeploymentEvidenceCollector().collect(request.deployment_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except DeploymentEvidenceCollectorError as exc:
+        message = str(exc)
+        if "was not found" in message:
+            raise HTTPException(status_code=404, detail=message) from exc
+        if "unable to reach" in message:
+            raise HTTPException(status_code=502, detail=message) from exc
+        raise HTTPException(status_code=422, detail=message) from exc
+
+    payload = evidence.payload
+    state = str(payload.get("state") or "")
+    repository_name = str(payload.get("repository_name") or "")
+    source_revision = payload.get("source_revision")
+    head_sha = ""
+    if isinstance(source_revision, dict):
+        head_sha = str(source_revision.get("head_sha") or "")
+    provenance = payload.get("provenance")
+
+    if state != "DEPLOYED":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "deployment evidence is not authoritative: run state must be "
+                f"DEPLOYED (got {state or 'unknown'})"
+            ),
+        )
+    if not repository_name or not head_sha:
+        raise HTTPException(
+            status_code=422,
+            detail="deployment evidence is not authoritative: repository and exact source SHA are required",
+        )
+    if not isinstance(provenance, dict) or not provenance:
+        raise HTTPException(
+            status_code=422,
+            detail="deployment evidence is not authoritative: provenance record missing",
+        )
+
+    try:
+        handler = AttachDeploymentEvidenceCommandHandler(
+            repository, _PrevalidatedEvidenceCollector(evidence)
+        )
+        handler.handle(
+            AttachDeploymentEvidenceCommand(incident_id, request.deployment_run_id)
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Second source of truth: the persisted aggregate must now carry the record.
+    persisted = repository.get_incident_by_id(incident_id)
+    record = next(
+        (
+            item
+            for item in (persisted.evidence if persisted else [])
+            if item.id == evidence.id
+        ),
+        None,
+    )
+    if record is None:
+        raise HTTPException(
+            status_code=500,
+            detail="deployment evidence was not persisted",
+        )
+    return {
+        "id": record.id,
+        "kind": record.kind,
+        "source": record.source,
+        "observed_at": record.observed_at.isoformat(),
+        "payload": dict(record.payload),
+    }
 
 
 @router.get("/{incident_id}/rca/evidence", response_model=Dict[str, Any])

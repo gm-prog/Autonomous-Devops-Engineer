@@ -135,6 +135,33 @@ _DEFAULT_PROFILES: Mapping[str, tuple[ValidationStep, ...]] = {
             max_output_bytes=MAX_OUTPUT_BYTES,
         ),
     ),
+    # Phase 8.4 §36 — staging/E2E-only fixture profile.
+    #
+    # Selected exclusively via REMEDIATION_VALIDATION_PROFILE=e2e_fixture
+    # in the isolated E2E environment (the default profile remains
+    # `incident_service`, so this never runs in the platform test suite
+    # unless explicitly configured). The steps are fixed, code-owned
+    # constants — request bodies can never contribute executable command
+    # strings. The workspace is the tiny disposable fixture repository,
+    # so the assertion checks exactly the one file the remediation patch
+    # is allowed to touch, read-only with respect to git metadata.
+    "e2e_fixture": (
+        ValidationStep(
+            name="e2e-fixture-target-assertion",
+            working_directory=".",
+            argv=(
+                "python",
+                "-c",
+                (
+                    "import pathlib,sys;"
+                    "p=pathlib.Path('src/service_config.py');"
+                    "sys.exit(0 if p.is_file() and 'SERVICE_NAME' in p.read_text() else 1)"
+                ),
+            ),
+            timeout_seconds=60.0,
+            max_output_bytes=65536,
+        ),
+    ),
 }
 
 
