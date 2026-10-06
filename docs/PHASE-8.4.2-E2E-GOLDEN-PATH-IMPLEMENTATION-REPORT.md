@@ -473,3 +473,20 @@ PASS is used only for checks that actually executed (tests, static
 audits). Everything requiring GitHub/Docker/kind execution is NOT
 VERIFIED. No production-readiness, exactly-once, or staging-success
 claim is made.
+
+## Corrective-hardening CI evidence (head `8bbee504a8688f51146a565123b480da59d7b50f`)
+
+Commits: `be19a4e` (fix(e2e)) → `3c729cb` (docs(e2e)) → `8bbee50`
+(test(e2e)); pushed to `arena/01a0cf63-autonomous-devops-engineer` only.
+
+- push run `37457087915` — **success, 5/5 jobs** (API gateway checks
+  `112247232467`, Compose validation `112247232663`, Backend tests
+  `112247232818`, Platform smoke tests `112247232825`, Incident, RCA
+  and remediation checks `112247232880`).
+- pull_request run `37457092501` — **success, 5/5 jobs**
+  (`112247247671`, `112247247896`, `112247247929`, `112247248040`,
+  `112247248238`).
+
+LIVE E2E: NOT VERIFIED — these runs execute the CI suites only; the
+golden-path workflow remains dispatch-only and not on the default
+branch, so no golden-path execution exists.
