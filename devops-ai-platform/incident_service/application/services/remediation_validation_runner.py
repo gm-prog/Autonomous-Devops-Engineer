@@ -43,6 +43,12 @@ _SECRET_ENV_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Exact post-patch fixture value asserted by the `e2e_fixture` profile
+# (Phase 8.4.1 §13). Must stay in lockstep with the deterministic RCA
+# adapter's fixture contract (agent_service deterministic_rca) — a
+# cross-service drift test proves both constants agree.
+E2E_FIXTURE_PATCHED_SERVICE_NAME = "checkout-service-remediated"
+
 
 class ValidationRunnerError(RuntimeError):
     """Base error for bounded remediation validation."""
@@ -135,7 +141,7 @@ _DEFAULT_PROFILES: Mapping[str, tuple[ValidationStep, ...]] = {
             max_output_bytes=MAX_OUTPUT_BYTES,
         ),
     ),
-    # Phase 8.4 §36 — staging/E2E-only fixture profile.
+    # Phase 8.4 §36 / 8.4.1 §13 — staging/E2E-only fixture profile.
     #
     # Selected exclusively via REMEDIATION_VALIDATION_PROFILE=e2e_fixture
     # in the isolated E2E environment (the default profile remains
@@ -143,8 +149,10 @@ _DEFAULT_PROFILES: Mapping[str, tuple[ValidationStep, ...]] = {
     # unless explicitly configured). The steps are fixed, code-owned
     # constants — request bodies can never contribute executable command
     # strings. The workspace is the tiny disposable fixture repository,
-    # so the assertion checks exactly the one file the remediation patch
-    # is allowed to touch, read-only with respect to git metadata.
+    # so the assertion checks exactly the post-patch state the approved
+    # remediation must produce: src/service_config.py exists AND its
+    # SERVICE_NAME assignment is EXACTLY the patched fixture value
+    # (AST-parsed — a substring of a longer value does not pass).
     "e2e_fixture": (
         ValidationStep(
             name="e2e-fixture-target-assertion",
@@ -153,9 +161,20 @@ _DEFAULT_PROFILES: Mapping[str, tuple[ValidationStep, ...]] = {
                 "python",
                 "-c",
                 (
-                    "import pathlib,sys;"
+                    "import ast,pathlib,sys;"
                     "p=pathlib.Path('src/service_config.py');"
-                    "sys.exit(0 if p.is_file() and 'SERVICE_NAME' in p.read_text() else 1)"
+                    "ok=False;"
+                    "\nif p.is_file():"
+                    "\n    try:"
+                    "\n        _t=ast.parse(p.read_text(encoding='utf-8'));"
+                    "\n        ok=any(isinstance(_n,ast.Assign)"
+                    " and any(getattr(_x,'id',None)=='SERVICE_NAME' for _x in _n.targets)"
+                    " and isinstance(_n.value,ast.Constant)"
+                    f" and _n.value.value=={E2E_FIXTURE_PATCHED_SERVICE_NAME!r}"
+                    " for _n in _t.body)"
+                    "\n    except Exception:"
+                    "\n        ok=False"
+                    "\nsys.exit(0 if ok else 1)"
                 ),
             ),
             timeout_seconds=60.0,
