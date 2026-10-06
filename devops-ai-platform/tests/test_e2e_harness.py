@@ -41,6 +41,93 @@ class ValidatorTests(unittest.TestCase):
         self.assertFalse(H.validate_digest_ref("python@sha256:zz"))
         self.assertFalse(H.validate_digest_ref("python@sha256:" + "a" * 63))
 
+    def test_digest_ref_accepts_a_registry_host_with_port(self):
+        """Phase 8.4.2-D D-1: the run-scoped images live in localhost:5001."""
+        self.assertTrue(H.validate_digest_ref(
+            "localhost:5001/ares-e2e-sandbox@sha256:" + "b" * 64))
+        self.assertTrue(H.validate_digest_ref(
+            "localhost:5001/ares-e2e-workload@sha256:" + "c" * 64))
+        self.assertFalse(H.validate_digest_ref("localhost:5001/ares-e2e-sandbox:v1"))
+        self.assertFalse(H.validate_digest_ref("UNRESOLVED"))
+        self.assertFalse(H.validate_digest_ref(
+            "localhost:5001/ares-e2e-sandbox@sha256:" + "b" * 63))
+
+
+class PinnedImageTests(unittest.TestCase):
+    """Committed immutable pins (Phase 8.4.2-D §5) — offline contract."""
+
+    PIN_FILE = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "e2e", "pinned-images.txt")
+
+    def test_committed_file_parses_to_six_digest_refs(self):
+        with open(self.PIN_FILE, encoding="utf-8") as handle:
+            records = H.parse_pinned_images(handle.read())
+        self.assertEqual(len(records), 6)
+        self.assertEqual(sorted(r["key"] for r in records),
+                         sorted(H.PINNED_IMAGE_KEYS))
+        for record in records:
+            self.assertRegex(record["digest"], r"^sha256:[0-9a-f]{64}$")
+            self.assertTrue(H.validate_digest_ref(record["ref"]), record)
+
+    def test_sentinel_and_malformed_pins_raise(self):
+        for pin in ("UNRESOLVED", "latest", "sha256:" + "a" * 63):
+            with self.subTest(pin=pin):
+                with self.assertRaises(ValueError):
+                    H.parse_pinned_images(
+                        f"python:3.11-slim {pin} E2E_PYTHON_BASE_IMAGE\n")
+
+    def test_provenance_exports_are_deterministic(self):
+        with open(self.PIN_FILE, encoding="utf-8") as handle:
+            records = H.parse_pinned_images(handle.read())
+        first = H.pin_provenance_exports(records)
+        self.assertEqual(first, H.pin_provenance_exports(records))
+        self.assertEqual(sorted(first), ["E2E_BASE_IMAGES",
+                                         "E2E_KIND_NODE_DIGEST",
+                                         "E2E_REGISTRY_DIGEST"])
+        mapping = H.parse_scalar_mapping(first["E2E_BASE_IMAGES"])
+        self.assertEqual(sorted(mapping), sorted(H.BASE_IMAGE_KEYS))
+
+
+class ExecutionProvenanceTests(unittest.TestCase):
+    """A live PASS may never be claimed with empty provenance (§9)."""
+
+    def _complete(self):
+        return dict(
+            source_sha="a" * 40, fixture_seed_sha="b" * 40,
+            workspace_root="/tmp/ares-e2e-workspaces",
+            registry_image_digest="registry@sha256:" + "1" * 64,
+            kind_node_image_digest="kindest/node@sha256:" + "2" * 64,
+            base_images="E2E_PYTHON_BASE_IMAGE=python@sha256:" + "3" * 64,
+            built_image_digests="E2E_WORKLOAD_IMAGE=localhost:5001/w@sha256:"
+                                + "4" * 64,
+            sandbox_image_digest="localhost:5001/s@sha256:" + "5" * 64)
+
+    def test_complete_provenance_passes(self):
+        manifest = H.new_manifest(**self._complete())
+        self.assertEqual(H.missing_execution_provenance(manifest), [])
+        H.finalize_execution_manifest(manifest, H.PASS)
+        self.assertEqual(manifest["result"], "PASS")
+
+    def test_each_missing_field_downgrades_a_pass(self):
+        for field in H.REQUIRED_EXECUTION_PROVENANCE:
+            with self.subTest(field=field):
+                fields = self._complete()
+                fields[field] = ""
+                manifest = H.new_manifest(**fields)
+                H.finalize_execution_manifest(manifest, H.PASS)
+                self.assertEqual(manifest["result"], "FAIL")
+                self.assertIn(field, manifest["provenance_rejection"])
+
+    def test_not_verified_manifests_need_no_provenance(self):
+        manifest = H.new_manifest(workflow_run_id="local")
+        H.finalize_manifest(manifest, H.NOT_VERIFIED)
+        self.assertEqual(manifest["result"], "NOT_VERIFIED")
+        blocked = H.new_manifest(workflow_run_id="local")
+        H.finalize_execution_manifest(blocked, H.BLOCKED)
+        self.assertEqual(blocked["result"], "BLOCKED")
+        self.assertNotIn("provenance_rejection", blocked)
+
     def test_extract_repo_digest_prefers_digest_refs(self):
         refs = ["python:3.11-slim", "python@sha256:" + "b" * 64]
         self.assertEqual(H.extract_repo_digest(refs), refs[1])

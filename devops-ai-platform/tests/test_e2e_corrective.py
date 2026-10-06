@@ -1,16 +1,19 @@
-"""Phase 8.4.2-C — focused regression tests for the nine audited defects.
+"""Phase 8.4.2-C/-D — focused regression tests for the audited defects.
 
-Each class maps to one defect group (P0-1..P1-6, items 7-9) from the
-corrective brief. These tests are static/contractual where Docker/kind/
-GitHub are required (those properties are proven live by the dispatch-only
-workflow); they are behavioral where the code runs locally. No test mocks
-the golden path itself — fakes appear only as in-process stand-ins for
-parser/contract units (e.g. a fake `compose config` command that echoes
-its environment, or a recorder for the workspace service's git calls).
+Each class maps to one defect group (8.4.2-C: P0-1..P1-6, items 7-9;
+8.4.2-D: committed image provenance, manifest provenance wiring, P2
+credential hygiene). These tests are static/contractual where Docker/
+kind/GitHub are required (those properties are proven live by the
+dispatch-only workflow); they are behavioral where the code runs locally.
+No test mocks the golden path itself — fakes appear only as in-process
+stand-ins for parser/contract units (e.g. a fake `compose config` command
+that echoes its environment, or a recorder for the workspace service's
+git calls).
 """
 
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import subprocess
@@ -25,10 +28,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PLATFORM = REPO_ROOT / "devops-ai-platform"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "e2e-golden-path.yml"
 COMPOSE_E2E = REPO_ROOT / "docker-compose.e2e.yml"
+COMPOSE_BASE = PLATFORM / "docker-compose.yml"
 DOCKERFILES = (
     PLATFORM / "deployment_service" / "Dockerfile.e2e",
     PLATFORM / "incident_service" / "Dockerfile.e2e",
     PLATFORM / "e2e" / "workload" / "Dockerfile",
+)
+#: §6.2 — compose services the golden-path `compose build` actually builds,
+#: mapped to the E2E-only Dockerfile that must own each build surface.
+E2E_BUILD_SURFACES = {
+    "api-gateway": "./api_gateway/Dockerfile.e2e",
+    "repo-service": "./repo_service/Dockerfile.e2e",
+    "agent-service": "./agent_service/Dockerfile.e2e",
+    "deployment-service": "./deployment_service/Dockerfile.e2e",
+    "monitoring-service": "./monitoring_service/Dockerfile.e2e",
+    "incident-service": "./incident_service/Dockerfile.e2e",
+    "incident-event-worker": "./incident_service/Dockerfile.e2e",
+}
+PRODUCTION_DOCKERFILES = (
+    PLATFORM / "api_gateway" / "Dockerfile",
+    PLATFORM / "repo_service" / "Dockerfile",
+    PLATFORM / "agent_service" / "Dockerfile",
+    PLATFORM / "deployment_service" / "Dockerfile",
+    PLATFORM / "monitoring_service" / "Dockerfile",
+    PLATFORM / "incident_service" / "Dockerfile",
 )
 PINNED_FILE = PLATFORM / "e2e" / "pinned-images.txt"
 DRIVER = PLATFORM / "e2e" / "golden_path.py"
@@ -38,11 +61,87 @@ WORKSPACE_SERVICE = (
 )
 REPORT = REPO_ROOT / "docs" / "PHASE-8.4.2-E2E-GOLDEN-PATH-IMPLEMENTATION-REPORT.md"
 
+#: the four manifest provenance variables the driver reads (§7.5).
+PROVENANCE_VARS = (
+    "E2E_REGISTRY_DIGEST",
+    "E2E_KIND_NODE_DIGEST",
+    "E2E_BASE_IMAGES",
+    "E2E_BUILT_IMAGE_DIGESTS",
+)
+DRIVER_STEP = "Execute golden path driver"
+
 sys.path.insert(0, str(PLATFORM))
+
+from e2e import helpers as H  # noqa: E402
+from e2e import image_pins  # noqa: E402
 
 
 def _workflow_text() -> str:
     return WORKFLOW.read_text()
+
+
+def _run_code(step: dict) -> str:
+    """A step's shell body with comment-only lines removed.
+
+    Contracts must be satisfied by executable shell, never by a comment
+    that merely mentions a variable name.
+    """
+    return "\n".join(
+        line
+        for line in str(step.get("run", "")).splitlines()
+        if not line.strip().startswith("#")
+    )
+
+
+def _github_env_exports(step: dict) -> set:
+    """Variables a step demonstrably appends to ``$GITHUB_ENV``.
+
+    Both recognised mechanisms are *verified*, not assumed:
+
+    * literal ``echo "VAR=…"`` lines in a block redirected to
+      ``$GITHUB_ENV`` (comments stripped first);
+    * the committed-pin renderer — its real output is computed here from
+      the committed pin file whenever the step redirects that output to a
+      file and appends that same file to ``$GITHUB_ENV``.
+    """
+    code = _run_code(step)
+    found: set = set()
+    if '>> "$GITHUB_ENV"' in code:
+        found |= set(re.findall(r'echo\s+"([A-Z][A-Z0-9_]*)=', code))
+    match = re.search(r"--exports\s*\\?\s*>\s*(\S+)", code)
+    if match:
+        target = match.group(1)
+        if re.search(rf"cat\s+{re.escape(target)}\s*>>\s*\"\$GITHUB_ENV\"", code):
+            for line in image_pins.render(PINNED_FILE.read_text(), "--exports"):
+                found.add(line.split("=", 1)[0])
+    return found
+
+
+def _step_index(doc: dict, prefix: str) -> int:
+    for index, step in enumerate(_steps(doc)):
+        if str(step.get("name", "")).startswith(prefix):
+            return index
+    raise AssertionError(f"step not found: {prefix}")
+
+
+def _pin_records() -> list:
+    return H.parse_pinned_images(PINNED_FILE.read_text())
+
+
+def _complete_provenance() -> dict:
+    """A manifest carrying realistic, non-secret provenance values."""
+    return dict(
+        source_sha="a" * 40,
+        fixture_seed_sha="b" * 40,
+        workspace_root="/tmp/ares-e2e-workspaces",
+        registry_image_digest="registry@sha256:" + "1" * 64,
+        kind_node_image_digest="kindest/node@sha256:" + "2" * 64,
+        base_images="E2E_PYTHON_BASE_IMAGE=python@sha256:" + "3" * 64,
+        built_image_digests=(
+            "E2E_WORKLOAD_IMAGE=localhost:5001/ares-e2e-workload@sha256:" + "4" * 64
+        ),
+        sandbox_image_digest="localhost:5001/ares-e2e-sandbox@sha256:" + "5" * 64,
+    )
 
 
 def _workflow_doc() -> dict:
@@ -432,13 +531,15 @@ class TestImmutability:
 
     def test_compose_requires_digest_pinned_refs(self):
         text = COMPOSE_E2E.read_text()
-        assert text.count("${E2E_PYTHON_BASE_IMAGE:?") == 2
+        # one per E2E build surface (§6.2: seven services are actually built)
+        assert text.count("${E2E_PYTHON_BASE_IMAGE:?") == len(E2E_BUILD_SURFACES)
         assert text.count("${E2E_POSTGRES_IMAGE:?") == 1
         assert text.count("${E2E_REDIS_IMAGE:?") == 1
         assert text.count("${E2E_QDRANT_IMAGE:?") == 1
         assert ":-postgres" not in text and ":-redis" not in text
 
-    def test_pinned_file_has_no_invented_digests(self):
+    def test_pinned_file_rejects_non_digest_pins(self):
+        """Every committed pin is a real sha256 digest — no sentinel."""
         seen_keys = 0
         for line in PINNED_FILE.read_text().splitlines():
             line = line.strip()
@@ -449,21 +550,21 @@ class TestImmutability:
             name, pin, key = parts
             assert "@" not in name, name
             assert re.fullmatch(r"[A-Z][A-Z0-9_]*", key), key
-            if pin != "UNRESOLVED":
-                assert re.fullmatch(r"sha256:[0-9a-f]{64}", pin), pin
+            assert pin != "UNRESOLVED", line
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", pin), pin
             seen_keys += 1
         assert seen_keys == 6
 
-    def test_workflow_resolves_inputs_from_pinned_file_only(self):
-        step = _step(_workflow_doc(), "Resolve immutable build inputs")
-        run = step["run"]
-        assert "pinned-images.txt" in run
+    def test_workflow_consumes_the_committed_pins_only(self):
+        step = _step(_workflow_doc(), "Load immutable image pins")
+        run = _run_code(step)
+        assert "pinned-images.txt" in step["run"]
+        assert "e2e.image_pins" in run and "--refs" in run
         assert 'echo "${KEY}=${REF}" >> "$GITHUB_ENV"' in run
         # no image source name appears anywhere in the workflow text
         pinned_names = [
-            ln.split()[0]
-            for ln in PINNED_FILE.read_text().splitlines()
-            if ln.strip() and not ln.startswith("#")
+            record["name"]
+            for record in H.parse_pinned_images(PINNED_FILE.read_text())
         ]
         text = _workflow_text()
         for name in pinned_names:
@@ -759,7 +860,7 @@ class TestWorkflowStaticValidation:
             "Validate untrusted identifiers",
             "Install pinned toolchain",
             "Compose config validation",
-            "Resolve immutable build inputs",
+            "Load immutable image pins",
             "Configure registry (own network)",
             "Build immutable E2E images",
             "Publish workload image",
@@ -781,3 +882,600 @@ class TestWorkflowStaticValidation:
             assert match is not None, prefix
             indexes.append(match)
         assert indexes == sorted(indexes), list(zip(required_order, indexes))
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-D §5/§10.1-10.2: committed pins are genuinely immutable
+# --------------------------------------------------------------------------
+
+class TestCommittedImmutablePins:
+    """The pin file is the single source of external image identity."""
+
+    def test_sentinel_is_rejected_by_the_parser(self):
+        text = "python:3.11-slim UNRESOLVED E2E_PYTHON_BASE_IMAGE\n"
+        with pytest.raises(ValueError, match="not an immutable sha256"):
+            H.parse_pinned_images(text)
+
+    def test_valid_digest_is_accepted(self):
+        records = _pin_records()
+        assert len(records) == 6
+        for record in records:
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", record["digest"])
+            assert H.validate_digest_ref(record["ref"]), record
+
+    @pytest.mark.parametrize(
+        "pin",
+        [
+            "UNRESOLVED",
+            "latest",
+            "sha256:" + "a" * 63,
+            "sha256:" + "A" * 64,
+            "sha256:" + "g" * 64,
+            "sha1:" + "a" * 40,
+            "@sha256:" + "a" * 64,
+        ],
+        ids=lambda p: p[:18],
+    )
+    def test_malformed_pins_fail_closed(self, pin):
+        with pytest.raises(ValueError):
+            H.parse_pinned_images(f"python:3.11-slim {pin} E2E_PYTHON_BASE_IMAGE\n")
+
+    def test_missing_pin_column_fails_closed(self):
+        with pytest.raises(ValueError, match="expected"):
+            H.parse_pinned_images("python:3.11-slim E2E_PYTHON_BASE_IMAGE\n")
+
+    def test_bad_env_key_fails_closed(self):
+        digest = "sha256:" + "a" * 64
+        with pytest.raises(ValueError, match="invalid env key"):
+            H.parse_pinned_images(f"python:3.11-slim {digest} lower_case\n")
+
+    def test_duplicate_key_and_duplicate_source_fail_closed(self):
+        digest = "sha256:" + "a" * 64
+        dup_key = (
+            f"python:3.11-slim {digest} E2E_PYTHON_BASE_IMAGE\n"
+            f"redis:7-alpine {digest} E2E_PYTHON_BASE_IMAGE\n"
+        )
+        with pytest.raises(ValueError, match="duplicate env key"):
+            H.parse_pinned_images(dup_key)
+        dup_name = (
+            f"python:3.11-slim {digest} E2E_PYTHON_BASE_IMAGE\n"
+            f"python:3.11-slim {digest} E2E_POSTGRES_IMAGE\n"
+        )
+        with pytest.raises(ValueError, match="duplicate source image"):
+            H.parse_pinned_images(dup_name)
+
+    def test_exactly_the_six_expected_keys_are_required(self):
+        assert sorted(r["key"] for r in _pin_records()) == sorted(
+            H.PINNED_IMAGE_KEYS
+        )
+        assert len(H.PINNED_IMAGE_KEYS) == 6
+        short = "\n".join(
+            line
+            for line in PINNED_FILE.read_text().splitlines()
+            if not line.startswith("registry:")
+        )
+        with pytest.raises(ValueError, match="must define exactly"):
+            H.parse_pinned_images(short)
+        extra = PINNED_FILE.read_text() + (
+            "busybox:1.36 sha256:" + "a" * 64 + " EXTRA_IMAGE\n"
+        )
+        with pytest.raises(ValueError, match="must define exactly"):
+            H.parse_pinned_images(extra)
+
+    def test_every_committed_entry_matches_the_grammar(self):
+        for record in _pin_records():
+            assert re.fullmatch(
+                r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
+                r":[A-Za-z0-9][A-Za-z0-9._-]*",
+                record["name"],
+            ), record["name"]
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", record["digest"])
+            assert re.fullmatch(r"[A-Z][A-Z0-9_]*", record["key"])
+            assert record["ref"].endswith("@" + record["digest"])
+            assert ":" not in record["ref"].split("@")[0]
+
+    def test_sentinel_token_is_gone_from_the_repository_surface(self):
+        assert "UNRESOLVED" not in PINNED_FILE.read_text()
+        assert "UNRESOLVED" not in _workflow_text()
+        assert "UNRESOLVED" not in (PLATFORM / "e2e" / "image_pins.py").read_text()
+
+    def test_canonical_ref_drops_the_tag_and_keeps_the_digest(self):
+        digest = "sha256:" + "c" * 64
+        assert H.canonical_digest_ref("python:3.11-slim", digest) == (
+            f"python@{digest}"
+        )
+        assert H.canonical_digest_ref("qdrant/qdrant:v1.12.4", digest) == (
+            f"qdrant/qdrant@{digest}"
+        )
+        with pytest.raises(ValueError):
+            H.canonical_digest_ref("python:3.11-slim", "UNRESOLVED")
+
+    def test_renderer_output_is_deterministic_and_digest_only(self):
+        text = PINNED_FILE.read_text()
+        refs = image_pins.render(text, "--refs")
+        assert refs == image_pins.render(text, "--refs")
+        assert len(refs) == 6
+        for line in refs:
+            key, ref = line.split()
+            assert key in H.PINNED_IMAGE_KEYS
+            assert H.validate_digest_ref(ref), line
+        exports = image_pins.render(text, "--exports")
+        assert [line.split("=", 1)[0] for line in exports] == [
+            "E2E_BASE_IMAGES",
+            "E2E_KIND_NODE_DIGEST",
+            "E2E_REGISTRY_DIGEST",
+        ]
+
+    def test_cli_exits_nonzero_on_a_sentinel_pin(self, tmp_path, capsys):
+        bad = tmp_path / "pins.txt"
+        bad.write_text("python:3.11-slim UNRESOLVED E2E_PYTHON_BASE_IMAGE\n")
+        assert image_pins.main([str(bad), "--refs"]) == 1
+        captured = capsys.readouterr()
+        assert captured.out.strip() == ""
+        assert "::error::" in captured.err
+        good = tmp_path / "good.txt"
+        good.write_text(PINNED_FILE.read_text())
+        assert image_pins.main([str(good), "--refs"]) == 0
+        assert image_pins.main([str(good)]) == 2
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-D §10.3/§10.4/§10.7/§10.8: workflow provenance wiring
+# --------------------------------------------------------------------------
+
+class TestWorkflowProvenanceWiring:
+    def test_no_dispatch_time_mutable_tag_resolution(self):
+        doc = _workflow_doc()
+        code = "\n".join(_run_code(step) for step in _steps(doc))
+        pulls = re.findall(r"docker\s+(?:image\s+)?pull\s+(?:-\S+\s+)*(\S+)", code)
+        assert pulls, "the workflow must still pull its inputs"
+        for target in pulls:
+            assert target in ('"$REF"', '"${REF}"'), target
+        # the old sentinel branch and tag→digest lookup must not come back
+        assert not re.search(r'\$\{?PIN\}?"?\s*=\s*"?UNRESOLVED', code)
+        assert not re.search(r"REF=.*RepoDigests", code)
+        assert not re.search(r"docker\s+(?:image\s+)?pull[^\n]*\$\{?NAME\}?", code)
+        assert "UNRESOLVED" not in _workflow_text()
+
+    def test_pins_step_pulls_and_inspects_by_digest_only(self):
+        code = _run_code(_step(_workflow_doc(), "Load immutable image pins"))
+        assert 'docker pull -q "$REF"' in code
+        assert 'docker image inspect "$REF"' in code
+        assert "RepoDigests" in code and 'grep -Fxq "$REF"' in code
+        # fail-closed: a non-digest reference can never reach docker
+        assert "@sha256:[0-9a-f]{64}$'" in code
+        assert "e2e.image_pins" in code
+
+    def test_all_four_provenance_vars_are_exported_before_the_driver(self):
+        doc = _workflow_doc()
+        steps = _steps(doc)
+        driver_index = _step_index(doc, DRIVER_STEP)
+        for var in PROVENANCE_VARS:
+            producers = [
+                index
+                for index, step in enumerate(steps)
+                if var in _github_env_exports(step)
+            ]
+            assert producers, f"{var} is never exported to $GITHUB_ENV"
+            assert max(producers) < driver_index, (var, producers, driver_index)
+
+    def test_provenance_vars_are_not_satisfied_by_comments(self):
+        doc = _workflow_doc()
+        for var in PROVENANCE_VARS:
+            commented = [
+                step.get("name")
+                for step in _steps(doc)
+                if re.search(rf"^\s*#.*{var}", step.get("run", "") or "", re.M)
+                and var not in _github_env_exports(step)
+            ]
+            assert not commented or any(
+                var in _github_env_exports(step) for step in _steps(doc)
+            ), (var, commented)
+
+    def test_built_image_digests_come_from_post_push_inspection(self):
+        code = _run_code(_step(_workflow_doc(), "Build immutable E2E images"))
+        assert code.index("docker push") < code.index("RepoDigests")
+        assert 'WORKLOAD_DIGEST="$(docker inspect' in code
+        assert 'SANDBOX_DIGEST="$(docker inspect' in code
+        assert "{{index .RepoDigests 0}}" in code
+        built = re.search(r'BUILT="([^"]+)"', code)
+        assert built, "E2E_BUILT_IMAGE_DIGESTS must be assembled from variables"
+        value = built.group(1)
+        assert "${WORKLOAD_DIGEST}" in value and "${SANDBOX_DIGEST}" in value
+        assert ":${E2E_SOURCE_SHA}" not in value, "mutable tag in built provenance"
+        assert 'echo "E2E_BUILT_IMAGE_DIGESTS=${BUILT}"' in code
+        assert "built image is not digest-addressed" in code
+        assert "manifest provenance not exported" in code
+
+    def test_registry_and_kind_digests_map_to_the_committed_pins(self):
+        doc = _workflow_doc()
+        registry_step = _run_code(_step(doc, "Configure registry"))
+        assert '"${REGISTRY_IMAGE}"' in registry_step
+        assert '--image "$NODE_IMAGE"' in registry_step
+        by_key = {record["key"]: record["ref"] for record in _pin_records()}
+        exports = H.pin_provenance_exports(_pin_records())
+        assert exports["E2E_REGISTRY_DIGEST"] == by_key["REGISTRY_IMAGE"]
+        assert exports["E2E_KIND_NODE_DIGEST"] == by_key["NODE_IMAGE"]
+        assert H.validate_digest_ref(exports["E2E_REGISTRY_DIGEST"])
+        assert H.validate_digest_ref(exports["E2E_KIND_NODE_DIGEST"])
+
+    def test_base_images_scalar_is_deterministic_and_parsable(self):
+        exports = H.pin_provenance_exports(_pin_records())
+        scalar = exports["E2E_BASE_IMAGES"]
+        assert isinstance(scalar, str) and ";" in scalar
+        mapping = H.parse_scalar_mapping(scalar)
+        assert sorted(mapping) == sorted(H.BASE_IMAGE_KEYS)
+        for key, ref in mapping.items():
+            assert H.validate_digest_ref(ref), (key, ref)
+        assert scalar == H.pin_provenance_exports(_pin_records())["E2E_BASE_IMAGES"]
+        with pytest.raises(ValueError):
+            H.format_scalar_mapping({"KEY": "has;separator"})
+        with pytest.raises(ValueError):
+            H.format_scalar_mapping({"KEY": ""})
+
+    def test_provenance_artifacts_are_recorded_without_secrets(self):
+        doc = _workflow_doc()
+        pins = _run_code(_step(doc, "Load immutable image pins"))
+        build = _run_code(_step(doc, "Build immutable E2E images"))
+        assert "image-provenance-inputs.txt" in pins
+        assert "manifest-provenance-env.txt" in pins
+        assert "image-provenance-built.txt" in build
+        for step in (_step(doc, "Load immutable image pins"),
+                     _step(doc, "Build immutable E2E images")):
+            assert "secrets." not in str(step.get("run", ""))
+            assert step.get("env") is None
+
+    def test_driver_step_still_runs_after_every_provenance_producer(self):
+        doc = _workflow_doc()
+        assert _step_index(doc, "Load immutable image pins") < _step_index(
+            doc, "Build immutable E2E images"
+        ) < _step_index(doc, DRIVER_STEP)
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-D §6.2: every E2E build surface is digest-controlled
+# --------------------------------------------------------------------------
+
+class TestE2EBuildSurfaces:
+    def test_every_built_service_uses_an_e2e_dockerfile(self):
+        base = yaml.safe_load(COMPOSE_BASE.read_text())
+        override = yaml.safe_load(COMPOSE_E2E.read_text())
+        built = {
+            name
+            for name, spec in base["services"].items()
+            if isinstance(spec, dict) and spec.get("build")
+        }
+        assert built == set(E2E_BUILD_SURFACES), built
+        for service, dockerfile in E2E_BUILD_SURFACES.items():
+            spec = override["services"][service]["build"]
+            assert spec["dockerfile"] == dockerfile, service
+            assert spec["context"] == "./devops-ai-platform", service
+            assert spec["args"]["BASE_IMAGE"].startswith("${E2E_PYTHON_BASE_IMAGE:?")
+
+    def test_every_e2e_dockerfile_is_fail_closed(self):
+        seen = set()
+        for dockerfile in set(E2E_BUILD_SURFACES.values()):
+            path = PLATFORM / dockerfile.lstrip("./")
+            text = path.read_text()
+            assert "ARG BASE_IMAGE\n" in text, path
+            assert "FROM ${BASE_IMAGE:?" in text, path
+            assert not re.search(r"^FROM\s+[a-z0-9]+:", text, re.M), path
+            seen.add(path)
+        for path in DOCKERFILES:
+            text = path.read_text()
+            assert "ARG BASE_IMAGE\n" in text and "FROM ${BASE_IMAGE:?" in text
+
+    def test_production_dockerfiles_stay_tag_based_and_unbuilt_by_e2e(self):
+        override = yaml.safe_load(COMPOSE_E2E.read_text())
+        used = {
+            spec["build"]["dockerfile"]
+            for spec in override["services"].values()
+            if isinstance(spec, dict) and spec.get("build")
+        }
+        for path in PRODUCTION_DOCKERFILES:
+            text = path.read_text()
+            assert re.search(r"^FROM\s+python:3\.11-slim\s*$", text, re.M), path
+            assert "@sha256:" not in text, path
+            relative = "./" + str(path.relative_to(PLATFORM))
+            assert relative not in used, f"{relative} is built by the E2E stack"
+
+    def test_no_duplicate_service_keys_in_the_override(self):
+        names = re.findall(r"^  ([a-z0-9-]+):\s*$", COMPOSE_E2E.read_text(), re.M)
+        assert len(names) == len(set(names)), names
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-D §7/§9/§10.5/§10.6/§10.9: manifest provenance completeness
+# --------------------------------------------------------------------------
+
+class TestManifestProvenance:
+    def test_driver_reads_all_four_variables(self):
+        src = DRIVER.read_text()
+        for field, env in (
+            ("registry_image_digest", "E2E_REGISTRY_DIGEST"),
+            ("kind_node_image_digest", "E2E_KIND_NODE_DIGEST"),
+            ("base_images", "E2E_BASE_IMAGES"),
+            ("built_image_digests", "E2E_BUILT_IMAGE_DIGESTS"),
+        ):
+            assert re.search(
+                rf'{field}=os\.environ\.get\("{env}"', src
+            ), field
+        assert "finalize_execution_manifest" in src
+
+    def test_harness_manifest_is_populated_from_the_environment(
+        self, tmp_path, monkeypatch
+    ):
+        """Offline proof: no Docker, no GitHub, no secrets required."""
+        values = {
+            "E2E_REGISTRY_DIGEST": "registry@sha256:" + "1" * 64,
+            "E2E_KIND_NODE_DIGEST": "kindest/node@sha256:" + "2" * 64,
+            "E2E_BASE_IMAGES": "E2E_PYTHON_BASE_IMAGE=python@sha256:" + "3" * 64,
+            "E2E_BUILT_IMAGE_DIGESTS": (
+                "E2E_WORKLOAD_IMAGE=localhost:5001/ares-e2e-workload@sha256:"
+                + "4" * 64
+            ),
+            "E2E_SANDBOX_DIGEST": "localhost:5001/ares-e2e-sandbox@sha256:" + "5" * 64,
+            "E2E_SOURCE_SHA": "a" * 40,
+            "E2E_FIXTURE_SEED_SHA": "b" * 40,
+            "E2E_WORKSPACES_ROOT": str(tmp_path / "workspaces"),
+            "E2E_ARTIFACT_DIR": str(tmp_path / "artifacts"),
+            "E2E_JWT_SECRET": "unit-test-secret-not-a-credential",
+            "E2E_FIXTURE_REPOSITORY": "gm-prog/ares-e2e-fixture",
+        }
+        for key, value in values.items():
+            monkeypatch.setenv(key, value)
+        driver = importlib.reload(importlib.import_module("e2e.golden_path"))
+        try:
+            manifest = driver.Harness().manifest
+            assert manifest["registry_image_digest"] == values["E2E_REGISTRY_DIGEST"]
+            assert manifest["kind_node_image_digest"] == values["E2E_KIND_NODE_DIGEST"]
+            assert manifest["base_images"] == values["E2E_BASE_IMAGES"]
+            assert manifest["built_image_digests"] == (
+                values["E2E_BUILT_IMAGE_DIGESTS"]
+            )
+            assert manifest["sandbox_image_digest"] == values["E2E_SANDBOX_DIGEST"]
+            assert manifest["source_sha"] == values["E2E_SOURCE_SHA"]
+            assert manifest["fixture_seed_sha"] == values["E2E_FIXTURE_SEED_SHA"]
+            assert manifest["workspace_root"] == values["E2E_WORKSPACES_ROOT"]
+            assert H.validate_manifest(manifest) == []
+            assert H.missing_execution_provenance(manifest) == []
+            H.finalize_execution_manifest(manifest, H.PASS)
+            assert manifest["result"] == H.PASS
+            assert "provenance_rejection" not in manifest
+        finally:
+            monkeypatch.undo()
+            importlib.reload(importlib.import_module("e2e.golden_path"))
+
+    def test_pass_with_complete_provenance_is_accepted(self):
+        manifest = H.new_manifest(**_complete_provenance())
+        H.finalize_execution_manifest(manifest, H.PASS)
+        assert manifest["result"] == H.PASS
+        assert H.validate_manifest(manifest) == []
+
+    @pytest.mark.parametrize("field", H.REQUIRED_EXECUTION_PROVENANCE)
+    def test_pass_with_any_empty_required_field_is_rejected(self, field):
+        fields = _complete_provenance()
+        fields[field] = ""
+        manifest = H.new_manifest(**fields)
+        assert H.missing_execution_provenance(manifest) == [field]
+        H.finalize_execution_manifest(manifest, H.PASS)
+        assert manifest["result"] == H.FAIL
+        assert field in manifest["provenance_rejection"]
+        assert H.validate_manifest(manifest) == []
+
+    def test_empty_four_provenance_vars_cannot_claim_success(self):
+        fields = _complete_provenance()
+        for field in (
+            "registry_image_digest",
+            "kind_node_image_digest",
+            "base_images",
+            "built_image_digests",
+        ):
+            fields[field] = ""
+        manifest = H.new_manifest(**fields)
+        H.finalize_execution_manifest(manifest, H.PASS)
+        assert manifest["result"] == H.FAIL
+        rejection = manifest["provenance_rejection"]
+        for field in (
+            "registry_image_digest",
+            "kind_node_image_digest",
+            "base_images",
+            "built_image_digests",
+        ):
+            assert field in rejection
+
+    def test_whitespace_only_provenance_is_not_accepted(self):
+        fields = _complete_provenance()
+        fields["registry_image_digest"] = "   "
+        manifest = H.new_manifest(**fields)
+        H.finalize_execution_manifest(manifest, H.PASS)
+        assert manifest["result"] == H.FAIL
+
+    def test_preflight_manifests_stay_representable(self):
+        """NOT_VERIFIED / BLOCKED runs legitimately have no provenance."""
+        manifest = H.new_manifest(workflow_run_id="local")
+        H.finalize_manifest(manifest, H.NOT_VERIFIED)
+        assert manifest["result"] == H.NOT_VERIFIED
+        blocked = H.new_manifest(workflow_run_id="local")
+        H.finalize_execution_manifest(blocked, H.BLOCKED)
+        assert blocked["result"] == H.BLOCKED
+        assert "provenance_rejection" not in blocked
+        failed = H.new_manifest(workflow_run_id="local")
+        H.finalize_execution_manifest(failed, H.FAIL)
+        assert failed["result"] == H.FAIL
+
+    def test_manifest_schema_still_scalar_only(self):
+        manifest = H.new_manifest(**_complete_provenance())
+        H.finalize_execution_manifest(manifest, H.PASS)
+        for key, value in manifest.items():
+            assert re.fullmatch(r"[a-z_]+", key), key
+            assert isinstance(value, (str, int, float, bool)), key
+
+    def test_driver_exit_code_follows_the_finalized_manifest(self):
+        src = DRIVER.read_text()
+        assert "H.finalize_execution_manifest(self.manifest, overall)" in src
+        assert 'overall = str(self.manifest["result"])' in src
+        assert src.index("H.finalize_execution_manifest(self.manifest, overall)") < (
+            src.index('return overall, 0 if overall == H.PASS else 1')
+        )
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-D P2: raw Git credential is not inherited by child processes
+# --------------------------------------------------------------------------
+
+class TestCredentialHygiene:
+    TOKEN = "ghp_UnitTestOnly0000000000000000000000"
+
+    def _service(self, tmp_path, monkeypatch):
+        from incident_service.application.services.remediation_workspace_service import (
+            RemediationWorkspaceService,
+        )
+        monkeypatch.setenv("GITHUB_OAUTH_TOKEN", self.TOKEN)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        return RemediationWorkspaceService(workspace_root=str(tmp_path))
+
+    def test_auth_free_git_call_gets_no_raw_token(self, tmp_path, monkeypatch):
+        import incident_service.application.services.remediation_workspace_service as mod
+
+        service = self._service(tmp_path, monkeypatch)
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+
+            class _R:
+                stdout = ""
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        service._run_git(["git", "rev-parse", "HEAD"], cwd=tmp_path)
+        env = captured["env"]
+        assert "GITHUB_OAUTH_TOKEN" not in env
+        assert all(self.TOKEN not in value for value in env.values())
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert "GIT_CONFIG_VALUE_0" not in env
+
+    def test_auth_required_call_gets_only_the_header_env(self, tmp_path, monkeypatch):
+        import incident_service.application.services.remediation_workspace_service as mod
+
+        service = self._service(tmp_path, monkeypatch)
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["env"] = dict(kwargs.get("env") or {})
+
+            class _R:
+                stdout = ""
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        service._run_git(
+            ["git", "fetch", "--no-tags", "origin", "a" * 40],
+            cwd=tmp_path,
+            extra_env={
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {self.TOKEN}",
+            },
+        )
+        env = captured["env"]
+        assert "GITHUB_OAUTH_TOKEN" not in env
+        assert env["GIT_CONFIG_VALUE_0"] == f"Authorization: Bearer {self.TOKEN}"
+        assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+
+    def test_real_child_git_process_cannot_see_the_token(self, tmp_path, monkeypatch):
+        """Live process proof using the real `git` binary (no network)."""
+        service = self._service(tmp_path, monkeypatch)
+        header = f"Authorization: Bearer {self.TOKEN}"
+        authenticated = service._run_git(
+            ["git", "config", "--get", "http.extraHeader"],
+            extra_env={
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": header,
+            },
+        )
+        assert authenticated.stdout.strip() == header
+        try:
+            plain = service._run_git(["git", "config", "--get", "http.extraHeader"])
+        except subprocess.CalledProcessError:
+            pass  # no header configured at all — the intended outcome
+        else:
+            assert self.TOKEN not in plain.stdout
+
+    def test_service_source_scrubs_the_token_for_every_child(self):
+        src = WORKSPACE_SERVICE.read_text()
+        block = src[src.index("def _run_git"):]
+        assert '"GITHUB_OAUTH_TOKEN",' in block.split("env[\"GIT_TERMINAL_PROMPT\"]")[0]
+        assert "x-access-token" not in src
+        assert "GIT_ASKPASS" not in src
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-D §16: deterministic provenance audit (no Docker, no GitHub)
+# --------------------------------------------------------------------------
+
+class TestProvenanceAudit:
+    """Nine mechanical checks an auditor can run offline."""
+
+    def test_1_pin_file_has_zero_unresolved_entries(self):
+        assert "UNRESOLVED" not in PINNED_FILE.read_text()
+
+    def test_2_every_pin_is_a_sha256_digest(self):
+        for record in _pin_records():
+            assert re.fullmatch(r"sha256:[0-9a-f]{64}", record["digest"])
+
+    def test_3_every_key_is_valid_and_expected(self):
+        keys = [record["key"] for record in _pin_records()]
+        assert sorted(keys) == sorted(H.PINNED_IMAGE_KEYS)
+        for key in keys:
+            assert re.fullmatch(r"[A-Z][A-Z0-9_]*", key)
+
+    def test_4_workflow_has_no_mutable_tag_resolution_path(self):
+        code = "\n".join(_run_code(step) for step in _steps(_workflow_doc()))
+        assert "UNRESOLVED" not in code
+        for target in re.findall(
+            r"docker\s+(?:image\s+)?pull\s+(?:-\S+\s+)*(\S+)", code
+        ):
+            assert target in ('"$REF"', '"${REF}"'), target
+
+    def test_5_workflow_exports_all_four_manifest_provenance_variables(self):
+        exported = set()
+        for step in _steps(_workflow_doc()):
+            exported |= _github_env_exports(step)
+        assert set(PROVENANCE_VARS) <= exported, sorted(exported)
+
+    def test_6_exports_occur_before_driver_execution(self):
+        doc = _workflow_doc()
+        driver_index = _step_index(doc, DRIVER_STEP)
+        for index, step in enumerate(_steps(doc)):
+            if _github_env_exports(step) & set(PROVENANCE_VARS):
+                assert index < driver_index, step.get("name")
+
+    def test_7_driver_maps_all_four_variables_into_the_manifest(self):
+        src = DRIVER.read_text()
+        for field, env in (
+            ("registry_image_digest", "E2E_REGISTRY_DIGEST"),
+            ("kind_node_image_digest", "E2E_KIND_NODE_DIGEST"),
+            ("base_images", "E2E_BASE_IMAGES"),
+            ("built_image_digests", "E2E_BUILT_IMAGE_DIGESTS"),
+        ):
+            assert f'{field}=os.environ.get("{env}", "")' in src
+
+    def test_8_successful_finalization_rejects_missing_provenance(self):
+        manifest = H.new_manifest(**{**_complete_provenance(),
+                                     "registry_image_digest": ""})
+        H.finalize_execution_manifest(manifest, H.PASS)
+        assert manifest["result"] == H.FAIL
+
+    def test_9_documentation_does_not_claim_live_e2e_pass(self):
+        text = REPORT.read_text()
+        assert "LIVE E2E: NOT VERIFIED" in text
+        assert not re.search(r"LIVE E2E:\s*PASS", text)
+        assert not re.search(r"golden[- ]path(?: workflow)?[^.\n]{0,40}executed "
+                             r"successfully", text, re.I)
