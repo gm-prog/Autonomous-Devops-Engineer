@@ -24,7 +24,7 @@ on external evidence.
 | Implementation commits | `1eedb5e` (§47 operator hardening + §48 seam documentation), `d16f2bd` (harness), `633cdfe` (harness unit tests) |
 | Documentation commit | this file |
 | `main` | `7b30a56d2bfd06798c0a90023acd1c6bd5cd3420` — **UNCHANGED** (re-verified) |
-| Integration refs | all five byte-identical to the brief (`1184eb6…`, `4bd799b…`, `3d87007…`, `71713d8…`, `a0bf760…`) — untouched |
+| Integration refs | **six integration refs** — 6 audited / 0 modified, byte-identical: `4bd799b3` (foundation), `3d87007d` (phase-8), `71713d83` (phase-8.1), `a0bf7600` (phase-8.2), `1184eb67` (reconciliation), `d1961e43` (remediation-reconstruction) |
 | PRs #8–#11 | untouched (opened/closed/edited nothing) |
 | Force-push / history rewrite | none |
 
@@ -193,8 +193,9 @@ result). Not exercised (no run).
 
 ## §56 final hostile audit (answered with evidence)
 
-- main exactly `7b30a56d…`? **YES** (re-verified after push) · five
-  integration refs untouched? **YES** (verified byte-identical) · PRs
+- main exactly `7b30a56d…`? **YES** (re-verified after push) · six
+  integration refs untouched? **YES** (6 audited / 0 modified,
+  verified byte-identical) · PRs
   untouched? **YES** · force-push? **NONE** · unrelated files modified?
   **NO** (diff confined to harness/E2E files + §47 assertion).
 - Did the real compose stack boot / readiness pass / kind run /
@@ -222,3 +223,253 @@ cryptographic source-to-artifact derivation, or staging success is made.
 The execution model remains at-least-once attempts + deterministic
 idempotency + durable lease + CAS + reconciliation + fail-closed
 conflicts.
+
+---
+
+# Phase 8.4.2-C corrective hardening (2026-10-06)
+
+## Executive result
+
+```text
+HARNESS: CORRECTIVE REPAIRS IMPLEMENTED + CI-VALIDATED (per-defect below)
+LIVE E2E: NOT VERIFIED — the golden path has still never executed
+          end-to-end on GitHub Actions (workflow not on the default
+          branch; fixture repo/secrets not provisionable from this
+          session's credential). No stage in this document is promoted
+          to PASS on the basis of the corrective work.
+```
+
+Authoritative base of this phase: `f518a171…` (Phase 8.4.1 head);
+start point: previous head `75943a743eef15a5b7c42cd6862cffe27750dd0e`.
+`main` stays `7b30a56d2bfd06798c0a90023acd1c6bd5cd3420` — untouched.
+
+## Happy-path chain as now implemented (audit narrative)
+
+1. Dispatch-only workflow (`e2e-golden-path`, `permissions: contents: read`,
+   `environment: e2e-staging`) validates slug/SHA inputs and the presence
+   of the two step-scoped secrets.
+2. Pinned toolchain installs (terraform/kubectl checksum-verified, kind
+   via sumdb-verified module install).
+3. Compose config validation runs with valid-format digest placeholders.
+4. **Resolve immutable build inputs**: source names are read from
+   committed `e2e/pinned-images.txt`; every entry resolves to an
+   authoritative `name@sha256:<64hex>`, is pulled by digest, and is
+   exported/recorded — the workflow text contains no bare image tags.
+5. **Registry ordering (P0-1)**: registry container starts on its own
+   `e2e-registry-net` first; kind is created after it; only then is the
+   registry connected to the `kind` network, TCP reachability is proven
+   from the node, and (after publishing) a fixture pod proves a real
+   image pull from the registry.
+6. Application/sandbox/workload images build from digest-pinned bases
+   (`ARG BASE_IMAGE` + `FROM ${BASE_IMAGE:?…}` fail-closed).
+7. Workspace root step creates the ONE host-visible directory
+   `/tmp/ares-e2e-workspaces` (job env `E2E_WORKSPACES_ROOT`).
+8. Compose boots with step-scoped real secrets; readiness uses bounded
+   observable probes; deployment-service reaches kind by container name.
+9. Live §6 proof: a file written inside the platform's remediation
+   workspace is found at the identical path on the runner host and is
+   readable READ-ONLY at `/workspace` inside the real sandbox image
+   (single `:ro` bind, network none, no write possible).
+10. Live §7 proof: unauthenticated `git ls-remote` against the fixture
+    repo is denied; an authenticated fetch succeeds with the token fed
+    on stdin into `GIT_CONFIG_*` env (never argv/URL/config/logs).
+11. The driver executes the full gateway-only chain (preflight →
+    security → deployment → monitoring → replay → evidence → RCA →
+    proposal → approval → sandbox-failure → execution → remote checks →
+    DB cross-check → finalize), writing the manifest and artifacts.
+12. Evidence collection → recursive secret-scan backstop (gates upload)
+    → artifact upload → teardown (compose, kind, registry, workspace
+    root, fixture-only branch/PR cleanup).
+
+## Defect-by-defect results
+
+| ID | Defect | Fix | Evidence |
+| --- | --- | --- | --- |
+| P0-1 | Registry started `--network kind` (assumed kind network pre-existed); no proofs | Registry now created first on `e2e-registry-net`, connected after `kind create`, TCP + pull proofs recorded (`registry-state.txt`, `registry-networks-preconnect/postconnect.txt`, `kind-registry-connectivity.txt`, `kind-image-pull-proof.txt`, `workload-push.txt`) | `TestRegistryOrderingRegression` (6 tests, ordering asserted inside the step block); live NOT VERIFIED |
+| P0-2 | No dedicated host-visible workspace root; sandbox would bind-create an absent dir | Job env `E2E_WORKSPACES_ROOT`; compose mounts `/tmp/ares-e2e-workspaces` at the same path host+container; `RemediationWorkspaceService(workspace_root=…)` requires absolute+existing root, mkdtemp under it, cleanup refuses outside; `build_run_plan` (root mode) requires mount source to exist beneath `REMEDIATION_WORKSPACE_ROOT` and fails closed; §6 live visibility/RO proof step added | `TestHostVisibleWorkspace` (7 tests); existing sandbox suites (559-module CI set) unmodified and green |
+| P0-3 | Fixture acquisition unauthenticated/prefix-cleanup mismatch | Root-mode `prepare()` fails closed without `GITHUB_OAUTH_TOKEN`; clone+fetch carry the token via per-process `GIT_CONFIG_*` `http.extraHeader`; URL/argv never contain credentials; workflow proves private-then-authenticated fetch via stdin pipe | `TestAuthenticatedFixtureClone` (6 tests) + live workflow proof (NOT VERIFIED) |
+| P1-4 | Weak race oracle (`successes >= 0`), no order guarantees | `classify_execution_outcomes()` requires exactly two outcomes, exactly one winner ∈ {200,502,504} and exactly one 409, zero invalid; driver assertion strict; **[200,502,504] winner semantics = relay-timeout-with-continuation** (gateway 10 s relay while durable execution proceeds; verified via read endpoints/DB/remote, never via the timed-out response) | `TestConcurrencyOracle`: PASS `[200,409] [409,200] [502,409] [409,502] [504,409] [409,504]`; FAIL `[200,200] [502,502] [504,504] [409,409] [200,500] [404,409] [] [200] [200,409,409]` |
+| P1-5 | Floating build inputs (`python:3.11-slim` bare in workflow/Dockerfiles; bare `resolve <tag>` step) | `pinned-images.txt` (source, pin, env key) resolves authoritative digests at dispatch and pulls by digest; Dockerfiles/compose use `ARG/…:?` fail-closed refs; static tests reject `python:3.11-slim`/`python:latest`/`python@invalid` in workflow+compose+Dockerfiles and require `@sha256:<64hex>` everywhere | `TestImmutability` (8 tests); sandbox digest enforcement untouched |
+| P1-6 | Secrets job-global; `compose config` rendered live secrets into artifacts; upload unconditional | Secrets moved to step `env:` (validate/boot/prove/execute/driver/cleanup only); diagnostics rendered by `render_compose_config()` from a sanitized env (placeholder `[REDACTED-NON-SECRET]`, which the scanner now explicitly exempts while still matching real values); recursive scan is a separate step with `id: secretscan`; upload `if: … && steps.secretscan.outcome == 'success'` | `TestSecretStaging` (8 tests incl. injected-fixture-secret fails scan → upload gated) |
+| 7 | Replay used fixed `time.sleep(6)` as proof | Bounded `wait_until("replay-consumed", …)` over observable state: group `last-delivered-id` ≥ replayed id AND `XPENDING` empty for that id; deadline+interval+structured timeout diagnostics; no `time.sleep` anywhere in the replay path | `TestReplayPolling` (3 tests) |
+| 8 | Docs under-counted the integration refs (five-refs phrasing) | Six integration refs listed — **6 audited / 0 modified**: `4bd799b3`, `3d87007d`, `71713d83`, `a0bf7600`, `1184eb67`, `d1961e43` | `test_docs_list_six_integration_refs` |
+| 9 | `cancel-in-progress` wording overstated | Workflow header + this report state: `cancel-in-progress: false` only prevents cancellation of a running execution; **no stronger queue guarantee is claimed** than GitHub documents (no FIFO/strict-ordering claim for the queued run) | `test_workflow_comments_state_no_stronger_queue_guarantee`, `test_docs_state_cancel_in_progress_scope_honestly` |
+
+Driver contract fixes found during the audit and included above:
+`_fixture_prs()` now queries the **recorded** `branch_name`
+(`automation/remediation/{incident}/{proposal}` via
+`RemediationWorkspaceService.build_branch_name`), the sandbox-failure
+check queries ALL fixture PRs (`state=all`, no head filter), the
+manifest gained scalar fields `workspace_root`, `fixture_seed_sha`,
+`registry_image_digest`, `kind_node_image_digest`, `base_images`,
+`built_image_digests` (all validated against `^[a-z_]+$` scalars), and
+preflight fails closed on fixture slug/seed/token/JWT/sandbox digest/
+workspaces-root (`E2E_WORKSPACES_ROOT missing or not absolute`).
+
+## §13 repository-wide credential-flow audit
+
+Scripted term search over all tracked `.py/.yml/.md/.sh/.txt/.json`
+files (terms: `ghp_`, `github_pat_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
+`x-access-token`, `Bearer `, `GIT_CONFIG_VALUE_0`, `extraHeader`,
+`GITHUB_OAUTH_TOKEN`, `E2E_FIXTURE_GITHUB_TOKEN`, `E2E_JWT_SECRET`,
+`JWT_SECRET`, `password=`, `Authorization:`), every match classified by
+inspecting the flow:
+
+- **secure flows**: `GIT_CONFIG_VALUE_0`/`extraHeader` matches are all
+  the env-only credential mechanism (workspace service, push tests,
+  workflow stdin pipe, corrective tests); `Bearer ` in gateway auth is
+  the documented authorization header parsing; `x-access-token` matches
+  exist only as deny-patterns in scanner/test code (never constructed).
+- **unit tests / deny-patterns**: `ghp_`-shaped literals appear only in
+  test fixtures and in `proposal_execution_service.py`'s rejection
+  regex (a pattern that BLOCKS tokens, not one that emits them); the
+  single synthetic `ghp_…` in `tests/test_e2e_corrective.py` is
+  deliberately under GitHub's real token length.
+- **redacted/legacy docs**: `FORENSIC_REPORT.md` (pre-existing tracked
+  file), `CHANGELOG.md`, `README.md`, roadmaps mention token/secret
+  NAMES only; no values.
+- **forbidden**: **0 matches** — no literal credential exists in the
+  repository, no token in any URL/`.git-config`/argv/log/artifact path
+  (`test_no_static_secret_values`, `test_no_token_in_command_lines…`,
+  workspace-service argv assertions).
+- Result: **PASS (static audit)**; live artifact contents remain
+  NOT VERIFIED until a run uploads them.
+
+## §14 sandbox boundary re-verification
+
+Verified by executable tests (`TestHostVisibleWorkspace`) plus the
+unmodified CI sandbox suites: exactly ONE mount expression
+`{workspace}:/workspace:ro` (asserted `== 1` in source); absolute-path
+requirement; root-mode existence + beneath-root enforcement (fail
+closed, no other host path); `docker.sock` string absent from both
+sandbox modules (the socket is mounted only on `incident-service`, the
+orchestrator, per the Phase 6.2.2 design); `--network none`, read-only
+rootfs, tmpfs `/tmp`, cap-drop ALL, no-new-privileges, pids/memory/cpu
+limits and non-root default unchanged; no host/in-process fallback
+(`remediation validation will not run on the host` guard intact).
+**PASS (static/unit)**; container-execution claims NOT VERIFIED
+locally (no Docker runtime in this environment).
+
+## §15 production-boundary audit (intentional production-path changes)
+
+| Path | Change | Reason | Tests |
+| --- | --- | --- | --- |
+| `incident_service/…/remediation_workspace_service.py` | Constructor `workspace_root` param (default ← `REMEDIATION_WORKSPACE_ROOT` env, else legacy system-tmp); root-mode clones authenticate + clean only under root | P0-2/P0-3; production default (env unset) byte-equivalent to previous behaviour | corrective tests + existing workspace-service suite (signature update `fake_git(…, **kwargs)` only) |
+| `incident_service/…/validation_sandbox.py` | Root-mode guard: mount source must exist and lie beneath `REMEDIATION_WORKSPACE_ROOT` | P0-2 fail-closed; guard inactive when env unset (unit contexts) | corrective + existing sandbox suites (35-module set) |
+| `deployment_service/Dockerfile.e2e`, `incident_service/Dockerfile.e2e` | `ARG BASE_IMAGE` + fail-closed `FROM` | P1-5 immutability (E2E-only Dockerfiles; production Dockerfiles untouched) | `TestImmutability` |
+| `e2e/*`, workflow, `docker-compose.e2e.yml` | harness-only | scope | test files below |
+
+No other production file changed; `main`, integration refs and PRs
+#8–#11 untouched.
+
+## §16 test matrix (executed this phase, exact cwd + counts)
+
+| Scope (cwd) | Command | Result |
+| --- | --- | --- |
+| `devops-ai-platform` | `pytest tests/ deployment_service/tests` (CI scope) | **403 passed + 131 subtests** (325 baseline + 78 new corrective) |
+| `devops-ai-platform` | CI incident job command (`python -m unittest` with the 35 enumerated modules) | **Ran 559 — OK (3 skipped)** |
+| `devops-ai-platform` | `python -m unittest discover -s incident_service -p 'test_*.py' -t .` (superset) | Ran 553 — OK (3 skipped) |
+| `devops-ai-platform` | `compileall incident_service api_gateway` + `pytest api_gateway/tests` (CI scope) | **79 passed + 60 subtests** |
+| `backend` | `pytest tests/` (CI scope) | **49 passed** |
+| `devops-ai-platform` | `pytest tests/test_e2e_harness.py` | **24 passed + 7 subtests** (unmodified) |
+| repo root | `git diff --check` | clean |
+
+## §17 workflow static validation (executed)
+
+Real YAML parse (`yaml.safe_load`) → OK; `bash -n` on every `run:`
+block → OK (0 failures); both actions pinned to full SHAs
+(`actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1`,
+`actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`);
+`on: workflow_dispatch` only, no `pull_request`/`pull_request_target`
+keys; `permissions: contents: read`; `environment: e2e-staging`; job
+env contains **zero** `secrets.*` references; every secret-touching
+step declares its own `env:`; no static secret-shaped values; step
+order has no forward dependencies (asserted). actionlint remains
+unavailable in this environment (download blocked) — GitHub validates
+the workflow on push.
+
+## §18 CI scopes (exact commands, cwd, counts)
+
+Identical to §16 table; no aggregate "grand total" is claimed. Local
+environment cannot run docker/kind/terraform → **§19: no local
+golden-path claim is made; LIVE E2E: NOT VERIFIED.**
+
+## §20 workflow step order (no forward dependencies)
+
+validate inputs → toolchain → compose config validation → resolve
+digests → registry/kind/connect/prove → build immutable images →
+publish + kind pull proof → create workspace root → boot + readiness →
+§6 workspace proof → §7 git-auth proof → driver → collect → scan gate
+→ upload (gated on scan) → cleanup (compose/kind/registry/workspace
+root + fixture-only remote branch cleanup).
+
+## §21 driver fail-closed preconditions (asserted in `preflight()`)
+
+fixture slug (`E2E_FIXTURE_REPOSITORY is not owner/repo`), seed
+(`E2E_FIXTURE_SEED_SHA is not 40-hex` + live commit + seed content
+exact match), token presence (`E2E_FIXTURE_GITHUB_TOKEN missing`),
+JWT (`E2E_JWT_SECRET missing`), sandbox digest
+(`REMEDIATION_SANDBOX_IMAGE is not digest-pinned`), workspaces root
+(`E2E_WORKSPACES_ROOT missing or not absolute` / `… does not exist on
+the runner`); seed `SERVICE_NAME = "checkout-service"`; target
+`checkout-service-remediated` comes only from the runner's code
+constant (fixture config cannot alter it — asserted).
+
+## §24 manifest fields
+
+`schema`, `result`, `workflow_run_id`, `source_repository`,
+`source_sha`, `fixture_seed_sha`, `fixture_repository`,
+`remediation_branch`, `workspace_root`, `registry_image_digest`,
+`kind_node_image_digest`, `base_images`, `built_image_digests`,
+`sandbox_image_digest`, `terraform/kubectl/kind versions`, evidence
+IDs, stage results — all **scalars** (`validate_manifest` enforces
+`^[a-z_]+$` keys, non-container values); no secret can enter (scanner
++ shape validation).
+
+## §28 hostile audit (explicit answers)
+
+1. **Registry** — does anything assume the kind network pre-exists?
+   **No**: registry runs on `e2e-registry-net` before `kind create`;
+   the kind attach is a separate later command; ordering + proofs are
+   regression-tested.
+2. **Workspace** — one root? fail-closed if absent? cleanup escaped?
+   **One root** (`E2E_WORKSPACES_ROOT`, compose-mounted at the identical
+   path), absent root/mount source fails closed, `_cleanup_path`
+   refuses anything outside the root (test raises), no host fallback.
+3. **Git auth** — token in URL/config/argv/logs/artifacts? **No**:
+   stdin→env `GIT_CONFIG_*` only; tests assert token absence from argv,
+   URLs, `.git/config` and workflow command lines; live proof step
+   (NOT VERIFIED).
+4. **Concurrency** — does the oracle accept two winners/zero winners?
+   **No**: exactly-one-winner + exactly-one-409 + terminal `PR_CREATED`
+   or FAIL (15 patterns asserted).
+5. **Immutability** — any floating tag left? **None** in
+   workflow/compose/Dockerfiles (static tests); digests resolved at
+   dispatch from committed source names and recorded; sandbox digest
+   enforcement untouched.
+6. **Secrets** — can a secret enter artifact staging? **Not via the
+   primary path** (sanitized render; scanner exemption is limited to
+   the literal placeholder) and the backstop scan **gates upload**
+   (injected-secret test proves `if:` gating).
+7. **Cleanup** — can it touch production or escape the root?
+   Refuses any branch outside `automation/remediation/`, refuses the
+   production repo explicitly, workspace rm is root-scoped, kind/
+   registry deletion is name-scoped.
+
+## Remaining blockers (unchanged honesty)
+
+1. Golden-path workflow is not on the default branch → no dispatch
+   run exists (**LIVE E2E: NOT VERIFIED**).
+2. This session's GitHub credential cannot create the fixture repo or
+   provision `E2E_JWT_SECRET`/`E2E_FIXTURE_GITHUB_TOKEN` (App token,
+   `Resource not accessible by integration`); §57 stop honored — the
+   all-powerful token was NOT wired.
+3. No Docker/kind/terraform locally → all container proofs above are
+   static/unit-level until CI executes them.
+
+## Vocabulary discipline (this section)
+
+PASS is used only for checks that actually executed (tests, static
+audits). Everything requiring GitHub/Docker/kind execution is NOT
+VERIFIED. No production-readiness, exactly-once, or staging-success
+claim is made.
