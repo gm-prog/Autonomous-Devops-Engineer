@@ -1,13 +1,24 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# check=skip=InvalidDefaultArgInFrom;error=true
+
 # Phase 8.4.2 — E2E-only incident-service image.
 # Adds exactly what the real remediation path needs at runtime:
 #   git   — workspace clone/checkout/commit/push (RemediationWorkspace*)
 #   docker CLI — sibling-container validation sandbox via the mounted
 #                socket (there is NO host-execution fallback, 6.2.2).
-# Immutable build input (§9): BASE_IMAGE must be name@sha256:<64hex>.
-# No tag default is allowed — a missing/non-digest reference fails
-# the build (tests/test_e2e_corrective.py static checks).
+# Immutable build input (Phase 8.4.2-E1): BASE_IMAGE must be a
+# <name>@sha256:<64hex> reference. It is supplied by the committed pin
+# file (e2e/pinned-images.txt) through the compose build argument
+# BASE_IMAGE, where E2E_PYTHON_BASE_IMAGE is interpolated with Compose's
+# required-value operator. That operator is valid in COMPOSE ONLY; the
+# Dockerfile parser does not implement it, so this file must never carry
+# it — the supported forms here are plain ${VAR}, :- , - , :+ and + .
+# There is no default and no fallback here: omitting the build argument
+# leaves the base name blank and BuildKit refuses the build. Both facts
+# are proved against real BuildKit by the Dockerfile contract gate in
+# .github/workflows/ci.yml.
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+FROM ${BASE_IMAGE}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git docker.io \

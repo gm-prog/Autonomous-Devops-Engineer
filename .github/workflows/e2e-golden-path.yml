@@ -269,10 +269,15 @@ jobs:
             -t "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}" \
             devops-ai-platform/e2e/workload
           # sandbox image (digest-pinned base via ARG, §9; pushed to the
-          # private registry so its tag@digest is content-addressed)
-          printf 'ARG BASE_IMAGE\nFROM ${BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}\nUSER nobody\n' > /tmp/sandbox.Dockerfile
+          # private registry so its tag@digest is content-addressed).
+          # Phase 8.4.2-E1: built from the COMMITTED Dockerfile — the same
+          # bytes the CI BuildKit contract gate checks — instead of a
+          # printf into /tmp, which was both unsupported Dockerfile syntax
+          # and invisible to ordinary CI.
           docker build --build-arg BASE_IMAGE="$E2E_PYTHON_BASE_IMAGE" \
-            -t "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}" -f /tmp/sandbox.Dockerfile /tmp
+            -t "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}" \
+            -f devops-ai-platform/e2e/sandbox/Dockerfile \
+            devops-ai-platform/e2e/sandbox
           docker push -q "localhost:5001/ares-e2e-workload:${E2E_SOURCE_SHA}"
           docker push -q "localhost:5001/ares-e2e-sandbox:${E2E_SOURCE_SHA}"
           # §7.4: built-image provenance comes from the REAL post-push
@@ -546,7 +551,7 @@ jobs:
           kind delete cluster --name ares-e2e || true
           docker rm -f kind-registry >/dev/null 2>&1 || true
           docker network rm e2e-registry-net >/dev/null 2>&1 || true
-          rm -f "$E2E_KUBECONFIG_HOST_PATH" "$HOME/.kube/kind-ares-e2e" /tmp/sandbox.Dockerfile || true
+          rm -f "$E2E_KUBECONFIG_HOST_PATH" "$HOME/.kube/kind-ares-e2e" || true
           # remote cleanup: only the run-created branch + PR on the FIXTURE repo
           python3 - <<'PY' || true
           import json, os, urllib.request
