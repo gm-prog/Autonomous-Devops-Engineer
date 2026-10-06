@@ -1687,3 +1687,62 @@ class TestSandboxSurfaceIsCommitted:
             if line.strip() and not line.startswith("#")
         ]
         assert instructions == ["ARG BASE_IMAGE", "FROM ${BASE_IMAGE}", "USER nobody"]
+
+
+# --------------------------------------------------------------------------
+# Phase 8.4.2-F: the fixture repository may never be production (§21-F)
+# --------------------------------------------------------------------------
+
+
+class TestFixtureRepositoryIsNeverProduction:
+    """The golden path pushes branches and opens PRs against the fixture.
+
+    Before this phase the only guard was a slug *shape* check, which the
+    production slug satisfies; the prohibition was structural (the value is
+    a hardcoded workflow env, not a dispatch input) but never asserted.
+    """
+
+    PRODUCTION = "gm-prog/Autonomous-Devops-Engineer"
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            PRODUCTION,
+            PRODUCTION.lower(),
+            PRODUCTION.upper(),
+            PRODUCTION + ".git",
+            PRODUCTION + "/",
+            "  " + PRODUCTION + "  ",
+        ],
+    )
+    def test_guard_rejects_every_spelling_of_production(self, slug):
+        assert H.is_production_repository(slug) is True
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "gm-prog/ares-e2e-fixture",
+            "gm-prog/Autonomous-Devops-Engineer-fixture",
+            "other/Autonomous-Devops-Engineer",
+            "",
+            None,
+        ],
+    )
+    def test_guard_accepts_disposable_fixtures(self, slug):
+        assert H.is_production_repository(slug) is False
+
+    def test_production_constant_matches_this_repository(self):
+        assert H.PRODUCTION_REPOSITORY == self.PRODUCTION
+
+    def test_driver_preflight_rejects_a_production_fixture(self):
+        src = DRIVER.read_text()
+        assert "is_production_repository(FIXTURE_REPO)" in src
+        assert "must not be the production repository" in src
+
+    def test_workflow_denies_a_production_fixture_before_any_build(self):
+        text = WORKFLOW.read_text()
+        assert "fixture repository must never be the production repository" in text
+        assert "gm-prog/autonomous-devops-engineer" in text
+        guard = text.index("must never be the production repository")
+        for later in ("docker build --build-arg BASE_IMAGE=", "kind create cluster"):
+            assert text.index(later) > guard, f"{later} must run after the guard"
