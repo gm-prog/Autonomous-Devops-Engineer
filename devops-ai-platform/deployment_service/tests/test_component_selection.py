@@ -153,3 +153,30 @@ def test_execute_request_also_carries_the_selection():
                            dockerfile="", k8s_yaml="", terraform_tf=TF,
                            pipeline_yaml="", components=["terraform"])
     assert model.components == ["terraform"]
+
+
+# ------------------------------------------------- the health gate stands
+#
+# A deployment with no deterministic health signal must never reach
+# DEPLOYED. Declaring fewer components must not become a way around it.
+
+from deployment_service.application.services.health_check_service import (  # noqa: E402
+    HealthCheckService,
+)
+
+
+def test_no_health_signal_is_still_a_failure():
+    result = HealthCheckService().check(kubectl=None, deployment_names=[],
+                                        namespace="ns", healthcheck_url="")
+    assert result["status"] == "FAIL"
+    assert "deterministic health signal" in result["error"]
+
+
+def test_a_real_http_signal_is_required_to_pass(monkeypatch):
+    """A component selection without Kubernetes still needs a signal."""
+    svc = HealthCheckService()
+    monkeypatch.setattr(svc, "_http_check",
+                        lambda url: {"status": "FAIL", "url": url})
+    result = svc.check(kubectl=None, deployment_names=[], namespace="ns",
+                       healthcheck_url="http://stub/healthz")
+    assert result["status"] == "FAIL", "a failing HTTP signal must not pass"

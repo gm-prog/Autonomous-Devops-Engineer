@@ -142,6 +142,18 @@ def sh(argv, **kw):
 
 class _CommitStub(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
+        if self.path == "/healthz":
+            # A real deterministic health signal for this topology. The
+            # service performs a genuine HTTP request to it from inside
+            # the container; the engine's "no health signal configured
+            # => FAIL" rule is untouched and still applies.
+            payload = b'{"status":"healthy"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         match = re.fullmatch(r"/repos/([^/]+/[^/]+)/commits/([0-9a-f]{40})", self.path)
         if not match:
             self.send_error(404)
@@ -576,10 +588,17 @@ def deployment_payload():
     }
 
 
+#: Set once the harness stub is listening; the service performs a real
+#: HTTP request to it, so the deployment has a genuine health signal
+#: even though this topology deploys no Kubernetes workload.
+HEALTHCHECK_URL = ""
+
+
 def execute_body(payload, dry):
     body = {k: payload[k] for k in _EXECUTE_FIELDS}
     body["artifact_hash"] = dry.get("artifact_hash")
     body["plan_hash"] = dry.get("plan_hash")
+    body["healthcheck_url"] = HEALTHCHECK_URL
     return body
 
 
@@ -767,6 +786,8 @@ def main() -> int:
     try:
         server, stub_port = start_commit_stub()
         commit_api = f"http://{host_gateway_ip()}:{stub_port}"
+        global HEALTHCHECK_URL
+        HEALTHCHECK_URL = f"{commit_api}/healthz"
         print(f"\n-- images --")
         digest = build_sandbox_image(args.registry, args.base_image,
                                      args.terraform_version)
