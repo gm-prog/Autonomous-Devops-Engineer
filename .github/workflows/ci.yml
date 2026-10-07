@@ -101,12 +101,23 @@ jobs:
         working-directory: .
         run: |
           set -euo pipefail
-          # The authoritative live topology lives in the E2E overlay, so
-          # validate THAT, not only the default compose file.
-          E2E_PYTHON_BASE_IMAGE=python@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce \
-          REMEDIATION_SANDBOX_IMAGE=placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000 \
-          TERRAFORM_SANDBOX_IMAGE=placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000 \
-          docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml config >/dev/null
+          # The authoritative live topology is the E2E overlay, so validate
+          # THAT, not only the default compose file. External image inputs
+          # come from the committed digest pins; the two sandbox images are
+          # supplied as syntactically valid placeholders because this step
+          # renders configuration and pulls nothing.
+          PINS=devops-ai-platform/e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=devops-ai-platform python3 -m e2e.image_pins "$PINS" --refs)
+          export JWT_SECRET=compose-config-validation-only
+          ZERO=$(printf '0%.0s' $(seq 64))
+          export REMEDIATION_SANDBOX_IMAGE="placeholder@sha256:${ZERO}"
+          export TERRAFORM_SANDBOX_IMAGE="placeholder@sha256:${ZERO}"
+          docker compose \
+            -f devops-ai-platform/docker-compose.yml \
+            -f docker-compose.e2e.yml config >/dev/null
           echo "E2E compose topology is valid" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Containerized deployment-service trust boundary proof
         env:
