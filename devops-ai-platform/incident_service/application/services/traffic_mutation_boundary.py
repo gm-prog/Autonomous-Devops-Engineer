@@ -27,11 +27,14 @@ What is here
   auditability, idempotency and evidence correlation.
 * :class:`TrafficMutationResult` — the outcome vocabulary, in which
   "the call returned", "the provider reported a value", "the provider
-  accepted it" and "the remote state is now verified at the requested
-  percentage" are four different things and are never collapsed into
-  one. A result carries the :class:`TrafficMutationRequest` it answers
-  and derives ``request_digest`` from it, so request A can never be
-  paired with request B's digest.
+  accepted it" and "the remote state is now verified" are four
+  different things and are never collapsed into one. A result carries
+  the :class:`TrafficMutationRequest` it answers and derives
+  ``request_digest`` from it, so request A can never be paired with
+  request B's digest; and verification is operation-aware, because both
+  operations complete the same forward request — ``APPLY`` is verified
+  by the requested percentage and ``ROLLBACK`` by the percentage the
+  transition started from (:func:`expected_verified_percentage`).
 * :class:`TrafficMutationPort` — exactly ``apply()`` and ``rollback()``.
 * :class:`UnavailableTrafficMutationProvider` — the default provider,
   which raises :class:`TrafficMutationProviderUnavailable` and never
@@ -334,6 +337,35 @@ class TrafficMutationRequest:
 # --------------------------------------------------------------------------
 
 
+def expected_verified_percentage(
+    operation: str, request: "TrafficMutationRequest"
+) -> int:
+    """The ONE remote observation that can verify ``operation``.
+
+    A request describes a forward transition, and both operations are
+    verified against that same request — they simply complete it from
+    opposite ends:
+
+    * ``APPLY`` moves the forward transition, so it is verified by
+      observing the request's ``requested_percentage``;
+    * ``ROLLBACK`` undoes that transition, so it is verified by
+      observing the request's ``expected_current_percentage``.
+
+    Deriving the rollback target from the bound request is the point:
+    there is no second request shape and no caller-supplied rollback
+    target, so a rollback cannot be verified against a state the
+    approved transition never defined.
+    """
+    if operation == OP_APPLY:
+        return request.requested_percentage
+    if operation == OP_ROLLBACK:
+        return request.expected_current_percentage
+    allowed = ", ".join(TRAFFIC_MUTATION_OPERATIONS)
+    raise InvalidTrafficMutationRequest(
+        f"operation must be one of: {allowed}"
+    )
+
+
 @dataclass(frozen=True)
 class TrafficMutationResult:
     """What a provider reports afterwards — bound to the exact request.
@@ -345,20 +377,27 @@ class TrafficMutationResult:
     B's digest, and no path that can pair them by accident: the pairing
     is structural, not conventional.
 
-    ``verified`` is the only field that claims the remote state is now
-    the requested one, and it is only permitted when the bound request's
-    ``requested_percentage`` is exactly what was observed remotely. A
-    provider call that returned, a provider that accepted the request,
-    and a remote state that actually changed remain three different
-    facts:
+    ``verified`` is the only field that claims the post-operation remote
+    state, and which state that is depends on the operation. Both
+    operations complete the SAME forward request, from opposite ends:
+
+    * ``APPLY`` moves the forward transition, so it is verified only
+      when ``remote_percentage == request.requested_percentage``;
+    * ``ROLLBACK`` undoes it, so it is verified only when
+      ``remote_percentage == request.expected_current_percentage``.
+
+    A provider call that returned, a provider that reported a value, a
+    provider that accepted the request, and a remote state that actually
+    changed remain four different facts:
 
     * ``verified=False`` with ``remote_percentage=None`` — nothing was
       observed (or the observation is unavailable);
     * ``verified=False`` with a percentage — the provider reported a
       value, and it is recorded, but it was not proven to the standard a
-      verified claim requires;
-    * ``verified=True`` — the remote observation equals the requested
-      percentage for this exact request.
+      verified claim requires (true for either operation);
+    * ``verified=True`` — the remote observation equals
+      :attr:`expected_verified_percentage` for this exact request and
+      operation.
 
     ``verified=False`` is a normal, representable outcome and is never
     rewritten into success.
@@ -389,24 +428,23 @@ class TrafficMutationResult:
             raise InvalidTrafficMutationRequest("verified must be a boolean")
         if self.remote_percentage is not None:
             validate_percentage(self.remote_percentage, "remote_percentage")
-        # Verification is a claim about ONE exact remote state: the
-        # percentage the bound request asked for. An observation of
-        # anything else cannot verify this request, whatever the
-        # provider reported.
+        # Verification is a claim about ONE exact remote state, and which
+        # state that is depends on the operation: an APPLY is verified by
+        # the requested percentage, a ROLLBACK by the percentage the
+        # forward transition started from. Either way it is derived from
+        # the bound request; an observation of anything else cannot
+        # verify this operation, whatever the provider reported.
         if self.verified and self.remote_percentage is None:
             raise InvalidTrafficMutationRequest(
                 "verified=True requires the observed remote_percentage; a "
                 "verification with no observed value proves nothing"
             )
-        if (
-            self.verified
-            and self.remote_percentage != self.request.requested_percentage
-        ):
+        if self.verified and self.remote_percentage != self.expected_verified_percentage:
             raise InvalidTrafficMutationRequest(
                 "verified=True requires remote_percentage to equal the "
-                f"bound request's requested_percentage "
+                f"remote state this {self.operation} completes "
                 f"(remote={self.remote_percentage}, "
-                f"requested={self.request.requested_percentage}); an "
+                f"expected={self.expected_verified_percentage}); an "
                 "observation of a different state verifies nothing about "
                 "this request"
             )
@@ -434,6 +472,16 @@ class TrafficMutationResult:
     def request_digest(self) -> str:
         """The digest of the bound request — derived, never supplied."""
         return self.request.digest()
+
+    @property
+    def expected_verified_percentage(self) -> int:
+        """The remote state that alone verifies this operation.
+
+        ``APPLY`` -> the request's ``requested_percentage``;
+        ``ROLLBACK`` -> the request's ``expected_current_percentage``.
+        Derived from the bound request, never supplied by a caller.
+        """
+        return expected_verified_percentage(self.operation, self.request)
 
     @classmethod
     def from_request(
@@ -464,12 +512,20 @@ class TrafficMutationResult:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Serialisable audit record; ``request_digest`` is derived."""
+        """Serialisable audit record; the derived fields are derived.
+
+        ``request_digest`` is the digest of the bound request and
+        ``expected_verified_percentage`` is the state this operation
+        would have had to observe — both are recorded so a reader can
+        see what the ``verified`` claim was measured against without
+        recomputing it from the request.
+        """
         return {
             "provider": self.provider,
             "request_digest": self.request_digest,
             "operation": self.operation,
             "remote_percentage": self.remote_percentage,
+            "expected_verified_percentage": self.expected_verified_percentage,
             "verified": self.verified,
             "external_operation_id": self.external_operation_id,
             "detail": self.detail,
@@ -501,7 +557,9 @@ class TrafficMutationPort(Protocol):
     "backward" request, because a request can only ever describe a
     forward move (``requested > observed``). Reversing it is a distinct
     operation with its own authorisation, which is exactly why it is a
-    distinct member and never a negative ``apply``.
+    distinct member and never a negative ``apply``. A verified rollback
+    observes the request's ``expected_current_percentage``; a verified
+    apply observes its ``requested_percentage``.
     """
 
     def apply(self, request: TrafficMutationRequest) -> TrafficMutationResult: ...
@@ -603,6 +661,7 @@ __all__ = [
     "TrafficMutationResult",
     "UNAVAILABLE_PROVIDER",
     "UnavailableTrafficMutationProvider",
+    "expected_verified_percentage",
     "is_traffic_mutation_port",
     "validate_identifier",
     "validate_percentage",

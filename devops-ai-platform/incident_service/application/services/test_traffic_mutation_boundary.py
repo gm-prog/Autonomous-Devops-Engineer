@@ -42,6 +42,7 @@ from incident_service.application.services.traffic_mutation_boundary import (
     TrafficMutationResult,
     UNAVAILABLE_PROVIDER,
     UnavailableTrafficMutationProvider,
+    expected_verified_percentage,
     is_traffic_mutation_port,
 )
 
@@ -705,16 +706,294 @@ class TrafficMutationResultTests(unittest.TestCase):
             set(payload),
             {
                 "provider", "request_digest", "operation",
-                "remote_percentage", "verified", "external_operation_id",
-                "detail",
+                "remote_percentage", "expected_verified_percentage",
+                "verified", "external_operation_id", "detail",
             },
         )
         self.assertEqual(payload["request_digest"], request.digest())
         self.assertEqual(len(payload["request_digest"]), 64)
         self.assertEqual(payload["verified"], True)
         self.assertEqual(payload["remote_percentage"], 25)
+        # The record states what the verified claim was measured against.
+        self.assertEqual(payload["expected_verified_percentage"], 25)
         import json
         self.assertEqual(json.loads(json.dumps(payload)), payload)
+
+    def test_audit_representation_records_the_rollback_target(self):
+        request = _request()  # 5 -> 25
+        applied = self._result(
+            request, operation=OP_APPLY, remote_percentage=25, verified=True
+        )
+        rolled = self._result(
+            request, operation=OP_ROLLBACK, remote_percentage=5, verified=True
+        )
+        self.assertEqual(applied.to_dict()["expected_verified_percentage"], 25)
+        self.assertEqual(rolled.to_dict()["expected_verified_percentage"], 5)
+        self.assertNotEqual(
+            applied.to_dict()["expected_verified_percentage"],
+            rolled.to_dict()["expected_verified_percentage"],
+        )
+        # Both are bound to the same exact forward request.
+        self.assertEqual(
+            applied.to_dict()["request_digest"],
+            rolled.to_dict()["request_digest"],
+        )
+
+
+class TrafficMutationOperationMatrixTests(unittest.TestCase):
+    """The operation matrix, driven through the real classes.
+
+    A request describes one forward transition (5 -> 25) and both
+    operations complete that same request — APPLY from the near end,
+    ROLLBACK from the far end:
+
+        Forward request: 5% -> 25%
+        APPLY    verified -> remote 25%
+        ROLLBACK verified -> remote  5%
+
+    Nothing here re-implements the contract in a test helper: every row
+    builds an actual TrafficMutationResult bound to an actual
+    TrafficMutationRequest and observes whether construction is allowed.
+    """
+
+    #: (operation, remote_percentage, verified, may_be_constructed)
+    MATRIX = (
+        # APPLY: verified only at the requested percentage.
+        (OP_APPLY, 25, True, True),
+        (OP_APPLY, 5, True, False),
+        (OP_APPLY, 50, True, False),
+        (OP_APPLY, 100, True, False),
+        (OP_APPLY, 24, True, False),
+        (OP_APPLY, 26, True, False),
+        (OP_APPLY, None, True, False),
+        # ROLLBACK: verified only at the state the transition started from.
+        (OP_ROLLBACK, 5, True, True),
+        (OP_ROLLBACK, 25, True, False),
+        (OP_ROLLBACK, 50, True, False),
+        (OP_ROLLBACK, 100, True, False),
+        (OP_ROLLBACK, 0, True, False),
+        (OP_ROLLBACK, None, True, False),
+        # Unverified: any observed value, or none, for either operation.
+        (OP_APPLY, None, False, True),
+        (OP_APPLY, 0, False, True),
+        (OP_APPLY, 5, False, True),
+        (OP_APPLY, 25, False, True),
+        (OP_APPLY, 50, False, True),
+        (OP_ROLLBACK, None, False, True),
+        (OP_ROLLBACK, 0, False, True),
+        (OP_ROLLBACK, 5, False, True),
+        (OP_ROLLBACK, 25, False, True),
+        (OP_ROLLBACK, 50, False, True),
+    )
+
+    def test_operation_matrix(self):
+        request = _request()  # 5 -> 25
+        self.assertEqual(request.expected_current_percentage, 5)
+        self.assertEqual(request.requested_percentage, 25)
+        for operation, remote, verified, allowed in self.MATRIX:
+            with self.subTest(operation=operation, remote=remote,
+                              verified=verified):
+                if allowed:
+                    result = TrafficMutationResult.from_request(
+                        request, provider="matrix-provider",
+                        operation=operation, remote_percentage=remote,
+                        verified=verified,
+                    )
+                    self.assertEqual(result.operation, operation)
+                    self.assertEqual(result.remote_percentage, remote)
+                    self.assertEqual(result.verified, verified)
+                    self.assertIs(result.request, request)
+                    self.assertEqual(result.request_digest, request.digest())
+                else:
+                    with self.assertRaises(InvalidTrafficMutationRequest):
+                        TrafficMutationResult.from_request(
+                            request, provider="matrix-provider",
+                            operation=operation, remote_percentage=remote,
+                            verified=verified,
+                        )
+
+    def test_matrix_rows_are_independently_meaningful(self):
+        """Guard against a matrix that silently stops testing anything:
+        each operation must have at least one accepted and one rejected
+        verified row, and unverified rows must never be rejected."""
+        for operation in TRAFFIC_MUTATION_OPERATIONS:
+            verified_rows = [
+                row for row in self.MATRIX
+                if row[0] == operation and row[2] is True
+            ]
+            self.assertTrue(
+                any(row[3] for row in verified_rows),
+                f"{operation} has no accepted verified row",
+            )
+            self.assertTrue(
+                any(not row[3] for row in verified_rows),
+                f"{operation} has no rejected verified row",
+            )
+            self.assertTrue(
+                all(row[3] for row in self.MATRIX
+                    if row[0] == operation and row[2] is False),
+                f"an unverified {operation} row was rejected",
+            )
+
+    def test_verified_rollback_can_be_represented(self):
+        """The audit finding: before this correction, an honestly
+        verified rollback was IMPOSSIBLE to express. It is now
+        expressible, and it carries proof of what it observed."""
+        request = _request()  # 5 -> 25
+        result = TrafficMutationResult.from_request(
+            request, provider="some-provider", operation=OP_ROLLBACK,
+            remote_percentage=request.expected_current_percentage,
+            verified=True, external_operation_id="op-rollback-1",
+            detail="remote rejoined the 5% state",
+        )
+        self.assertTrue(result.verified)
+        self.assertEqual(result.remote_percentage, 5)
+        self.assertEqual(result.expected_verified_percentage, 5)
+        self.assertEqual(result.operation, OP_ROLLBACK)
+        self.assertEqual(
+            result.request_digest, request.digest(),
+            "the verified rollback is bound to the same exact request",
+        )
+        # …and the same request still refuses the wrong observation.
+        with self.assertRaises(InvalidTrafficMutationRequest):
+            TrafficMutationResult.from_request(
+                request, provider="some-provider", operation=OP_ROLLBACK,
+                remote_percentage=25, verified=True,
+            )
+
+    def test_apply_and_rollback_share_one_request_and_one_digest(self):
+        request = _request()
+        applied = TrafficMutationResult.from_request(
+            request, provider="some-provider", operation=OP_APPLY,
+            remote_percentage=25, verified=True,
+        )
+        rolled = TrafficMutationResult.from_request(
+            request, provider="some-provider", operation=OP_ROLLBACK,
+            remote_percentage=5, verified=True,
+        )
+        self.assertIs(applied.request, rolled.request)
+        self.assertEqual(applied.request_digest, rolled.request_digest)
+        self.assertEqual(applied.request_digest, request.digest())
+        self.assertNotEqual(applied.operation, rolled.operation)
+        self.assertNotEqual(
+            applied.expected_verified_percentage,
+            rolled.expected_verified_percentage,
+        )
+
+    def test_rollback_verification_target_is_derived_not_supplied(self):
+        """No path lets a caller name its own rollback target: the target
+        is a property of the bound request, and neither construction
+        path has a parameter for it."""
+        for constructor in (
+            TrafficMutationResult,
+            TrafficMutationResult.from_request,
+        ):
+            parameters = set(inspect.signature(constructor).parameters)
+            for forbidden in (
+                "request_digest", "rollback_target", "target_percentage",
+                "expected_percentage",
+            ):
+                with self.subTest(constructor=constructor,
+                                  parameter=forbidden):
+                    self.assertNotIn(forbidden, parameters)
+        with self.assertRaises(TypeError):
+            TrafficMutationResult.from_request(
+                _request(), provider="some-provider", operation=OP_ROLLBACK,
+                remote_percentage=5, verified=True,
+                rollback_target=5,
+            )
+
+    def test_the_derived_target_tracks_a_different_request(self):
+        """A request for 25 -> 50 moves both ends of the matrix."""
+        request = _request(
+            expected_current_percentage=25, observed_percentage=25,
+            requested_percentage=50,
+        )
+        applied = TrafficMutationResult.from_request(
+            request, provider="some-provider", operation=OP_APPLY,
+            remote_percentage=50, verified=True,
+        )
+        rolled = TrafficMutationResult.from_request(
+            request, provider="some-provider", operation=OP_ROLLBACK,
+            remote_percentage=25, verified=True,
+        )
+        self.assertEqual(applied.expected_verified_percentage, 50)
+        self.assertEqual(rolled.expected_verified_percentage, 25)
+        for operation, remote in ((OP_APPLY, 25), (OP_ROLLBACK, 50)):
+            with self.subTest(operation=operation, remote=remote):
+                with self.assertRaises(InvalidTrafficMutationRequest):
+                    TrafficMutationResult.from_request(
+                        request, provider="some-provider",
+                        operation=operation, remote_percentage=remote,
+                        verified=True,
+                    )
+
+    def test_unverified_rollback_may_report_any_observed_state(self):
+        """An honest "we looked, and it is not where we expected" result
+        stays representable for rollback too."""
+        request = _request()
+        for remote in (None, 5, 25, 50):
+            with self.subTest(remote=remote):
+                result = TrafficMutationResult.from_request(
+                    request, provider="some-provider", operation=OP_ROLLBACK,
+                    remote_percentage=remote, verified=False,
+                )
+                self.assertFalse(result.verified)
+                self.assertEqual(result.remote_percentage, remote)
+
+
+class ExpectedVerifiedPercentageTests(unittest.TestCase):
+    """The operation-aware target is one explicit, reusable concept."""
+
+    def test_apply_targets_the_requested_percentage(self):
+        self.assertEqual(
+            expected_verified_percentage(OP_APPLY, _request()), 25
+        )
+
+    def test_rollback_targets_the_expected_current_percentage(self):
+        self.assertEqual(
+            expected_verified_percentage(OP_ROLLBACK, _request()), 5
+        )
+
+    def test_target_is_read_from_the_request_alone(self):
+        request = _request(
+            expected_current_percentage=50, observed_percentage=50,
+            requested_percentage=100,
+        )
+        self.assertEqual(expected_verified_percentage(OP_APPLY, request), 100)
+        self.assertEqual(
+            expected_verified_percentage(OP_ROLLBACK, request), 50
+        )
+
+    def test_invalid_operation_has_no_target(self):
+        for operation in ("SET", "apply", "", "MUTATE", None, 1):
+            with self.subTest(operation=operation):
+                with self.assertRaises(InvalidTrafficMutationRequest):
+                    expected_verified_percentage(operation, _request())
+
+    def test_the_operation_vocabulary_stays_two_valued(self):
+        self.assertEqual(
+            set(TRAFFIC_MUTATION_OPERATIONS), {OP_APPLY, OP_ROLLBACK}
+        )
+        for operation in TRAFFIC_MUTATION_OPERATIONS:
+            with self.subTest(operation=operation):
+                self.assertIn(
+                    expected_verified_percentage(operation, _request()),
+                    (5, 25),
+                )
+
+    def test_result_property_agrees_with_the_function(self):
+        request = _request()
+        for operation in TRAFFIC_MUTATION_OPERATIONS:
+            with self.subTest(operation=operation):
+                result = TrafficMutationResult.from_request(
+                    request, provider="some-provider", operation=operation,
+                    remote_percentage=None, verified=False,
+                )
+                self.assertEqual(
+                    result.expected_verified_percentage,
+                    expected_verified_percentage(operation, request),
+                )
 
 
 # ------------------------------------------------- provider / port surface

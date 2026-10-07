@@ -131,7 +131,9 @@ check that reachability alone cannot make.
 because a request can only describe a forward move
 (`requested > observed`); reversing one is a distinct operation with its
 own authorisation — which is why it is a distinct member and never a
-negative `apply`.
+negative `apply`. A verified rollback observes the request's
+`expected_current_percentage`; a verified apply observes its
+`requested_percentage`.
 
 ### 2.5 Verification semantics
 
@@ -148,42 +150,73 @@ default. The four facts that are commonly conflated are kept apart:
 1. the provider call returned,
 2. the provider reported a remote value,
 3. the provider accepted the request,
-4. the remote state is now verified at the requested percentage.
+4. the remote state is now verified at the state the operation completes.
 
-Only (4) is `verified=True`, and it is permitted only when all three of
-these hold:
+Only (4) is `verified=True`. A request always describes a **forward**
+transition, and both operations complete that one request from opposite
+ends:
 
 ```
-remote_percentage == request.requested_percentage
-AND the result is bound to that exact request
-AND verified is explicitly true
+Forward request: 5% → 25%
+
+APPLY    verified  →  remote 25%   (request.requested_percentage)
+ROLLBACK verified  →  remote  5%   (request.expected_current_percentage)
 ```
+
+**Verification is operation-aware.** The target is derived from the
+bound request by one explicit rule
+(`expected_verified_percentage(operation, request)`), never supplied by
+a caller and never a second request shape:
+
+* **For APPLY**, `verified=True` means the exact request's
+  `requested_percentage` was observed remotely.
+* **For ROLLBACK**, `verified=True` means the exact request's
+  `expected_current_percentage` was observed remotely after undoing the
+  forward transition.
+
+Both directions must also satisfy the request binding: the same
+immutable request, and therefore the same `request_digest`.
 
 **Unverified (valid).** A provider may report a remote percentage
-without enough evidence to claim the requested state is verified. The
-observation is recorded and the claim is not made:
+without enough evidence to claim the operation's completing state is
+verified. The observation is recorded and the claim is not made:
 
 ```python
-remote_percentage = 25
-verified = false          # still valid, still informative
+operation = "ROLLBACK"
+remote_percentage = 25   # reported: the rollback has not taken effect
+verified = false         # still valid, still informative
 ```
 
 `remote_percentage = None` with `verified = false` is equally valid: it
 says nothing was observed (or the observation was unavailable).
 
-**Verified (requires the requested state).** A remote observation of
-*any other* percentage cannot verify this request, however confident the
-provider is:
+**Verified (requires the operation's completing state).** A remote
+observation of any other percentage cannot verify the operation, however
+confident the provider is:
 
 ```
-requested = 25, remote_percentage = 50, verified = true   →  rejected
-requested = 25, remote_percentage = 25, verified = true   →  accepted
+request 5 → 25   APPLY    remote 25  verified true   →  accepted
+request 5 → 25   APPLY    remote  5  verified true   →  rejected
+request 5 → 25   APPLY    remote 50  verified true   →  rejected
+request 5 → 25   ROLLBACK remote  5  verified true   →  accepted
+request 5 → 25   ROLLBACK remote 25  verified true   →  rejected
+request 5 → 25   ROLLBACK remote 50  verified true   →  rejected
+request 5 → 25   either   any value  verified false  →  accepted
 ```
 
 Two further integrity rules keep the claim meaningful: a result may not
 claim verification while naming the unavailable provider, and
 `verified=True` requires an explicit `remote_percentage` at all — a
 verification with no observed value proves nothing.
+
+The audit record states what the claim was measured against, so a reader
+does not have to recompute it: `to_dict()` carries
+`expected_verified_percentage` alongside the observed
+`remote_percentage` (REQUESTED vs OBSERVED, kept separate).
+
+Rollback **semantics** are defined here; rollback **execution** is not.
+No provider exists in this phase, so a verified rollback result is a
+representable object, not an operation anything can currently perform.
 
 ### 2.6 Fail-closed default
 
