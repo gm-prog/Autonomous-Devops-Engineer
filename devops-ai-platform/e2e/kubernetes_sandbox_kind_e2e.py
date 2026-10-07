@@ -59,6 +59,7 @@ from deployment_service.application.services.kubectl_sandbox import (  # noqa: E
     KubectlSandboxSpec,
     KubectlSandboxStep,
     build_kubectl_argv,
+    build_run_plan,
     sandbox_policy_identity,
 )
 from deployment_service.infrastructure.kubernetes.rbac_profile import (  # noqa: E402
@@ -319,6 +320,96 @@ def check_unrelated_destination_blocked(spec: KubectlSandboxSpec) -> None:
            "an off-policy destination is unreachable from the sandbox network",
            f"exit={out.returncode} detail={combined.strip()[:200]!r}",
            blocked)
+
+
+def check_docker_socket_denied(spec: KubectlSandboxSpec) -> None:
+    """The untrusted sandbox must never hold the container runtime socket."""
+    # Derive the REAL argv the production code would run, so this
+    # observes the actual invocation rather than an empty list.
+    plan = build_run_plan(
+        spec=spec,
+        step=KubectlSandboxStep(
+            operation=KubectlOperation.APPLY,
+            argv=build_kubectl_argv(KubectlOperation.APPLY, namespace=NAMESPACE),
+            timeout_seconds=60),
+        manifest_host_path="/tmp/ares-probe/manifest.yaml",
+        kubeconfig_host_path="/tmp/ares-probe/kubeconfig",
+        kuberc_host_path="/tmp/ares-probe/kuberc",
+        container_name="ares-probe-argv",
+    )
+    argv = list(plan.argv)
+    sock = [a for a in argv if "docker.sock" in str(a) or "containerd.sock" in str(a)]
+    privileged = [a for a in argv if str(a) in ("--privileged", "--pid=host")]
+    record("network:docker-socket-never-mounted",
+           "no runtime socket and no privileged flag in the real sandbox argv",
+           f"argv_len={len(argv)} socket_matches={sock} privileged={privileged}",
+           not sock and not privileged and len(argv) > 5)
+
+    probe = [
+        "docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+        "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges:true", "--pull", "never",
+        "--entrypoint", "sh", spec.image, "-c",
+        "test -S /var/run/docker.sock && echo SOCKET_PRESENT || echo SOCKET_ABSENT",
+    ]
+    out = subprocess.run(probe, capture_output=True, text=True, timeout=90)
+    combined = f"{out.stdout}{out.stderr}".strip()
+    record("network:docker-socket-absent-inside-sandbox",
+           "the container runtime socket is not reachable from the sandbox",
+           f"detail={combined[:160]!r}",
+           "SOCKET_ABSENT" in combined)
+
+
+def check_same_network_peer(spec: KubectlSandboxSpec) -> None:
+    """`--internal` proves no Internet; it does NOT isolate peers.
+
+    An unrelated container attached to the same network is a co-tenant.
+    This measures reachability honestly: whatever the answer is, it is
+    recorded as observed rather than assumed.
+    """
+    peer = "ares-e2e-unrelated-peer"
+    subprocess.run(["docker", "rm", "-f", peer],
+                   capture_output=True, text=True, timeout=60)
+    started = subprocess.run(
+        ["docker", "run", "-d", "--name", peer, "--network", SANDBOX_NETWORK,
+         "--pull", "never", "--entrypoint", "sh", spec.image, "-c",
+         # a trivial listener on 9999, using only what the image has
+         "while true; do nc -l -p 9999 >/dev/null 2>&1 || sleep 1; done"],
+        capture_output=True, text=True, timeout=120)
+    if started.returncode != 0:
+        record("network:adversarial-peer-started",
+               "an unrelated peer joins the sandbox network",
+               f"NOT VERIFIED: {started.stderr.strip()[:160]!r}", False)
+        return
+    record("network:adversarial-peer-started",
+           "an unrelated peer joins the sandbox network", "started", True)
+    try:
+        probe = [
+            "docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+            "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges:true", "--pull", "never",
+            "--entrypoint", "kubectl", spec.image,
+            "--server", f"https://{peer}:9999", "--insecure-skip-tls-verify=true",
+            "--token", "peer-probe-not-a-credential",
+            "--request-timeout=8s", "get", "namespaces",
+        ]
+        out = subprocess.run(probe, capture_output=True, text=True, timeout=90)
+        combined = f"{out.stdout}\n{out.stderr}".lower()
+        unreachable = ("no such host", "could not resolve", "i/o timeout",
+                       "connection refused", "no route to host",
+                       "network is unreachable", "context deadline")
+        prompted = "please enter username" in combined
+        denied = (out.returncode != 0 and not prompted
+                  and any(m in combined for m in unreachable))
+        if prompted:
+            combined += " [PROBE DEFECT: kubectl prompted instead of connecting]"
+        record("network:same-network-peer-not-reachable",
+               "a co-tenant on the sandbox network is unreachable",
+               f"exit={out.returncode} detail={combined.strip()[:200]!r}",
+               denied)
+    finally:
+        subprocess.run(["docker", "rm", "-f", peer],
+                       capture_output=True, text=True, timeout=60)
 
 
 def check_malicious_manifests(runner: KubectlRunnerService, workdir: Path) -> None:
@@ -703,6 +794,8 @@ def main() -> int:
         print("\n== network policy ==", flush=True)
         check_network_reachability(sandbox, sanitized.content)
         check_unrelated_destination_blocked(spec)
+        check_docker_socket_denied(spec)
+        check_same_network_peer(spec)
 
         print("\n== sandbox runtime ==", flush=True)
         check_plugin_execution(spec)

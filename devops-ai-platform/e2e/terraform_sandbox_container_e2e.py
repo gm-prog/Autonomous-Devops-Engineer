@@ -60,6 +60,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from urllib.parse import urlparse
 import time
 import urllib.error
 import urllib.request
@@ -373,6 +374,10 @@ def start_service(image, workspace_root: Path, sandbox_digest,
         "-e", "DEPLOYMENT_ALLOWED_NAMESPACES=devops-production-namespace",
         "-e", "DEPLOYMENT_CREDENTIAL_ENV_KEYS=",
         "-e", f"DEPLOYMENT_SOURCE_API_BASE_URL={commit_api}",
+        # The health-check host allowlist is host-owned and deny-by-default
+        # (an empty allowlist blocks every URL). The harness endpoint is
+        # named explicitly here; the control itself is untouched.
+        "-e", f"HEALTHCHECK_ALLOWED_HOSTS={urlparse(commit_api).hostname}",
         image,
     ]
     started = sh(argv)
