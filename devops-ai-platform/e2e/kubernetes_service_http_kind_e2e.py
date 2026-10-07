@@ -38,12 +38,23 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from e2e.evidence_provenance import provenance, seal  # noqa: E402
+# The deployment-service verifies that the requested revision exists
+# before it will plan anything. 8.5-A already ships a deterministic,
+# host-owned endpoint for exactly this; reusing it keeps one
+# implementation rather than a second, divergent stub. It serves
+# repository metadata only -- it is NOT a Kubernetes API server and
+# nothing on the Kubernetes path is stubbed.
+from e2e.terraform_sandbox_container_e2e import (  # noqa: E402
+    host_gateway_ip,
+    start_commit_stub,
+)
 
 SERVICE_NAME = "ares-k8s-http-service"
 REDIS_NAME = "ares-k8s-http-redis"
@@ -244,7 +255,8 @@ def start_redis(redis_image: str) -> None:
 def start_service(service_image: str, sandbox_digest: str, kubeconfig: Path,
                   workspace_root: Path, sandbox_network: str,
                   network_identity: str, peers: List[str],
-                  api_server: str, ca_fingerprint: str) -> None:
+                  api_server: str, ca_fingerprint: str,
+                  commit_api: str) -> None:
     sh(["docker", "rm", "-f", SERVICE_NAME])
     argv = [
         "docker", "run", "-d", "--name", SERVICE_NAME,
@@ -274,6 +286,11 @@ def start_service(service_image: str, sandbox_digest: str, kubeconfig: Path,
         "-e", f"DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY={network_identity}",
         "-e", f"DEPLOYMENT_K8S_SANDBOX_PEERS={','.join(peers)}",
         "-e", "DEPLOYMENT_CREDENTIAL_ENV_KEYS=",
+        "-e", f"DEPLOYMENT_SOURCE_API_BASE_URL={commit_api}",
+        # Host-owned and deny-by-default: an empty allowlist blocks
+        # every URL. The harness endpoint is named explicitly here; the
+        # SSRF control itself is untouched.
+        "-e", f"HEALTHCHECK_ALLOWED_HOSTS={urlparse(commit_api).hostname}",
         service_image,
     ]
     out = sh(argv)
@@ -703,10 +720,12 @@ def main() -> int:
                "a token-bound kubeconfig for the least-privilege account",
                f"server={api_server} ca_sha256={ca_fingerprint[:16]}... "
                f"profile={CREDENTIAL_PROFILE}", True)
+        stub, stub_port = start_commit_stub()
+        commit_api = f"http://{host_gateway_ip()}:{stub_port}"
         start_redis(args.redis_image)
         start_service(args.service_image, args.sandbox_image, kubeconfig,
                       workspace_root, exec_network.name, identity.digest(),
-                      [control_plane], api_server, ca_fingerprint)
+                      [control_plane], api_server, ca_fingerprint, commit_api)
         started = True
         # The service container must also reach the sandbox network's
         # peers to launch containers on it; the daemon does that, not
