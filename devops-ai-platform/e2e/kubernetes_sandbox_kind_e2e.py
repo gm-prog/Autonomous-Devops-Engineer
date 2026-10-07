@@ -289,16 +289,26 @@ def check_unrelated_destination_blocked(spec: KubectlSandboxSpec) -> None:
         "--security-opt", "no-new-privileges:true", "--pull", "never",
         "--entrypoint", "kubectl", spec.image,
         "--server", "https://example.com:443", "--insecure-skip-tls-verify=true",
+        # Without a credential kubectl prompts for a username and exits
+        # on EOF, which measures nothing. A dummy token (not a secret)
+        # forces it to actually attempt the connection, so the result
+        # reflects reachability.
+        "--token", "egress-probe-not-a-credential",
         "--request-timeout=8s", "get", "namespaces",
     ]
     out = subprocess.run(probe, capture_output=True, text=True, timeout=90)
     combined = f"{out.stdout}\n{out.stderr}".lower()
-    blocked = out.returncode != 0 and (
-        "no such host" in combined or "timeout" in combined
-        or "i/o timeout" in combined or "connection refused" in combined
-        or "could not resolve" in combined or "server could not find" in combined
-        or "unable to connect" in combined or "context deadline" in combined
+    unreachable_markers = (
+        "no such host", "i/o timeout", "timeout", "connection refused",
+        "could not resolve", "unable to connect", "context deadline",
+        "network is unreachable", "no route to host", "dial tcp",
     )
+    prompted = "please enter username" in combined
+    blocked = (out.returncode != 0 and not prompted
+               and any(m in combined for m in unreachable_markers))
+    if prompted:
+        # The probe did not observe its property, so it cannot pass.
+        combined += " [PROBE DEFECT: kubectl prompted instead of connecting]"
     record("network:unrelated-destination-not-reachable",
            "an off-policy destination is unreachable from the sandbox network",
            f"exit={out.returncode} detail={combined.strip()[:200]!r}",
@@ -596,7 +606,14 @@ def main() -> int:
         image_id = pinned.split("@", 1)[1]
 
         # ---- dedicated network, joined to the kind network ----------
-        run(["docker", "network", "create", SANDBOX_NETWORK], check=False)
+        # --internal is what makes egress destination-controlled: Docker
+        # installs no NAT route for this network, so the sandbox can
+        # reach ONLY the containers attached to it. The kind
+        # control-plane is attached below; nothing else is reachable.
+        # A plain user-defined bridge would NAT to the Internet, which
+        # the trust boundary forbids.
+        run(["docker", "network", "create", "--internal", SANDBOX_NETWORK],
+            check=False)
         run(["docker", "network", "connect", SANDBOX_NETWORK,
              f"{CLUSTER}-control-plane"], check=False)
 
