@@ -267,6 +267,95 @@ jobs:
           path: devops-ai-platform/kubernetes-kind-e2e-evidence.json
           if-no-files-found: warn
 
+  kubernetes-service-http-e2e:
+    name: Phase 8.6-A real deployment-service to Kind E2E
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: devops-ai-platform } }
+    services:
+      # Present only so the locally built sandbox image acquires an
+      # immutable repository digest. Nothing is pulled from the Internet.
+      registry:
+        image: registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: ["5002:5000"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: devops-ai-platform/requirements.txt }
+      - run: pip install -r requirements.txt
+      - name: Record runtime prerequisites
+        run: |
+          set -euo pipefail
+          docker --version
+          kind --version
+          docker info --format 'daemon: {{.ServerVersion}}'
+      - name: Fetch kubectl against the committed checksum
+        run: |
+          set -euo pipefail
+          read -r KVER KSHA < <(grep -v '^#' e2e/pinned-kubectl.txt | grep -v '^$' | head -1)
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+          echo "${KSHA}  /tmp/kubectl" | sha256sum -c -
+          chmod 0755 /tmp/kubectl
+          echo "ARES_KUBECTL_BINARY=/tmp/kubectl" >> "$GITHUB_ENV"
+          echo "ARES_KUBECTL_VERSION=${KVER}" >> "$GITHUB_ENV"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      - name: Start a real Kind cluster
+        run: |
+          set -euo pipefail
+          PINS=e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          kind create cluster --name ares-http-e2e \
+            --image "$NODE_IMAGE" --config e2e/kind-config.yaml --wait 180s
+          kubectl --context kind-ares-http-e2e get nodes -o wide
+      - name: Real deployment-service to Kind proof over HTTP
+        run: |
+          set -euo pipefail
+          PINS=e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          PYTHONPATH=. python e2e/kubernetes_service_http_kind_e2e.py \
+            --cluster ares-http-e2e \
+            --base-image "$E2E_PYTHON_BASE_IMAGE" \
+            --redis-image "$E2E_REDIS_IMAGE" \
+            --registry localhost:5002 \
+            --kubectl-version "$ARES_KUBECTL_VERSION" \
+            --evidence kubernetes-http-e2e-evidence.json
+      - name: Publish live evidence
+        if: always()
+        run: |
+          set +e
+          if [ -f kubernetes-http-e2e-evidence.json ]; then
+            {
+              echo '### Phase 8.6-A real deployment-service to Kind evidence'
+              echo '```json'
+              cat kubernetes-http-e2e-evidence.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f /tmp/ares-k8s-http-service.log ]; then
+            {
+              echo '<details><summary>deployment-service logs</summary>'
+              echo '```'
+              tail -c 20000 /tmp/ares-k8s-http-service.log
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Tear down the cluster
+        if: always()
+        run: kind delete cluster --name ares-http-e2e || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kubernetes-http-e2e-evidence
+          path: devops-ai-platform/kubernetes-http-e2e-evidence.json
+          if-no-files-found: warn
+
   api-gateway:
     name: API gateway checks
     runs-on: ubuntu-latest

@@ -300,3 +300,47 @@ def test_sa_token_posture_alone_changes_the_workload_identity(monkeypatch):
     assert strict.workload_identity_policy() != relaxed.workload_identity_policy(), \
         "enabling service-account tokens did not change the workload identity"
     assert strict.identity() != relaxed.identity()
+
+
+# ------------------------------------- Workstream B: the authoritative path
+
+def test_workstream_b_driver_never_instantiates_the_engine_or_runner():
+    """The §5 rule, enforced mechanically rather than by reading.
+
+    If this driver ever constructs the engine, the runner or the
+    sandbox directly, it stops proving the HTTP path and silently
+    becomes another unit test wearing an E2E's name.
+    """
+    import ast
+    import pathlib
+    source = pathlib.Path("e2e/kubernetes_service_http_kind_e2e.py").read_text()
+    tree = ast.parse(source)
+    forbidden = {"DeploymentEngine", "KubectlRunnerService", "ContainerKubectlSandbox",
+                 "KubernetesManifestPolicy", "build_run_plan"}
+    built = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id in forbidden
+    }
+    assert not built, (
+        f"the authoritative Workstream B driver constructs {sorted(built)} "
+        f"directly; it must reach the system only over HTTP")
+
+
+def test_workstream_b_driver_talks_http_to_the_real_service():
+    import pathlib
+    source = pathlib.Path("e2e/kubernetes_service_http_kind_e2e.py").read_text()
+    assert "/api/internal/deployments/dry-run" in source
+    assert "/approve" in source and "/execute" in source
+    assert "urllib.request" in source
+
+
+def test_workstream_b_driver_refuses_to_fake_a_cluster():
+    """A missing Kind control plane must abort, never degrade to a stub."""
+    import pathlib
+    source = pathlib.Path("e2e/kubernetes_service_http_kind_e2e.py").read_text()
+    assert "will not fake one" in source
+    for forbidden in ("stub_kubectl", "fake_cluster", "--dry-run=client",
+                      "--validate=false"):
+        assert forbidden not in source, f"{forbidden} appears on the authoritative path"
