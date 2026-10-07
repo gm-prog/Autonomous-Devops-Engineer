@@ -395,17 +395,29 @@ def check_same_network_peer(spec: KubectlSandboxSpec) -> None:
         ]
         out = subprocess.run(probe, capture_output=True, text=True, timeout=90)
         combined = f"{out.stdout}\n{out.stderr}".lower()
-        unreachable = ("no such host", "could not resolve", "i/o timeout",
-                       "connection refused", "no route to host",
-                       "network is unreachable", "context deadline")
+        # "connection refused" means the SYN REACHED the peer and was
+        # reset: that is reachability, not isolation. Only an absent
+        # route or an unresolvable name proves the peer cannot be
+        # addressed. Classifying a refusal as "blocked" would be a
+        # probe that cannot observe its own property.
+        isolated = ("no such host", "could not resolve", "i/o timeout",
+                    "no route to host", "network is unreachable",
+                    "context deadline")
+        reachable = ("connection refused", "connection reset",
+                     "tls", "x509", "server gave http response")
         prompted = "please enter username" in combined
-        denied = (out.returncode != 0 and not prompted
-                  and any(m in combined for m in unreachable))
+        was_reachable = any(m in combined for m in reachable)
+        denied = (out.returncode != 0 and not prompted and not was_reachable
+                  and any(m in combined for m in isolated))
         if prompted:
             combined += " [PROBE DEFECT: kubectl prompted instead of connecting]"
+        if was_reachable:
+            combined += (" [PEER REACHABLE: the connection was answered or reset, "
+                         "so the co-tenant is addressable from the sandbox]")
         record("network:same-network-peer-not-reachable",
                "a co-tenant on the sandbox network is unreachable",
-               f"exit={out.returncode} detail={combined.strip()[:200]!r}",
+               f"exit={out.returncode} reachable={was_reachable} "
+               f"detail={combined.strip()[:220]!r}",
                denied)
     finally:
         subprocess.run(["docker", "rm", "-f", peer],

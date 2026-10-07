@@ -57,6 +57,59 @@ source, or the committed pins.
 
 ---
 
+## 2a. Named threats (Phase 8.6-A corrective)
+
+Each threat names the defence that closes it and the committed test that
+proves the attack is refused. Nothing here is claimed beyond what the
+named test executes.
+
+| # | Threat | Defence | Proof |
+|---|---|---|---|
+| T1 | Approval granted against cluster A is executed against cluster B | execution identity binds the API server; re-derived and compared before any mutation | `test_endpoint_switch_after_approval_is_refused`; live `identity:endpoint-switch-is-refused` |
+| T2 | The API endpoint is kept but the CA is swapped, enabling interception | CA fingerprint is part of the identity and may be pinned by host config | `test_ca_switch_after_approval_is_refused`, `test_pinned_ca_fingerprint_is_enforced` |
+| T3 | Execution moves to another namespace after approval | namespace is part of the identity, and the manifest may not choose its own | `test_namespace_switch_after_approval_is_refused`, `switch:namespace-declared-in-manifest` |
+| T4 | A different credential profile is used at execution | credential-profile identity is part of the identity | `test_credential_profile_switch_after_approval_is_refused` |
+| T5 | A weakened manifest policy inherits a stricter policy's approval | manifest-policy identity is part of the identity and of the plan hash | `test_manifest_policy_identity_switch_after_approval_is_refused` |
+| T6 | A mutation is executed with no approval bound at all | `verify_binding` fails closed when the approved identity is absent | `test_apply_without_an_approved_identity_is_refused` |
+| T7 | A workload reads an arbitrary Secret by mounting it | Secret references are deny-by-default against a host-owned allowlist, across volumes, projected sources, `env.valueFrom` and `envFrom` | `test_arbitrary_secret_volume_is_denied`, `test_env_secret_key_ref_is_denied`, `test_env_from_secret_ref_is_denied`, `test_projected_secret_volume_is_denied` |
+| T8 | A workload attaches an arbitrary PersistentVolumeClaim | PVC references are deny-by-default against a host-owned allowlist | `test_arbitrary_pvc_is_denied` |
+| T9 | A workload obtains a Kubernetes API identity via a projected service-account token | token projection is opt-in and off by default | `test_service_account_token_projection_is_denied` |
+| T10 | A workload runs as the ARES deployment identity and inherits deployment rights | the deployment service account is never a valid workload service account | `test_workload_running_as_the_deployment_identity_is_denied` |
+| T11 | A workload silently inherits the namespace default service-account token | `automountServiceAccountToken` must be explicitly present | `test_automount_must_be_explicit`, `test_automount_true_without_an_approved_workload_sa_is_denied` |
+| T12 | A reference escapes the execution namespace via a qualified name | names containing `/` or `:` are rejected; references resolve in the host-owned namespace only | `test_cross_namespace_secret_selection_is_denied` |
+
+### Component selection is not an escape hatch
+
+A deployment may declare that it contains no Kubernetes component. That
+is **not applicable**, not "skipped" and not "passed":
+
+- an unrequested component is never validated, planned or executed, and
+  no sandbox is invoked for it;
+- a **requested** component that is empty or invalid still fails, so
+  "not requested" and "requested but failed" cannot collapse;
+- supplying content for a component that was not requested is rejected
+  as a contradictory payload;
+- the selection is bound into the artifact hash, so a Terraform-only
+  approval can never later acquire a Kubernetes component;
+- the health gate is unchanged: a run with no deterministic health
+  signal never reaches `DEPLOYED`.
+
+When Kubernetes **is** requested, every control above remains mandatory.
+
+### Evidence provenance
+
+On a `pull_request` event `GITHUB_SHA` is the ephemeral merge commit,
+not the commit under review. Evidence therefore records three
+separately named commits — `head_sha`, `workflow_merge_sha` and
+`evidence_generation_commit` — alongside repository, branch, workflow
+run id and attempt, event name and `generated_at`. There is no bare
+`commit` or `proof_commit` field to misread, and an unresolvable value
+is empty rather than a plausible substitute. Artifacts are sealed with
+a `sha256sum -c` compatible sidecar so every digest is independently
+recomputable.
+
+---
+
 ## 3. Trust boundaries
 
 ```
