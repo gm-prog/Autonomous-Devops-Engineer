@@ -469,3 +469,78 @@ class TestCredentialProfileIdentity:
         assert "SUPER-SECRET" not in identity
         # and not a hash of the value either
         assert hashlib.sha256(b"AKIA-SUPER-SECRET-VALUE").hexdigest() not in identity
+
+
+# =====================================================================
+# 23 — sandbox identity overrides must be workable, not merely non-root
+# =====================================================================
+
+
+class TestSandboxIdentityOverrides:
+    """A non-root control plane cannot chown, so an override to a
+    different identity would silently create an unwritable workspace."""
+
+    def test_matching_override_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("DEPLOYMENT_TERRAFORM_SANDBOX_UID", str(os.getuid()))
+        monkeypatch.setenv("DEPLOYMENT_TERRAFORM_SANDBOX_GID", str(os.getgid()))
+        assert sandbox_runtime_identity() == (os.getuid(), os.getgid())
+
+    @pytest.mark.skipif(os.getuid() == 0, reason="requires a non-root test runner")
+    @pytest.mark.parametrize("uid,gid", [("65532", None), (None, "65532")])
+    def test_mismatching_override_fails_closed(self, monkeypatch, uid, gid):
+        if uid:
+            monkeypatch.setenv("DEPLOYMENT_TERRAFORM_SANDBOX_UID", uid)
+        if gid:
+            monkeypatch.setenv("DEPLOYMENT_TERRAFORM_SANDBOX_GID", gid)
+        with pytest.raises(TerraformSandboxConfigurationError) as err:
+            sandbox_runtime_identity()
+        assert "cannot give the sandbox ownership" in str(err.value)
+
+    @pytest.mark.parametrize(
+        "var", ["DEPLOYMENT_TERRAFORM_SANDBOX_UID", "DEPLOYMENT_TERRAFORM_SANDBOX_GID"]
+    )
+    @pytest.mark.parametrize("value", ["0", "-1", "1.5", "abc", "  "])
+    def test_root_or_malformed_values_are_refused(self, monkeypatch, var, value):
+        monkeypatch.setenv(var, value)
+        if value.strip() == "":
+            # blank means "unset"; it must fall back, never crash
+            assert sandbox_runtime_identity()[0] != 0
+            return
+        with pytest.raises(TerraformSandboxConfigurationError):
+            sandbox_runtime_identity()
+
+    def test_workspace_owner_always_equals_the_sandbox_identity(self):
+        _, run = _approved()
+        uid, gid = sandbox_runtime_identity()
+        info = os.stat(_workspace_of(run))
+        assert (info.st_uid, info.st_gid) == (uid, gid)
+
+
+# =====================================================================
+# 29 — the control-plane image must never regain a terraform binary
+# =====================================================================
+
+
+class TestControlPlaneImageContract:
+    @staticmethod
+    def _dockerfile():
+        from pathlib import Path as _P
+
+        return (
+            _P(__file__).resolve().parents[2] / "deployment_service" / "Dockerfile.e2e"
+        ).read_text(encoding="utf-8")
+
+    def test_image_does_not_install_terraform(self):
+        body = self._dockerfile()
+        assert "releases.hashicorp.com/terraform" not in body, (
+            "the trusted control plane must not carry a terraform binary"
+        )
+
+    def test_image_installs_the_docker_cli(self):
+        assert "docker-ce-cli" in self._dockerfile()
+
+    def test_image_build_asserts_terraform_is_absent(self):
+        """A comment is not a control; the build must actually fail."""
+        body = " ".join(self._dockerfile().split())
+        assert "command -v terraform" in body
+        assert "exit 1" in body

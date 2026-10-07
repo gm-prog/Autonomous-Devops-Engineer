@@ -662,11 +662,23 @@ def sandbox_runtime_identity() -> tuple[int, int]:
     current_uid = os.getuid()
     current_gid = os.getgid()
     if current_uid != 0:
-        # Non-root control plane: match it, unless explicitly overridden.
-        return (
-            _configured(SANDBOX_UID_VAR, current_uid),
-            _configured(SANDBOX_GID_VAR, current_gid),
-        )
+        # Non-root control plane. It cannot chown, so the workspace it
+        # creates is owned by ITS identity. An override to any other
+        # identity would produce a workspace the sandbox cannot write --
+        # and the failure would surface later, as an inscrutable
+        # Terraform error, long after the misconfiguration. Refuse it
+        # here instead, where the cause is obvious.
+        uid = _configured(SANDBOX_UID_VAR, current_uid)
+        gid = _configured(SANDBOX_GID_VAR, current_gid)
+        if (uid, gid) != (current_uid, current_gid):
+            raise TerraformSandboxConfigurationError(
+                f"{SANDBOX_UID_VAR}/{SANDBOX_GID_VAR} request {uid}:{gid}, but "
+                f"an unprivileged control plane ({current_uid}:{current_gid}) "
+                "cannot give the sandbox ownership of the workspace. Run the "
+                "control plane as root to delegate a dedicated identity, or "
+                "drop the override."
+            )
+        return (uid, gid)
     return (
         _configured(SANDBOX_UID_VAR, DEFAULT_SANDBOX_UID),
         _configured(SANDBOX_GID_VAR, DEFAULT_SANDBOX_GID),

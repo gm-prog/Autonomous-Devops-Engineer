@@ -79,13 +79,11 @@ jobs:
           python scripts/mutation_probe_terraform_boundary.py \
             | tee -a "$GITHUB_STEP_SUMMARY"
 
-  terraform-sandbox-live-e2e:
-    name: Phase 8.5-A live terraform sandbox E2E
+  terraform-sandbox-container-e2e:
+    name: Phase 8.5-A containerized deployment-service E2E
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: devops-ai-platform } }
     services:
-      # Local registry so the sandbox image gets a REAL immutable digest
-      # from a registry rather than a hand-written one.
       registry:
         image: registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
         ports: ["5001:5000"]
@@ -99,35 +97,45 @@ jobs:
           set -euo pipefail
           docker --version
           docker info --format 'daemon: {{.ServerVersion}}'
-      - name: Live Terraform execution trust boundary proof
+      - name: Validate the E2E compose topology
+        working-directory: .
+        run: |
+          set -euo pipefail
+          # The authoritative live topology lives in the E2E overlay, so
+          # validate THAT, not only the default compose file.
+          E2E_PYTHON_BASE_IMAGE=python@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce \
+          REMEDIATION_SANDBOX_IMAGE=placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+          TERRAFORM_SANDBOX_IMAGE=placeholder@sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+          docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml config >/dev/null
+          echo "E2E compose topology is valid" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Containerized deployment-service trust boundary proof
         env:
-          PYTHONPATH: .
-          # The committed, digest-pinned base (e2e/pinned-images.txt).
           E2E_PYTHON_BASE_IMAGE: python@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
         run: |
           set -euo pipefail
-          python e2e/terraform_sandbox_live.py \
+          python e2e/terraform_sandbox_container_e2e.py \
             --registry localhost:5001 \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \
             --terraform-version 1.9.8 \
-            --evidence terraform-sandbox-live-evidence.json
+            --workspace-root /tmp/ares-e2e-tf-workspaces \
+            --evidence terraform-container-e2e-evidence.json
       - name: Publish evidence
         if: always()
         run: |
           set -euo pipefail
-          if [ -f terraform-sandbox-live-evidence.json ]; then
+          if [ -f terraform-container-e2e-evidence.json ]; then
             {
-              echo '### Live Terraform sandbox evidence'
+              echo '### Containerized deployment-service E2E evidence'
               echo '```json'
-              cat terraform-sandbox-live-evidence.json
+              cat terraform-container-e2e-evidence.json
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: terraform-sandbox-live-evidence
-          path: devops-ai-platform/terraform-sandbox-live-evidence.json
+          name: terraform-container-e2e-evidence
+          path: devops-ai-platform/terraform-container-e2e-evidence.json
           if-no-files-found: warn
 
   api-gateway:
