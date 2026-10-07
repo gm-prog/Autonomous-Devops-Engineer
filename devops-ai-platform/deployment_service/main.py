@@ -122,6 +122,20 @@ class ExecuteRequest(BaseModel):
         return _validate_components(value)
 
 
+class RollbackRequest(BaseModel):
+    """Approval-bound rollback. Deliberately carries no capability.
+
+    There is no workload name, revision or kubectl flag here: those are
+    derived from the approved artifact and the host-owned configuration,
+    so this endpoint cannot be turned into a general cluster-mutation
+    primitive.
+    """
+
+    artifact_hash: str = Field(min_length=64, max_length=64)
+    plan_hash: str = Field(min_length=64, max_length=64)
+    namespace: str = ""
+
+
 @app.get("/health")
 def health():
     return {"status": "healthy", "service": "deployment-service", "version": "2.0.0",
@@ -167,5 +181,21 @@ def approve(run_id: str, request: ApprovalRequest):
 def execute(run_id: str, request: ExecuteRequest):
     try:
         return engine.execute(run_id, request.model_dump(), request.artifact_hash, request.plan_hash, request.namespace, request.healthcheck_url, request.previous_good_terraform_tf).to_dict()
+    except DeploymentActionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/internal/deployments/{run_id}/rollback")
+def rollback(run_id: str, request: RollbackRequest):
+    """Approval-bound rollback of an executed Kubernetes deployment.
+
+    A mutation, so it is granted nothing that execute was not: the same
+    approval hashes, the same host-owned namespace check and the same
+    approval-bound execution identity. The request carries no workload
+    name, no revision and no kubectl argument -- those come from the
+    approved artifact.
+    """
+    try:
+        return engine.rollback(run_id, request.artifact_hash, request.plan_hash, request.namespace).to_dict()
     except DeploymentActionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

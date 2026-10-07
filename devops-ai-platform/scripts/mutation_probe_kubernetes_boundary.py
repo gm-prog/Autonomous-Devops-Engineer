@@ -43,6 +43,8 @@ ADAPTER = "deployment_service/infrastructure/sandbox/container_kubectl_sandbox.p
 
 BOUNDARY_TESTS = "deployment_service/tests/test_kubernetes_trust_boundary.py"
 NETWORK_TESTS = "deployment_service/tests/test_sandbox_network_isolation.py"
+ENGINE_TESTS = "deployment_service/tests/test_kubernetes_only_execution_path.py"
+ENGINE = "deployment_service/application/services/deployment_engine.py"
 
 
 class MutationNotApplied(RuntimeError):
@@ -512,6 +514,126 @@ PROBES: list[Probe] = [
                 '            f"namespace={self.namespace}",',
                 'f"sa_tokens=",\n            f"namespace={self.namespace}",'),
         tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    # ---- Phase 8.6-A final corrective: the destination-isolated
+    # ---- network, the configuration snapshot and the application path
+    Probe(
+        "sandbox-reads-peers-from-the-environment",
+        "re-read the approved destinations at execution time (TOCTOU)",
+        replace(ADAPTER,
+                "        if not self._approved_peers:",
+                "        from deployment_service.infrastructure.sandbox."
+                "kubernetes_sandbox_network import approved_peers_from_environment\n"
+                "        self._approved_peers = approved_peers_from_environment()\n"
+                "        if not self._approved_peers:"),
+        tests=[NETWORK_TESTS],
+    ),
+    Probe(
+        "sandbox-launches-without-a-destination",
+        "treat 'no approved destination' as a licence to launch",
+        replace(ADAPTER,
+                '        if not self._approved_peers:\n'
+                '            raise KubectlSandboxPolicyViolation(\n'
+                '                "no approved sandbox destination is configured, so network "\n'
+                '                "membership cannot be proven; refusing to launch the sandbox "\n'
+                '                "onto an unverified network"\n'
+                '            )',
+                "        if not self._approved_peers:\n"
+                "            self._verify_network = False"),
+        tests=[NETWORK_TESTS],
+    ),
+    Probe(
+        "network-exempt-any-sandbox-lookalike",
+        "exempt any container whose name starts with the sandbox prefix",
+        replace(NETWORK,
+                "if m not in permitted and not _TRANSIENT_SANDBOX.match(m)]",
+                'if m not in permitted and not m.startswith("ares-kubectl-")]'),
+        tests=[NETWORK_TESTS],
+    ),
+    Probe(
+        "snapshot-drops-the-approved-destinations",
+        "stop binding the approved destination set into the snapshot",
+        replace(IDENTITY, '"sandbox_peers": list(self.sandbox_peers),',
+                '"sandbox_peers": [],'),
+        tests=[NETWORK_TESTS],
+    ),
+    Probe(
+        "terraform-leg-runs-when-not-declared",
+        "send a Kubernetes-only deployment to the Terraform sandbox",
+        replace(ENGINE,
+                "            if not self._terraform_is_declared(effective_payload):",
+                "            if False and not self._terraform_is_declared("
+                "effective_payload):"),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "requested-kubernetes-becomes-not-applicable",
+        "report a requested Kubernetes component as not applicable",
+        replace(ENGINE,
+                'return (result or {}).get("status") in ("PASS", "NOT_APPLICABLE")\n\n'
+                '    @staticmethod\n    def _kubernetes_not_applicable',
+                'return True\n\n    @staticmethod\n    def _kubernetes_not_applicable'),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "applied-manifest-may-differ-from-approved",
+        "let a manifest that changed after approval deploy successfully",
+        replace(ENGINE,
+                "                    and applied_manifest_hash != approved_manifest_hash):",
+                "                    and False):"),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "kubernetes-applied-when-not-applicable",
+        "count a not-applicable Kubernetes leg as an applied mutation",
+        replace(ENGINE,
+                'kubernetes_declared and kubernetes_apply.get("status") == "PASS")',
+                'kubernetes_apply.get("status") in ("PASS", "NOT_APPLICABLE"))'),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "rollback-accepts-unapproved-hashes",
+        "roll back without the approval's hashes",
+        replace(ENGINE,
+                '        if run.approval.get("artifact_hash") != artifact_hash \\\n'
+                '                or run.approval.get("plan_hash") != plan_hash:\n'
+                '            raise DeploymentActionError(\n'
+                '                "Rollback hashes do not match the approval record.")',
+                "        pass"),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "rollback-without-an-approved-identity",
+        "roll back against a target the approval never named",
+        replace(ENGINE,
+                '        if approved_identity is None:\n'
+                '            raise DeploymentActionError(\n'
+                '                "No approved Kubernetes execution identity is bound to this "\n'
+                '                "run; refusing to roll back against an unidentified target.")',
+                "        pass"),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "rollback-may-guess-the-workload",
+        "let a rollback invent its own target",
+        replace(ENGINE,
+                '        if not workloads:\n'
+                '            raise DeploymentActionError(\n'
+                '                "The approved artifact records no Kubernetes workload; "\n'
+                '                "refusing to guess what to roll back.")',
+                '        workloads = workloads or ["checkout-service"]'),
+        tests=[ENGINE_TESTS],
+    ),
+    Probe(
+        "rollback-needs-no-applied-mutation",
+        "roll back a deployment that never mutated the cluster",
+        replace(ENGINE,
+                '        if not run.execution.get("kubernetes_applied"):\n'
+                '            raise DeploymentActionError(\n'
+                '                "This run applied no Kubernetes mutation, so there is "\n'
+                '                "nothing to roll back.")',
+                "        pass"),
+        tests=[ENGINE_TESTS],
     ),
 ]
 

@@ -270,11 +270,14 @@ def test_sandbox_refuses_to_execute_on_an_unverifiable_network(monkeypatch, tmp_
     from deployment_service.infrastructure.sandbox.container_kubectl_sandbox import (
         ContainerKubectlSandbox,
     )
-    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "ares-e2e-control-plane")
     spec = KubectlSandboxSpec(
         image="registry.local/kubectl@sha256:" + "a" * 64,
         network="ares-k8s-x-000000000000", kubectl_version="v1.31.4")
-    sandbox = ContainerKubectlSandbox(spec, staging_root=str(tmp_path))
+    # The approved destinations are handed in by the caller that holds
+    # the immutable snapshot -- never re-read from the environment here.
+    sandbox = ContainerKubectlSandbox(
+        spec, staging_root=str(tmp_path),
+        approved_peers=("ares-e2e-control-plane",))
     launched = []
     with mock.patch("subprocess.run", side_effect=lambda *a, **k: launched.append(a)):
         with _patch(None, returncode=1):
@@ -344,3 +347,97 @@ def test_workstream_b_driver_refuses_to_fake_a_cluster():
     for forbidden in ("stub_kubectl", "fake_cluster", "--dry-run=client",
                       "--validate=false"):
         assert forbidden not in source, f"{forbidden} appears on the authoritative path"
+
+
+# --------------------------------- Workstream A/C: the production adapter
+# These drive ContainerKubectlSandbox itself, because a rule that only
+# holds in validate_network() and is never reached from the adapter is
+# not a control.
+
+def _sandbox_spec():
+    from deployment_service.application.services.kubectl_sandbox import (
+        KubectlSandboxSpec,
+    )
+    return KubectlSandboxSpec(
+        image="registry.local/kubectl@sha256:" + "a" * 64,
+        network=SANDBOX_NET, kubectl_version="v1.31.4")
+
+
+def _apply_step():
+    from deployment_service.application.services.kubectl_sandbox import (
+        KubectlOperation, KubectlSandboxStep,
+    )
+    return KubectlSandboxStep(
+        operation=KubectlOperation.APPLY,
+        argv=("kubectl", "apply", "-f", "/workspace/deployment.yaml"),
+        timeout_seconds=120)
+
+
+def test_the_adapter_refuses_to_launch_with_no_approved_destination(monkeypatch, tmp_path):
+    """No configured destination => membership is unprovable => no launch."""
+    from deployment_service.application.services.kubectl_sandbox import (
+        KubectlSandboxPolicyViolation,
+    )
+    from deployment_service.infrastructure.sandbox.container_kubectl_sandbox import (
+        ContainerKubectlSandbox,
+    )
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "")
+    sandbox = ContainerKubectlSandbox(_sandbox_spec(), staging_root=str(tmp_path))
+    launched = []
+    with mock.patch("subprocess.run", side_effect=lambda *a, **k: launched.append(a)):
+        with pytest.raises(KubectlSandboxPolicyViolation, match="cannot be proven"):
+            sandbox.execute(_apply_step(), manifest_yaml="kind: Deployment\n",
+                            kubeconfig_yaml="apiVersion: v1\n", namespace="ns")
+    assert launched == [], "the sandbox was launched without a verified network"
+
+
+def test_the_adapter_validates_the_snapshot_and_not_the_environment(monkeypatch, tmp_path):
+    """TOCTOU: the environment cannot redirect the membership check."""
+    from deployment_service.infrastructure.sandbox.container_kubectl_sandbox import (
+        ContainerKubectlSandbox,
+    )
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "attacker-peer")
+    sandbox = ContainerKubectlSandbox(
+        _sandbox_spec(), staging_root=str(tmp_path),
+        approved_peers=(PEER,))
+    launched = []
+    with _patch(_inspection()):
+        with mock.patch("subprocess.run",
+                        side_effect=lambda *a, **k: launched.append(a) or mock.Mock(
+                            returncode=0, stdout=b"", stderr=b"")):
+            result = sandbox.execute(_apply_step(), manifest_yaml="kind: Deployment\n",
+                                     kubeconfig_yaml="apiVersion: v1\n", namespace="ns")
+    assert result.exit_code == 0
+    assert launched, "the sandbox should have run once the snapshot validated"
+
+
+def test_a_container_that_only_looks_like_a_sandbox_is_not_exempt():
+    with _patch(_inspection(members=(PEER, "ares-kubectl-evil"))):
+        with pytest.raises(KubernetesSandboxNetworkError, match="co-tenant"):
+            validate_network(SANDBOX_NET, approved_identity=None,
+                             approved_peers=[PEER])
+
+
+def test_the_exact_sandbox_container_shape_is_the_only_exemption():
+    with _patch(_inspection(members=(PEER, "ares-kubectl-0123456789ab"))):
+        validate_network(SANDBOX_NET, approved_identity=None, approved_peers=[PEER])
+
+
+def test_the_config_snapshot_carries_the_approved_destinations(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "b-peer,a-peer , a-peer")
+    snapshot = KubernetesExecutionConfig.from_environment()
+    assert snapshot.sandbox_peers == ("a-peer", "b-peer")
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "moved-after-approval")
+    assert snapshot.sandbox_peers == ("a-peer", "b-peer"), \
+        "the snapshot was re-read from the environment"
+
+
+def test_the_snapshot_digest_covers_the_approved_destinations():
+    import dataclasses
+    base = KubernetesExecutionConfig(
+        namespace="ns", kubeconfig_path="/k", credential_profile_id="p",
+        expected_api_server="https://a:6443", expected_ca_fingerprint="ab" * 32,
+        sandbox_network="n", sandbox_network_identity="net-v1:aa",
+        container_runtime="docker", sandbox_peers=("peer-a",))
+    other = dataclasses.replace(base, sandbox_peers=("peer-a", "peer-b"))
+    assert base.digest() != other.digest(), "approved peers are not bound"

@@ -143,6 +143,12 @@ class KubectlRunnerService:
             load_spec_from_environment(),
             runtime=self._config.container_runtime,
             staging_root=self._config.staging_root or None,
+            # Workstream C: the approved network identity and the
+            # approved destination set come from the ONE immutable
+            # snapshot this runner was built with -- not from a second
+            # environment read at execution time.
+            approved_network_identity=self._config.sandbox_network_identity or None,
+            approved_peers=self._config.sandbox_peers,
         )
         self._sandbox = sandbox
         return sandbox

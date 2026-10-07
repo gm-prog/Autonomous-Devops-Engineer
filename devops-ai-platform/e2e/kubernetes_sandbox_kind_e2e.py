@@ -895,6 +895,10 @@ def main() -> int:
         sandbox_network = exec_network.name
         os.environ["DEPLOYMENT_KUBECTL_SANDBOX_NETWORK"] = sandbox_network
         os.environ["DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY"] = network_identity.digest()
+        # Host-owned destination set. The sandbox re-validates membership
+        # against exactly this set immediately before every launch, and
+        # refuses to run at all when no destination is declared.
+        os.environ["DEPLOYMENT_K8S_SANDBOX_PEERS"] = ",".join(approved_peers)
         notice(f"8.6-A network: {sandbox_network} "
                f"identity={network_identity.digest()} "
                f"internal={network_identity.internal} "
@@ -922,7 +926,12 @@ def main() -> int:
         os.environ["DEPLOYMENT_KUBERNETES_NAMESPACE"] = NAMESPACE
         os.environ["DEPLOYMENT_K8S_SERVICE_ACCOUNT"] = "default"
 
-        sandbox = ContainerKubectlSandbox(spec, staging_root=str(workdir))
+        sandbox = ContainerKubectlSandbox(
+            spec,
+            staging_root=str(workdir),
+            approved_network_identity=network_identity.digest(),
+            approved_peers=tuple(approved_peers),
+        )
         runner = KubectlRunnerService(sandbox=sandbox)
 
         sanitized = sanitize_kubeconfig(deployer_kubeconfig(fixture),

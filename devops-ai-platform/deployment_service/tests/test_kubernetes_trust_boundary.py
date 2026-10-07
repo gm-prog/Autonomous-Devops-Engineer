@@ -716,7 +716,9 @@ def test_absent_manifest_is_not_applicable_rather_than_allowed():
     assert DeploymentEngine._kubernetes_is_declared({"k8s_yaml": ""}) is False
     assert DeploymentEngine._kubernetes_is_declared({"k8s_yaml": "   \n"}) is False
     skipped = DeploymentEngine._kubernetes_not_applicable()
-    assert skipped["status"] == "SKIPPED"
+    assert skipped["status"] == "NOT_APPLICABLE"
+    assert skipped["status"] != "PASS", \
+        "not-applicable is a distinct outcome, never a success"
     assert skipped["cluster_access"] is False
 
 
@@ -743,7 +745,7 @@ def test_skipping_cannot_be_reached_with_a_manifest_present(tmp_path, monkeypatc
     sandbox = RecordingSandbox()
     result = KubectlRunnerService(sandbox=sandbox).apply(str(manifest))
     assert result["status"] == "BLOCKED"
-    assert result["status"] != "SKIPPED"
+    assert result["status"] not in ("SKIPPED", "NOT_APPLICABLE")
 
 
 # =====================================================================
@@ -1153,3 +1155,60 @@ def test_execution_identity_evidence_includes_the_new_fields(bound):
     assert "network_identity" in body
     assert "workload_identity_policy" in body
     assert body["workload_identity_policy"].startswith("kubernetes-workload-identity-v1:")
+
+
+def test_sandbox_policy_switch_after_approval_is_refused(bound, monkeypatch):
+    """A different sandbox image is a different trust boundary.
+
+    The sandbox policy identity (image, kubectl version, user, network,
+    limits, operation set) participates in the execution identity, so a
+    service that comes back with a weaker sandbox must not inherit an
+    approval granted under a stronger one.
+    """
+    from deployment_service.application.services.kubectl_sandbox import (
+        load_spec_from_environment, sandbox_policy_identity,
+    )
+
+    class SpecHonestSandbox(RecordingSandbox):
+        """Derives its policy identity from the real host configuration."""
+
+        def policy_identity(self, namespace):
+            return sandbox_policy_identity(load_spec_from_environment(), namespace)
+
+    runner, _, manifest, _ = bound
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_SANDBOX_IMAGE",
+                       "registry.local/kubectl@sha256:" + "a" * 64)
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_VERSION", "v1.31.4")
+    approved = KubectlRunnerService(sandbox=SpecHonestSandbox()).execution_identity()
+
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_SANDBOX_IMAGE",
+                       "registry.invalid/kubectl@sha256:" + "c" * 64)
+    fresh = SpecHonestSandbox()
+    result = KubectlRunnerService(sandbox=fresh).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert "sandbox_policy" in result["stderr"] or "changed after approval" in result["stderr"]
+    assert fresh.calls == [], "a weakened sandbox policy reached the cluster"
+
+
+def test_sandbox_runtime_user_change_after_approval_is_refused(bound, monkeypatch):
+    """Running the sandbox as root is a different execution posture."""
+    from deployment_service.application.services.kubectl_sandbox import (
+        load_spec_from_environment, sandbox_policy_identity,
+    )
+
+    class SpecHonestSandbox(RecordingSandbox):
+        def policy_identity(self, namespace):
+            return sandbox_policy_identity(load_spec_from_environment(), namespace)
+
+    runner, _, manifest, _ = bound
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_SANDBOX_IMAGE",
+                       "registry.local/kubectl@sha256:" + "a" * 64)
+    approved = KubectlRunnerService(sandbox=SpecHonestSandbox()).execution_identity()
+
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_SANDBOX_USER", "0:0")
+    fresh = SpecHonestSandbox()
+    result = KubectlRunnerService(sandbox=fresh).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert fresh.calls == []

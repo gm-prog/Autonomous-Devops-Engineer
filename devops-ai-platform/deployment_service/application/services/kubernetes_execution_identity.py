@@ -25,7 +25,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 IDENTITY_VERSION = "kubernetes-execution-identity-v1"
 
@@ -128,6 +128,10 @@ class KubernetesExecutionConfig:
     sandbox_network: str
     sandbox_network_identity: str
     container_runtime: str
+    #: The ONLY destinations the sandbox may reach. Host-owned, read in
+    #: the same single pass as everything else so an execution cannot
+    #: validate membership against a set that changed after approval.
+    sandbox_peers: Tuple[str, ...] = ()
     #: Where the adapter stages manifests and credentials. When the
     #: control plane itself runs in a container this MUST be a path the
     #: daemon also sees at the same absolute location, or the sandbox's
@@ -155,6 +159,13 @@ class KubernetesExecutionConfig:
                 "DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY", "").strip(),
             container_runtime=(os.getenv("DEPLOYMENT_CONTAINER_RUNTIME", "").strip()
                                or "docker"),
+            # A canonical set: sorted and de-duplicated, so a repeated
+            # name cannot change the identity or the membership check.
+            sandbox_peers=tuple(sorted({
+                peer.strip()
+                for peer in os.getenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "").split(",")
+                if peer.strip()
+            })),
             staging_root=os.getenv("DEPLOYMENT_KUBECTL_STAGING_ROOT", "").strip(),
         )
 
@@ -172,6 +183,7 @@ class KubernetesExecutionConfig:
             "sandbox_network": self.sandbox_network,
             "sandbox_network_identity": self.sandbox_network_identity,
             "container_runtime": self.container_runtime,
+            "sandbox_peers": list(self.sandbox_peers),
             "staging_root": self.staging_root,
         }
 

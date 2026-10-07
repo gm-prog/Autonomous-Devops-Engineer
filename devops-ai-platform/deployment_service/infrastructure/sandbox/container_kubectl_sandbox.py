@@ -20,7 +20,7 @@ import subprocess  # noqa: S404 - trusted adapter; see module docstring
 import tempfile
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from deployment_service.application.services.kubectl_sandbox import (
     KUBERC_DENY_ALL,
@@ -88,6 +88,8 @@ class ContainerKubectlSandbox:
         runtime: str = "docker",
         staging_root: Optional[str] = None,
         verify_network: bool = True,
+        approved_network_identity: Optional[str] = None,
+        approved_peers: Sequence[str] = (),
     ) -> None:
         self._spec = spec
         if runtime not in ("docker", "podman"):
@@ -95,10 +97,15 @@ class ContainerKubectlSandbox:
         self._runtime = runtime
         self._staging_root = staging_root or tempfile.gettempdir()
         self._verify_network = verify_network
-        # The network identity captured at approval, if the host
-        # published one. A mismatch at execution time is fatal.
-        self._approved_network_digest = os.getenv(
-            "DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY", "").strip() or None
+        # Workstream C (TOCTOU): the approved network identity and the
+        # approved destination set are handed in by the caller that
+        # already holds the immutable snapshot. They are deliberately NOT
+        # re-read from the environment here: a value read again at
+        # execution time could have moved since the approval it is
+        # supposed to describe.
+        self._approved_network_digest = (
+            (approved_network_identity or "").strip() or None)
+        self._approved_peers = tuple(p.strip() for p in approved_peers if p.strip())
 
     @property
     def spec(self) -> KubectlSandboxSpec:
@@ -108,22 +115,30 @@ class ContainerKubectlSandbox:
         return sandbox_policy_identity(self._spec, namespace)
 
     def _validate_network(self) -> None:
-        """Fail closed unless the destination network is still as approved."""
+        """Fail closed unless the destination network is still as approved.
+
+        Membership is not optional. Without a host-declared destination
+        set there is nothing to compare observed members against, so
+        "no peers configured" is a configuration error, not a licence to
+        launch on whatever happens to be attached.
+        """
         if not self._verify_network:
             return
         from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import (
             KubernetesSandboxNetworkError,
-            approved_peers_from_environment,
             validate_network,
         )
-        peers = approved_peers_from_environment()
-        if not peers:
-            return
+        if not self._approved_peers:
+            raise KubectlSandboxPolicyViolation(
+                "no approved sandbox destination is configured, so network "
+                "membership cannot be proven; refusing to launch the sandbox "
+                "onto an unverified network"
+            )
         try:
             validate_network(
                 self._spec.network,
                 approved_identity=None,
-                approved_peers=peers,
+                approved_peers=self._approved_peers,
                 approved_digest=self._approved_network_digest,
                 runtime=self._runtime,
             )

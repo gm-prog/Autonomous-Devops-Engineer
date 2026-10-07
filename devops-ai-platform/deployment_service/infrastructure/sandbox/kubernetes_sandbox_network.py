@@ -43,6 +43,12 @@ ALLOWED_DRIVERS = ("bridge",)
 
 _NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
 
+#: The exact shape of the sandbox containers this system launches
+#: (``ares-kubectl-<12 hex>``). Only that shape is exempt from the
+#: co-tenant check, so a container called ``ares-kubectl-something``
+#: cannot borrow the exemption just by starting with the right prefix.
+_TRANSIENT_SANDBOX = re.compile(r"^ares-kubectl-[0-9a-f]{12}$")
+
 
 class KubernetesSandboxNetworkError(Exception):
     """Raised when the sandbox network is not provably isolated."""
@@ -182,7 +188,7 @@ def validate_network(
     members = observed_members(raw)
     permitted = set(approved_peers) | set(allow_transient_members)
     unexpected = [m for m in members
-                  if m not in permitted and not m.startswith("ares-kubectl-")]
+                  if m not in permitted and not _TRANSIENT_SANDBOX.match(m)]
     if unexpected:
         raise KubernetesSandboxNetworkError(
             f"network {name!r} carries unapproved co-tenant(s) {unexpected}; "

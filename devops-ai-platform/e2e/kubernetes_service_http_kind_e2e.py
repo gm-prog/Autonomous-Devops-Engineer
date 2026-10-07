@@ -191,6 +191,15 @@ subjects:
     return "ares-deployer"
 
 
+def server_version(cluster: str) -> str:
+    """The server version the cluster itself reports (observed, not asked)."""
+    out = sh(["kubectl", "--context", f"kind-{cluster}", "get", "--raw", "/version"])
+    try:
+        return str(json.loads(out.stdout).get("gitVersion", ""))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def build_sanitized_kubeconfig(cluster: str, control_plane: str,
                                service_account: str) -> Tuple[Path, str, str]:
     """A token-bound kubeconfig for the least-privilege SA.
@@ -372,6 +381,36 @@ def k8s_dry(result: dict) -> dict:
     return result.get("kubernetes_dry_run") or {}
 
 
+#: Pod-template annotation used to create a second revision, so that a
+#: rollback has a previous revision to restore. A revision only changes
+#: when the pod template changes; scaling does not create one.
+ROLLBACK_ANNOTATION_KEY = "ares-e2e/rollback-proof"
+
+
+def manifest_with_second_revision(manifest: str) -> str:
+    """The same workload with a new pod-template annotation (revision 2)."""
+    marker = "    metadata:\n      labels:\n        app: checkout-service\n    spec:"
+    assert marker in manifest, "the fixture manifest changed shape"
+    return manifest.replace(
+        marker,
+        "    metadata:\n      labels:\n        app: checkout-service\n"
+        f"      annotations:\n        {ROLLBACK_ANNOTATION_KEY}: v2\n    spec:",
+        1,
+    )
+
+
+def revision_annotation(cluster: str) -> str:
+    """The rollback-proof annotation currently on the live pod template."""
+    got = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", WORKLOAD_NAME,
+                  "-o", f"jsonpath={{.spec.template.metadata.annotations['{ROLLBACK_ANNOTATION_KEY}']}}")
+    return got.stdout.strip()
+
+
+#: REQUESTED vs OBSERVED, kept apart on purpose. A configured value
+#: proves intent; only an observed value proves behaviour.
+OBSERVATIONS: Dict[str, Any] = {"requested": {}, "observed": {}}
+
+
 # ---------------------------------------------------------------- the proof
 
 def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
@@ -430,14 +469,28 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
            f"status={code} state={executed.get('state')} "
            f"kubernetes={json.dumps(applied)[:220]}",
            code in (200, 201) and applied.get("status") == "PASS")
+    OBSERVATIONS["observed"]["execution_identity"] = identity
+    OBSERVATIONS["observed"]["sandbox_policy_identity"] = (
+        applied.get("sandbox_policy_identity") or leg.get("sandbox_policy_identity") or "")
+    OBSERVATIONS["observed"]["replanned_after_approval"] = executed.get(
+        "replanned_after_approval",
+        applied.get("replanned_after_approval"))
 
     # ---- 13. approved manifest == applied manifest ----
-    approved_hash = identity.get("approved_manifest_hash") or dry.get("artifact_hash")
-    applied_hash = (applied.get("applied_manifest_hash")
-                    or executed.get("artifact_hash"))
+    # Compared as MANIFEST hashes (the canonical bytes the manifest
+    # policy derives at each step), not as artifact hashes: the artifact
+    # hash covers the whole payload, while these two cover the exact
+    # manifest that was validated and the exact manifest that reached
+    # the API server.
+    approved_hash = (applied.get("approved_manifest_hash")
+                     or leg.get("manifest_sha256") or "")
+    applied_hash = applied.get("applied_manifest_hash") or ""
+    OBSERVATIONS["observed"]["approved_manifest_hash"] = approved_hash
+    OBSERVATIONS["observed"]["applied_manifest_hash"] = applied_hash
     record("manifest:approved-equals-applied",
-           "the bytes approved are the bytes applied",
-           f"approved={str(approved_hash)[:20]} applied={str(applied_hash)[:20]}",
+           "the manifest bytes approved are the bytes applied",
+           f"approved_manifest={str(approved_hash)[:20]} "
+           f"applied_manifest={str(applied_hash)[:20]}",
            bool(approved_hash) and approved_hash == applied_hash)
     replanned = (executed.get("replanned_after_approval")
                  if "replanned_after_approval" in executed
@@ -459,6 +512,11 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
     record("cluster:rollout-converged", "the rollout reaches a ready state",
            f"rc={rollout.returncode} out={rollout.stdout.strip()[:140]!r} "
            f"err={rollout.stderr.strip()[:140]!r}", rollout.returncode == 0)
+    health = executed.get("health_check") or {}
+    record("health:service-side-verification-passed",
+           "the service's own post-deployment verification passed",
+           f"status={health.get('status')} detail={json.dumps(health)[:180]}",
+           health.get("status") == "PASS")
 
     # ---- 18. tamper: execute a manifest that was never approved ----
     tampered = dict(body)
@@ -530,20 +588,77 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
                f"state={result.get('state')}",
                code != 422 and bad_leg.get("status") != "PASS")
 
-    # ---- 16/17. rollback ----
-    # The deployment API exposes no rollback endpoint: POST .../rollback
-    # returns 404 because the route does not exist. That is recorded as
-    # a finding rather than dressed up as a pass, and rollback itself is
-    # proven where it is actually driven -- the live Kind E2E runs
-    # kubectl rollout undo through the same sandbox. Inventing a
-    # rollback row here would claim a capability this path does not have.
-    code, _ = api("POST", f"/api/internal/deployments/{run_id}/rollback", {},
-                  expect=(200, 201, 202, 400, 404, 405, 409, 422))
-    record("rollback:http-surface-is-absent-and-reported",
-           "the absence of an HTTP rollback route is observed, not papered over",
-           f"status={code} (404/405 means no such route); rollback is exercised "
-           f"by the live Kind E2E's rollout undo, not by this path",
-           code in (404, 405))
+    # ---- 16/17. rollback through the same approval-bound HTTP path ----
+    # A rollback only means something when there is a previous revision
+    # to restore, so a second revision is deployed first -- through the
+    # same dry-run -> approve -> execute path, never by an out-of-band
+    # kubectl call, which would make the rollback target someone else's
+    # mutation.
+    v2_manifest = manifest_with_second_revision(manifest)
+    v2_body = payload(v2_manifest)
+    code, v2_dry = dry_run(v2_body)
+    v2_run_id = v2_dry.get("id") or v2_dry.get("run_id") or ""
+    v2_state = v2_dry.get("state")
+    v2_ok = (code in (200, 201) and v2_state == "AWAITING_APPROVAL"
+             and bool(v2_run_id))
+    v2_detail = f"dry_status={code} state={v2_state} run_id={v2_run_id or 'ABSENT'}"
+    if v2_ok:
+        code, v2_approved = approve(v2_run_id, v2_dry)
+        v2_ok = code in (200, 201) and v2_approved.get("state") == "APPROVED"
+        v2_detail += f" approve_status={code} state={v2_approved.get('state')}"
+    if v2_ok:
+        code, v2_executed = api(
+            "POST", f"/api/internal/deployments/{v2_run_id}/execute",
+            execute_body(v2_body, v2_dry))
+        v2_leg = k8s_leg(v2_executed)
+        v2_ok = code in (200, 201) and v2_leg.get("status") == "PASS"
+        v2_detail += (f" execute_status={code} state={v2_executed.get('state')}"
+                      f" kubernetes={v2_leg.get('status')}")
+    record("rollback:second-revision-applied-over-http",
+           "a second revision reaches the cluster through the same approved path",
+           v2_detail, v2_ok)
+
+    v2_live = revision_annotation(cluster)
+    record("rollback:cluster-shows-the-second-revision",
+           "the second revision is observable on the live pod template",
+           f"annotation={ROLLBACK_ANNOTATION_KEY}={v2_live!r}", v2_live == "v2")
+
+    # A rollback that accepted anyone's hashes would be a general
+    # cluster-mutation primitive, so the negative case comes first.
+    code, refused = api("POST", f"/api/internal/deployments/{v2_run_id}/rollback",
+                        {"artifact_hash": "0" * 64,
+                         "plan_hash": v2_dry.get("plan_hash") or "",
+                         "namespace": NAMESPACE},
+                        expect=(200, 201, 400, 403, 404, 409, 422))
+    record("rollback:unapproved-hashes-are-refused",
+           "a rollback that does not carry the approval's hashes is refused",
+           f"status={code} state={refused.get('state')}",
+           code != 404 and refused.get("state") not in ("ROLLED_BACK",))
+    still_v2 = revision_annotation(cluster)
+    record("rollback:cluster-unchanged-after-the-refused-rollback",
+           "the refused rollback mutated nothing",
+           f"annotation={still_v2!r}", still_v2 == "v2")
+
+    if v2_ok:
+        code, rolled = api("POST", f"/api/internal/deployments/{v2_run_id}/rollback",
+                           {"artifact_hash": v2_dry.get("artifact_hash"),
+                            "plan_hash": v2_dry.get("plan_hash"),
+                            "namespace": NAMESPACE})
+        rollback_detail = (f"status={code} state={rolled.get('state')} "
+                           f"rollback={json.dumps(rolled.get('rollback') or {})[:160]}")
+        rolled_ok = code in (200, 201) and rolled.get("state") == "ROLLED_BACK"
+    else:
+        rollback_detail = "NOT VERIFIED: no approved second revision to roll back"
+        rolled_ok = False
+    record("rollback:http-rollback-restores-the-approved-revision",
+           "the approved rollback restores the previous revision over HTTP",
+           rollback_detail, rolled_ok)
+
+    back_to_v1 = revision_annotation(cluster)
+    record("rollback:cluster-is-back-at-the-approved-revision",
+           "the live pod template is back to the approved revision",
+           f"annotation={ROLLBACK_ANNOTATION_KEY}={back_to_v1!r} (empty means v1)",
+           back_to_v1 == "")
     after = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", WORKLOAD_NAME,
                     "-o", "jsonpath={.status.replicas}")
     record("rollback:workload-still-consistent",
@@ -638,6 +753,18 @@ def check_sandbox_runtime_posture(watcher: "SandboxWatcher",
     record("sandbox:observed-by-the-service",
            "the sandbox container the service itself launched is inspected",
            f"container={snap['container']} image={snap.get('image', '')[:60]}", True)
+    OBSERVATIONS["observed"]["sandbox"] = {
+        "container": snap["container"],
+        "image": snap.get("image", ""),
+        "binds": json.loads(snap.get("binds") or "[]"),
+        "user": snap.get("user", ""),
+        "readonly_rootfs": snap.get("readonly"),
+        "security_opt": json.loads(snap.get("secopt") or "[]"),
+        "cap_drop": json.loads(snap.get("capdrop") or "[]"),
+        "privileged": snap.get("privileged"),
+        "networks": list(json.loads(snap.get("networks") or "{}").keys()),
+        "observed_by": "host-side docker inspect while the sandbox ran",
+    }
 
     binds = snap.get("binds", "")
     record("sandbox:no-docker-socket",
@@ -788,6 +915,15 @@ def main() -> int:
                f"driver={identity.driver} peers={list(identity.approved_peers)}",
                identity.internal and identity.driver == "bridge"
                and list(identity.approved_peers) == [control_plane])
+        # requested: what the host-owned configuration tells the service
+        # it must attach to. observed: what Docker actually reports.
+        OBSERVATIONS["requested"]["network"] = {
+            "name": exec_network.name,
+            "network_identity": identity.digest(),
+            "approved_peers": list(identity.approved_peers),
+        }
+        OBSERVATIONS["observed"]["network"] = identity.to_dict()
+        OBSERVATIONS["observed"]["network_identity"] = identity.digest()
 
         # ---- 5-7. kubeconfig, redis, the real service container ----
         kubeconfig, api_server, ca_fingerprint = build_sanitized_kubeconfig(
@@ -796,6 +932,13 @@ def main() -> int:
                "a token-bound kubeconfig for the least-privilege account",
                f"server={api_server} ca_sha256={ca_fingerprint[:16]}... "
                f"profile={CREDENTIAL_PROFILE}", True)
+        OBSERVATIONS["observed"]["cluster_identity"] = {
+            "name": args.cluster,
+            "endpoint": api_server,
+            "ca_fingerprint_sha256": ca_fingerprint,
+            "server_version": server_version(args.cluster),
+            "credential_profile": CREDENTIAL_PROFILE,
+        }
         stub, stub_port = start_commit_stub()
         commit_api = f"http://{host_gateway_ip()}:{stub_port}"
         start_redis(args.redis_image)
@@ -844,18 +987,39 @@ def main() -> int:
 
     passed = sum(1 for r in RESULTS if r["status"] == "PASS")
     total = len(RESULTS)
+    failing = [r["check"] for r in RESULTS if r["status"] != "PASS"]
     evidence = {
         "suite": "phase-8.6-A-workstream-B-service-http-kind",
         "authoritative_path": ("runner -> HTTP -> deployment-service container -> "
                                "DeploymentAPI -> DeploymentEngine -> "
                                "KubectlRunnerService -> ContainerKubectlSandbox -> Kind"),
         "driver_instantiates_engine_or_runner": False,
-        "cluster": args.cluster,
+        "cluster": OBSERVATIONS["observed"].get("cluster_identity", {}).get(
+            "name", args.cluster),
         "namespace": NAMESPACE,
         "credential_profile": CREDENTIAL_PROFILE,
         "kubectl_sandbox_image": args.sandbox_image,
         "service_image": args.service_image,
+        # REQUESTED and OBSERVED are kept apart: a configured value is
+        # intent, an observed value is behaviour. They are never merged
+        # into one field that could be mistaken for proof.
+        "kubernetes_execution": OBSERVATIONS,
+        # A flag (`--internal`, `--read-only`, `--cap-drop ALL`) is a
+        # request. What the running sandbox actually had is recorded in
+        # the sandbox rows and in sandbox_observed below.
+        "sandbox_observed": OBSERVATIONS["observed"].get("sandbox", {}),
+        "approved_manifest_hash": OBSERVATIONS["observed"].get(
+            "approved_manifest_hash", ""),
+        "applied_manifest_hash": OBSERVATIONS["observed"].get(
+            "applied_manifest_hash", ""),
+        "approved_manifest_equals_applied": bool(
+            OBSERVATIONS["observed"].get("approved_manifest_hash"))
+        and OBSERVATIONS["observed"].get("approved_manifest_hash")
+        == OBSERVATIONS["observed"].get("applied_manifest_hash"),
+        "replanned_after_approval": OBSERVATIONS["observed"].get(
+            "replanned_after_approval", None),
         "passed": passed, "total": total,
+        "failing_checks": failing,
         "checks": RESULTS,
         "provenance": provenance(),
     }
@@ -866,19 +1030,28 @@ def main() -> int:
     notice(f"{passed}/{total} PASS -- evidence at {out}")
     print(f"::notice title=8.6-B::service->HTTP->Kind E2E: {passed}/{total} PASS, "
           f"{total - passed} FAIL")
-    # GitHub keeps only ten annotations per step and raw log download
-    # is unreliable for this repository, so the full result table also
-    # goes out as one compact, self-describing annotation.
-    import gzip as _gzip
-    packed = base64.b64encode(_gzip.compress(
-        json.dumps(RESULTS, separators=(",", ":")).encode())).decode()
-    for index in range(0, len(packed), 900):
-        print(f"::notice title=8.6-B results {index // 900}::"
-              f"{packed[index:index + 900]}")
-    for row in RESULTS[:6]:
-        if row["status"] != "PASS":
-            print(f"::error title=8.6-B FAIL::{row['check']} :: "
-                  f"observed={row['observed'][:280]}")
+    # GitHub keeps only ten annotations per step, and raw log download is
+    # unreliable for this repository, so the annotations are spent where
+    # they carry the most information: WHEN ANYTHING FAILED, one
+    # annotation per failing check, naming the check and what was
+    # observed. (The previous version annotated only the first six rows,
+    # which are almost always green -- so a red run published a count and
+    # nothing a reader could act on.) Only a fully green run spends its
+    # budget on the compact copy of the whole table.
+    if passed != total:
+        for row in RESULTS:
+            if row["status"] == "PASS":
+                continue
+            print(f"::error title=8.6-B FAIL {row['check']}::"
+                  f"requested={row['requested'][:120]} "
+                  f"observed={row['observed'][:300]}")
+    else:
+        import gzip as _gzip
+        packed = base64.b64encode(_gzip.compress(
+            json.dumps(RESULTS, separators=(",", ":")).encode())).decode()
+        for index in range(0, len(packed), 900):
+            print(f"::notice title=8.6-B results {index // 900}::"
+                  f"{packed[index:index + 900]}")
     return 0 if passed == total and total > 0 else 1
 
 

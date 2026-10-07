@@ -51,7 +51,10 @@ _ALLOWED = {
     DeploymentState.ROLLBACK_FAILED: {DeploymentState.ROLLBACK_PENDING},
     DeploymentState.VALIDATION_FAILED: set(),
     DeploymentState.DRY_RUN_FAILED: set(),
-    DeploymentState.DEPLOYED: set(),
+    # A deployed release can be rolled back. The transition exists so an
+    # approval-bound rollback is an explicit, recorded state change
+    # rather than an out-of-band kubectl call nobody can audit.
+    DeploymentState.DEPLOYED: {DeploymentState.ROLLBACK_PENDING},
     DeploymentState.ROLLED_BACK: set(),
 }
 

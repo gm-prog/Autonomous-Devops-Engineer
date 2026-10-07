@@ -261,11 +261,33 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/upload-artifact@v4
+        id: upload-kind-evidence
         if: always()
         with:
           name: kubernetes-kind-e2e-evidence
-          path: devops-ai-platform/kubernetes-kind-e2e-evidence.json
+          path: |
+            devops-ai-platform/kubernetes-kind-e2e-evidence.json
+            devops-ai-platform/kubernetes-kind-e2e-evidence.json.sha256
           if-no-files-found: warn
+      - name: Publish evidence provenance
+        if: always()
+        run: |
+          set +e
+          # The artifact id and the run/job identity only exist after the
+          # upload, so they are published here rather than inside the
+          # sealed evidence file (which cannot contain its own identifiers).
+          DIGEST=$(cat kubernetes-kind-e2e-evidence.json.sha256 2>/dev/null)
+          ARTIFACT_ID="${{ steps.upload-kind-evidence.outputs.artifact-id }}"
+          {
+            echo '### Phase 8.6-A live Kind E2E provenance'
+            echo "- python_run_id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})"
+            echo "- job_key: ${{ github.job }}"
+            echo "- artifact_id: ${ARTIFACT_ID}"
+            echo "- evidence_digest: ${DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '::notice title=8.6-A Kind evidence provenance::run_id=%s attempt=%s job=%s artifact_id=%s digest=%s\n' \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" "${{ github.job }}" \
+            "${ARTIFACT_ID}" "${DIGEST}"
 
   kubernetes-service-http-e2e:
     name: Phase 8.6-A real deployment-service to Kind E2E
@@ -380,11 +402,30 @@ jobs:
         if: always()
         run: kind delete cluster --name ares-http-e2e || true
       - uses: actions/upload-artifact@v4
+        id: upload-http-evidence
         if: always()
         with:
           name: kubernetes-http-e2e-evidence
-          path: devops-ai-platform/kubernetes-http-e2e-evidence.json
+          path: |
+            devops-ai-platform/kubernetes-http-e2e-evidence.json
+            devops-ai-platform/kubernetes-http-e2e-evidence.json.sha256
           if-no-files-found: warn
+      - name: Publish evidence provenance
+        if: always()
+        run: |
+          set +e
+          DIGEST=$(cat kubernetes-http-e2e-evidence.json.sha256 2>/dev/null)
+          ARTIFACT_ID="${{ steps.upload-http-evidence.outputs.artifact-id }}"
+          {
+            echo '### Phase 8.6-A real service HTTP E2E provenance'
+            echo "- python_run_id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})"
+            echo "- job_key: ${{ github.job }}"
+            echo "- artifact_id: ${ARTIFACT_ID}"
+            echo "- evidence_digest: ${DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '::notice title=8.6-B evidence provenance::run_id=%s attempt=%s job=%s artifact_id=%s digest=%s\n' \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" "${{ github.job }}" \
+            "${ARTIFACT_ID}" "${DIGEST}"
 
   api-gateway:
     name: API gateway checks

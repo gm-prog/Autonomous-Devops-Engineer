@@ -196,7 +196,29 @@ class DeploymentEngine:
             manifest_policy_identity=stored["manifest_policy_identity"],
             sandbox_policy_identity=stored["sandbox_policy_identity"],
             network_identity=stored.get("network_identity", ""),
+            # Every field of the snapshot is restored, including the
+            # workload-identity policy. Rebuilding the identity while
+            # silently dropping a field made the rebuilt digest differ
+            # from the approved one for every real manifest, so a
+            # legitimate execution was refused -- and, worse, a policy
+            # relaxation would have been invisible rather than fatal.
+            # A field that is missing from an older record stays empty
+            # and therefore still fails the digest comparison closed.
+            workload_identity_policy=stored.get("workload_identity_policy", ""),
         )
+
+    def _kubernetes_workloads(self, run) -> List[str]:
+        """The workload names the approved artifact is allowed to touch.
+
+        Recorded at approval time from the approved manifest, so a
+        rollback can never be pointed at a workload that was not part of
+        the approved artifact. Persisted as names only -- no manifest
+        body, no credential material.
+        """
+        recorded = (run.execution or {}).get("kubernetes_workloads")
+        if isinstance(recorded, list):
+            return [str(name) for name in recorded if str(name).strip()]
+        return []
 
     @staticmethod
     def _terraform_is_declared(payload) -> bool:
@@ -224,9 +246,30 @@ class DeploymentEngine:
         }
 
     @staticmethod
+    def _terraform_ready(result: Dict[str, Any]) -> bool:
+        """Is the Terraform leg a reason to proceed?
+
+        PASS and NOT_APPLICABLE are both reasons to proceed; they are
+        NOT the same result, which is why the status stays distinct in
+        the record. BLOCKED, FAIL, TIMEOUT and an absent status are not.
+        """
+        return (result or {}).get("status") in ("PASS", "NOT_APPLICABLE")
+
+    @staticmethod
+    def _kubernetes_ready(result: Dict[str, Any]) -> bool:
+        """Is the Kubernetes leg a reason to proceed?
+
+        PASS and NOT_APPLICABLE are both reasons to proceed. A Kubernetes
+        component that was REQUESTED but did not pass is never a reason
+        to proceed: requested-but-unavailable stays a failure and is
+        never reported as not applicable.
+        """
+        return (result or {}).get("status") in ("PASS", "NOT_APPLICABLE")
+
+    @staticmethod
     def _kubernetes_not_applicable() -> Dict[str, Any]:
         return {
-            "status": "SKIPPED",
+            "status": "NOT_APPLICABLE",
             "stdout": "",
             "stderr": "Kubernetes is not a declared component of this "
                       "deployment; no Kubernetes operation is performed, "
@@ -391,10 +434,18 @@ class DeploymentEngine:
             run.execution["kubernetes_execution_identity"] = (
                 run.kubernetes_dry_run.get("execution_identity") or {}
             )
+            # The workloads the approved artifact may touch, recorded
+            # from the approved manifest so a later rollback cannot be
+            # aimed at anything the approval did not cover.
+            run.execution["kubernetes_workloads"] = (
+                self._deployment_names(effective_payload.get("k8s_yaml", ""))
+                if self._kubernetes_is_declared(effective_payload)
+                else []
+            )
             run.artifact_hash = self._artifact_hash(effective_payload)
             run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
-            if run.terraform_plan["status"] == "PASS" and \
-                    run.kubernetes_dry_run["status"] in ("PASS", "SKIPPED"):
+            if self._terraform_ready(run.terraform_plan) and \
+                    self._kubernetes_ready(run.kubernetes_dry_run):
                 run.move(DeploymentState.DRY_RUN_PASSED)
                 run.move(DeploymentState.AWAITING_APPROVAL)
                 run.add_log("AWAITING_APPROVAL: exact artifact and dry-run hashes are bound to this run.")
@@ -438,6 +489,99 @@ class DeploymentEngine:
         run.add_log(f"APPROVED: deployment approved by {approved_by.strip()} for artifact {artifact_hash[:12]}.")
         self.store.save(run)
         return run
+
+    #: States from which an approval-bound rollback may be requested.
+    #: Each one is a state in which a Kubernetes mutation may have
+    #: actually reached the cluster.
+    ROLLBACK_STATES = (
+        DeploymentState.DEPLOYED,
+        DeploymentState.DEPLOYMENT_FAILED,
+        DeploymentState.ROLLBACK_FAILED,
+    )
+
+    def rollback(self, run_id: str, artifact_hash: str, plan_hash: str,
+                 namespace: str = "") -> DeploymentRun:
+        """Roll back an already-executed Kubernetes deployment.
+
+        Rollback is a mutation, so it is bound by the same controls as
+        apply rather than being a privileged side door:
+
+        * execution must be enabled;
+        * the request must carry the exact approval hashes;
+        * the run must have actually applied Kubernetes work;
+        * only the workloads recorded from the APPROVED manifest may be
+          touched -- there is no caller-supplied workload name, revision
+          or kubectl argument anywhere in this method;
+        * the approval-bound execution identity is re-derived and
+          compared before the sandbox runs, so a rollback can never
+          reach a cluster the approval was not granted for.
+        """
+        self._require_execution_enabled()
+        stored = self.store.get(run_id)
+        if not stored:
+            raise DeploymentActionError("Deployment run not found.")
+        run = DeploymentRun.from_dict(stored)
+        if run.state not in self.ROLLBACK_STATES:
+            raise DeploymentActionError(
+                "Only a deployment that reached the cluster can be rolled "
+                f"back (state is {run.state.value})."
+            )
+        if run.approval.get("artifact_hash") != artifact_hash \
+                or run.approval.get("plan_hash") != plan_hash:
+            raise DeploymentActionError(
+                "Rollback hashes do not match the approval record.")
+        if not run.execution.get("kubernetes_applied"):
+            raise DeploymentActionError(
+                "This run applied no Kubernetes mutation, so there is "
+                "nothing to roll back.")
+        workloads = self._kubernetes_workloads(run)
+        if not workloads:
+            raise DeploymentActionError(
+                "The approved artifact records no Kubernetes workload; "
+                "refusing to guess what to roll back.")
+        approved_identity = self._approved_kubernetes_identity(run)
+        if approved_identity is None:
+            raise DeploymentActionError(
+                "No approved Kubernetes execution identity is bound to this "
+                "run; refusing to roll back against an unidentified target.")
+        if not self.store.acquire_lock(run.id):
+            raise DeploymentActionError("Deployment is already executing.")
+        try:
+            run.move(DeploymentState.ROLLBACK_PENDING)
+            run.add_log(
+                "ROLLBACK_PENDING: approval-bound rollback of "
+                f"{workloads} requested.")
+            results = []
+            for name in workloads:
+                results.append({
+                    "component": f"kubernetes:{name}",
+                    "result": self.kubectl.rollout_undo(
+                        name, namespace or None,
+                        approved_identity=approved_identity),
+                })
+            failed = [r for r in results
+                      if (r.get("result") or {}).get("status") != "PASS"]
+            run.rollback = {
+                "status": "PASS" if not failed else "FAIL",
+                "components": results,
+                "namespace": namespace or approved_identity.namespace,
+            }
+            if failed:
+                run.move(DeploymentState.ROLLBACK_FAILED)
+                run.add_log("ROLLBACK_FAILED: one or more workloads could not be restored.")
+            else:
+                run.move(DeploymentState.ROLLED_BACK)
+                run.add_log("ROLLED_BACK: the approved workloads were rolled back.")
+            self.store.save(run)
+            return run
+        except Exception as exc:  # noqa: BLE001
+            run.error = type(exc).__name__
+            if run.state == DeploymentState.ROLLBACK_PENDING:
+                run.move(DeploymentState.ROLLBACK_FAILED)
+            self.store.save(run)
+            return run
+        finally:
+            self.store.release_lock(run.id)
 
     @staticmethod
     def _blocked_terraform(error):
@@ -581,58 +725,76 @@ class DeploymentEngine:
             # does not re-plan: a second plan could legitimately differ
             # from the approved one (drift, provider behaviour, time) and
             # the approval would then be meaningless.
-            blocked = self._blocked_terraform(
-                self._verify_approved_plan_recoverable(
-                    tf_workspace,
-                    approved_plan_hash,
-                    approved.get("credential_profile_id", ""),
-                )
-            )
-            if blocked is None:
-                init = self.terraform.initialize(tf_workspace)
-                run.execution["terraform_init"] = init
-                blocked = (
-                    None
-                    if init.get("status") == "PASS"
-                    else self._blocked_terraform(
-                        "Terraform initialization of the approved workspace "
-                        f"failed ({init.get('status')})."
+            #
+            # Component selection is authoritative here too. A deployment
+            # that declared no Terraform has no plan to recover, so it is
+            # NOT APPLICABLE -- not BLOCKED, and not a reason to abort a
+            # Kubernetes-only deployment that the user did ask for.
+            if not self._terraform_is_declared(effective_payload):
+                not_applicable = self._terraform_not_applicable()
+                not_applicable["replanned_after_approval"] = False
+                not_applicable["plan_source"] = "not-applicable"
+                not_applicable["executed"] = False
+                run.execution["terraform_plan"] = not_applicable
+                run.execution["terraform_apply"] = not_applicable
+                run.execution["approved_plan_hash"] = ""
+                run.execution["applied_plan_hash"] = ""
+                run.execution["terraform_applied"] = False
+                blocked = None
+            else:
+                blocked = self._blocked_terraform(
+                    self._verify_approved_plan_recoverable(
+                        tf_workspace,
+                        approved_plan_hash,
+                        approved.get("credential_profile_id", ""),
                     )
                 )
-            if blocked is not None:
-                run.execution["terraform_plan"] = blocked
-                run.error = blocked["error"]
-                run.move(DeploymentState.DEPLOYMENT_FAILED)
-                run.add_log(
-                    "DEPLOYMENT_FAILED: the approved Terraform plan could not "
-                    "be recovered and verified; nothing was applied."
+                if blocked is None:
+                    init = self.terraform.initialize(tf_workspace)
+                    run.execution["terraform_init"] = init
+                    blocked = (
+                        None
+                        if init.get("status") == "PASS"
+                        else self._blocked_terraform(
+                            "Terraform initialization of the approved workspace "
+                            f"failed ({init.get('status')})."
+                        )
+                    )
+                if blocked is not None:
+                    run.execution["terraform_plan"] = blocked
+                    run.error = blocked["error"]
+                    run.move(DeploymentState.DEPLOYMENT_FAILED)
+                    run.add_log(
+                        "DEPLOYMENT_FAILED: the approved Terraform plan could not "
+                        "be recovered and verified; nothing was applied."
+                    )
+                    self.store.save(run)
+                    return run
+
+                # Contract-preserving evidence: the plan recorded against
+                # the execution IS the approved plan, explicitly marked as not
+                # regenerated so an auditor can tell the difference.
+                terraform_plan = dict(approved)
+                terraform_plan["replanned_after_approval"] = False
+                terraform_plan["plan_source"] = "approved"
+                run.execution["terraform_plan"] = terraform_plan
+                run.execution["approved_plan_hash"] = approved_plan_hash
+
+                terraform_apply = self.terraform.apply_plan(
+                    tf_workspace,
+                    str(Path(tf_workspace, PLAN_FILENAME)),
+                    expected_plan_file_hash=approved_plan_hash,
                 )
-                self.store.save(run)
-                return run
+                run.execution["applied_plan_hash"] = terraform_apply.get(
+                    "plan_file_hash", ""
+                )
+                run.execution["terraform_apply"] = terraform_apply
+                run.execution["terraform_applied"] = terraform_apply.get("status") == "PASS"
+                if not run.execution["terraform_applied"]:
+                    run.error = "Terraform apply failed."
+                    run.move(DeploymentState.DEPLOYMENT_FAILED)
+                    return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
 
-            # Contract-preserving evidence: the plan recorded against the
-            # execution IS the approved plan, explicitly marked as not
-            # regenerated so an auditor can tell the difference.
-            terraform_plan = dict(approved)
-            terraform_plan["replanned_after_approval"] = False
-            terraform_plan["plan_source"] = "approved"
-            run.execution["terraform_plan"] = terraform_plan
-            run.execution["approved_plan_hash"] = approved_plan_hash
-
-            terraform_apply = self.terraform.apply_plan(
-                tf_workspace,
-                str(Path(tf_workspace, PLAN_FILENAME)),
-                expected_plan_file_hash=approved_plan_hash,
-            )
-            run.execution["applied_plan_hash"] = terraform_apply.get(
-                "plan_file_hash", ""
-            )
-            run.execution["terraform_apply"] = terraform_apply
-            run.execution["terraform_applied"] = terraform_apply.get("status") == "PASS"
-            if not run.execution["terraform_applied"]:
-                run.error = "Terraform apply failed."
-                run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
 
             # Phase 6.5.2 corrective — the manifest file written above IS
             # the approved artifact (identity already bound in
@@ -645,9 +807,44 @@ class DeploymentEngine:
                 if self._kubernetes_is_declared(effective_payload)
                 else self._kubernetes_not_applicable()
             )
+            # Bind the bytes: the manifest hash the approval was taken
+            # against, and the manifest hash that was actually applied.
+            # Both are recorded, so "approved == applied" is checkable
+            # from the evidence alone instead of being asserted.
+            approved_manifest_hash = str(
+                (run.kubernetes_dry_run or {}).get("manifest_sha256", ""))
+            applied_manifest_hash = str(kubernetes_apply.get("manifest_sha256", ""))
+            if isinstance(kubernetes_apply, dict):
+                kubernetes_apply["approved_manifest_hash"] = approved_manifest_hash
+                kubernetes_apply["applied_manifest_hash"] = applied_manifest_hash
+            run.execution["approved_manifest_hash"] = approved_manifest_hash
+            run.execution["applied_manifest_hash"] = applied_manifest_hash
+            # Execute never re-plans. Stated on the record so the claim is
+            # machine-checkable rather than inferred from prose.
+            run.execution["replanned_after_approval"] = False
+            if (self._kubernetes_is_declared(effective_payload)
+                    and kubernetes_apply.get("status") == "PASS"
+                    and approved_manifest_hash
+                    and applied_manifest_hash != approved_manifest_hash):
+                # The bytes that reached the API server are not the bytes
+                # that were approved. This must never happen; if it does,
+                # the deployment is failed and the rollout is undone
+                # rather than reported as a success.
+                kubernetes_apply["status"] = "FAIL"
+                kubernetes_apply["stderr"] = (
+                    "the applied manifest does not match the approved "
+                    f"manifest hash (approved={approved_manifest_hash[:16]}... "
+                    f"applied={applied_manifest_hash[:16]}...)"
+                )
             run.execution["kubernetes_apply"] = kubernetes_apply
-            run.execution["kubernetes_applied"] = kubernetes_apply.get("status") in ("PASS", "SKIPPED")
-            if not run.execution["kubernetes_applied"]:
+            # "applied" means a Kubernetes mutation actually reached the
+            # cluster. A deployment that declared no Kubernetes has
+            # nothing to roll back and nothing to report as applied --
+            # NOT_APPLICABLE is recorded, and is not a mutation.
+            kubernetes_declared = self._kubernetes_is_declared(effective_payload)
+            run.execution["kubernetes_applied"] = (
+                kubernetes_declared and kubernetes_apply.get("status") == "PASS")
+            if kubernetes_declared and kubernetes_apply.get("status") != "PASS":
                 run.error = "Kubernetes apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
                 return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
