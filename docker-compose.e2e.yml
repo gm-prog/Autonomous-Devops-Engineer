@@ -63,8 +63,37 @@ services:
       - DEPLOYMENT_KUBECONFIG_PATH=/etc/deployment/kubeconfig
       - DEPLOYMENT_ALLOWED_NAMESPACES=devops-production-namespace
       - HEALTHCHECK_ALLOWED_HOSTS=${E2E_HEALTHCHECK_ALLOWED_HOSTS:-}
+      # Phase 8.5-A corrective (Workstream A): the Terraform sandbox image
+      # must be digest-pinned and must already exist locally -- the
+      # control plane runs it with --pull never and refuses a tag.
+      - DEPLOYMENT_TERRAFORM_SANDBOX_IMAGE=${TERRAFORM_SANDBOX_IMAGE:?E2E requires a digest-pinned terraform sandbox image}
+      - DEPLOYMENT_TERRAFORM_SANDBOX_VERSION=${E2E_TERRAFORM_VERSION:-1.9.8}
+      # Workstream C: the identity the sandbox runs as. The control plane
+      # creates each workspace owned by it. Never 0.
+      - DEPLOYMENT_TERRAFORM_SANDBOX_UID=65532
+      - DEPLOYMENT_TERRAFORM_SANDBOX_GID=65532
+      # Workstream B: the workspace root, mounted at the SAME absolute
+      # path on the host and in this container (see volumes below).
+      - DEPLOYMENT_WORKSPACE_ROOT=/tmp/ares-e2e-tf-workspaces
+      # Workstream F: v1 forwards no credentials into Terraform at all.
+      - DEPLOYMENT_CREDENTIAL_ENV_KEYS=
     volumes:
       - ${E2E_KUBECONFIG_HOST_PATH:-/tmp/ares-e2e-kubeconfig}:/etc/deployment/kubeconfig:ro
+      # TRUST BOUNDARY NOTE. The socket is mounted into the deployment
+      # service because that service IS the trusted control plane: it
+      # launches the sandbox. It is NEVER passed into the sandbox
+      # container itself -- the Terraform workload gets --network none,
+      # no socket, and only its own workspace. Mounting the socket here
+      # grants this container control-plane authority over the daemon,
+      # which is exactly the privilege it already needs and must be
+      # treated as such when reviewing changes to this service.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace root bind-mounted at an IDENTICAL absolute path on both
+      # sides. This is required, not cosmetic: the control plane asks the
+      # daemon to bind-mount a workspace path, and the daemon resolves
+      # that path on the HOST. A path that exists only inside this
+      # container would silently mount the wrong thing.
+      - /tmp/ares-e2e-tf-workspaces:/tmp/ares-e2e-tf-workspaces
 
   incident-service:
     build:

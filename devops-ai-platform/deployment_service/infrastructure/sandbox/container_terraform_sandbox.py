@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Mapping
 
 from deployment_service.application.services.terraform_sandbox import (
+    sandbox_runtime_identity,
     SANDBOX_IMAGE_VAR,
     TerraformSandboxConfigurationError,
     TerraformSandboxOutcome,
@@ -107,11 +108,11 @@ class ContainerTerraformSandbox:
         """
         return cls(
             image=os.environ.get(SANDBOX_IMAGE_VAR, ""),
-            user=(
-                f"{os.getuid()}:{os.getgid()}"
-                if os.getuid() != 0
-                else "65532:65532"
-            ),
+            # Phase 8.5-A corrective: the runtime identity and the
+            # workspace owner are resolved by ONE helper so they cannot
+            # drift apart and leave Terraform unable to write (or, far
+            # worse, tempt someone to "fix" it by running as root).
+            user="%d:%d" % sandbox_runtime_identity(),
             network_mode="none",
             terraform_version=os.environ.get(
                 _SANDBOX_TERRAFORM_VERSION_VAR, ""

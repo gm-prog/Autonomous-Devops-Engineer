@@ -15,6 +15,12 @@ import subprocess
 import pytest
 
 from deployment_service.application.services.iac_validator import IaCValidator
+from deployment_service.application.services.plan_artifact import (
+    PLAN_FILENAME,
+    PlanArtifactError,
+    hash_plan_artifact,
+    resolve_plan_artifact,
+)
 from deployment_service.application.services.terraform_runner import (
     TerraformRunnerService,
 )
@@ -832,10 +838,26 @@ class TestPlanArtifactBinding:
 
     def test_apply_refuses_a_missing_plan(self, tmp_path):
         result = self._runner().apply_plan(
-            str(tmp_path), str(tmp_path / "nope.tfplan")
+            str(tmp_path),
+            str(tmp_path / PLAN_FILENAME),
+            expected_plan_file_hash="b" * 64,
         )
         assert result["status"] == "BLOCKED"
         assert result["error_code"] == "PLAN_ARTIFACT_MISSING"
+
+    def test_apply_refuses_when_no_approved_hash_is_supplied(self, tmp_path):
+        """Corrective: there is no unverified apply mode.
+
+        Applying with nothing to compare against would make the approval
+        binding unprovable, so it is refused even when the plan exists.
+        """
+        (tmp_path / PLAN_FILENAME).write_bytes(b"plan-bytes")
+        result = self._runner().apply_plan(
+            str(tmp_path), str(tmp_path / PLAN_FILENAME)
+        )
+        assert result["status"] == "BLOCKED"
+        assert result["error_code"] == "PLAN_ARTIFACT_UNVERIFIED"
+        assert result["executed"] is False
 
     @pytest.mark.parametrize(
         "evil", ["/etc/passwd", "../outside.tfplan", "nested/dir.tfplan"]

@@ -11,9 +11,14 @@ planned. It can never choose the executable, argv, image, user, network,
 mounts, limits, environment or credentials.
 """
 
-import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from deployment_service.application.services.plan_artifact import (
+    PLAN_FILENAME,
+    PlanArtifactError,
+    hash_plan_artifact,
+)
 
 from deployment_service.application.services.terraform_sandbox import (
     OPERATION_TIMEOUTS,
@@ -175,22 +180,19 @@ class TerraformRunnerService:
 
         plan_file_hash = ""
         if status == STATUS_PASS and plan_output_path:
-            candidate = Path(plan_output_path)
-            if candidate.is_file():
-                plan_file_hash = hashlib.sha256(
-                    candidate.read_bytes()
-                ).hexdigest()
-            else:
-                # The sandbox reported success but produced no saved plan:
-                # refuse to treat that as a usable plan.
+            # The saved plan was written by untrusted Terraform inside a
+            # workspace it controls, so the host may only touch it through
+            # the proven-safe artifact guard (symlink/confinement checks).
+            try:
+                plan_file_hash = hash_plan_artifact(iac_dir, plan_output_path)
+            except PlanArtifactError as exc:
                 status = STATUS_BLOCKED
                 steps.append(
                     {
                         "status": STATUS_BLOCKED,
                         "operation": TerraformOperation.PLAN.value,
-                        "error_code": "SANDBOX_RESULT_INVALID",
-                        "error": "saved terraform plan is missing after a "
-                        "successful plan operation",
+                        "error_code": exc.code,
+                        "error": str(exc),
                         "executed": False,
                     }
                 )
@@ -229,19 +231,33 @@ class TerraformRunnerService:
                 "sandbox": self.describe_sandbox(),
             }
 
-        candidate = Path(plan_output_path)
-        if not candidate.is_file():
+        if not expected_plan_file_hash:
+            # Phase 8.5-A corrective: applying without a hash to compare
+            # against would make the approval binding unprovable. There is
+            # no "unverified apply" mode.
             return {
                 "status": STATUS_BLOCKED,
                 "operation": TerraformOperation.APPLY.value,
-                "error_code": "PLAN_ARTIFACT_MISSING",
-                "error": "saved terraform plan does not exist",
+                "error_code": "PLAN_ARTIFACT_UNVERIFIED",
+                "error": "refusing to apply a plan with no approved hash "
+                "to verify it against",
                 "executed": False,
                 "sandbox": self.describe_sandbox(),
             }
 
-        actual_hash = hashlib.sha256(candidate.read_bytes()).hexdigest()
-        if expected_plan_file_hash and actual_hash != expected_plan_file_hash:
+        try:
+            actual_hash = hash_plan_artifact(iac_dir, plan_output_path)
+        except PlanArtifactError as exc:
+            return {
+                "status": STATUS_BLOCKED,
+                "operation": TerraformOperation.APPLY.value,
+                "error_code": exc.code,
+                "error": str(exc),
+                "executed": False,
+                "sandbox": self.describe_sandbox(),
+            }
+
+        if actual_hash != expected_plan_file_hash:
             # The approved plan artifact changed between plan and apply.
             return {
                 "status": STATUS_BLOCKED,
@@ -261,6 +277,22 @@ class TerraformRunnerService:
             plan_file=plan_file,
         )
         result["plan_file_hash"] = actual_hash
+        result["sandbox"] = self.describe_sandbox()
+        return result
+
+    # --- post-approval preparation ---------------------------------------
+
+    def initialize(self, iac_dir: str) -> Dict[str, Any]:
+        """Run ONLY ``terraform init`` (no plan) in an existing workspace.
+
+        Phase 8.5-A corrective, Workstream D: the execution path must be
+        able to make a recovered approval workspace usable again without
+        producing a new plan. ``init`` cannot create or alter a plan, so
+        it cannot change what is about to be applied.
+        """
+        result = self._execute(
+            TerraformOperation.INIT, iac_dir, execution=True
+        )
         result["sandbox"] = self.describe_sandbox()
         return result
 

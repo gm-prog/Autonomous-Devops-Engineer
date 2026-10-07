@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# check=error=true
+
+# Phase 8.5-A corrective — the untrusted Terraform execution sandbox.
+#
+# This is the ONLY place Terraform is allowed to exist and run. The
+# deployment service (the trusted control plane) deliberately has no
+# Terraform binary at all; it launches this image with a fixed,
+# policy-owned argv and a locked-down runtime profile:
+#
+#     --network none --read-only --cap-drop ALL
+#     --security-opt no-new-privileges --pids-limit --memory --cpus
+#     --user <non-root> --rm --pull never
+#
+# Nothing in here is trusted. The image intentionally contains no shell
+# entrypoint wrapper, no package manager at runtime, no cloud CLIs, no
+# credentials and no Docker client: a workload that escapes Terraform
+# itself should find as little as possible to work with.
+#
+# Built and pushed to a registry so it has a real, immutable digest; the
+# control plane refuses any image reference that is not name@sha256:...
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS fetch
+
+ARG TERRAFORM_VERSION=1.9.8
+ARG TARGETARCH=amd64
+
+# Official release + official SHA256SUMS, verified before use.
+RUN set -eu; \
+    apk add --no-cache curl unzip >/dev/null 2>&1 || \
+      (apt-get update && apt-get install -y --no-install-recommends curl unzip \
+       && rm -rf /var/lib/apt/lists/*); \
+    base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"; \
+    curl -fsSLo /tmp/tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
+    curl -fsSLo /tmp/tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
+    (cd /tmp && grep "terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip" tf.sums | sha256sum -c -); \
+    unzip -o /tmp/tf.zip -d /usr/local/bin terraform; \
+    chmod 0755 /usr/local/bin/terraform; \
+    rm -f /tmp/tf.zip /tmp/tf.sums; \
+    /usr/local/bin/terraform version
+
+# ---------------------------------------------------------------------
+# Runtime stage: a minimal image carrying the verified binary and a
+# dedicated unprivileged identity. Nothing from the fetch stage's
+# tooling (curl, unzip, package manager) survives into it.
+# ---------------------------------------------------------------------
+FROM ${BASE_IMAGE}
+
+ARG SANDBOX_UID=65532
+ARG SANDBOX_GID=65532
+
+COPY --from=fetch /usr/local/bin/terraform /usr/local/bin/terraform
+
+# A real, fixed, non-root identity. The control plane creates the
+# workspace owned by exactly this uid:gid so Terraform can write its
+# plan without anyone being tempted to widen permissions or run as root.
+RUN set -eu; \
+    (addgroup -g "${SANDBOX_GID}" -S sandbox 2>/dev/null || \
+     groupadd -g "${SANDBOX_GID}" -r sandbox); \
+    (adduser -u "${SANDBOX_UID}" -S -G sandbox -H -s /sbin/nologin sandbox 2>/dev/null || \
+     useradd -u "${SANDBOX_UID}" -g "${SANDBOX_GID}" -r -M -s /usr/sbin/nologin sandbox); \
+    mkdir -p /workspace; \
+    chown "${SANDBOX_UID}:${SANDBOX_GID}" /workspace
+
+# Terraform must never phone home or check for upgrades from inside a
+# network-none sandbox; these keep it from wasting the timeout trying.
+ENV CHECKPOINT_DISABLE=1 \
+    TF_IN_AUTOMATION=1 \
+    TF_INPUT=0 \
+    TF_CLI_ARGS=""
+
+USER ${SANDBOX_UID}:${SANDBOX_GID}
+WORKDIR /workspace
+
+# Fixed executable. The control plane supplies only subcommands and
+# flags it assembled itself, so there is no shell and no path by which
+# untrusted content can choose what runs.
+ENTRYPOINT ["/usr/local/bin/terraform"]
+CMD ["version"]

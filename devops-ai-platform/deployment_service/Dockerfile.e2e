@@ -19,6 +19,9 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# Terraform version is declared for evidence only: it is the version the
+# SANDBOX image is built from (Dockerfile.terraform-sandbox). It is
+# intentionally unused here -- see the assertion below.
 ARG TERRAFORM_VERSION=1.9.8
 ARG KUBECTL_VERSION=v1.31.4
 ARG TARGETARCH=amd64
@@ -27,16 +30,41 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Terraform: official release + official SHA256SUMS, verified (§6).
+# Phase 8.5-A corrective (Workstream A) — NO TERRAFORM BINARY HERE.
+#
+# This container is the TRUSTED CONTROL PLANE. Untrusted Terraform runs in
+# a separate, locked-down sandbox container, so the control plane needs
+# the ability to LAUNCH containers, not the ability to run Terraform.
+#
+# Deliberately omitting the binary turns "the code must never exec host
+# terraform" from a rule into a physical fact: there is nothing to exec.
+# The build asserts that below.
+#
+# The Docker CLI is installed from Docker's official apt repository with
+# its signing key, so the package is cryptographically verified by apt.
+# Only the CLI (docker-ce-cli) is installed -- no daemon, no containerd.
 RUN set -eu; \
-    base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"; \
-    curl -fsSLo /tmp/tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
-    curl -fsSLo /tmp/tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
-    (cd /tmp && grep "terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip" tf.sums | sha256sum -c -); \
-    unzip -o /tmp/tf.zip -d /usr/local/bin terraform; \
-    chmod 0755 /usr/local/bin/terraform; \
-    rm -f /tmp/tf.zip /tmp/tf.sums; \
-    terraform version
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+        -o /etc/apt/keyrings/docker.asc; \
+    chmod a+r /etc/apt/keyrings/docker.asc; \
+    echo "deb [arch=${TARGETARCH} signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends docker-ce-cli; \
+    rm -rf /var/lib/apt/lists/*; \
+    docker --version
+
+# Fail the build if a Terraform binary is ever reintroduced into the
+# control plane: that would re-open the host-execution path this phase
+# exists to close.
+RUN set -eu; \
+    if command -v terraform >/dev/null 2>&1; then \
+        echo "FATAL: terraform must not exist in the control-plane image" >&2; \
+        exit 1; \
+    fi; \
+    echo "verified: no terraform binary in the control-plane image"
 
 # kubectl: official release + official .sha256, verified (§6).
 RUN set -eu; \

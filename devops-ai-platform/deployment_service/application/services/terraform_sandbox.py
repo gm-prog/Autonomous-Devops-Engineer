@@ -108,6 +108,18 @@ _IMAGE_DIGEST_PATTERN = r"^[^@\s]+@sha256:[0-9a-f]{64}$"
 _RELATIVE_FILE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
 
 SANDBOX_IMAGE_VAR = "DEPLOYMENT_TERRAFORM_SANDBOX_IMAGE"
+SANDBOX_UID_VAR = "DEPLOYMENT_TERRAFORM_SANDBOX_UID"
+SANDBOX_GID_VAR = "DEPLOYMENT_TERRAFORM_SANDBOX_GID"
+
+#: Phase 8.5-A corrective, Workstream C. The sandbox must run as a real
+#: non-root identity AND must be able to write the workspace the control
+#: plane created for it. Those two requirements meet here, in ONE place,
+#: so the runtime user and the workspace owner can never drift apart.
+#:
+#: Distroless-style "nonroot" UID. Only used when the control plane is
+#: root and therefore able to hand ownership over deliberately.
+DEFAULT_SANDBOX_UID = 65532
+DEFAULT_SANDBOX_GID = 65532
 SANDBOX_WORKSPACE_ROOT_VAR = "DEPLOYMENT_WORKSPACE_ROOT"
 
 
@@ -609,3 +621,78 @@ def new_container_name(hint: str = "") -> str:
     suffix = uuid.uuid4().hex[:12]
     base = f"tf-sbx-{cleaned}" if cleaned else "tf-sbx"
     return f"{base}-{suffix}"[:128]
+
+
+# ---------------------------------------------------------------------
+# Phase 8.5-A corrective — runtime identity and credential profile
+# ---------------------------------------------------------------------
+
+
+def sandbox_runtime_identity() -> tuple[int, int]:
+    """Resolve the (uid, gid) the Terraform container must run as.
+
+    Two cases, and neither of them is root:
+
+    * The control plane is itself non-root. It cannot ``chown`` anything,
+      so the sandbox reuses the control plane's own identity and the
+      workspace it creates is writable by construction.
+    * The control plane is root. It can hand ownership over explicitly,
+      so the sandbox uses a dedicated unprivileged identity and the
+      workspace is chowned to it.
+
+    A configured UID/GID of 0 is refused outright: there is no
+    configuration path to a root Terraform container.
+    """
+    def _configured(var: str, fallback: int) -> int:
+        raw = os.environ.get(var, "").strip()
+        if not raw:
+            return fallback
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise TerraformSandboxConfigurationError(
+                f"{var} must be an integer id, got {raw!r}"
+            ) from exc
+        if value <= 0:
+            raise TerraformSandboxConfigurationError(
+                f"{var} must be a non-root id, got {value}"
+            )
+        return value
+
+    current_uid = os.getuid()
+    current_gid = os.getgid()
+    if current_uid != 0:
+        # Non-root control plane: match it, unless explicitly overridden.
+        return (
+            _configured(SANDBOX_UID_VAR, current_uid),
+            _configured(SANDBOX_GID_VAR, current_gid),
+        )
+    return (
+        _configured(SANDBOX_UID_VAR, DEFAULT_SANDBOX_UID),
+        _configured(SANDBOX_GID_VAR, DEFAULT_SANDBOX_GID),
+    )
+
+
+#: Stable, non-secret identity of the "no credentials at all" profile.
+CREDENTIALS_DISABLED_PROFILE = "credentials-disabled"
+
+
+def credential_profile_identity() -> str:
+    """Non-secret identity of the credential context for this execution.
+
+    This exists so that approval can bind *which* credential context was
+    in force without ever touching a secret value. Only the NAMES are
+    hashed -- never values, never a hash of a value, because a hash of a
+    low-entropy secret is itself a disclosure risk.
+
+    A profile change after approval (credentials switched on, or a
+    different credential set configured) changes this identity and is
+    therefore rejected at execution time.
+    """
+    keys = resolve_credential_env_keys()
+    if not keys:
+        return CREDENTIALS_DISABLED_PROFILE
+    digest = hashlib.sha256(
+        json.dumps(sorted(keys), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return f"credential-names:{digest[:32]}"

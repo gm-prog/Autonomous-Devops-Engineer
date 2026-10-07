@@ -19,7 +19,16 @@ from deployment_service.application.services.release_identity_injection import (
 from deployment_service.application.services.source_verification import (
     GitHubSourceVerifier,
 )
+from deployment_service.application.services.plan_artifact import (
+    PLAN_FILENAME,
+    PlanArtifactError,
+    hash_plan_artifact,
+)
 from deployment_service.application.services.terraform_runner import TerraformRunnerService
+from deployment_service.application.services.terraform_sandbox import (
+    credential_profile_identity,
+    sandbox_runtime_identity,
+)
 from deployment_service.domain.entities.deployment_run import DeploymentRun
 from deployment_service.domain.value_objects.deployment_state import DeploymentState
 from deployment_service.infrastructure.persistence.redis_pipeline_store import RedisPipelineStore
@@ -27,6 +36,17 @@ from deployment_service.infrastructure.persistence.redis_pipeline_store import R
 
 class DeploymentActionError(RuntimeError):
     pass
+
+
+#: States after which an approved plan can never legitimately be applied.
+_TERMINAL_STATES = frozenset(
+    {
+        DeploymentState.DEPLOYED,
+        DeploymentState.DEPLOYMENT_FAILED,
+        DeploymentState.ROLLED_BACK,
+        DeploymentState.ROLLBACK_FAILED,
+    }
+)
 
 
 class DeploymentEngine:
@@ -107,6 +127,14 @@ class DeploymentEngine:
             # different sandbox policy must not silently reuse an earlier
             # approval identity.
             "sandbox_policy_identity": (terraform_result.get("sandbox") or {}).get("sandbox_policy_identity", ""),
+            # Phase 8.5-A corrective, Workstream D. The approval must bind
+            # the EXACT plan artifact, not a description of it. Without
+            # this, approving "plan A" and applying a freshly generated
+            # "plan B" would produce the same identity.
+            "plan_file_hash": terraform_result.get("plan_file_hash", ""),
+            # Workstream F: which credential context was in force. Names
+            # only -- never values (see credential_profile_identity).
+            "credential_profile_id": terraform_result.get("credential_profile_id", ""),
             "kubernetes": {"status": kubernetes_result.get("status"), "stdout": kubernetes_result.get("stdout", "")},
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -155,6 +183,46 @@ class DeploymentEngine:
             return tempfile.mkdtemp(prefix=prefix, dir=root)
         return tempfile.mkdtemp(prefix=prefix)
 
+    @staticmethod
+    def _approval_workspace(run_id: str) -> str:
+        """Create the PERSISTENT workspace that holds the approved plan.
+
+        Phase 8.5-A corrective, Workstreams B and C.
+
+        This directory outlives the dry-run on purpose: it is the only
+        place the exact approved plan exists, and execution applies that
+        artifact rather than regenerating one. It must therefore be:
+
+        * beneath the configured workspace root, so it is visible at the
+          SAME absolute path to the container runtime (a path that exists
+          only inside the control-plane container cannot be bind-mounted);
+        * owned by the identity the sandbox runs as, so a non-root
+          Terraform can write ``.terraform/`` and the saved plan;
+        * group-traversable at most -- never world-readable, because a
+          saved plan describes private infrastructure.
+        """
+        root = os.getenv("DEPLOYMENT_WORKSPACE_ROOT", "").strip()
+        base = Path(root) if root else Path(tempfile.gettempdir())
+        base.mkdir(parents=True, exist_ok=True)
+        workspace = base / f"approved-{run_id}"
+        workspace.mkdir(parents=True, exist_ok=False)
+        # 0o2770: owner+group rwx, setgid so Terraform-created files stay
+        # in the shared group; nothing for "other". Explicitly NOT 0o777.
+        os.chmod(workspace, 0o2770)
+        uid, gid = sandbox_runtime_identity()
+        if os.getuid() == 0 and (uid, gid) != (os.getuid(), os.getgid()):
+            # Only a root control plane can, and must, hand ownership to
+            # the unprivileged sandbox identity.
+            os.chown(workspace, uid, gid)
+        return str(workspace)
+
+    @staticmethod
+    def _discard_approval_workspace(run_id: str) -> None:
+        """Remove a persisted approval workspace once it can never apply."""
+        root = os.getenv("DEPLOYMENT_WORKSPACE_ROOT", "").strip()
+        base = Path(root) if root else Path(tempfile.gettempdir())
+        shutil.rmtree(base / f"approved-{run_id}", ignore_errors=True)
+
     def create_dry_run(self, payload: Dict[str, Any]) -> DeploymentRun:
         source_revision = self._validated_source_revision(payload.get("source_revision"))
         # Independent source verification happens FIRST: if the exact
@@ -195,10 +263,19 @@ class DeploymentEngine:
         run.add_log("DRY_RUNNING: executing local Terraform plan and Kubernetes client-side dry-run.")
         self.store.save(run)
 
-        temp_dir = self._new_workspace(f"devops-deploy-{run.id}-")
+        # Phase 8.5-A corrective: the dry-run plan IS the plan that will
+        # be applied, so it is produced into a persistent, correctly-owned
+        # workspace and saved to disk. Nothing re-plans after this point.
+        temp_dir = self._approval_workspace(run.id)
         try:
             paths = self._write_iac(effective_payload, temp_dir)
-            run.terraform_plan = self.terraform.run_plan(temp_dir, execution=False)
+            run.terraform_plan = self.terraform.run_plan(
+                temp_dir,
+                execution=False,
+                plan_output_path=paths["terraform_plan"],
+            )
+            run.terraform_plan["credential_profile_id"] = credential_profile_identity()
+            run.terraform_plan["approval_workspace"] = temp_dir
             run.kubernetes_dry_run = self.kubectl.dry_run(paths["kubernetes"])
             run.artifact_hash = self._artifact_hash(effective_payload)
             run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
@@ -217,7 +294,11 @@ class DeploymentEngine:
             self.store.save(run)
             return run
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            # Keep the workspace only while it can still be executed; a
+            # run that never reached AWAITING_APPROVAL has no approved
+            # plan to protect, so its saved plan is destroyed immediately.
+            if run.state != DeploymentState.AWAITING_APPROVAL:
+                self._discard_approval_workspace(run.id)
 
     def approve(self, run_id: str, approved_by: str, artifact_hash: str, plan_hash: str) -> DeploymentRun:
         payload = self.store.get(run_id)
@@ -242,6 +323,63 @@ class DeploymentEngine:
         run.add_log(f"APPROVED: deployment approved by {approved_by.strip()} for artifact {artifact_hash[:12]}.")
         self.store.save(run)
         return run
+
+    @staticmethod
+    def _blocked_terraform(error):
+        """Wrap a refusal reason as a BLOCKED terraform result (or pass None)."""
+        if error is None:
+            return None
+        return {
+            "status": "BLOCKED",
+            "error": error,
+            "executed": False,
+            "replanned_after_approval": False,
+            "plan_source": "approved",
+        }
+
+    def _verify_approved_plan_recoverable(
+        self, workspace, approved_hash, approved_profile=""
+    ):
+        """Return a refusal reason, or None when the approved plan is intact.
+
+        Checked before anything is applied, and deliberately strict: a
+        missing or altered approval workspace means the approved plan no
+        longer exists, which is a reason to stop, never a reason to make
+        a new one.
+        """
+        if not approved_hash:
+            return (
+                "The approval record carries no saved plan hash, so the "
+                "approved plan cannot be proven."
+            )
+        if not workspace:
+            return "The approved plan workspace is not recorded on this run."
+        if not Path(workspace).is_dir():
+            return (
+                "The approved plan workspace no longer exists; re-run the "
+                "dry run to obtain a fresh approval."
+            )
+        try:
+            actual = hash_plan_artifact(workspace, str(Path(workspace, PLAN_FILENAME)))
+        except PlanArtifactError as exc:
+            return f"The approved plan artifact is unusable: {exc}"
+        if actual != approved_hash:
+            return (
+                "The saved Terraform plan no longer matches the approved "
+                "plan hash; refusing to apply a plan that was not approved."
+            )
+        # Workstream F: the credential context in force at execution must
+        # be the one that was approved. Switching credentials on (or
+        # changing the credential set) after approval materially changes
+        # what the apply can reach, so it is rejected rather than merged.
+        current_profile = credential_profile_identity()
+        if approved_profile and approved_profile != current_profile:
+            return (
+                "The credential profile changed after approval "
+                f"(approved {approved_profile!r}, now {current_profile!r}); "
+                "refusing to execute under a different credential context."
+            )
+        return None
 
     def _require_execution_enabled(self) -> None:
         if os.getenv("DEPLOYMENT_EXECUTION_ENABLED", "false").lower() != "true":
@@ -308,25 +446,69 @@ class DeploymentEngine:
         if not self.store.acquire_lock(run.id):
             raise DeploymentActionError("Deployment is already executing.")
 
+        # The Kubernetes manifest still needs an ephemeral workspace, but
+        # Terraform does NOT: it reuses the exact approval workspace that
+        # already holds the approved plan.
         temp_dir = self._new_workspace(f"devops-exec-{run.id}-")
+        approved = run.terraform_plan or {}
+        approved_plan_hash = approved.get("plan_file_hash", "")
+        tf_workspace = approved.get("approval_workspace", "")
         deployment_names = self._deployment_names(effective_payload.get("k8s_yaml", ""))
         try:
             run.move(DeploymentState.DEPLOYING)
             run.add_log("DEPLOYING: starting controlled Terraform and Kubernetes execution.")
             paths = self._write_iac(effective_payload, temp_dir)
-            terraform_plan = self.terraform.run_plan(temp_dir, execution=True, plan_output_path=paths["terraform_plan"])
-            run.execution["terraform_plan"] = terraform_plan
-            if terraform_plan.get("status") != "PASS":
-                run.error = "Terraform execution plan failed."
+
+            # ---- Phase 8.5-A corrective, Workstream D ----------------
+            # Execution applies the EXACT artifact that was approved. It
+            # does not re-plan: a second plan could legitimately differ
+            # from the approved one (drift, provider behaviour, time) and
+            # the approval would then be meaningless.
+            blocked = self._blocked_terraform(
+                self._verify_approved_plan_recoverable(
+                    tf_workspace,
+                    approved_plan_hash,
+                    approved.get("credential_profile_id", ""),
+                )
+            )
+            if blocked is None:
+                init = self.terraform.initialize(tf_workspace)
+                run.execution["terraform_init"] = init
+                blocked = (
+                    None
+                    if init.get("status") == "PASS"
+                    else self._blocked_terraform(
+                        "Terraform initialization of the approved workspace "
+                        f"failed ({init.get('status')})."
+                    )
+                )
+            if blocked is not None:
+                run.execution["terraform_plan"] = blocked
+                run.error = blocked["error"]
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                run.add_log("DEPLOYMENT_FAILED: Terraform execution plan failed before infrastructure mutation; rollback is not required.")
+                run.add_log(
+                    "DEPLOYMENT_FAILED: the approved Terraform plan could not "
+                    "be recovered and verified; nothing was applied."
+                )
                 self.store.save(run)
                 return run
 
+            # Contract-preserving evidence: the plan recorded against the
+            # execution IS the approved plan, explicitly marked as not
+            # regenerated so an auditor can tell the difference.
+            terraform_plan = dict(approved)
+            terraform_plan["replanned_after_approval"] = False
+            terraform_plan["plan_source"] = "approved"
+            run.execution["terraform_plan"] = terraform_plan
+            run.execution["approved_plan_hash"] = approved_plan_hash
+
             terraform_apply = self.terraform.apply_plan(
-                temp_dir,
-                paths["terraform_plan"],
-                expected_plan_file_hash=terraform_plan.get("plan_file_hash", ""),
+                tf_workspace,
+                str(Path(tf_workspace, PLAN_FILENAME)),
+                expected_plan_file_hash=approved_plan_hash,
+            )
+            run.execution["applied_plan_hash"] = terraform_apply.get(
+                "plan_file_hash", ""
             )
             run.execution["terraform_apply"] = terraform_apply
             run.execution["terraform_applied"] = terraform_apply.get("status") == "PASS"
@@ -370,3 +552,8 @@ class DeploymentEngine:
         finally:
             self.store.release_lock(run.id)
             shutil.rmtree(temp_dir, ignore_errors=True)
+            # A saved plan is sensitive and single-use: once the run has
+            # reached a terminal state it can never be applied again, so
+            # the approval workspace is destroyed.
+            if run.state in _TERMINAL_STATES:
+                self._discard_approval_workspace(run.id)

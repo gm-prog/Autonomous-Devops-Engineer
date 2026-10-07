@@ -168,6 +168,126 @@ not required for the zero-provider profile, and adding an artifact to
 request validation, hashing, approval binding and replay merely because it
 sounds secure would have been unjustified scope.
 
+## 6a. Corrective (Phase 8.5-A-C): runtime wiring and approval integrity
+
+The first 8.5-A implementation built a correct sandbox *abstraction* but
+left four acceptance-blocking gaps. They are closed as follows.
+
+### Runtime topology — the sandbox can now actually run
+
+The deployment-service image had no Docker CLI, and nothing mounted a
+container runtime socket, so the adapter had nothing to talk to. The
+corrective adopts the **acceptable v1 fallback**: the deployment service
+is treated as trusted infrastructure control-plane code and is given the
+minimum runtime access needed to launch the sandbox.
+
+```
+deployment-service container          <- TRUSTED control plane
+  |  docker CLI (docker-ce-cli only, no daemon)
+  |  /var/run/docker.sock             <- control-plane authority
+  v
+Docker daemon (host)
+  |
+  v
+terraform sandbox container           <- UNTRUSTED workload
+     --network none --read-only --cap-drop ALL
+     --security-opt no-new-privileges --user 65532:65532
+     --pids-limit --memory --cpus --rm --pull never
+     NO docker socket, NO host mounts, ONE workspace bind
+```
+
+Why this is acceptable for v1, and what it costs: the socket grants the
+deployment service effective root on the host daemon. That authority is
+confined to one service whose Docker invocation is fixed and
+policy-built — there is no generic "run a container" API — and it is
+never propagated into the workload. A dedicated sandbox-runtime service
+remains the preferred end state; this is a deliberate, documented
+residual risk, not an oversight.
+
+**Terraform was removed from the control-plane image.** The control plane
+launches containers; it does not run Terraform. The image build now fails
+if a `terraform` binary is present, so "never exec host terraform" is a
+physical property, not a coding rule.
+
+### Workspace contract
+
+| Property | Value |
+| --- | --- |
+| root | `DEPLOYMENT_WORKSPACE_ROOT` (E2E: `/tmp/ares-e2e-tf-workspaces`) |
+| host visibility | bind-mounted at the **same absolute path** on host and control plane |
+| per-run path | `<root>/approved-<run_id>` |
+| ownership | `DEPLOYMENT_TERRAFORM_SANDBOX_UID:GID` (default 65532, never 0) |
+| permissions | `0o2770` — owner+group only, setgid; never `0o777` |
+| sandbox mount | exactly one `-v <workspace>:/workspace:rw` |
+| cleanup | on non-approval dry-run failure, and on every terminal state |
+
+The daemon resolves bind sources on the **host**, so a path that exists
+only inside the control-plane container would silently mount the wrong
+thing. Identical absolute paths on both sides is a correctness
+requirement, not a convenience.
+
+### Non-root permission contract
+
+The sandbox UID/GID and the workspace owner are resolved by one helper,
+so they cannot drift. If the control plane is unprivileged the sandbox
+reuses its identity (no `chown` needed); if it is root it hands ownership
+to an unprivileged identity explicitly. A configured UID of 0 is refused.
+No `chmod 777`, and no "fix" that runs Terraform as root.
+
+### Exact-plan approval (the most important change)
+
+Before, approval was meaningless in a way the tests did not reveal:
+
+```
+dry run : plan A -> hash(A) -> workspace DELETED
+approve : hash(A)
+execute : plan B -> hash(B) -> apply B      <- A was never applied
+```
+
+Hashing B against itself always succeeds. The corrected contract:
+
+```
+dry run : plan A -> saved to a persistent, owned workspace
+approve : binds A's exact BYTES (plan_file_hash is in the plan identity)
+execute : recover A -> re-verify A -> terraform init -> apply A
+```
+
+`execute()` performs **no plan operation**. `init` is permitted and
+counted separately because it cannot create or alter a plan. A missing,
+modified, replaced or symlinked plan, a deleted workspace, or a changed
+credential profile all fail closed before anything is applied, and a
+terminal run destroys its saved plan so it can never be replayed.
+
+### Plan-artifact safety
+
+The saved plan is written by untrusted Terraform into a directory it
+controls, so every host-side touch goes through one guard
+(`plan_artifact.py`) that proves: direct child of the resolved
+workspace, exact expected filename, no symlink in any path component,
+regular file, size-bounded, still confined after resolution, and opened
+with `O_NOFOLLOW` so a check/read race also fails closed. Four
+independent layers; the mutation harness proves the stack as a whole.
+
+### Credential context
+
+v1 forwards **no credentials** (`DEPLOYMENT_CREDENTIAL_ENV_KEYS=`), so the
+profile identity is `credentials-disabled`. The profile is derived from
+credential **names only** — never values, and never a hash of a value —
+and is bound into plan identity, so switching credentials on after
+approval is rejected.
+
+### What the policy identity does and does not prove
+
+`sandbox_policy_identity` fingerprints the requested policy: image
+reference, user, network, limits, capability/rootfs posture, workspace
+mount and allowed operations. It proves what the control plane
+**asked for**. It does not, by itself, prove what the kernel delivered,
+and the declared `DEPLOYMENT_TERRAFORM_SANDBOX_VERSION` is a label, not a
+measurement of the binary. The **image digest** is the runtime trust
+anchor; the live E2E is what confirms the delivered runtime. The default
+Docker seccomp profile is relied upon as-is — no custom seccomp profile
+exists and none is claimed.
+
 ## 7. Operational status — honest scope
 
 * The sandbox image is **host-configured** via
@@ -176,10 +296,19 @@ sounds secure would have been unjustified scope.
   the Terraform version in evidence. The repository's established
   Terraform version is **1.9.8** (`deployment_service/Dockerfile.e2e`) and
   was not changed.
-* **Live E2E execution of the sandbox is NOT VERIFIED.** No sandbox image
-  has been built, pulled or executed, and no Terraform has run inside a
-  container as part of this phase. Unit tests prove policy and
-  orchestration; they are not a live run.
+* Live execution is proved by the `terraform-sandbox-live-e2e` CI job
+  (`e2e/terraform_sandbox_live.py`), which builds the sandbox image,
+  pushes it to a registry to obtain a real digest, pulls it by digest and
+  runs the full chain. It interrogates the running container from the
+  inside (uid, interfaces, socket, rootfs, capabilities, NoNewPrivs)
+  rather than trusting the flags that were requested, and proves
+  `approved_plan_hash == applied_plan_hash` with no post-approval
+  re-plan. If the runtime is unavailable it reports **BLOCKED** and never
+  PASS. The authoritative result is the job's published evidence
+  artifact for the commit under review -- a green job on an earlier
+  commit is not evidence for a later one.
+* This agent's own sandbox has **no Docker CLI and no daemon**, so the
+  live driver was exercised here only along its BLOCKED path.
 * Docker runtime availability remains a trusted-infrastructure dependency
   of the host orchestration side.
 * This phase does **not** make the platform "production-ready autonomous
