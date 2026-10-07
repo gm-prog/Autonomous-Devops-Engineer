@@ -340,7 +340,10 @@ def run_approval_flow(st: Checks, image: str, workspace_root: Path) -> dict:
     saved = Path(run.terraform_plan["approval_workspace"], PLAN_FILENAME)
     st.truthy("approved plan artifact exists on disk", saved.is_file())
     st.truthy("approved plan hash recorded", len(approved_hash) == 64)
-    notice("approved-plan-hash", approved_hash)
+    # Label precisely: this run exists to be tampered with. Emitting it
+    # as plain "approved-plan-hash" next to the honest run's
+    # "applied-plan-hash" would read like a mismatch to a reviewer.
+    notice("tamper-run-approved-plan-hash", approved_hash)
 
     engine.approve(run.id, "live-e2e", run.artifact_hash, run.plan_hash)
 
@@ -377,7 +380,11 @@ def run_approval_flow(st: Checks, image: str, workspace_root: Path) -> dict:
               runner.init_calls >= 1)
     st.truthy("saved plan destroyed after a terminal state",
               not Path(run2.terraform_plan["approval_workspace"]).exists())
-    notice("applied-plan-hash", str(done.execution.get("applied_plan_hash")))
+    notice("honest-run-approved-plan-hash", approved2)
+    notice("honest-run-applied-plan-hash",
+           str(done.execution.get("applied_plan_hash")))
+    notice("honest-run-hashes-equal",
+           str(approved2 == done.execution.get("applied_plan_hash")))
 
     return {
         "approval_plan_hash": approved2,
