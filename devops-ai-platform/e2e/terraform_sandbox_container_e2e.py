@@ -533,8 +533,15 @@ def observe_sandbox(st: Checks, digest, workspace_root: Path):
 
 #: Only the fields ExecuteRequest actually accepts.
 _EXECUTE_FIELDS = (
-    "dockerfile", "k8s_yaml", "terraform_tf", "pipeline_yaml",
+    "dockerfile", "k8s_yaml", "terraform_tf", "pipeline_yaml", "components",
 )
+
+#: This topology provisions infrastructure only. There is no Kubernetes
+#: cluster here and none is claimed: the deployment declares no
+#: Kubernetes component, so that leg is NOT APPLICABLE rather than
+#: skipped, faked, or quietly passed. The Kubernetes boundary is proven
+#: by the live Kind E2E, which runs against a real cluster.
+E2E_COMPONENTS = ["dockerfile", "terraform", "pipeline"]
 
 
 def deployment_payload():
@@ -552,7 +559,11 @@ def deployment_payload():
         "repository_name": FIXTURE_REPO,
         "requested_by": "ares-e2e",
         "dockerfile": read("Dockerfile"),
-        "k8s_yaml": read("k8s-deployment.yaml"),
+        # Declared-absent, not empty-by-accident: supplying manifest
+        # content while not requesting the component is rejected by the
+        # service as a contradictory payload.
+        "k8s_yaml": "",
+        "components": list(E2E_COMPONENTS),
         "terraform_tf": FIXTURE_TF.read_text(encoding="utf-8"),
         "pipeline_yaml": read("pipeline.yaml"),
         "source_revision": {"head_sha": FIXTURE_SHA},
@@ -580,6 +591,25 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     tf_plan = dry.get("terraform_plan") or {}
     st.equals("terraform plan PASS inside the sandbox", "PASS", tf_plan.get("status"))
     st.equals("dry run awaits approval", "AWAITING_APPROVAL", dry.get("state"))
+
+    # ---- Kubernetes is NOT APPLICABLE here, and says so explicitly ----
+    k8s = dry.get("kubernetes_dry_run") or {}
+    checks = ((dry.get("validation") or {}).get("checks") or {})
+    k8s_check = (checks.get("kubernetes") or {}).get("status", "")
+    detail("kubernetes-validation-status", k8s_check or "(absent)")
+    detail("kubernetes-dry-run-status", k8s.get("status", "(absent)"))
+    st.equals("kubernetes validation is NOT_APPLICABLE", "NOT_APPLICABLE", k8s_check)
+    st.truthy("kubernetes leg is not reported as a success",
+              k8s.get("status") != "PASS", k8s.get("status", "(absent)"))
+    st.truthy("kubernetes is explicitly marked not applicable",
+              k8s.get("kubernetes_applicable") is False
+              or k8s.get("status") in {"NOT_APPLICABLE", "SKIPPED"},
+              json.dumps(k8s)[:160])
+    st.truthy("no cluster access is claimed without a cluster",
+              k8s.get("cluster_access") is not True, str(k8s.get("cluster_access")))
+    st.truthy("no kubectl sandbox was invoked",
+              not k8s.get("sandbox") and not k8s.get("image_digest"),
+              json.dumps(k8s)[:160])
     workspace = tf_plan.get("approval_workspace", "")
     approved_hash = tf_plan.get("plan_file_hash", "")
     st.truthy("approved plan hash recorded (64 hex)", len(approved_hash) == 64)
@@ -615,6 +645,18 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
         {"approved_by": "ares-e2e", "artifact_hash": dry.get("artifact_hash"),
          "plan_hash": dry.get("plan_hash")})
 
+    if not host_test("-f", saved):
+        # Precondition for the tamper test did not hold. Report it as a
+        # failure of the tamper test rather than crashing, and never
+        # treat an untestable condition as a pass.
+        st.record("approved plan exists before tampering",
+                  "plan artifact present", "absent", False)
+        st.record("tampered plan execution fails closed",
+                  "tamper performed on a real plan",
+                  "NOT VERIFIED: no plan to tamper", False)
+        return {}
+    st.record("approved plan exists before tampering",
+              "plan artifact present", "present", True)
     host_append(saved, b"\x00tampered")
     status, tampered = api(
         "POST", f"/api/internal/deployments/{run_id}/execute",

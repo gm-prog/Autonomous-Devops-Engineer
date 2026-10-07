@@ -1,5 +1,6 @@
 
 import re
+from typing import List
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -44,6 +45,25 @@ class SourceRevision(BaseModel):
         return value
 
 
+#: The components a deployment may declare. A component that is not
+#: requested is NOT APPLICABLE: no validation, no plan, no execution and
+#: no sandbox invocation. That is distinct from a requested component
+#: that failed, which is always an error.
+KNOWN_COMPONENTS = ("dockerfile", "kubernetes", "terraform", "pipeline")
+
+
+def _validate_components(value: List[str]) -> List[str]:
+    if not value:
+        raise ValueError("at least one component must be requested")
+    unknown = sorted(set(value) - set(KNOWN_COMPONENTS))
+    if unknown:
+        raise ValueError(f"unknown component(s): {unknown}")
+    if len(set(value)) != len(value):
+        raise ValueError("components must not repeat")
+    # canonical order, so the same selection always hashes identically
+    return [c for c in KNOWN_COMPONENTS if c in value]
+
+
 class DryRunRequest(BaseModel):
     repository_id: int
     # canonical owner/repository identity - bare names and dot-only segments
@@ -56,6 +76,14 @@ class DryRunRequest(BaseModel):
     pipeline_yaml: str
     # required: the deployment must identify the exact revision deployed
     source_revision: SourceRevision
+    #: Which components this deployment declares. Defaults to all
+    #: four, so existing callers are unaffected.
+    components: List[str] = list(KNOWN_COMPONENTS)
+
+    @field_validator("components")
+    @classmethod
+    def _components(cls, value: List[str]) -> List[str]:
+        return _validate_components(value)
 
     @field_validator("repository_name")
     @classmethod
@@ -84,6 +112,14 @@ class ExecuteRequest(BaseModel):
     k8s_yaml: str
     terraform_tf: str
     pipeline_yaml: str
+    #: Which components this deployment declares. Defaults to all
+    #: four, so existing callers are unaffected.
+    components: List[str] = list(KNOWN_COMPONENTS)
+
+    @field_validator("components")
+    @classmethod
+    def _components(cls, value: List[str]) -> List[str]:
+        return _validate_components(value)
 
 
 @app.get("/health")

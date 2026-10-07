@@ -110,6 +110,8 @@ class DeploymentEngine:
     @staticmethod
     def _artifact_hash(payload: Dict[str, Any]) -> str:
         bundle = {k: payload.get(k, "") for k in ("dockerfile", "k8s_yaml", "terraform_tf", "pipeline_yaml")}
+        # Which components were declared is part of artifact identity.
+        bundle["components"] = list(payload.get("components") or [])
         return hashlib.sha256(json.dumps(bundle, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
@@ -162,6 +164,12 @@ class DeploymentEngine:
         therefore cannot later acquire one: injecting a manifest changes
         the artifact hash and invalidates the approval.
         """
+        components = payload.get("components")
+        if components is not None:
+            # An explicit selection is authoritative. Contradictory
+            # payloads (manifest supplied but Kubernetes not requested)
+            # are rejected by IaCValidator before reaching here.
+            return "kubernetes" in components
         return bool(str(payload.get("k8s_yaml", "") or "").strip())
 
     @staticmethod
@@ -195,8 +203,14 @@ class DeploymentEngine:
         return {
             "status": "SKIPPED",
             "stdout": "",
-            "stderr": "No Kubernetes manifest was supplied; no Kubernetes "
-                      "operation is performed for this deployment.",
+            "stderr": "Kubernetes is not a declared component of this "
+                      "deployment; no Kubernetes operation is performed, "
+                      "attempted, or claimed.",
+            # Explicit and machine-checkable. A consumer must be able to
+            # tell "no Kubernetes work was requested" apart from
+            # "Kubernetes work was requested and succeeded" without
+            # interpreting prose.
+            "kubernetes_applicable": False,
             "cluster_access": False,
             "sandboxed": True,
         }
@@ -313,7 +327,7 @@ class DeploymentEngine:
         )
         run.move(DeploymentState.VALIDATING)
         run.add_log("VALIDATING: static IaC safety and syntax checks started.")
-        run.validation = self.validator.validate(effective_payload.get("dockerfile", ""), effective_payload.get("k8s_yaml", ""), effective_payload.get("terraform_tf", ""), effective_payload.get("pipeline_yaml", ""))
+        run.validation = self.validator.validate(effective_payload.get("dockerfile", ""), effective_payload.get("k8s_yaml", ""), effective_payload.get("terraform_tf", ""), effective_payload.get("pipeline_yaml", ""), effective_payload.get("components"))
         if run.validation["status"] == "FAIL":
             run.move(DeploymentState.VALIDATION_FAILED)
             run.add_log("VALIDATION_FAILED: blocking IaC checks detected.")
