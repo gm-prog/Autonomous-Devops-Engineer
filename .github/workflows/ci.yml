@@ -120,13 +120,19 @@ jobs:
             -f docker-compose.e2e.yml config >/dev/null
           echo "E2E compose topology is valid" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Containerized deployment-service trust boundary proof
-        env:
-          E2E_PYTHON_BASE_IMAGE: python@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
         run: |
           set -euo pipefail
+          # Every external image comes from the committed digest pins, so
+          # this workflow text carries no hand-written digest and no tag.
+          PINS=e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
           python e2e/terraform_sandbox_container_e2e.py \
             --registry localhost:5001 \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \
+            --redis-image "$E2E_REDIS_IMAGE" \
             --terraform-version 1.9.8 \
             --workspace-root /tmp/ares-e2e-tf-workspaces \
             --evidence terraform-container-e2e-evidence.json

@@ -63,6 +63,8 @@ FIXTURE_TF = HERE / "terraform" / "main.tf"
 FIXTURES = HERE / "fixtures"
 
 SERVICE_NAME = "ares-e2e-deployment-service"
+REDIS_NAME = "ares-e2e-redis"
+NETWORK_NAME = "ares-e2e-net"
 SERVICE_PORT = 8030
 FIXTURE_SHA = "a" * 40
 FIXTURE_REPO = "ares-e2e/fixture"
@@ -243,12 +245,40 @@ def write_kubectl_stub(directory: Path) -> Path:
     return stub
 
 
+def start_support_stack(redis_image: str) -> None:
+    """Redis is a declared runtime dependency of the service (compose
+    `depends_on: [redis]`), so the proof runs the real thing on a
+    user-defined network rather than stubbing the service's own storage."""
+    sh(["docker", "rm", "-f", REDIS_NAME])
+    sh(["docker", "network", "rm", NETWORK_NAME])
+    created = sh(["docker", "network", "create", NETWORK_NAME])
+    if created.returncode != 0:
+        raise RuntimeError(f"could not create e2e network: {created.stderr[-300:]}")
+    started = sh([
+        "docker", "run", "-d", "--name", REDIS_NAME,
+        "--network", NETWORK_NAME, "--network-alias", "redis",
+        redis_image,
+    ])
+    if started.returncode != 0:
+        raise RuntimeError(f"redis failed to start: {started.stderr[-500:]}")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        ping = sh(["docker", "exec", REDIS_NAME, "redis-cli", "ping"])
+        if "PONG" in ping.stdout.upper():
+            return
+        time.sleep(1)
+    raise RuntimeError("redis did not become ready within 60s")
+
+
 def start_service(image, workspace_root: Path, sandbox_digest,
                   stub_dir: Path, commit_api) -> str:
     sh(["docker", "rm", "-f", SERVICE_NAME])
     argv = [
         "docker", "run", "-d", "--name", SERVICE_NAME,
+        "--network", NETWORK_NAME,
         "-p", f"{SERVICE_PORT}:8030",
+        "-e", "REDIS_HOST=redis",
+        "-e", "REDIS_PORT=6379",
         # TRUSTED control plane: it needs daemon authority to launch the
         # sandbox. This is the documented v1 residual risk.
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
@@ -578,6 +608,7 @@ def main() -> int:
     parser.add_argument("--registry", default="localhost:5001")
     parser.add_argument("--base-image", required=True)
     parser.add_argument("--terraform-version", default="1.9.8")
+    parser.add_argument("--redis-image", required=True)
     parser.add_argument("--workspace-root", default="/tmp/ares-e2e-tf-workspaces")
     parser.add_argument("--evidence", default="terraform-container-e2e-evidence.json")
     args = parser.parse_args()
@@ -630,6 +661,7 @@ def main() -> int:
                   "PRESENT", probe.stdout.strip())
 
         print("\n-- starting the real deployment-service container --")
+        start_support_stack(args.redis_image)
         start_service(service_image, workspace_root, digest, stub_dir, commit_api)
         health = wait_for_health()
         st.truthy("deployment-service container started", True)
@@ -687,6 +719,8 @@ def main() -> int:
                 for line in (keep or lines)[-10:]:
                     print(f"::error title=service-log::{line[:380]}")
         sh(["docker", "rm", "-f", SERVICE_NAME])
+        sh(["docker", "rm", "-f", REDIS_NAME])
+        sh(["docker", "network", "rm", NETWORK_NAME])
         if server:
             server.shutdown()
         shutil.rmtree(stub_dir, ignore_errors=True)
