@@ -462,6 +462,14 @@ def main() -> int:
     }
     Path(args.evidence).write_text(json.dumps(payload, indent=2, sort_keys=True))
 
+    notice(
+        "live-e2e-summary",
+        f"{status} {payload['checks_passed']}/{payload['checks_total']} checks; "
+        f"approved={payload.get('approval_plan_hash', '')[:16]} "
+        f"applied={payload.get('applied_plan_hash', '')[:16]} "
+        f"uid_gid={payload['sandbox_uid_gid']} "
+        f"credentials={payload['credential_profile_id']}",
+    )
     print("\n" + "=" * 70)
     print(f"LIVE E2E: {status}  ({payload['checks_passed']}/{payload['checks_total']} checks)")
     for row in st.failed:
