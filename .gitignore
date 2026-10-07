@@ -16,3 +16,18 @@
 local.properties
 .env
 debug.keystore
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+*.sqlite3
+*.db
+
+# Local test databases
+backend/*.db
+backend/tests/*.db

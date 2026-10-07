@@ -1,0 +1,140 @@
+"""Typed application failures for the Phase 6.1 proposal pipeline (§25).
+
+Every failure mode gets its own type so callers (REST layer, tests,
+future Phase 6.2 executors) never have to decode a generic ``False`` or a
+bare string. Presentation maps each type to a deliberate HTTP status.
+"""
+
+
+class Phase6PipelineError(Exception):
+    """Base class for typed Phase 6.1 application failures."""
+
+
+class IncidentNotFound(Phase6PipelineError):
+    """The referenced incident does not exist."""
+
+
+class EvidenceUnavailable(Phase6PipelineError):
+    """The incident's evidence pack could not be built."""
+
+
+class DeploymentEvidenceUnavailable(Phase6PipelineError):
+    """Deployment evidence could not be collected/inspected."""
+
+
+class RcaGenerationFailed(Phase6PipelineError):
+    """The RCA provider could not produce a result (unavailable/broken)."""
+
+
+class InvalidRcaResult(Phase6PipelineError):
+    """Provider output failed the structured RCA schema (fail closed)."""
+
+
+class TargetBindingFailed(Phase6PipelineError):
+    """Requested target identity is not provable from trusted evidence."""
+
+
+class ProposalValidationFailed(Phase6PipelineError):
+    """Deterministic patch/proposal validation rejected the proposal."""
+
+
+class ProposalPersistenceFailed(Phase6PipelineError):
+    """The proposal could not be persisted."""
+
+
+class ProposalLifecycleConflict(Phase6PipelineError):
+    """Persisted proposal state forbids this lifecycle operation
+    (Phase 8 §4): e.g. regeneration attempting to reset an
+    APPROVED / EXECUTING / PR_CREATED / EXECUTION_FAILED proposal
+    back to PROPOSED. Mapped to HTTP 409 — never silently coerced."""
+
+
+class IncidentConcurrencyConflict(Phase6PipelineError):
+    """Optimistic-concurrency rejection (Phase 8.1 §5): the durable
+    incident aggregate changed since this writer loaded it, so the stale
+    write was refused — NOTHING was overwritten. Mapped to HTTP 409.
+
+    Carries only bounded identifiers (incident id + expected version);
+    never SQL text, payloads, or secrets."""
+
+    def __init__(self, incident_id: str, expected_version: int):
+        self.incident_id = str(incident_id)
+        self.expected_version = int(expected_version)
+        super().__init__(
+            f"incident {self.incident_id} write rejected: stale aggregate "
+            f"version {self.expected_version} (concurrency conflict)"
+        )
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.2: approval + controlled execution
+# ---------------------------------------------------------------------- #
+class ProposalNotFoundError(Phase6PipelineError):
+    """The referenced proposal does not exist on the incident."""
+
+
+class ProposalIntegrityError(Phase6PipelineError):
+    """Canonical hash could not be reproduced or does not match the claim."""
+
+
+class ProposalNotApprovedError(Phase6PipelineError):
+    """Execution was requested for a proposal that is not approved."""
+
+
+class ProposalAlreadyExecutingError(Phase6PipelineError):
+    """Another execution attempt holds this proposal right now."""
+
+
+class ProposalStaleError(Phase6PipelineError):
+    """The approval (or proposal) is older than the freshness contract."""
+
+
+class ApprovalPolicyError(Phase6PipelineError):
+    """Deterministic approval policy rejected the proposal."""
+
+
+class TargetRevalidationError(Phase6PipelineError):
+    """Authoritative deployment evidence no longer matches the proposal."""
+
+
+class ProposalPatchPolicyError(Phase6PipelineError):
+    """Deterministic patch policy rejected the persisted proposal."""
+
+
+class RemediationValidationFailedError(Phase6PipelineError):
+    """Workspace validation failed; commit/push/PR are forbidden."""
+
+
+class ProposalExecutionFailedError(Phase6PipelineError):
+    """A later execution stage failed; state is persisted for audit/retry."""
+
+    def __init__(self, message: str, stage: str = "unknown"):
+        super().__init__(message)
+        self.stage = stage
+
+
+# ---------------------------------------------------------------------- #
+# Phase 6.2.1: durable execution coordination + remote reconciliation
+# ---------------------------------------------------------------------- #
+class ExecutionLeaseUnavailable(Phase6PipelineError):
+    """Another live owner currently holds the durable execution lease."""
+
+
+class ExecutionLeaseExpired(Phase6PipelineError):
+    """The execution lease expired and recovery conditions were not met."""
+
+
+class ExecutionRecoveryConflict(Phase6PipelineError):
+    """Recovery found durable/remote state that cannot be reconciled safely."""
+
+
+class RemoteBranchConflict(Phase6PipelineError):
+    """The deterministic remediation branch exists at an unexpected commit."""
+
+
+class ExistingPullRequestConflict(Phase6PipelineError):
+    """An existing PR for the remediation identity cannot be safely reused."""
+
+
+class RemoteReconciliationFailed(Phase6PipelineError):
+    """Remote state could not be inspected or is missing when expected."""
