@@ -298,3 +298,25 @@ was being applied. `FixtureApplyOrderTests` covers the ordering
 (including a non-vacuous check that the fixture layout really has the
 hazard), the file-attributed error, the one-line collapsing, and a static
 guard that the directory apply cannot come back.
+
+The fifth run showed both fixes holding — the three images built (each
+with its observable `sha256` id in the log), the fixture applied
+namespace-first, and the failure arrived attributed to a single file: the
+pinned Gateway API **v1.4.1** CRD caps `GatewayClass.spec.description` at
+64 characters, and the API server enforces it at admission time, so the
+fixture's folded three-line description made the object — and with it the
+whole topology — unappliable:
+
+    topology fixture [gatewayclass.yaml] failed (rc=1):
+      The GatewayClass "ares-gatewayclass" is invalid:
+        * spec.description: Too long: may not be longer than 64
+
+The description is now a single 58-character line, and
+`verify_documents()` — the same contract the driver checks live as
+`topology:fixture-valid` — refuses anything longer
+(`GATEWAY_CLASS_DESCRIPTION_LIMIT`), with a non-vacuous unit test that
+proves an over-long value is rejected and exactly 64 characters is not.
+Before spending another run, the *whole* rendered fixture was validated
+locally against the pinned CRD schemas (Gateway API v1.4.1 experimental,
+the channel CI installs): the check reproduced the CI error verbatim, and
+now reports zero problems.

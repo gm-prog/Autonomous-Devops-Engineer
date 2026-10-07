@@ -39,6 +39,20 @@ GATEWAY_CLASS = "ares-gatewayclass"
 ENVOY_CONTROLLER_NAME = "gateway.envoyproxy.io/gatewayclass-controller"
 ENVOY_PROXY = "ares-envoy-proxy"
 ENVOY_PROXY_NAMESPACE = "envoy-gateway-system"
+# Pinned Gateway API v1.4.1 CRD limit for GatewayClass.spec.description.
+# The API server enforces it at admission time, so a longer string makes
+# the whole fixture unappliable (observed live: `GatewayClass
+# "ares-gatewayclass" is invalid: spec.description: Too long: may not be
+# longer than 64`). It is a contract rule, not a style preference: an
+# object the API server refuses cannot route anything.
+GATEWAY_CLASS_DESCRIPTION_LIMIT = 64
+# Pinned Gateway API v1.4.1 CRD limit for GatewayClass.spec.description.
+# The API server enforces it at admission time, so a longer string makes
+# the whole fixture unappliable (observed live:
+# `GatewayClass "ares-gatewayclass" is invalid: spec.description: Too
+#  long: may not be longer than 64`). It is a contract rule, not a style
+# preference: an object the API server refuses cannot route anything.
+GATEWAY_CLASS_DESCRIPTION_LIMIT = 64
 GATEWAY = "ares-gateway"
 GATEWAY_LISTENER_PORT = 80
 HTTP_ROUTE = "ares-route"
@@ -219,6 +233,18 @@ def verify_documents(documents: Sequence[Mapping[str, Any]]) -> List[str]:
     parameters_ref = class_spec.get("parametersRef") or {}
     if (parameters_ref.get("kind"), parameters_ref.get("name")) != ("EnvoyProxy", ENVOY_PROXY):
         violations.append("GatewayClass parametersRef must point at the EnvoyProxy fixture")
+    description = class_spec.get("description")
+    if description is not None and len(description) > GATEWAY_CLASS_DESCRIPTION_LIMIT:
+        violations.append(
+            f"GatewayClass description is {len(description)} characters; the pinned "
+            f"CRD caps it at {GATEWAY_CLASS_DESCRIPTION_LIMIT}")
+
+    description = class_spec.get("description")
+    if description is not None and len(description) > GATEWAY_CLASS_DESCRIPTION_LIMIT:
+        violations.append(
+            f"GatewayClass description is {len(description)} characters; the pinned "
+            f"CRD caps it at {GATEWAY_CLASS_DESCRIPTION_LIMIT}"
+        )
 
     proxy = grouped["EnvoyProxy"][0]
     provider = _spec(proxy).get("provider") or {}

@@ -255,6 +255,41 @@ class TopologyFixtureTests(unittest.TestCase):
                          "the class must be served by a real Gateway API "
                          "implementation, not a placeholder controller")
 
+    def test_gateway_class_description_respects_the_pinned_crd_limit(self):
+        """The live API server rejected the fixture over this field.
+
+        Pinned Gateway API v1.4.1 caps ``GatewayClass.spec.description`` at
+        64 characters, and admission-time rejection means an over-long
+        description makes the whole fixture unappliable:
+
+            The GatewayClass "ares-gatewayclass" is invalid:
+              spec.description: Too long: may not be longer than 64
+        """
+        documents = topo.load_documents()
+        gateway_class = next(document for document in documents
+                             if document.get("kind") == "GatewayClass")
+        description = gateway_class["spec"]["description"]
+        self.assertIsInstance(description, str)
+        self.assertLessEqual(len(description), topo.GATEWAY_CLASS_DESCRIPTION_LIMIT)
+        self.assertEqual(topo.verify_documents(documents), [],
+                         "the committed fixture must satisfy its contract")
+
+    def test_the_contract_rejects_an_over_long_description(self):
+        """Non-vacuous: the rule actually fires on an over-long value."""
+        import copy
+
+        documents = copy.deepcopy(topo.load_documents())
+        gateway_class = next(document for document in documents
+                             if document.get("kind") == "GatewayClass")
+        gateway_class["spec"]["description"] = "x" * 65
+        violations = topo.verify_documents(documents)
+        self.assertTrue(any("description" in violation for violation in violations),
+                        f"over-long description must be a violation: {violations}")
+        gateway_class["spec"]["description"] = "x" * 64
+        self.assertEqual([v for v in topo.verify_documents(documents)
+                          if "description" in v], [],
+                         "exactly 64 characters is admissible")
+
     def test_listener_is_plain_http_with_no_tls(self):
         gateway = next(doc for doc in topo.load_documents() if doc["kind"] == "Gateway")
         self.assertEqual(len(gateway["spec"]["listeners"]), 1)

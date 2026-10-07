@@ -25,6 +25,14 @@ spec:
     kind: EnvoyProxy
     name: ares-envoy-proxy
     namespace: envoy-gateway-system
-  description: >-
-    ARES weighted stable/canary topology (Phase 8.7-B.0). Declared for
-    the repository's Kind E2E; not a production ingress configuration.
+  # `spec.description` is capped at 64 characters by the pinned Gateway
+  # API v1.4.1 CRD, and the API server enforces it at admission time: a
+  # 3-line folded block here made the fixture unappliable
+  #   The GatewayClass "ares-gatewayclass" is invalid:
+  #     spec.description: Too long: may not be longer than 64
+  # The string below is therefore short by construction (58 characters)
+  # and `verify_documents()` rejects anything longer, so the fixture
+  # cannot be committed in a shape the cluster refuses. The class is
+  # declared for the repository's Kind E2E and is not a production
+  # ingress configuration.
+  description: ARES weighted stable/canary topology for the repo Kind E2E
