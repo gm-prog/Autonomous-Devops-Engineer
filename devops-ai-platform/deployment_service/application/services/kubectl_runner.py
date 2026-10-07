@@ -142,6 +142,7 @@ class KubectlRunnerService:
         sandbox = ContainerKubectlSandbox(
             load_spec_from_environment(),
             runtime=self._config.container_runtime,
+            staging_root=self._config.staging_root or None,
         )
         self._sandbox = sandbox
         return sandbox

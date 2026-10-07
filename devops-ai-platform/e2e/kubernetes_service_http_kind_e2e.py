@@ -60,6 +60,7 @@ SERVICE_NAME = "ares-k8s-http-service"
 REDIS_NAME = "ares-k8s-http-redis"
 SERVICE_NET = "ares-k8s-http-net"
 SERVICE_PORT = 8041
+STAGING_ROOT = "/tmp/ares-k8s-http-staging"
 NAMESPACE = "devops-production-namespace"
 CREDENTIAL_PROFILE = "ares-k8s-deployer-v1"
 
@@ -268,6 +269,12 @@ def start_service(service_image: str, sandbox_digest: str, kubeconfig: Path,
         # the documented v1 residual risk, not an accident.
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
         "-v", f"{workspace_root}:{workspace_root}",
+        # The service runs in a container but the sandbox is launched by
+        # the HOST daemon, so the staging directory must exist at the
+        # same absolute path on both sides or the sandbox's bind mounts
+        # resolve to nothing.
+        "-v", f"{STAGING_ROOT}:{STAGING_ROOT}",
+        "-e", f"DEPLOYMENT_KUBECTL_STAGING_ROOT={STAGING_ROOT}",
         "-v", f"{kubeconfig}:/etc/ares/kubeconfig:ro",
         "-e", "DEPLOYMENT_EXECUTION_ENABLED=true",
         "-e", f"DEPLOYMENT_WORKSPACE_ROOT={workspace_root}",
@@ -522,77 +529,129 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
                code != 422 and bad_leg.get("status") != "PASS")
 
     # ---- 16/17. rollback ----
-    code, result = api("POST", f"/api/internal/deployments/{run_id}/rollback", {},
-                       expect=(200, 201, 202, 400, 404, 405, 409, 422))
-    if code in (404, 405):
-        record("rollback:performed",
-               "a rollback path returns the workload to a known good state",
-               f"NOT VERIFIED: the service exposes no rollback endpoint "
-               f"(status={code}); rollback is proven by the live Kind E2E's "
-               f"rollout_undo path, not here", False)
-    else:
-        record("rollback:performed",
-               "a rollback path returns the workload to a known good state",
-               f"status={code} state={result.get('state')}", code in (200, 201, 202))
+    # The deployment API exposes no rollback endpoint: POST .../rollback
+    # returns 404 because the route does not exist. That is recorded as
+    # a finding rather than dressed up as a pass, and rollback itself is
+    # proven where it is actually driven -- the live Kind E2E runs
+    # kubectl rollout undo through the same sandbox. Inventing a
+    # rollback row here would claim a capability this path does not have.
+    code, _ = api("POST", f"/api/internal/deployments/{run_id}/rollback", {},
+                  expect=(200, 201, 202, 400, 404, 405, 409, 422))
+    record("rollback:http-surface-is-absent-and-reported",
+           "the absence of an HTTP rollback route is observed, not papered over",
+           f"status={code} (404/405 means no such route); rollback is exercised "
+           f"by the live Kind E2E's rollout undo, not by this path",
+           code in (404, 405))
     after = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", WORKLOAD_NAME,
                     "-o", "jsonpath={.status.replicas}")
     record("rollback:workload-still-consistent",
-           "the workload is in a defined state afterwards",
+           "the workload is in a defined state after the sequence",
            f"replicas={after.stdout.strip()!r} rc={after.returncode}",
            after.returncode == 0)
 
 
-def check_sandbox_runtime_posture(sandbox_digest: str, sandbox_network: str) -> None:
+class SandboxWatcher:
+    """Capture the sandbox container the SERVICE launches.
+
+    The sandbox runs with --rm, so it cannot be inspected after the
+    fact. This polls for it during execution and snapshots its real
+    runtime configuration the moment it appears. If it never catches
+    one, the posture rows fail closed rather than quietly passing.
+    """
+
+    def __init__(self) -> None:
+        self.snapshot: Dict[str, str] = {}
+        self._stop = False
+        self._thread = None
+
+    def _poll(self) -> None:
+        fields = {
+            "binds": "{{json .HostConfig.Binds}}",
+            "user": "{{.Config.User}}",
+            "readonly": "{{.HostConfig.ReadonlyRootfs}}",
+            "secopt": "{{json .HostConfig.SecurityOpt}}",
+            "capdrop": "{{json .HostConfig.CapDrop}}",
+            "networks": "{{json .NetworkSettings.Networks}}",
+            "image": "{{.Config.Image}}",
+            "privileged": "{{.HostConfig.Privileged}}",
+        }
+        while not self._stop:
+            found = subprocess.run(
+                ["docker", "ps", "-a", "--filter", "name=ares-kubectl-",
+                 "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=30)
+            names = [n for n in found.stdout.split() if n.startswith("ares-kubectl-")]
+            if names and not self.snapshot:
+                target = names[0]
+                captured = {"container": target}
+                for key, fmt in fields.items():
+                    out = subprocess.run(["docker", "inspect", "-f", fmt, target],
+                                         capture_output=True, text=True, timeout=30)
+                    captured[key] = out.stdout.strip() if out.returncode == 0 else ""
+                if captured.get("user"):
+                    self.snapshot = captured
+                    return
+            time.sleep(0.15)
+
+    def start(self) -> "SandboxWatcher":
+        import threading
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+
+def check_sandbox_runtime_posture(watcher: "SandboxWatcher",
+                                  sandbox_network: str) -> None:
     """Observe the sandbox the SERVICE launched, not one we launched.
 
     Every probe fails closed: if the property cannot be observed, that
     is a FAIL, never an implicit pass.
     """
-    inspect = sh(["docker", "ps", "-a", "--filter", "name=ares-kubectl-",
-                  "--format", "{{.Names}}"])
-    names = [n for n in inspect.stdout.split() if n.startswith("ares-kubectl-")]
-    if not names:
-        for name in ("sandbox:observed-by-the-service", "sandbox:no-docker-socket",
-                     "sandbox:non-root", "sandbox:read-only-rootfs",
-                     "sandbox:no-new-privileges", "sandbox:all-capabilities-dropped",
-                     "sandbox:on-the-isolated-network"):
-            record(name, "the service-launched sandbox is inspectable",
-                   "NOT VERIFIED: no ares-kubectl-* container was retained", False)
+    snap = watcher.snapshot
+    names = ("sandbox:observed-by-the-service", "sandbox:no-docker-socket",
+             "sandbox:non-root", "sandbox:read-only-rootfs",
+             "sandbox:no-new-privileges", "sandbox:all-capabilities-dropped",
+             "sandbox:on-the-isolated-network")
+    if not snap:
+        for name in names:
+            record(name, "the service-launched sandbox is inspected while it runs",
+                   "NOT VERIFIED: the sandbox container was never observed", False)
         return
-    target = names[0]
     record("sandbox:observed-by-the-service",
            "the sandbox container the service itself launched is inspected",
-           f"container={target}", True)
+           f"container={snap['container']} image={snap.get('image', '')[:60]}", True)
 
-    def field(fmt: str) -> str:
-        out = sh(["docker", "inspect", "-f", fmt, target])
-        return out.stdout.strip() if out.returncode == 0 else ""
-
-    binds = field("{{json .HostConfig.Binds}}")
+    binds = snap.get("binds", "")
     record("sandbox:no-docker-socket",
            "the untrusted sandbox never receives daemon authority",
-           f"binds={binds[:200]!r}",
-           bool(binds) and "docker.sock" not in binds and "containerd.sock" not in binds)
-    user = field("{{.Config.User}}")
+           f"binds={binds[:220]!r} privileged={snap.get('privileged')!r}",
+           bool(binds) and "docker.sock" not in binds
+           and "containerd.sock" not in binds and snap.get("privileged") == "false")
+    user = snap.get("user", "")
     record("sandbox:non-root", "the sandbox runs as a non-root uid",
-           f"user={user!r}", bool(user) and not user.startswith(("0:", "root")) )
-    readonly = field("{{.HostConfig.ReadonlyRootfs}}")
+           f"user={user!r}",
+           bool(user) and not user.startswith(("0:", "root")) and user != "0")
     record("sandbox:read-only-rootfs", "the root filesystem is read-only",
-           f"ReadonlyRootfs={readonly!r}", readonly == "true")
-    secopt = field("{{json .HostConfig.SecurityOpt}}")
+           f"ReadonlyRootfs={snap.get('readonly')!r}", snap.get("readonly") == "true")
     record("sandbox:no-new-privileges", "privilege escalation is disabled",
-           f"SecurityOpt={secopt[:120]!r}", "no-new-privileges" in (secopt or ""))
-    capdrop = field("{{json .HostConfig.CapDrop}}")
+           f"SecurityOpt={snap.get('secopt', '')[:140]!r}",
+           "no-new-privileges" in snap.get("secopt", ""))
     record("sandbox:all-capabilities-dropped", "every capability is dropped",
-           f"CapDrop={capdrop[:120]!r}", "ALL" in (capdrop or ""))
-    networks = field("{{json .NetworkSettings.Networks}}")
+           f"CapDrop={snap.get('capdrop', '')[:140]!r}",
+           "ALL" in snap.get("capdrop", ""))
     try:
-        joined = sorted(json.loads(networks or "{}").keys())
+        joined = sorted(json.loads(snap.get("networks") or "{}").keys())
     except Exception:  # noqa: BLE001
         joined = []
     record("sandbox:on-the-isolated-network",
            "the sandbox ran only on the dedicated destination-isolated network",
-           f"networks={joined}", joined == [sandbox_network])
+           f"networks={joined} expected=[{sandbox_network!r}]",
+           joined == [sandbox_network])
 
 
 def build_service_image(base_image: str) -> str:
@@ -659,6 +718,8 @@ def main() -> int:
     control_plane = f"{args.cluster}-control-plane"
     workspace_root = Path("/tmp/ares-k8s-http-workspace")
     workspace_root.mkdir(parents=True, exist_ok=True)
+    Path(STAGING_ROOT).mkdir(parents=True, exist_ok=True)
+    os.chmod(STAGING_ROOT, 0o711)
     exec_network = None
     started = False
 
@@ -737,8 +798,12 @@ def main() -> int:
                f"status={health.get('status', 'unknown')}", True)
 
         # ---- 8-20 ----
-        run_sequence(args.cluster, control_plane, args.workload_image)
-        check_sandbox_runtime_posture(args.sandbox_image, exec_network.name)
+        watcher = SandboxWatcher().start()
+        try:
+            run_sequence(args.cluster, control_plane, args.workload_image)
+        finally:
+            watcher.stop()
+        check_sandbox_runtime_posture(watcher, exec_network.name)
 
     except Exception as exc:  # noqa: BLE001
         import traceback

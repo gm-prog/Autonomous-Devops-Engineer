@@ -128,6 +128,11 @@ class KubernetesExecutionConfig:
     sandbox_network: str
     sandbox_network_identity: str
     container_runtime: str
+    #: Where the adapter stages manifests and credentials. When the
+    #: control plane itself runs in a container this MUST be a path the
+    #: daemon also sees at the same absolute location, or the sandbox's
+    #: bind mounts resolve to nothing.
+    staging_root: str = ""
 
     @classmethod
     def from_environment(cls) -> "KubernetesExecutionConfig":
@@ -150,6 +155,7 @@ class KubernetesExecutionConfig:
                 "DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY", "").strip(),
             container_runtime=(os.getenv("DEPLOYMENT_CONTAINER_RUNTIME", "").strip()
                                or "docker"),
+            staging_root=os.getenv("DEPLOYMENT_KUBECTL_STAGING_ROOT", "").strip(),
         )
 
     @property
@@ -166,6 +172,7 @@ class KubernetesExecutionConfig:
             "sandbox_network": self.sandbox_network,
             "sandbox_network_identity": self.sandbox_network_identity,
             "container_runtime": self.container_runtime,
+            "staging_root": self.staging_root,
         }
 
     def digest(self) -> str:
