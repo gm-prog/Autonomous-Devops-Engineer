@@ -159,16 +159,20 @@ def build_and_pin_image(args) -> str:
         # Keep this short and last-lines-only: it is surfaced as a CI
         # annotation, which is the one channel always readable.
         blob = (build.stderr or "") + "\n" + (build.stdout or "")
-        lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
-        # BuildKit prints the useful cause on lines mentioning ERROR or
-        # the failing process; the surrounding block is just context.
-        interesting = [
-            ln for ln in lines
-            if "ERROR" in ln or "error:" in ln.lower()
-            or "did not complete successfully" in ln
-            or "E:" == ln[:2] or "not found" in ln.lower()
+        lines = [ln.rstrip() for ln in blob.splitlines() if ln.strip()]
+        # BuildKit prefixes a RUN step's OWN output with "#<step> <secs> ".
+        # Those lines carry the actual cause; everything else is the
+        # progress display and the Dockerfile context echo.
+        import re as _re
+        output = [
+            _re.sub(r"^#\d+\s+[\d.]+\s*", "", ln)
+            for ln in lines
+            if _re.match(r"^#\d+\s+[\d.]+\s", ln)
         ]
-        tail = " | ".join((interesting or lines)[-6:])
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for line in (output or lines)[-8:]:
+                print(f"::error title=image-build-output::{line[:380]}")
+        tail = " | ".join((output or lines)[-5:])
         raise RuntimeError(f"sandbox image build failed: {tail[:900]}")
 
     push = subprocess.run(["docker", "push", tag], capture_output=True, text=True)
