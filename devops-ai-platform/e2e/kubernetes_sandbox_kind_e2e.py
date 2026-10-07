@@ -536,6 +536,7 @@ def main() -> int:
     parser.add_argument("--node-image", required=True)
     parser.add_argument("--base-image", required=True)
     parser.add_argument("--workload-image", required=True)
+    parser.add_argument("--registry", default="localhost:5001")
     parser.add_argument("--kubectl-version", default="v1.31.4")
     parser.add_argument("--evidence", default="kubernetes-kind-e2e-evidence.json")
     args = parser.parse_args()
@@ -574,17 +575,25 @@ def main() -> int:
                     ctx / "Dockerfile")
         kubectl_bin = Path(os.environ["ARES_KUBECTL_BINARY"])
         shutil.copy(kubectl_bin, ctx / "kubectl")
-        tag = f"ares-kubectl-sandbox:{uuid.uuid4().hex[:10]}"
+        repo = f"{args.registry}/ares-kubectl-sandbox"
+        tag = f"{repo}:{uuid.uuid4().hex[:10]}"
         run(["docker", "build", "--build-arg", f"BASE_IMAGE={args.base_image}",
              "-t", tag, str(ctx)], timeout=900)
-        image_id = run(["docker", "image", "inspect", tag,
-                        "-f", "{{.Id}}"]).stdout.strip()
-        if not image_id.startswith("sha256:"):
-            raise Blocked(f"could not resolve a digest for {tag}")
-        pinned = f"ares-kubectl-sandbox@{image_id}"
-        # `docker run` resolves name@sha256:<image id> locally, so the
-        # sandbox never runs a tag that could be repointed.
-        run(["docker", "tag", tag, "ares-kubectl-sandbox:pinned"])
+        # A digest pin must be a REPOSITORY digest. docker cannot resolve
+        # name@sha256:<local image id>, so the image is pushed to the
+        # job-local registry purely to obtain its immutable identity; it
+        # is already present locally, so --pull never still holds.
+        run(["docker", "push", tag], timeout=900)
+        repo_digests = json.loads(run(
+            ["docker", "image", "inspect", tag, "-f", "{{json .RepoDigests}}"]
+        ).stdout.strip() or "[]")
+        pinned = next((r for r in repo_digests if r.startswith(repo + "@")), "")
+        if "@sha256:" not in pinned:
+            raise Blocked(
+                f"could not resolve a repository digest for {tag}; "
+                f"observed RepoDigests={repo_digests}"
+            )
+        image_id = pinned.split("@", 1)[1]
 
         # ---- dedicated network, joined to the kind network ----------
         run(["docker", "network", "create", SANDBOX_NETWORK], check=False)

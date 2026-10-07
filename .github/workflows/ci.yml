@@ -197,6 +197,12 @@ jobs:
     name: Phase 8.6-A live Kind Kubernetes E2E
     runs-on: ubuntu-latest
     defaults: { run: { working-directory: devops-ai-platform } }
+    services:
+      # Present only so the locally built sandbox image acquires an
+      # immutable repository digest. Nothing is pulled from the Internet.
+      registry:
+        image: registry@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: ["5001:5000"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -239,6 +245,7 @@ jobs:
             --node-image "$NODE_IMAGE" \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \
             --workload-image ares-e2e-workload:local \
+            --registry localhost:5001 \
             --kubectl-version "$ARES_KUBECTL_VERSION" \
             --evidence kubernetes-kind-e2e-evidence.json
       - name: Publish live evidence
