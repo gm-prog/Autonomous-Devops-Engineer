@@ -693,3 +693,46 @@ def test_runner_evidence_never_leaks_credentials(wired):
     blob = repr(runner.apply(str(manifest)))
     for secret in ("redacted-test-token", "BEGIN CERTIFICATE", CA_B64):
         assert secret not in blob
+
+
+# =====================================================================
+# 6. "No Kubernetes component" must not become a bypass
+# =====================================================================
+
+def test_absent_manifest_is_not_applicable_rather_than_allowed():
+    """A payload with no manifest performs no Kubernetes operation."""
+    from deployment_service.application.services.deployment_engine import (
+        DeploymentEngine,
+    )
+    assert DeploymentEngine._kubernetes_is_declared({}) is False
+    assert DeploymentEngine._kubernetes_is_declared({"k8s_yaml": ""}) is False
+    assert DeploymentEngine._kubernetes_is_declared({"k8s_yaml": "   \n"}) is False
+    skipped = DeploymentEngine._kubernetes_not_applicable()
+    assert skipped["status"] == "SKIPPED"
+    assert skipped["cluster_access"] is False
+
+
+def test_a_present_manifest_is_never_skipped():
+    """The skip must key on absence only -- never on content."""
+    from deployment_service.application.services.deployment_engine import (
+        DeploymentEngine,
+    )
+    assert DeploymentEngine._kubernetes_is_declared({"k8s_yaml": real_manifest()})
+    # even a hostile manifest counts as "declared", so it goes to the
+    # policy and is rejected there rather than being skipped.
+    assert DeploymentEngine._kubernetes_is_declared(
+        {"k8s_yaml": ATTACKS["cluster_role"]})
+
+
+def test_skipping_cannot_be_reached_with_a_manifest_present(tmp_path, monkeypatch):
+    """End to end: a declared manifest always reaches the policy."""
+    kc = tmp_path / "kubeconfig"
+    kc.write_text(kubeconfig())
+    monkeypatch.setenv("DEPLOYMENT_KUBECONFIG_PATH", str(kc))
+    monkeypatch.setenv("DEPLOYMENT_KUBERNETES_NAMESPACE", NAMESPACE)
+    manifest = tmp_path / "k8s.yaml"
+    manifest.write_text(ATTACKS["cluster_role"])
+    sandbox = RecordingSandbox()
+    result = KubectlRunnerService(sandbox=sandbox).apply(str(manifest))
+    assert result["status"] == "BLOCKED"
+    assert result["status"] != "SKIPPED"

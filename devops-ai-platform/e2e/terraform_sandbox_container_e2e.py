@@ -552,7 +552,6 @@ def deployment_payload():
         "repository_name": FIXTURE_REPO,
         "requested_by": "ares-e2e",
         "dockerfile": read("Dockerfile"),
-        "k8s_yaml": read("k8s-deployment.yaml"),
         "terraform_tf": FIXTURE_TF.read_text(encoding="utf-8"),
         "pipeline_yaml": read("pipeline.yaml"),
         "source_revision": {"head_sha": FIXTURE_SHA},
@@ -830,7 +829,10 @@ def main() -> int:
         "workspace_root": str(workspace_root),
         "credential_profile_id": "credentials-disabled",
         "observed_runtime": runtime,
-        "kubernetes": "STUBBED at the test topology — NOT validated",
+        "kubernetes": "NOT APPLICABLE — this Terraform topology has no cluster. "
+                      "Phase 8.6-A replaced the client-side dry run with a "
+                      "server-side one, so a Kubernetes component cannot be "
+                      "faked here; it is proven live in the kubernetes-kind-e2e job.",
         **evidence,
         "checks": st.rows,
     }

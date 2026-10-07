@@ -325,6 +325,13 @@ PROBES: list[Probe] = [
                 '                "applied_resources": approved.resources,'),
     ),
     Probe(
+        "skip-kubernetes-whenever-convenient",
+        "treat every deployment as having no Kubernetes component",
+        replace("deployment_service/application/services/deployment_engine.py",
+                'return bool(str(payload.get("k8s_yaml", "") or "").strip())',
+                "return False"),
+    ),
+    Probe(
         "copy-the-host-environment",
         "hand the whole host environment to the container runtime",
         replace(ADAPTER, '        env = {\n            "PATH": "/usr/local/bin:/usr/bin:/bin",',

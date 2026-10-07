@@ -140,6 +140,34 @@ class DeploymentEngine:
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     @staticmethod
+    def _kubernetes_is_declared(payload) -> bool:
+        """True when the deployment actually has a Kubernetes component.
+
+        Phase 8.6-A: the Kubernetes dry run is now a SERVER-side dry run
+        against the real cluster, so it cannot be performed without one.
+        A payload that declares no manifest performs no Kubernetes
+        operation at all, so there is nothing to validate and nothing to
+        execute -- that is "not applicable", not "allowed through".
+
+        This is deliberately keyed on the manifest text, which is part of
+        the artifact hash. A run approved with no Kubernetes component
+        therefore cannot later acquire one: injecting a manifest changes
+        the artifact hash and invalidates the approval.
+        """
+        return bool(str(payload.get("k8s_yaml", "") or "").strip())
+
+    @staticmethod
+    def _kubernetes_not_applicable() -> Dict[str, Any]:
+        return {
+            "status": "SKIPPED",
+            "stdout": "",
+            "stderr": "No Kubernetes manifest was supplied; no Kubernetes "
+                      "operation is performed for this deployment.",
+            "cluster_access": False,
+            "sandboxed": True,
+        }
+
+    @staticmethod
     def _deployment_names(k8s_yaml: str) -> List[str]:
         try:
             documents = [doc for doc in yaml.safe_load_all(k8s_yaml) if isinstance(doc, dict)]
@@ -276,10 +304,15 @@ class DeploymentEngine:
             )
             run.terraform_plan["credential_profile_id"] = credential_profile_identity()
             run.terraform_plan["approval_workspace"] = temp_dir
-            run.kubernetes_dry_run = self.kubectl.dry_run(paths["kubernetes"])
+            run.kubernetes_dry_run = (
+                self.kubectl.dry_run(paths["kubernetes"])
+                if self._kubernetes_is_declared(effective_payload)
+                else self._kubernetes_not_applicable()
+            )
             run.artifact_hash = self._artifact_hash(effective_payload)
             run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
-            if run.terraform_plan["status"] == "PASS" and run.kubernetes_dry_run["status"] == "PASS":
+            if run.terraform_plan["status"] == "PASS" and \
+                    run.kubernetes_dry_run["status"] in ("PASS", "SKIPPED"):
                 run.move(DeploymentState.DRY_RUN_PASSED)
                 run.move(DeploymentState.AWAITING_APPROVAL)
                 run.add_log("AWAITING_APPROVAL: exact artifact and dry-run hashes are bound to this run.")
@@ -521,9 +554,13 @@ class DeploymentEngine:
             # the approved artifact (identity already bound in
             # create_dry_run); apply it byte-for-byte with no further
             # mutation after the hash check.
-            kubernetes_apply = self.kubectl.apply(paths["kubernetes"], namespace)
+            kubernetes_apply = (
+                self.kubectl.apply(paths["kubernetes"], namespace)
+                if self._kubernetes_is_declared(effective_payload)
+                else self._kubernetes_not_applicable()
+            )
             run.execution["kubernetes_apply"] = kubernetes_apply
-            run.execution["kubernetes_applied"] = kubernetes_apply.get("status") == "PASS"
+            run.execution["kubernetes_applied"] = kubernetes_apply.get("status") in ("PASS", "SKIPPED")
             if not run.execution["kubernetes_applied"]:
                 run.error = "Kubernetes apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)

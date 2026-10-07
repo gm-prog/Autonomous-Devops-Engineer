@@ -662,6 +662,11 @@ def main() -> int:
             "duration_seconds": round(time.time() - _START, 1),
         }
         Path(args.evidence).write_text(json.dumps(evidence, indent=2, sort_keys=True))
+        for check in CHECKS:
+            if check["result"] == "FAIL":
+                print(f"::error::8.6-A FAIL {check['case']} :: "
+                      f"requested={check['requested']} :: "
+                      f"observed={check['observed']}", flush=True)
         notice(f"8.6-A live Kind E2E: {passed}/{len(CHECKS)} PASS, {failed} FAIL")
         print(f"\n{'=' * 64}\nLIVE KIND E2E: {passed}/{len(CHECKS)} PASS, "
               f"{failed} FAIL\n{'=' * 64}", flush=True)
