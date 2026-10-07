@@ -11,11 +11,10 @@ contradictory payload can never reach "not applicable".
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
 
 from deployment_service.application.services.deployment_engine import DeploymentEngine
 from deployment_service.application.services.iac_validator import IaCValidator
-from deployment_service.main import KNOWN_COMPONENTS, app
+from deployment_service.main import KNOWN_COMPONENTS
 
 TF = 'resource "null_resource" "x" {}\n'
 DOCKERFILE = "FROM scratch\n"
@@ -93,13 +92,18 @@ def test_not_applicable_result_is_explicit_and_not_a_success():
 
 
 # ---------------------------------------------------------------- contract
+#
+# These exercise the request contract directly through the pydantic
+# models. Posting to the endpoint would drive the real engine, which
+# reaches for source verification and a container runtime -- a unit
+# test must not require Docker, GitHub or secrets.
 
-@pytest.fixture()
-def client():
-    return TestClient(app)
+from pydantic import ValidationError  # noqa: E402
+
+from deployment_service.main import DryRunRequest, ExecuteRequest  # noqa: E402
 
 
-def _payload(**over):
+def _body(**over):
     body = {
         "repository_id": 1, "repository_name": "acme/demo", "requested_by": "dev",
         "dockerfile": DOCKERFILE, "k8s_yaml": MANIFEST, "terraform_tf": TF,
@@ -110,32 +114,42 @@ def _payload(**over):
     return body
 
 
-def test_components_defaults_to_all_so_existing_callers_are_unaffected(client):
-    r = client.post("/api/internal/deployments/dry-run", json=_payload())
-    assert r.status_code != 422, r.text
+def test_components_defaults_to_all_so_existing_callers_are_unaffected():
+    model = DryRunRequest(**_body())
+    assert model.components == list(KNOWN_COMPONENTS)
 
 
-def test_unknown_component_is_rejected_by_the_contract(client):
-    r = client.post("/api/internal/deployments/dry-run",
-                    json=_payload(components=["terraform", "wordpress"]))
-    assert r.status_code == 422
-    assert "unknown component" in r.text
+def test_unknown_component_is_rejected_by_the_contract():
+    with pytest.raises(ValidationError, match="unknown component"):
+        DryRunRequest(**_body(components=["terraform", "wordpress"]))
 
 
-def test_empty_component_selection_is_rejected(client):
-    r = client.post("/api/internal/deployments/dry-run",
-                    json=_payload(components=[]))
-    assert r.status_code == 422
+def test_empty_component_selection_is_rejected():
+    with pytest.raises(ValidationError, match="at least one component"):
+        DryRunRequest(**_body(components=[]))
 
 
-def test_repeated_component_is_rejected(client):
-    r = client.post("/api/internal/deployments/dry-run",
-                    json=_payload(components=["terraform", "terraform"]))
-    assert r.status_code == 422
+def test_repeated_component_is_rejected():
+    with pytest.raises(ValidationError, match="must not repeat"):
+        DryRunRequest(**_body(components=["terraform", "terraform"]))
 
 
-def test_k8s_yaml_remains_a_required_field(client):
-    """The API contract is unchanged: omission is still a 422."""
-    body = _payload()
+def test_selection_is_canonically_ordered_so_it_hashes_stably():
+    a = DryRunRequest(**_body(components=["pipeline", "terraform"]))
+    b = DryRunRequest(**_body(components=["terraform", "pipeline"]))
+    assert a.components == b.components == ["terraform", "pipeline"]
+
+
+def test_k8s_yaml_remains_a_required_field():
+    """The API contract is unchanged: omission is still invalid."""
+    body = _body()
     del body["k8s_yaml"]
-    assert client.post("/api/internal/deployments/dry-run", json=body).status_code == 422
+    with pytest.raises(ValidationError):
+        DryRunRequest(**body)
+
+
+def test_execute_request_also_carries_the_selection():
+    model = ExecuteRequest(artifact_hash="a" * 64, plan_hash="b" * 64,
+                           dockerfile="", k8s_yaml="", terraform_tf=TF,
+                           pipeline_yaml="", components=["terraform"])
+    assert model.components == ["terraform"]
