@@ -70,7 +70,12 @@ RUN set -eu; \
 RUN set -eu; \
     curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl"; \
     curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256"; \
-    (cd /usr/local/bin && sha256sum -c /tmp/kubectl.sha256); \
+    DIGEST="$(tr -d " \t\r\n" < /tmp/kubectl.sha256)"; \
+    printf '%s' "$DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { \
+        echo "kubectl checksum file is not a bare 64-hex digest" >&2; \
+        exit 1; \
+    }; \
+    printf '%s  %s\n' "$DIGEST" /usr/local/bin/kubectl | sha256sum -c -; \
     chmod 0755 /usr/local/bin/kubectl; \
     rm -f /tmp/kubectl.sha256; \
     kubectl version --client
