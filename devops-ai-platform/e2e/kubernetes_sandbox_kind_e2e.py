@@ -54,7 +54,7 @@ from deployment_service.application.services.kubeconfig_policy import (  # noqa:
 from deployment_service.application.services.kubectl_runner import (  # noqa: E402
     KubectlRunnerService,
 )
-from deployment_service.application.services.kubernetes_sandbox_network import (  # noqa: E402
+from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import (  # noqa: E402
     PerExecutionNetwork,
 )
 from deployment_service.application.services.kubectl_sandbox import (  # noqa: E402
@@ -395,27 +395,40 @@ def check_peer_isolation(spec: KubectlSandboxSpec, network: str) -> None:
     record("network:adversarial-peer-started",
            "an unrelated peer is running on its own network", "started", True)
 
-    def probe(from_network: str) -> tuple[int, str]:
+    def probe(from_network: str, target: str) -> tuple[int, str]:
         out = subprocess.run(
             ["docker", "run", "--rm", "--network", from_network,
              "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
              "--security-opt", "no-new-privileges:true", "--pull", "never",
              "--entrypoint", "kubectl", spec.image,
-             "--server", f"https://{peer}:9999", "--insecure-skip-tls-verify=true",
+             "--server", f"https://{target}:9999", "--insecure-skip-tls-verify=true",
              "--token", "peer-probe-not-a-credential",
              "--request-timeout=8s", "get", "namespaces"],
-            capture_output=True, text=True, timeout=90)
+            capture_output=True, text=True, timeout=120)
         return out.returncode, f"{out.stdout}\n{out.stderr}".lower()
 
+    peer_ip = subprocess.run(
+        ["docker", "inspect", "-f",
+         "{{(index .NetworkSettings.Networks \"" + peer_net + "\").IPAddress}}", peer],
+        capture_output=True, text=True, timeout=60).stdout.strip()
+
     # Semantics, stated once and applied to both probes.
+    # A refusal or a reset means the SYN ARRIVED: that is reachability,
+    # not isolation. Only an unresolvable name or an absent route
+    # proves the peer cannot be addressed.
     REACHED = ("connection refused", "connection reset", "tls", "x509",
                "server gave http response", "eof")
+    # "server misbehaving" is Go's wording when the embedded DNS
+    # resolver answers SERVFAIL for a name that exists on no network
+    # this container is attached to. Like "no such host" it means the
+    # name never resolved, so no packet was ever sent.
     ISOLATED = ("no such host", "could not resolve", "i/o timeout",
-                "no route to host", "network is unreachable", "context deadline")
+                "no route to host", "network is unreachable", "context deadline",
+                "server misbehaving", "temporary failure in name resolution")
 
     try:
         # --- positive control: reachable from its own network ---
-        _, ctl = probe(peer_net)
+        _, ctl = probe(peer_net, peer)
         ctl_prompted = "please enter username" in ctl
         ctl_reached = any(m in ctl for m in REACHED) and not ctl_prompted
         record("network:peer-reachable-from-its-own-network",
@@ -423,20 +436,43 @@ def check_peer_isolation(spec: KubectlSandboxSpec, network: str) -> None:
                f"reached={ctl_reached} detail={ctl.strip()[:180]!r}",
                ctl_reached)
 
-        # --- the actual isolation claim ---
-        code, out = probe(network)
-        prompted = "please enter username" in out
-        reached = any(m in out for m in REACHED)
-        isolated = (code != 0 and not prompted and not reached
-                    and any(m in out for m in ISOLATED))
-        if prompted:
-            out += " [PROBE DEFECT: kubectl prompted instead of connecting]"
-        if reached:
-            out += " [PEER REACHABLE: the connection was answered or reset]"
-        record("network:unrelated-peer-not-reachable-from-sandbox",
-               "a container outside the approved destination set is unreachable",
-               f"exit={code} reached={reached} detail={out.strip()[:200]!r}",
-               isolated)
+        def classify(code: int, out: str) -> tuple[bool, bool, str]:
+            prompted = "please enter username" in out
+            reached = any(m in out for m in REACHED)
+            ok = (code != 0 and not prompted and not reached
+                  and any(m in out for m in ISOLATED))
+            note = ""
+            if prompted:
+                note = " [PROBE DEFECT: kubectl prompted instead of connecting]"
+            elif reached:
+                note = " [PEER REACHABLE: the connection was answered or reset]"
+            elif not ok:
+                note = " [UNCLASSIFIED: not provably isolated]"
+            return ok, reached, note
+
+        # --- isolation claim 1: the name does not resolve ---
+        code, out = probe(network, peer)
+        ok_name, reached_name, note = classify(code, out)
+        record("network:unrelated-peer-not-reachable-by-name",
+               "a container outside the approved destination set has no DNS entry",
+               f"exit={code} reached={reached_name} "
+               f"detail={(out.strip() + note)[-260:]!r}", ok_name)
+
+        # --- isolation claim 2: and neither is its address ---
+        # DNS alone is weak evidence: a name can fail to resolve while
+        # the host is still routable. This probes the peer's real IP,
+        # so the claim rests on layer 3 rather than on name service.
+        if not peer_ip:
+            record("network:unrelated-peer-not-reachable-by-address",
+                   "the peer's address is unreachable from the sandbox network",
+                   "NOT VERIFIED: the peer's IP could not be read", False)
+        else:
+            code_ip, out_ip = probe(network, peer_ip)
+            ok_ip, reached_ip, note_ip = classify(code_ip, out_ip)
+            record("network:unrelated-peer-not-reachable-by-address",
+                   "the peer's address is unreachable from the sandbox network",
+                   f"peer_ip={peer_ip} exit={code_ip} reached={reached_ip} "
+                   f"detail={(out_ip.strip() + note_ip)[-260:]!r}", ok_ip)
     finally:
         subprocess.run(["docker", "rm", "-f", peer], capture_output=True,
                        text=True, timeout=60)
@@ -446,7 +482,7 @@ def check_peer_isolation(spec: KubectlSandboxSpec, network: str) -> None:
 
 def check_unapproved_cotenant_rejected(network: str, peers: list) -> None:
     """A co-tenant that joins the approved network fails the run closed."""
-    from deployment_service.application.services.kubernetes_sandbox_network import (
+    from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import (
         KubernetesSandboxNetworkError, validate_network,
     )
     squatter = "ares-e2e-squatter"

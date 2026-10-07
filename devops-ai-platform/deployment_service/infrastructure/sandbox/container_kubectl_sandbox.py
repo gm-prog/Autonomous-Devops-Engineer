@@ -111,7 +111,7 @@ class ContainerKubectlSandbox:
         """Fail closed unless the destination network is still as approved."""
         if not self._verify_network:
             return
-        from deployment_service.application.services.kubernetes_sandbox_network import (
+        from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import (
             KubernetesSandboxNetworkError,
             approved_peers_from_environment,
             validate_network,

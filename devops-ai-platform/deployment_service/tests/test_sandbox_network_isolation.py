@@ -21,7 +21,7 @@ from deployment_service.application.services.kubernetes_execution_identity impor
     KubernetesExecutionConfig,
     KubernetesExecutionIdentity,
 )
-from deployment_service.application.services.kubernetes_sandbox_network import (
+from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import (
     ALLOWED_DRIVERS,
     KubernetesSandboxNetworkError,
     SandboxNetworkIdentity,
@@ -52,7 +52,7 @@ def _patch(payload, returncode=0):
                           stdout=json.dumps(payload) if payload is not None else "",
                           stderr="" if returncode == 0 else "no such network")
     return mock.patch(
-        "deployment_service.application.services.kubernetes_sandbox_network._run",
+        "deployment_service.infrastructure.sandbox.kubernetes_sandbox_network._run",
         return_value=completed)
 
 

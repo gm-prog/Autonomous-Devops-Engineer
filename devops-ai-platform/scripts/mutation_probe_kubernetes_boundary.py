@@ -38,7 +38,7 @@ SANDBOX = "deployment_service/application/services/kubectl_sandbox.py"
 RUNNER = "deployment_service/application/services/kubectl_runner.py"
 POLICY = "deployment_service/application/services/kubernetes_manifest_policy.py"
 IDENTITY = "deployment_service/application/services/kubernetes_execution_identity.py"
-NETWORK = "deployment_service/application/services/kubernetes_sandbox_network.py"
+NETWORK = "deployment_service/infrastructure/sandbox/kubernetes_sandbox_network.py"
 ADAPTER = "deployment_service/infrastructure/sandbox/container_kubectl_sandbox.py"
 
 BOUNDARY_TESTS = "deployment_service/tests/test_kubernetes_trust_boundary.py"

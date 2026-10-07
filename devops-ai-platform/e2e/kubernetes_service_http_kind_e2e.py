@@ -623,27 +623,34 @@ def main() -> int:
     parser.add_argument("--evidence", default="e2e-evidence/kubernetes-http-e2e.json")
     args = parser.parse_args()
 
-    if not args.service_image:
-        if not args.base_image:
-            raise SystemExit("--service-image or --base-image is required")
-        args.service_image = build_service_image(args.base_image)
-    if not args.sandbox_image:
-        if not (args.base_image and args.registry):
-            raise SystemExit("--sandbox-image or --base-image+--registry is required")
-        args.sandbox_image = build_sandbox_image(
-            args.base_image, args.registry, args.kubectl_version)
-
     control_plane = f"{args.cluster}-control-plane"
     workspace_root = Path("/tmp/ares-k8s-http-workspace")
     workspace_root.mkdir(parents=True, exist_ok=True)
     exec_network = None
     started = False
 
-    from deployment_service.application.services.kubernetes_sandbox_network import (
+    from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import (
         PerExecutionNetwork,
     )
 
     try:
+        # Image builds live inside the try so a build failure produces
+        # evidence and an annotation instead of a silent traceback.
+        if not args.service_image:
+            if not args.base_image:
+                raise RuntimeError("--service-image or --base-image is required")
+            args.service_image = build_service_image(args.base_image)
+        if not args.sandbox_image:
+            if not (args.base_image and args.registry):
+                raise RuntimeError(
+                    "--sandbox-image, or --base-image with --registry, is required")
+            args.sandbox_image = build_sandbox_image(
+                args.base_image, args.registry, args.kubectl_version)
+        record("build:images-ready",
+               "the real service image and a digest-pinned sandbox image exist",
+               f"service={args.service_image} sandbox={args.sandbox_image[:72]}",
+               "@sha256:" in args.sandbox_image)
+
         # ---- 1-3. cluster, namespace, least-privilege RBAC ----
         alive = sh(["docker", "inspect", "-f", "{{.State.Running}}", control_plane])
         if alive.stdout.strip() != "true":
@@ -693,8 +700,10 @@ def main() -> int:
         check_sandbox_runtime_posture(args.sandbox_image, exec_network.name)
 
     except Exception as exc:  # noqa: BLE001
+        import traceback
         record("harness:completed", "the driver reached the end of the sequence",
-               f"{type(exc).__name__}: {exc}", False)
+               f"{type(exc).__name__}: {str(exc)[:600]}", False)
+        notice("traceback:\n" + traceback.format_exc()[-3000:])
         logs = sh(["docker", "logs", "--tail", "120", SERVICE_NAME])
         if logs.stdout or logs.stderr:
             notice(f"service logs:\n{(logs.stdout + logs.stderr)[-2500:]}")
