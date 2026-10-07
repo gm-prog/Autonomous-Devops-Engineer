@@ -275,3 +275,26 @@ on any name used but bound nowhere in the CI-only modules, and the same
 harness confirms the driver returns 0 with 34/34 checks on a healthy
 topology, 1 when a sampler report is unparseable, and 1 when a single
 response leaks from a weight-0 backend.
+
+The fourth run reached the fixture stage and stopped on a defect of its
+own: the driver applied the rendered fixture with one
+`kubectl apply -f <directory>`, and kubectl walks a directory in
+*lexicographic* order — `namespace.yaml` sorts after `gateway.yaml` and
+`httproute.yaml`, so the API server rejected those two namespaced objects
+with `namespaces "ares-traffic" not found`. Replaying the pre-fix call
+against the stub cluster (which now models namespace existence) fails the
+same way, with the same `… created` / `NotFound` output shape the run
+reported. The fixture is now applied namespace-first, one file per
+`kubectl` call, so a failure also names the file that caused it.
+
+The *reporting* was part of the defect: the driver's message was
+multi-line, and GitHub ends an `::error` annotation at the first newline,
+which is why the run showed only `topology fixture failed:  created` — a
+fragment of kubectl's own output — and hid the API server's error
+entirely. Failure text is now collapsed onto one line
+(`one_line()`), failing checks are annotated line by line, and
+`kubectl_apply` reports `rc`, `stderr` and `stdout` with the file that
+was being applied. `FixtureApplyOrderTests` covers the ordering
+(including a non-vacuous check that the fixture layout really has the
+hazard), the file-attributed error, the one-line collapsing, and a static
+guard that the directory apply cannot come back.

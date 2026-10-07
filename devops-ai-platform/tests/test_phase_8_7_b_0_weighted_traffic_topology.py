@@ -881,6 +881,112 @@ class ServerVersionProbeTests(unittest.TestCase):
             "the server version must be read through the raw helper")
 
 
+class FixtureApplyOrderTests(unittest.TestCase):
+    """The fixture must be applied namespace-first.
+
+    ``kubectl apply -f <dir>`` walks a directory lexicographically, and the
+    fixture's ``namespace.yaml`` sorts AFTER ``gateway.yaml``,
+    ``httproute.yaml``, ``services.yaml`` and ``workloads.yaml``. The API
+    server therefore rejected every namespaced object with
+    ``namespaces "ares-traffic" not found`` — the failure the live run hit
+    immediately after the raw-version probe was repaired. The driver now
+    applies Namespace definitions first, one file per ``kubectl`` call, so
+    a failure also names the file that caused it.
+    """
+
+    def setUp(self):
+        self._sh = driver.sh
+
+    def tearDown(self):
+        driver.sh = self._sh
+
+    def test_the_namespace_is_applied_before_the_namespaced_objects(self):
+        calls = []
+
+        def fake_sh(argv, timeout=300):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "created\n", "")
+
+        driver.sh = fake_sh
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "workloads.yaml").write_text(
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+                "  name: ares-stable\n  namespace: ares-traffic\n",
+                encoding="utf-8")
+            (directory / "gateway.yaml").write_text(
+                "apiVersion: gateway.networking.k8s.io/v1\nkind: Gateway\n"
+                "metadata:\n  name: ares-gateway\n  namespace: ares-traffic\n",
+                encoding="utf-8")
+            (directory / "namespace.yaml").write_text(
+                "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: ares-traffic\n",
+                encoding="utf-8")
+            applied = driver.apply_fixture("cluster", directory, "topology fixture")
+        order = [pathlib.Path(call[-1]).name for call in calls]
+        self.assertEqual(order, ["namespace.yaml", "gateway.yaml", "workloads.yaml"],
+                         "the namespace must exist before the objects inside it")
+        self.assertIn("created", applied)
+        for call in calls:
+            self.assertEqual(call[:3], ["kubectl", "--context", "kind-cluster"],
+                             "each file is applied with one kubectl call")
+
+    def test_an_apply_failure_names_the_file_and_the_api_error(self):
+        driver.sh = lambda argv, timeout=300: subprocess.CompletedProcess(
+            argv, 1, "namespace/ares-traffic created\n",
+            'Error from server (NotFound): error when creating "gateway.yaml": '
+            'namespaces "ares-traffic" not found')
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = pathlib.Path(tmp)
+            (directory / "gateway.yaml").write_text(
+                "apiVersion: gateway.networking.k8s.io/v1\nkind: Gateway\n"
+                "metadata:\n  name: ares-gateway\n  namespace: ares-traffic\n",
+                encoding="utf-8")
+            with self.assertRaises(RuntimeError) as caught:
+                driver.apply_fixture("cluster", directory, "topology fixture")
+        message = str(caught.exception)
+        self.assertIn("gateway.yaml", message)
+        self.assertIn("namespaces \"ares-traffic\" not found", message)
+        self.assertNotIn("\n", message,
+                         "the message must survive the annotation channel")
+
+    def test_the_fixture_layout_is_the_one_that_defeats_lexicographic_apply(self):
+        """Non-vacuous: prove the fixture really has the ordering hazard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rendered_dir = pathlib.Path(tmp) / "rendered"
+            documents = driver.render_fixture(
+                rendered_dir,
+                {"stable": "ares-traffic-stable:local",
+                 "canary": "ares-traffic-canary:local"})
+            names = sorted(path.name for path in rendered_dir.iterdir())
+        self.assertIn("namespace.yaml", names)
+        self.assertLess(
+            names.index("gateway.yaml"), names.index("namespace.yaml"),
+            "namespace.yaml must sort after the namespaced manifests, which is "
+            "exactly why a plain directory apply cannot work")
+        kinds = {document.get("kind") for document in documents}
+        self.assertIn("Namespace", kinds)
+        namespaced = [document for document in documents
+                      if (document.get("metadata") or {}).get("namespace")]
+        self.assertTrue(namespaced, "the fixture must contain namespaced objects")
+
+    def test_the_driver_never_applies_the_fixture_directory_directly(self):
+        """Static guard: the directory apply must go through the ordered helper."""
+        source = DRIVER.read_text(encoding="utf-8")
+        self.assertIn('apply_fixture(cluster, workdir / "rendered", "topology fixture")',
+                      source)
+        self.assertNotIn("kubectl_apply(cluster, workdir", source,
+                         "a directory apply would walk the manifests "
+                         "lexicographically and hit the missing namespace again")
+
+    def test_one_line_collapses_output_for_annotations(self):
+        self.assertEqual(driver.one_line("a\nb\tc   d "), "a b c d")
+        self.assertEqual(driver.one_line(""), "<empty>")
+        long_text = "x" * 5000
+        collapsed = driver.one_line(long_text)
+        self.assertNotIn("\n", collapsed)
+        self.assertLess(len(collapsed), len(long_text))
+
+
 class PinTests(unittest.TestCase):
     """Every external artifact is pinned to an exact release by digest."""
 

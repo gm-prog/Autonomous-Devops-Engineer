@@ -168,11 +168,64 @@ def kubectl_raw(cluster: str, *args: str, timeout: int = 180) -> str:
     return out.stdout
 
 
+def one_line(text: str, head: int = 400, tail: int = 240) -> str:
+    """Collapse a command's output onto ONE line.
+
+    GitHub Actions parses an ``::error`` annotation up to the first
+    newline, so a multi-line failure message silently loses the part that
+    matters — which is exactly how this driver's first live failure was
+    reported as ``topology fixture failed:  created`` instead of the API
+    server's error.
+    """
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
+        return "<empty>"
+    if len(collapsed) <= head + tail:
+        return collapsed
+    return f"{collapsed[:head]} ... {collapsed[-tail:]}"
+
+
 def kubectl_apply(cluster: str, path: Path, what: str) -> str:
     out = kubectl(cluster, "apply", "-f", str(path))
     if out.returncode != 0:
-        raise RuntimeError(f"{what} failed: {(out.stdout + out.stderr)[-800:]}")
+        raise RuntimeError(
+            f"{what} failed (rc={out.returncode}): "
+            f"stderr={one_line(out.stderr)} stdout={one_line(out.stdout)}")
     return out.stdout.strip()
+
+
+def document_kinds(path: Path) -> set:
+    """The kinds a manifest file declares (empty when it cannot be read)."""
+    try:
+        documents = yaml.safe_load_all(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return set()
+    return {str(document.get("kind")) for document in documents
+            if isinstance(document, dict) and document.get("kind")}
+
+
+def apply_fixture(cluster: str, directory: Path, what: str) -> str:
+    """Apply every manifest in ``directory`` in a dependency-safe order.
+
+    ``kubectl apply -f <dir>`` walks a directory in LEXICOGRAPHIC order.
+    The topology fixture's ``namespace.yaml`` sorts after ``gateway.yaml``,
+    ``httproute.yaml``, ``services.yaml`` and ``workloads.yaml``, so a
+    single directory apply asks the API server to create namespaced
+    objects before their namespace exists and is rejected with
+    ``namespaces "ares-traffic" not found``. Namespace definitions are
+    therefore applied first and the rest follow in name order; each file
+    is applied on its own so a failure names the file that caused it.
+    """
+    paths = sorted(path for path in directory.iterdir()
+                   if path.is_file() and path.suffix in (".yaml", ".yml"))
+    if not paths:
+        raise RuntimeError(f"{what}: no manifests found in {directory}")
+    namespaces = [path for path in paths if "Namespace" in document_kinds(path)]
+    ordered = namespaces + [path for path in paths if path not in namespaces]
+    outputs = []
+    for path in ordered:
+        outputs.append(kubectl_apply(cluster, path, f"{what} [{path.name}]"))
+    return "\n".join(output for output in outputs if output)
 
 
 def wait_or_fail(name: str, probe, requested: str, timeout: float, cluster: str,
@@ -1055,9 +1108,16 @@ def run(args: argparse.Namespace, workdir: Path) -> bool:
                  "the topology contract",
                  f"rendered into {workdir / 'rendered'} (outside the repository)", True)
 
-    applied = kubectl_apply(cluster, workdir / "rendered", "topology fixture")
+    try:
+        applied = apply_fixture(cluster, workdir / "rendered", "topology fixture")
+    except RuntimeError as exc:
+        ok &= record("topology:applied",
+                     "the topology was applied to the cluster",
+                     f"{type(exc).__name__}: {exc}"[:1000], False)
+        return False
     ok &= record("topology:applied", "the topology was applied to the cluster",
-                 f"{len(applied.splitlines())} object line(s) reported by kubectl apply", True)
+                 f"{len(applied.splitlines())} object line(s) reported by kubectl apply "
+                 f"(namespace definitions applied first)", True)
 
     if not core_readiness(cluster, args):
         record("harness:stopped", "no traffic is measured until the controller and the "
@@ -1262,9 +1322,13 @@ def main() -> int:
         for row in RESULTS:
             if row["status"] == "PASS":
                 continue
-            print(f"::error title=8.7-B.0 FAIL {row['check']}::"
-                  f"requested={row['requested'][:120]} "
-                  f"observed={row['observed'][:300]}")
+            # One annotation per LINE: an annotation message ends at the
+            # first newline, so a multi-line failure would otherwise be
+            # reported as its first fragment alone.
+            message = (f"requested={row['requested'][:160]} "
+                       f"observed={row['observed'][:1200]}")
+            for line in message.splitlines() or [""]:
+                print(f"::error title=8.7-B.0 FAIL {row['check']}::{line}")
     else:
         import base64
         import gzip
