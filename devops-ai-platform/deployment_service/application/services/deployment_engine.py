@@ -136,6 +136,14 @@ class DeploymentEngine:
             # only -- never values (see credential_profile_identity).
             "credential_profile_id": terraform_result.get("credential_profile_id", ""),
             "kubernetes": {"status": kubernetes_result.get("status"), "stdout": kubernetes_result.get("stdout", "")},
+            # Phase 8.6-A corrective, Workstream B. Approval must bind the
+            # execution TARGET as well as the artifact: endpoint, CA,
+            # namespace, credential profile, manifest policy, sandbox
+            # policy and network. Without this an approval granted
+            # against one cluster could execute against another.
+            "kubernetes_execution_identity": (
+                kubernetes_result.get("execution_identity") or {}
+            ).get("execution_identity", ""),
         }
         return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -155,6 +163,32 @@ class DeploymentEngine:
         the artifact hash and invalidates the approval.
         """
         return bool(str(payload.get("k8s_yaml", "") or "").strip())
+
+    @staticmethod
+    def _approved_kubernetes_identity(run):
+        """Rebuild the approval-bound Kubernetes execution identity.
+
+        Returns None when the run carries none, which makes the runner
+        refuse to mutate -- fail closed rather than fall back.
+        """
+        from deployment_service.application.services.kubernetes_execution_identity import (
+            KubernetesExecutionIdentity,
+        )
+        stored = (run.execution or {}).get("kubernetes_execution_identity") or {}
+        required = ("namespace", "api_server", "ca_fingerprint_sha256",
+                    "credential_profile_id", "manifest_policy_identity",
+                    "sandbox_policy_identity")
+        if not all(stored.get(k) for k in required):
+            return None
+        return KubernetesExecutionIdentity(
+            namespace=stored["namespace"],
+            api_server=stored["api_server"],
+            ca_fingerprint_sha256=stored["ca_fingerprint_sha256"],
+            credential_profile_id=stored["credential_profile_id"],
+            manifest_policy_identity=stored["manifest_policy_identity"],
+            sandbox_policy_identity=stored["sandbox_policy_identity"],
+            network_identity=stored.get("network_identity", ""),
+        )
 
     @staticmethod
     def _kubernetes_not_applicable() -> Dict[str, Any]:
@@ -309,6 +343,11 @@ class DeploymentEngine:
                 if self._kubernetes_is_declared(effective_payload)
                 else self._kubernetes_not_applicable()
             )
+            # The identity the approval is granted against. Persisted on
+            # the run so execution can prove it has not moved.
+            run.execution["kubernetes_execution_identity"] = (
+                run.kubernetes_dry_run.get("execution_identity") or {}
+            )
             run.artifact_hash = self._artifact_hash(effective_payload)
             run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
             if run.terraform_plan["status"] == "PASS" and \
@@ -423,7 +462,9 @@ class DeploymentEngine:
         run.add_log("ROLLBACK_PENDING: attempting deterministic rollback.")
         results = []
         for name in deployment_names:
-            results.append({"component": f"kubernetes:{name}", "result": self.kubectl.rollout_undo(name, namespace)})
+            results.append({"component": f"kubernetes:{name}", "result": self.kubectl.rollout_undo(
+                name, namespace,
+                approved_identity=self._approved_kubernetes_identity(run))})
 
         if run.execution.get("terraform_applied"):
             if not previous_good_terraform_tf.strip():
@@ -554,8 +595,10 @@ class DeploymentEngine:
             # the approved artifact (identity already bound in
             # create_dry_run); apply it byte-for-byte with no further
             # mutation after the hash check.
+            approved_k8s_identity = self._approved_kubernetes_identity(run)
             kubernetes_apply = (
-                self.kubectl.apply(paths["kubernetes"], namespace)
+                self.kubectl.apply(paths["kubernetes"], namespace,
+                                   approved_identity=approved_k8s_identity)
                 if self._kubernetes_is_declared(effective_payload)
                 else self._kubernetes_not_applicable()
             )

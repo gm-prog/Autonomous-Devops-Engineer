@@ -32,6 +32,13 @@ from deployment_service.application.services.kubectl_sandbox import (
     build_kubectl_argv,
     load_spec_from_environment,
 )
+from deployment_service.application.services.kubernetes_execution_identity import (
+    KubernetesExecutionIdentity,
+    KubernetesExecutionIdentityError,
+    expected_api_server,
+    expected_ca_fingerprint,
+    verify_binding,
+)
 from deployment_service.application.services.kubernetes_manifest_policy import (
     KubernetesManifestPolicy,
 )
@@ -104,13 +111,24 @@ class KubectlRunnerService:
             raw = Path(path).read_text(encoding="utf-8")
         except OSError as exc:
             raise KubeconfigPolicyError(f"kubeconfig is unreadable: {exc}") from None
-        return sanitize_kubeconfig(
+        sanitized = sanitize_kubeconfig(
             raw,
             expected_namespace=self.namespace(),
             credential_profile_id=os.getenv(
                 "DEPLOYMENT_K8S_CREDENTIAL_PROFILE", "ares-k8s-deployer-v1"
             ).strip() or "ares-k8s-deployer-v1",
+            # The host-owned endpoint. Without this the runner would
+            # accept any syntactically valid https cluster, which makes
+            # the approved target a suggestion rather than a binding.
+            expected_server=expected_api_server(),
         )
+        pinned_ca = expected_ca_fingerprint()
+        if pinned_ca and sanitized.cluster_identity.ca_fingerprint_sha256 != pinned_ca:
+            raise KubeconfigPolicyError(
+                "the cluster CA does not match the host-owned fingerprint; "
+                "refusing to trust this control plane"
+            )
+        return sanitized
 
     def _resolve_sandbox(self) -> KubernetesSandboxPort:
         if self._sandbox is not None:
@@ -124,6 +142,30 @@ class KubectlRunnerService:
         )
         self._sandbox = sandbox
         return sandbox
+
+    # ---------------------------------------------------------- identity
+
+    def execution_identity(
+        self, kubeconfig: Optional[SanitizedKubeconfig] = None
+    ) -> KubernetesExecutionIdentity:
+        """Derive the full execution identity from host-owned state only."""
+        kubeconfig = kubeconfig or self._kubeconfig()
+        namespace = self.namespace()
+        try:
+            sandbox_identity = self._resolve_sandbox().policy_identity(namespace)
+        except KubectlSandboxConfigurationError as exc:
+            raise KubernetesExecutionIdentityError(
+                f"sandbox policy identity is unavailable: {exc}") from None
+        return KubernetesExecutionIdentity(
+            namespace=namespace,
+            api_server=kubeconfig.cluster_identity.server,
+            ca_fingerprint_sha256=kubeconfig.cluster_identity.ca_fingerprint_sha256,
+            credential_profile_id=kubeconfig.credential_profile_id,
+            manifest_policy_identity=self._manifest_policy.identity(),
+            sandbox_policy_identity=sandbox_identity,
+            network_identity=os.getenv(
+                "DEPLOYMENT_KUBECTL_SANDBOX_NETWORK", "").strip(),
+        )
 
     # --------------------------------------------------------------- manifest
 
@@ -147,6 +189,10 @@ class KubectlRunnerService:
 
     # -------------------------------------------------------------- execution
 
+    #: Operations that change cluster state. These may only run against
+    #: the exact target the approval was granted for.
+    MUTATING_OPERATIONS = (KubectlOperation.APPLY, KubectlOperation.ROLLOUT_UNDO)
+
     def _execute(
         self,
         operation: KubectlOperation,
@@ -155,11 +201,24 @@ class KubectlRunnerService:
         deployment_name: Optional[str] = None,
         rollout_timeout_seconds: int = 300,
         extra: Optional[Dict[str, Any]] = None,
+        approved_identity: Optional[KubernetesExecutionIdentity] = None,
     ) -> Dict[str, Any]:
         namespace = self.namespace()
         try:
             kubeconfig = self._kubeconfig()
         except KubeconfigPolicyError as exc:
+            return self._blocked(str(exc))
+
+        # Re-derive the execution target from host-owned state and
+        # compare it with what was approved. This happens BEFORE the
+        # sandbox is touched, so a moved cluster never receives a call.
+        try:
+            observed_identity = self.execution_identity(kubeconfig)
+            if operation in self.MUTATING_OPERATIONS:
+                verify_binding(approved_identity, observed_identity)
+            elif approved_identity is not None:
+                verify_binding(approved_identity, observed_identity)
+        except KubernetesExecutionIdentityError as exc:
             return self._blocked(str(exc))
 
         try:
@@ -206,6 +265,7 @@ class KubectlRunnerService:
             "truncated": bool(getattr(result, "truncated", False)),
             "sandbox_policy_identity": getattr(result, "policy_identity", ""),
             "credential_profile": kubeconfig.to_evidence(),
+            "execution_identity": observed_identity.to_dict(),
         }
         if extra:
             payload.update(extra)
@@ -236,7 +296,8 @@ class KubectlRunnerService:
             },
         )
 
-    def apply(self, manifest_path: str, namespace: Optional[str] = None) -> Dict[str, Any]:
+    def apply(self, manifest_path: str, namespace: Optional[str] = None,
+              approved_identity: Optional[KubernetesExecutionIdentity] = None) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
             return blocked
@@ -245,6 +306,7 @@ class KubectlRunnerService:
             return error
         return self._execute(
             KubectlOperation.APPLY,
+            approved_identity=approved_identity,
             manifest_yaml=approved.canonical_yaml,
             extra={
                 "manifest_sha256": approved.manifest_sha256,
@@ -273,12 +335,14 @@ class KubectlRunnerService:
         self,
         deployment_name: str,
         namespace: Optional[str] = None,
+        approved_identity: Optional[KubernetesExecutionIdentity] = None,
     ) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
             return blocked
         return self._execute(
             KubectlOperation.ROLLOUT_UNDO,
+            approved_identity=approved_identity,
             manifest_yaml="",
             deployment_name=deployment_name,
         )
