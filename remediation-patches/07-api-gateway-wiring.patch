@@ -1,0 +1,203 @@
+# Remediation patch 07 - see README.md in this directory
+# Targets commit 9b85d91848178a09a7b861db64d050d951ee6f72 (dev/remediation-pr-orchestration-v1)
+# Apply from the repository root:  git apply 07-api-gateway-wiring.patch
+# Note: pairs with 04 - the gateway only boots once auth.py is also patched.
+
+--- a/devops-ai-platform/api-gateway/routers/gateway_router.py
++++ b/devops-ai-platform/api-gateway/routers/gateway_router.py
+@@ -1,6 +1,6 @@
+ from fastapi import APIRouter, Depends, HTTPException, Request
+ from typing import List, Dict, Any
+-from ..core.auth import verify_token, GatewayRateLimiter
++from core.auth import verify_token, GatewayRateLimiter
+ import requests
+ 
+ router = APIRouter(prefix="/v1/gateway", tags=["Gateway Router"])
+--- a/devops-ai-platform/docker-compose.yml
++++ b/devops-ai-platform/docker-compose.yml
+@@ -37,6 +37,8 @@
+       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
+       - REDIS_HOST=redis
+       - GEMINI_API_KEY=${GEMINI_API_KEY}
++      - JWT_SECRET=${JWT_SECRET:-super-secret-devops-platform-signature-token}
++      - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
+     depends_on:
+       - postgres
+       - redis
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -101,6 +101,26 @@
+         working-directory: devops-ai-platform/monitoring-service
+         run: python -m unittest infrastructure.prometheus.test_scraper_client infrastructure.prometheus.test_live_metrics application.services.test_threshold_evaluator application.services.test_threshold_event_service -v
+ 
++  api-gateway:
++    name: API gateway checks
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++      - name: Install gateway dependencies
++        working-directory: devops-ai-platform/api-gateway
++        run: python -m pip install -r requirements.txt httpx
++      - name: Compile gateway
++        working-directory: devops-ai-platform/api-gateway
++        run: python -m compileall -q .
++      - name: Run gateway auth and routing tests
++        working-directory: devops-ai-platform/api-gateway
++        env:
++          PYTHONPATH: .
++        run: python -m unittest tests.test_gateway -v
++
+   compose:
+     name: Validate Docker Compose
+     runs-on: ubuntu-latest
+--- a/devops-ai-platform/api-gateway/main.py
++++ b/devops-ai-platform/api-gateway/main.py
+@@ -0,0 +1,23 @@
++"""API Gateway entrypoint (BFF layer in front of the platform microservices).
++
++Run from this directory:
++
++    uvicorn main:app --host 0.0.0.0 --port 8000
++
++Auth: every /v1/gateway/* route requires `Authorization: Bearer <JWT>`.
++Mint a dev token with:
++
++    python -m core.auth <subject> [Role1 Role2 ...]
++"""
++from fastapi import FastAPI
++
++from routers.gateway_router import router as gateway_router
++
++app = FastAPI(title="DevOps Platform API Gateway", version="1.0.0")
++
++app.include_router(gateway_router)
++
++
++@app.get("/health")
++def health():
++    return {"status": "healthy", "service": "api-gateway"}
+--- a/devops-ai-platform/api-gateway/Dockerfile
++++ b/devops-ai-platform/api-gateway/Dockerfile
+@@ -0,0 +1,13 @@
++FROM python:3.11-slim
++
++WORKDIR /app
++
++# Build context is devops-ai-platform/ (see docker-compose.yml).
++COPY api-gateway/requirements.txt /app/requirements.txt
++RUN pip install --no-cache-dir -r requirements.txt
++
++COPY api-gateway/ /app
++
++EXPOSE 8000
++
++CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+--- a/devops-ai-platform/api-gateway/requirements.txt
++++ b/devops-ai-platform/api-gateway/requirements.txt
+@@ -0,0 +1,4 @@
++fastapi>=0.100.0
++uvicorn>=0.22.0
++requests>=2.31.0
++pydantic>=2.0.0
+--- a/devops-ai-platform/api-gateway/tests/__init__.py
++++ b/devops-ai-platform/api-gateway/tests/__init__.py
+@@ -0,0 +1 @@
++"""API gateway test package."""
+--- a/devops-ai-platform/api-gateway/tests/test_gateway.py
++++ b/devops-ai-platform/api-gateway/tests/test_gateway.py
+@@ -0,0 +1,92 @@
++"""Smoke tests for gateway health, JWT enforcement and dispatch routing.
++
++Run from devops-ai-platform/api-gateway:
++
++    PYTHONPATH=. python -m unittest tests.test_gateway -v
++
++Requires httpx (installed in CI alongside requirements.txt) for TestClient.
++"""
++import unittest
++
++from fastapi.testclient import TestClient
++
++import main
++from core.auth import mint_token
++
++client = TestClient(main.app)
++
++
++def authed(token: str) -> dict:
++    return {"Authorization": f"Bearer {token}"}
++
++
++class GatewayHealthTest(unittest.TestCase):
++    def test_health_is_public(self):
++        resp = client.get("/health")
++        self.assertEqual(resp.status_code, 200)
++        self.assertEqual(resp.json()["service"], "api-gateway")
++
++
++class GatewayAuthTest(unittest.TestCase):
++    def test_missing_token_rejected(self):
++        resp = client.get("/v1/gateway/metrics")
++        self.assertIn(resp.status_code, (401, 403))
++
++    def test_valid_token_accepted(self):
++        token = mint_token("gateway-operator", ["DevOpsLead"])
++        resp = client.get("/v1/gateway/metrics", headers=authed(token))
++        self.assertEqual(resp.status_code, 200)
++        self.assertEqual(resp.json()["gateway_status"], "ONLINE")
++
++    def test_tampered_token_rejected(self):
++        token = mint_token("gateway-operator", ["DevOpsLead"])
++        head, body, sig = token.split(".")
++        flipped = ("AA" if not sig.endswith("AA") else "BB")
++        tampered = f"{head}.{body}.{sig[:-2]}{flipped}"
++        resp = client.get("/v1/gateway/metrics", headers=authed(tampered))
++        self.assertEqual(resp.status_code, 401)
++
++    def test_expired_token_rejected(self):
++        token = mint_token("gateway-operator", ["DevOpsLead"], ttl_seconds=-10)
++        resp = client.get("/v1/gateway/metrics", headers=authed(token))
++        self.assertEqual(resp.status_code, 401)
++
++    def test_legacy_mock_backdoor_token_rejected(self):
++        # The pre-patch backdoor accepted this literal as an admin identity.
++        resp = client.get(
++            "/v1/gateway/metrics",
++            headers=authed("mock-devops-admin-token-1842"),
++        )
++        self.assertEqual(resp.status_code, 401)
++
++    def test_short_garbage_token_rejected(self):
++        resp = client.get("/v1/gateway/metrics", headers=authed("abc"))
++        self.assertEqual(resp.status_code, 401)
++
++
++class GatewayDispatchTest(unittest.TestCase):
++    def test_unknown_service_404(self):
++        token = mint_token("gateway-operator")
++        resp = client.post(
++            "/v1/gateway/dispatch/nonexistent",
++            json={"a": 1},
++            headers=authed(token),
++        )
++        self.assertEqual(resp.status_code, 404)
++
++    def test_known_service_passthrough_echoes_identity(self):
++        token = mint_token("gateway-operator", ["DevOpsLead"])
++        resp = client.post(
++            "/v1/gateway/dispatch/agent",
++            json={"task": "rca"},
++            headers=authed(token),
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = resp.json()
++        self.assertEqual(data["status"], "PROXY_PASSTHROUGH")
++        self.assertEqual(data["authorizing_identity"], "gateway-operator")
++        self.assertEqual(data["payload_relayed"], {"task": "rca"})
++
++
++if __name__ == "__main__":
++    unittest.main()

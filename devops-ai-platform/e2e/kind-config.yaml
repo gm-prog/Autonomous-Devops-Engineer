@@ -1,0 +1,19 @@
+# Phase 8.4.2 — deterministic disposable kind cluster (name: ares-e2e).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: ares-e2e
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          certSANs:
+            - "ares-e2e-control-plane"
+            - "localhost"
+            - "127.0.0.1"
+  - role: worker
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."localhost:5001"]
+      endpoint = ["http://kind-registry:5000"]

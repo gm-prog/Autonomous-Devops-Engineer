@@ -1,0 +1,1069 @@
+"""Phase 6.3 analytics endpoint: controller contract tests.
+
+Direct controller calls (the established presentation-test convention)
+pin the typed window failure → HTTP 422 map, the success payload shape,
+and route registration order for ``GET /incidents/analytics/summary``.
+FastAPI-level parameter parsing (missing/malformed query strings → 422)
+is covered over real HTTP in ``tests/test_analytics_summary_e2e.py``.
+"""
+
+import os
+import tempfile
+import unittest
+from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+
+from fastapi import HTTPException
+
+from incident_service.domain.aggregates.incident import IncidentAggregate
+from incident_service.domain.entities.hotfix_proposal import HotfixProposal
+from incident_service.infrastructure.database.postgres_incident_repo import (
+    PostgresIncidentRepositoryAdapter,
+)
+from incident_service.presentation.rest.changes_controller import (
+    RolloutStageTransitionRequest,
+    get_change_health,
+    get_change_live_health,
+    get_change_release_gate,
+    get_change_rollout_plan,
+    get_change_rollout_state,
+    post_change_rollout_state_transition,
+    router as changes_router,
+)
+from incident_service.presentation.rest.controllers import (
+    get_operational_analytics_summary,
+    router,
+)
+
+# Phase 6.4 fixture: durable deployment-run evidence (genuine provenance).
+from incident_service.presentation.rest.test_remediation_authorization import (
+    _deployment_evidence,
+)
+from monitoring_service.infrastructure.prometheus.scraper_client import (
+    PrometheusUnavailableError,
+    RangeQueryResult,
+    RangeSample,
+    RangeSeries,
+)
+
+UTC = timezone.utc
+W_START = datetime(2026, 9, 1, tzinfo=UTC)
+W_END = datetime(2026, 9, 8, tzinfo=UTC)
+
+
+class AnalyticsEndpointContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(cls._temp.name, 'endpoint.db')}"
+        cls.repository = PostgresIncidentRepositoryAdapter(url)
+        incident = IncidentAggregate(
+            id="inc-analytics-1",
+            title="[sentry] checkout latency",
+            severity="CRITICAL",
+            context_details="p99 latency spike",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "RootCauseFound"
+        incident.patch_proposals.append(
+            HotfixProposal(
+                id="proposal-inc-analytics-1",
+                target_filepath="app/checkout.py",
+                diff_patch_payload="--- a/app/checkout.py\n+++ b/app/checkout.py\n",
+                status="PROPOSED",
+                generated_at=W_START + timedelta(hours=2),
+            )
+        )
+        cls.repository.save_incident(incident)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temp.cleanup()
+
+    def _summarize(self, start, end):
+        return get_operational_analytics_summary(
+            start=start, end=end, repository=self.repository
+        )
+
+    def test_success_returns_full_summary_shape(self):
+        summary = self._summarize(W_START, W_END)
+        self.assertEqual(summary["window"]["start"], W_START.isoformat())
+        self.assertEqual(summary["window"]["end"], W_END.isoformat())
+        self.assertEqual(summary["incidents"]["total"], 1)
+        self.assertEqual(summary["incidents"]["by_severity"], {"CRITICAL": 1})
+        self.assertEqual(summary["remediation"]["proposals_created"], 1)
+        self.assertIn("data_quality", summary)
+        self.assertIn("exclusions", summary["data_quality"])
+        self.assertIn("unsupported", summary)
+
+    def test_inverted_window_maps_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._summarize(W_END, W_START)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("strictly before end", str(ctx.exception.detail))
+
+    def test_window_over_31_days_maps_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._summarize(W_START, W_START + timedelta(days=31, seconds=1))
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("31 days", str(ctx.exception.detail))
+
+    def test_equal_bounds_map_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._summarize(W_START, W_START)
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_route_is_registered_and_not_shadowed_by_incident_id(self):
+        paths = [
+            (route.path, route.methods)
+            for route in router.routes
+            if getattr(route, "path", "").endswith("/analytics/summary")
+        ]
+        self.assertTrue(paths, "analytics summary route must be registered")
+        analytics_index = next(
+            index
+            for index, route in enumerate(router.routes)
+            if getattr(route, "path", "").endswith("/analytics/summary")
+        )
+        incident_id_index = next(
+            index
+            for index, route in enumerate(router.routes)
+            if getattr(route, "path", "").endswith("/{incident_id}")
+        )
+        self.assertLess(
+            analytics_index,
+            incident_id_index,
+            "analytics route must be declared before the /{incident_id} catch-all",
+        )
+
+
+class ChangeHealthEndpointTests(unittest.TestCase):
+    """Phase 6.4 controller contract: one typed, read-only health read."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(cls._temp.name, 'change-health.db')}"
+        cls.repository = PostgresIncidentRepositoryAdapter(url)
+        incident = IncidentAggregate(
+            id="inc-change-health",
+            title="[sentry] checkout 5xx",
+            severity="HIGH",
+            context_details="elevated error rate",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"  # terminal → does not force DEGRADED
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id="run-health-1",
+                evidence_id="deploy-change-health",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        cls.repository.save_incident(incident)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temp.cleanup()
+
+    def _assess(self, deployment_run_id="run-health-1", start=W_START, end=W_END):
+        return get_change_health(
+            deployment_run_id=deployment_run_id,
+            start=start,
+            end=end,
+            repository=self.repository,
+        )
+
+    def test_success_returns_typed_assessment_shape(self):
+        summary = self._assess()
+        self.assertEqual(summary["deployment_run_id"], "run-health-1")
+        self.assertEqual(
+            summary["decision"], "HEALTHY"
+        )  # carrier is terminal-status, all signals green
+        self.assertIn(summary["decision"], {"HEALTHY", "DEGRADED", "FAILED", "INCONCLUSIVE"})
+        self.assertEqual(summary["observation_window"]["start"], W_START.isoformat())
+        self.assertIn("change_impact", summary)
+        self.assertIn("signals", summary)
+        self.assertIn("data_quality", summary)
+        self.assertIn("exclusions", summary["data_quality"])
+        self.assertIsInstance(summary["reasons"], list)
+
+    def test_unknown_deployment_maps_to_http_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._assess(deployment_run_id="run-unknown")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertIn("no deployment-run evidence", str(ctx.exception.detail))
+
+    def test_inverted_window_maps_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._assess(start=W_END, end=W_START)
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_oversized_window_maps_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._assess(end=W_START + timedelta(days=31, seconds=1))
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("31 days", str(ctx.exception.detail))
+
+    def test_read_endpoint_never_invokes_mutation_paths(self):
+        from unittest.mock import patch
+
+        with patch.object(
+            self.repository,
+            "save_incident",
+            side_effect=AssertionError("health endpoint must be read-only"),
+        ) as save:
+            self._assess()
+        save.assert_not_called()
+
+    def test_response_carries_no_patch_or_credential_material(self):
+        import json as _json
+
+        text = _json.dumps(self._assess())
+        self.assertNotIn("diff_patch_payload", text)
+        self.assertNotIn("--- a/", text)
+        self.assertNotIn("JWT", text)
+        self.assertNotIn("authorization", text.lower())
+
+    def test_health_route_registered(self):
+        paths = [
+            getattr(route, "path", "")
+            for route in changes_router.routes
+        ]
+        self.assertTrue(
+            any(path.endswith("/{deployment_run_id}/health") for path in paths),
+            paths,
+        )
+
+
+class _FakeLivePrometheus:
+    """Canned attributable telemetry for controller contract tests."""
+
+    def __init__(self, error=None):
+        self.error = error
+        self.calls = []
+
+    def query_range_metric(self, template_name, start, end):
+        self.calls.append(template_name)
+        if self.error is not None:
+            raise self.error
+        base_ts = W_START.timestamp() + 3600
+        value = 10.0 if template_name == "request_rate" else 0.3
+        return RangeQueryResult(
+            template=template_name,
+            query="q",
+            start=W_START.timestamp(),
+            end=W_END.timestamp(),
+            step_seconds=60,
+            series=(
+                RangeSeries(
+                    labels={"deployment_id": "run-live-1"},
+                    samples=tuple(
+                        RangeSample(timestamp=base_ts + i * 600, value=value)
+                        for i in range(6)
+                    ),
+                ),
+            ),
+        )
+
+
+class ChangeLiveHealthEndpointTests(unittest.TestCase):
+    """Phase 6.5 controller contract: combined read model, fail-closed map."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._temp = tempfile.TemporaryDirectory()
+        url = f"sqlite:///{os.path.join(cls._temp.name, 'live-health.db')}"
+        cls.repository = PostgresIncidentRepositoryAdapter(url)
+        incident = IncidentAggregate(
+            id="inc-live-1",
+            title="[sentry] checkout 5xx",
+            severity="HIGH",
+            context_details="elevated error rate",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id="run-live-1",
+                evidence_id="deploy-live-1",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        cls.repository.save_incident(incident)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temp.cleanup()
+
+    def _call(
+        self,
+        deployment_run_id="run-live-1",
+        start=W_START,
+        end=W_END,
+        baseline_deployment_run_id=None,
+        prometheus=None,
+    ):
+        return get_change_live_health(
+            deployment_run_id=deployment_run_id,
+            start=start,
+            end=end,
+            baseline_deployment_run_id=baseline_deployment_run_id,
+            repository=self.repository,
+            prometheus=prometheus or _FakeLivePrometheus(),
+        )
+
+    def test_success_returns_combined_read_model(self):
+        body = self._call()
+        self.assertIn("durable_assessment", body)
+        self.assertIn("live_assessment", body)
+        durable = body["durable_assessment"]
+        live = body["live_assessment"]
+        self.assertEqual(durable["deployment_run_id"], "run-live-1")
+        self.assertEqual(durable["decision"], "HEALTHY")  # 6.4 semantics intact
+        self.assertIn(
+            live["decision"], {"HEALTHY", "DEGRADED", "FAILED", "INCONCLUSIVE"}
+        )
+        self.assertEqual(live["observation_window"], durable["observation_window"])
+        self.assertEqual(
+            live["release_identity"]["source_sha"],
+            durable["change_impact"]["source_sha"],
+        )
+        self.assertEqual(len(live["slis"]), 2)
+        self.assertIsNone(live["baseline_identity"])
+
+    def test_unknown_deployment_maps_to_http_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(deployment_run_id="run-unknown")
+        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertIn("no deployment-run evidence", str(ctx.exception.detail))
+
+    def test_inverted_window_maps_to_http_422(self):
+        prometheus = _FakeLivePrometheus()
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(start=W_END, end=W_START, prometheus=prometheus)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(prometheus.calls, [])
+
+    def test_oversized_window_maps_to_http_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(end=W_START + timedelta(days=31, seconds=1))
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_unreachable_prometheus_still_returns_200_inconclusive(self):
+        body = self._call(
+            prometheus=_FakeLivePrometheus(
+                error=PrometheusUnavailableError("refused")
+            )
+        )
+        live = body["live_assessment"]
+        self.assertEqual(live["decision"], "INCONCLUSIVE")
+        self.assertEqual(live["reasons"], ["telemetry_unavailable"])
+
+    def test_read_endpoint_never_invokes_mutation_paths(self):
+        from unittest.mock import patch
+
+        with patch.object(
+            self.repository,
+            "save_incident",
+            side_effect=AssertionError("live-health must be read-only"),
+        ) as save:
+            self._call()
+        save.assert_not_called()
+
+    def test_response_carries_no_patch_or_credential_material(self):
+        import json as _json
+
+        text = _json.dumps(self._call())
+        self.assertNotIn("diff_patch_payload", text)
+        self.assertNotIn("--- a/", text)
+        self.assertNotIn("authorization", text.lower())
+
+    def test_live_health_route_registered(self):
+        paths = [
+            getattr(route, "path", "")
+            for route in changes_router.routes
+        ]
+        self.assertTrue(
+            any(path.endswith("/live-health") for path in paths),
+            paths,
+        )
+
+
+class _FakeGateRepository:
+    def __init__(self):
+        self._incidents = []
+        self._gate_evaluations = []
+        incident = IncidentAggregate(
+            id="inc-gate-1",
+            title="[release] gate",
+            severity="HIGH",
+            context_details="gate fixture",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id="run-gate-1",
+                evidence_id="gate-evidence-1",
+                kind_extra={"health_check_status": "PASS"},
+            )
+        )
+        self._incidents.append(incident)
+
+    def list_incidents_in_window(self, start, end):
+        return list(self._incidents)
+
+    def save_incident(self, *args, **kwargs):
+        raise AssertionError("gate controller must be read-only")
+
+    def save_progressive_release_gate_evaluation(self, evaluation):
+        self._gate_evaluations.append(dict(evaluation))
+        return dict(evaluation)
+
+    def get_progressive_release_gate_evaluations(self, deployment_run_id, limit=50):
+        rows = [
+            row for row in self._gate_evaluations
+            if row["deployment_run_id"] == deployment_run_id
+        ]
+        return list(reversed(rows))[:limit]
+
+
+class _FakeGatePrometheus:
+    def __init__(self, error=None, cpu=0.30, request=10.0):
+        self.error = error
+        self.cpu = cpu
+        self.request = request
+        self.calls = []
+
+    def query_range_metric(self, template_name, start, end):
+        self.calls.append(template_name)
+        if self.error is not None:
+            raise self.error
+        value = self.request if template_name == "request_rate" else self.cpu
+        return RangeQueryResult(
+            template=template_name,
+            query="q",
+            start=W_START.timestamp(),
+            end=W_END.timestamp(),
+            step_seconds=60,
+            series=(
+                RangeSeries(
+                    labels={"deployment_id": "run-gate-1"},
+                    samples=tuple(
+                        RangeSample(
+                            timestamp=W_START.timestamp() + 3600 + i * 600,
+                            value=value,
+                        )
+                        for i in range(6)
+                    ),
+                ),
+            ),
+        )
+
+
+
+
+class ChangeReleaseGateEndpointTests(unittest.TestCase):
+    """Phase 6.6 controller contract: read-only gate evaluation."""
+
+    def _repo(self):
+        return _FakeGateRepository()
+
+    def _call(self, percentage=5, baseline=None, prometheus=None):
+        return get_change_release_gate(
+            deployment_run_id="run-gate-1",
+            start=W_START,
+            end=W_END,
+            target_percentage=percentage,
+            baseline_deployment_run_id=baseline,
+            repository=self._repo(),
+            prometheus=prometheus or _FakeGatePrometheus(),
+        )
+
+    def test_healthy_gate_promotes(self):
+        body = self._call()
+        self.assertEqual(body["gate_decision"], "PROMOTE")
+        self.assertEqual(body["target_percentage"], 5)
+
+    def test_above_five_requires_baseline(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(percentage=25)
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("baseline", str(ctx.exception.detail))
+
+    def test_invalid_percentage_maps_to_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._call(percentage=10)
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_route_is_registered(self):
+        paths = [getattr(route, "path", "") for route in changes_router.routes]
+        self.assertIn("/changes/{deployment_run_id}/gate", paths)
+
+    def test_direct_controller_call_rejects_fastapi_query_sentinel(self):
+        """A direct handler call must not accidentally treat Query(None) as a
+        real baseline identifier."""
+        from fastapi import Query
+
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_release_gate(
+                deployment_run_id="run-gate-1",
+                start=W_START,
+                end=W_END,
+                target_percentage=5,
+                baseline_deployment_run_id=Query(None),
+                repository=self._repo(),
+                prometheus=_FakeGatePrometheus(),
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_non_string_baseline_is_rejected_before_telemetry(self):
+        prometheus = _FakeGatePrometheus()
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_release_gate(
+                deployment_run_id="run-gate-1",
+                start=W_START,
+                end=W_END,
+                target_percentage=5,
+                baseline_deployment_run_id=123,
+                repository=self._repo(),
+                prometheus=prometheus,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(prometheus.calls, [])
+
+    def test_gate_is_read_only(self):
+        repo = self._repo()
+        with patch.object(
+            repo, "save_incident",
+            side_effect=AssertionError("gate must be read-only"),
+        ) as save:
+            body = get_change_release_gate(
+                deployment_run_id="run-gate-1",
+                start=W_START,
+                end=W_END,
+                target_percentage=5,
+                baseline_deployment_run_id=None,
+                repository=repo,
+                prometheus=_FakeGatePrometheus(),
+            )
+        self.assertEqual(body["gate_decision"], "PROMOTE")
+        save.assert_not_called()
+
+
+class ChangeReleaseGateHistoryEndpointTests(unittest.TestCase):
+    def test_history_route_is_registered(self):
+        paths = [getattr(route, "path", "") for route in changes_router.routes]
+        self.assertIn("/changes/{deployment_run_id}/gate/history", paths)
+
+    def test_history_returns_persisted_state(self):
+        repo = _FakeGateRepository()
+        now = datetime.now(timezone.utc)
+        row = {
+            "evaluation_id": "eval-1",
+            "deployment_run_id": "run-gate-1",
+            "source_sha": "a" * 40,
+            "repository_name": "gm-prog/example",
+            "target_percentage": 5,
+            "observation_start": W_START,
+            "observation_end": W_END,
+            "baseline_deployment_run_id": None,
+            "baseline_source_sha": None,
+            "health_decision": "HEALTHY",
+            "gate_decision": "PROMOTE",
+            "reasons": ["all_required_signals_healthy"],
+            "live_assessment": {"decision": "HEALTHY"},
+            "policy_version": "6.6.1",
+            "request_fingerprint": "b" * 64,
+            "assessment_fingerprint": "c" * 64,
+            "observed_at": now,
+            "expires_at": now + timedelta(minutes=15),
+        }
+        repo.save_progressive_release_gate_evaluation(row)
+        from incident_service.presentation.rest.changes_controller import get_change_release_gate_history
+        body = get_change_release_gate_history(
+            deployment_run_id="run-gate-1", limit=50, repository=repo
+        )
+        self.assertEqual(body["count"], 1)
+        self.assertTrue(body["evaluations"][0]["fresh"])
+
+    def test_history_invalid_limit_maps_to_422(self):
+        with self.assertRaises(HTTPException) as ctx:
+            from incident_service.presentation.rest.changes_controller import get_change_release_gate_history
+            get_change_release_gate_history(
+                deployment_run_id="run-gate-1", limit=0, repository=_FakeGateRepository()
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+
+class RolloutStageEndpointTests(unittest.TestCase):
+    """Phase 6.6.2 controller contract: durable rollout-state surface.
+
+    Direct handler calls (established convention) over a real SQLite
+    adapter; FastAPI body parsing (malformed JSON shape → 422) is proven
+    over real HTTP in ``tests/test_analytics_summary_e2e.py``.
+    """
+
+    SHA = "a" * 40
+    RUN_ID = "run-rollout-http"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.repository = PostgresIncidentRepositoryAdapter(
+            f"sqlite:///{os.path.join(self._temp.name, 'rollout-http.db')}"
+        )
+        incident = IncidentAggregate(
+            id="inc-rollout-http",
+            title="[release] rollout http",
+            severity="HIGH",
+            context_details="rollout state http fixture",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id=self.RUN_ID,
+                evidence_id="rollout-http-evidence",
+                head_sha=self.SHA,
+                kind_extra={
+                    "health_check_status": "PASS",
+                    "source_sha": self.SHA,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+        self.now = datetime.now(timezone.utc)
+
+    def _evaluate(self, target=5, cpu=0.30):
+        from incident_service.application.services.progressive_release_gate_service import (
+            ProgressiveReleaseGateService,
+        )
+
+        run_id = self.RUN_ID
+
+        class _RolloutPrometheus(_FakeGatePrometheus):
+            # attribution series must carry the requested deployment id
+            def query_range_metric(inner_self, template_name, start, end):
+                inner_self.calls.append(template_name)
+                value = (
+                    inner_self.request
+                    if template_name == "request_rate"
+                    else inner_self.cpu
+                )
+                return RangeQueryResult(
+                    template=template_name,
+                    query="q",
+                    start=W_START.timestamp(),
+                    end=W_END.timestamp(),
+                    step_seconds=60,
+                    series=(
+                        RangeSeries(
+                            labels={"deployment_id": run_id},
+                            samples=tuple(
+                                RangeSample(
+                                    timestamp=W_START.timestamp()
+                                    + 3600
+                                    + i * 600,
+                                    value=value,
+                                )
+                                for i in range(6)
+                            ),
+                        ),
+                    ),
+                )
+
+        return ProgressiveReleaseGateService(
+            self.repository,
+            _RolloutPrometheus(cpu=cpu),
+            now_factory=lambda: self.now,
+        ).evaluate(
+            self.RUN_ID,
+            W_START,
+            W_END,
+            target,
+            baseline_deployment_run_id=(
+                self.RUN_ID if target > 5 else None
+            ),
+        )
+
+    def _bootstrap(self):
+        evaluation = self._evaluate(5)
+        return post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=0,
+                target_percentage=5,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+
+    def test_routes_are_registered(self):
+        paths = [
+            getattr(route, "path", "") for route in changes_router.routes
+        ]
+        self.assertIn("/changes/{deployment_run_id}/rollout-state", paths)
+        self.assertIn(
+            "/changes/{deployment_run_id}/rollout-state/transition", paths
+        )
+
+    def test_read_missing_state_is_404(self):
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_state(
+                deployment_run_id="run-unknown", repository=self.repository
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_read_returns_persisted_stage_200(self):
+        created = self._bootstrap()
+        body = get_change_rollout_state(
+            deployment_run_id=self.RUN_ID, repository=self.repository
+        )
+        self.assertEqual(body, created)
+        self.assertEqual(body["current_percentage"], 5)
+        self.assertEqual(body["state"], "ACTIVE")
+
+    def test_successful_transition_is_200(self):
+        self._bootstrap()
+        evaluation = self._evaluate(25)
+        body = post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=5,
+                target_percentage=25,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+        self.assertEqual(body["current_percentage"], 25)
+        self.assertEqual(body["state"], "ACTIVE")
+
+    def test_illegal_transition_is_409(self):
+        self._bootstrap()
+        evaluation = self._evaluate(50)
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=50,
+                    evaluation_id=evaluation["evaluation_id"],
+                    source_sha=evaluation["source_sha"],
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+        # state untouched by the rejected request
+        self.assertEqual(
+            get_change_rollout_state(
+                deployment_run_id=self.RUN_ID, repository=self.repository
+            )["current_percentage"],
+            5,
+        )
+
+    def test_stale_expected_percentage_is_409(self):
+        self._bootstrap()
+        evaluation = self._evaluate(25)
+        # apply first...
+        post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=5,
+                target_percentage=25,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+        # ...then present the same computation again from a worker that
+        # still believes the stage is at 5% with a different evaluation
+        stale = self._evaluate(5)
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=5,
+                    evaluation_id=stale["evaluation_id"],
+                    source_sha=stale["source_sha"],
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_unknown_evaluation_is_404(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=25,
+                    evaluation_id="missing-evaluation",
+                    source_sha=self.SHA,
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_malformed_service_input_is_422(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            post_change_rollout_state_transition(
+                deployment_run_id=self.RUN_ID,
+                request=RolloutStageTransitionRequest(
+                    expected_percentage=5,
+                    target_percentage=10,  # not in the fixed sequence
+                    evaluation_id="x",
+                    source_sha=self.SHA,
+                ),
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_transition_only_touches_rollout_state(self):
+        self._bootstrap()
+        incidents_before = self.repository.get_incident_by_id(
+            "inc-rollout-http"
+        )
+        status_before = incidents_before.status
+        evidence_before = [
+            dict(item.payload) for item in incidents_before.evidence
+        ]
+        evaluation = self._evaluate(25)
+        evaluations_before = (
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            )
+        )
+        post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=5,
+                target_percentage=25,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+        incident_after = self.repository.get_incident_by_id(
+            "inc-rollout-http"
+        )
+        self.assertEqual(incident_after.status, status_before)
+        self.assertEqual(
+            [dict(item.payload) for item in incident_after.evidence],
+            evidence_before,
+        )
+        # evaluations are append-only audit rows: none mutated or removed
+        self.assertEqual(
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            ),
+            evaluations_before,
+        )
+
+
+class RolloutPlanEndpointTests(unittest.TestCase):
+    """Phase 6.7.1 controller contract: read-only traffic preflight.
+
+    Uses the default (deliberately unavailable) traffic provider — the
+    only honest production configuration today — so a 200 preflight is
+    INCONCLUSIVE/READY-class logic proven at the service layer and this
+    surface proves mapping, validation, and zero mutation.
+    """
+
+    SHA = "a" * 40
+    RUN_ID = "run-rollout-plan-http"
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.repository = PostgresIncidentRepositoryAdapter(
+            f"sqlite:///{os.path.join(self._temp.name, 'plan-http.db')}"
+        )
+        incident = IncidentAggregate(
+            id="inc-rollout-plan-http",
+            title="[release] rollout plan http",
+            severity="HIGH",
+            context_details="rollout plan http fixture",
+        )
+        incident.created_at = W_START + timedelta(hours=1)
+        incident.status = "Fixed"
+        incident.evidence.append(
+            _deployment_evidence(
+                run_id=self.RUN_ID,
+                evidence_id="plan-http-evidence",
+                head_sha=self.SHA,
+                kind_extra={
+                    "health_check_status": "PASS",
+                    "source_sha": self.SHA,
+                },
+            )
+        )
+        self.repository.save_incident(incident)
+        self.now = datetime.now(timezone.utc)
+
+    def _evaluate(self, target=5, cpu=0.30):
+        from incident_service.application.services.progressive_release_gate_service import (
+            ProgressiveReleaseGateService,
+        )
+
+        run_id = self.RUN_ID
+
+        class _RolloutPrometheus(_FakeGatePrometheus):
+            def query_range_metric(inner_self, template_name, start, end):
+                inner_self.calls.append(template_name)
+                value = (
+                    inner_self.request
+                    if template_name == "request_rate"
+                    else inner_self.cpu
+                )
+                return RangeQueryResult(
+                    template=template_name,
+                    query="q",
+                    start=W_START.timestamp(),
+                    end=W_END.timestamp(),
+                    step_seconds=60,
+                    series=(
+                        RangeSeries(
+                            labels={"deployment_id": run_id},
+                            samples=tuple(
+                                RangeSample(
+                                    timestamp=W_START.timestamp()
+                                    + 3600
+                                    + i * 600,
+                                    value=value,
+                                )
+                                for i in range(6)
+                            ),
+                        ),
+                    ),
+                )
+
+        return ProgressiveReleaseGateService(
+            self.repository,
+            _RolloutPrometheus(cpu=cpu),
+            now_factory=lambda: self.now,
+        ).evaluate(
+            self.RUN_ID,
+            W_START,
+            W_END,
+            target,
+            baseline_deployment_run_id=(
+                self.RUN_ID if target > 5 else None
+            ),
+        )
+
+    def _bootstrap(self):
+        evaluation = self._evaluate(5)
+        return post_change_rollout_state_transition(
+            deployment_run_id=self.RUN_ID,
+            request=RolloutStageTransitionRequest(
+                expected_percentage=0,
+                target_percentage=5,
+                evaluation_id=evaluation["evaluation_id"],
+                source_sha=evaluation["source_sha"],
+            ),
+            repository=self.repository,
+        )
+
+    def _plan(self, evaluation, requested):
+        return get_change_rollout_plan(
+            deployment_run_id=self.RUN_ID,
+            evaluation_id=evaluation["evaluation_id"],
+            requested_percentage=requested,
+            source_sha=self.SHA,
+            repository=self.repository,
+        )
+
+    def test_route_is_registered(self):
+        paths = [
+            getattr(route, "path", "") for route in changes_router.routes
+        ]
+        self.assertIn("/changes/{deployment_run_id}/rollout-plan", paths)
+
+    def test_unavailable_provider_returns_200_inconclusive(self):
+        self._bootstrap()
+        evaluation = self._evaluate(25)
+        body = self._plan(evaluation, 25)
+        self.assertEqual(body["preflight_status"], "INCONCLUSIVE")
+        self.assertEqual(body["observed_traffic"]["provider"], "unavailable")
+        self.assertEqual(body["requested_percentage"], 25)
+        self.assertEqual(body["rollout"]["current_percentage"], 5)
+        self.assertEqual(
+            body["evaluation"]["evaluation_id"], evaluation["evaluation_id"]
+        )
+
+    def test_missing_rollout_state_is_404(self):
+        evaluation = self._evaluate(5)
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_plan(
+                deployment_run_id="run-unknown-plan",
+                evaluation_id=evaluation["evaluation_id"],
+                requested_percentage=5,
+                source_sha=self.SHA,
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_unknown_evaluation_is_404(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_plan(
+                deployment_run_id=self.RUN_ID,
+                evaluation_id="missing-eval",
+                requested_percentage=25,
+                source_sha=self.SHA,
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_illegal_stage_jump_is_409(self):
+        self._bootstrap()
+        evaluation = self._evaluate(50)
+        with self.assertRaises(HTTPException) as ctx:
+            self._plan(evaluation, 50)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_malformed_input_is_422(self):
+        self._bootstrap()
+        with self.assertRaises(HTTPException) as ctx:
+            get_change_rollout_plan(
+                deployment_run_id=self.RUN_ID,
+                evaluation_id="whatever",
+                requested_percentage=10,  # not in 5/25/50/100
+                source_sha=self.SHA,
+                repository=self.repository,
+            )
+        self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_plan_is_read_only_over_every_durable_record(self):
+        self._bootstrap()
+        stage_before = self.repository.get_progressive_rollout_stage(
+            self.RUN_ID
+        )
+        evaluation = self._evaluate(25)
+        evaluations_before = list(
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            )
+        )
+        self._plan(evaluation, 25)
+        self.assertEqual(
+            self.repository.get_progressive_rollout_stage(self.RUN_ID),
+            stage_before,
+        )
+        self.assertEqual(
+            self.repository.get_progressive_release_gate_evaluations(
+                self.RUN_ID
+            ),
+            evaluations_before,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

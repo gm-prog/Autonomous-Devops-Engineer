@@ -9,6 +9,12 @@ scrape_configs:
       - targets: ['localhost:9090']
 
   # --- FASTAPI BACKEND TELEMETRY TARGETS ---
+  # The gateway now serves /metrics (devops_api_requests_total, process collectors)
   - job_name: 'devops-api-gateway'
     static_configs:
       - targets: ['api:8000']
+
+  # --- QDRANT VECTOR STORE (native /metrics on 6333) ---
+  - job_name: 'qdrant'
+    static_configs:
+      - targets: ['qdrant:6333']
