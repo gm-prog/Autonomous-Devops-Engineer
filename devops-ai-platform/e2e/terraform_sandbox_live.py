@@ -208,15 +208,25 @@ def probe_container_runtime(st: Checks, image: str, workspace: Path) -> None:
     actually see. Asking the kernel beats trusting our own flags.
     """
     from deployment_service.application.services.terraform_sandbox import (
-        build_run_plan, TerraformSandboxSpec, TerraformSandboxStep,
+        OPERATION_TIMEOUTS, build_run_plan, build_terraform_argv,
+        new_container_name, TerraformSandboxSpec, TerraformSandboxStep,
     )
 
     uid, gid = sandbox_runtime_identity()
     spec = TerraformSandboxSpec(image=image, user=f"{uid}:{gid}")
+    operation = TerraformOperation.VALIDATE
+    # argv comes from the policy template, not from here: build_run_plan
+    # re-derives it and refuses anything that does not match, which is
+    # exactly the property that stops callers smuggling flags.
     step = TerraformSandboxStep(
-        operation=TerraformOperation.VALIDATE, argv=("terraform", "validate")
+        operation=operation,
+        argv=build_terraform_argv(operation),
+        timeout_seconds=OPERATION_TIMEOUTS[operation],
     )
-    plan = build_run_plan(spec, step, workspace)
+    plan = build_run_plan(
+        spec=spec, step=step, workspace_path=workspace,
+        container_name=new_container_name(),
+    )
     argv = list(plan.cli_argv)
 
     def run_inside(shell_cmd: str) -> tuple[int, str]:
