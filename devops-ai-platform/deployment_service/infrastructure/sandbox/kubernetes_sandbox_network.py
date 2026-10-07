@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
 import uuid
@@ -268,8 +267,3 @@ class PerExecutionNetwork:
     def __exit__(self, *exc: Any) -> None:
         self.destroy()
 
-
-def approved_peers_from_environment() -> Tuple[str, ...]:
-    """Host-owned list of destinations the sandbox may reach."""
-    raw = os.getenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "").strip()
-    return tuple(sorted(p.strip() for p in raw.split(",") if p.strip()))

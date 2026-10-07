@@ -522,9 +522,10 @@ PROBES: list[Probe] = [
         "re-read the approved destinations at execution time (TOCTOU)",
         replace(ADAPTER,
                 "        if not self._approved_peers:",
-                "        from deployment_service.infrastructure.sandbox."
-                "kubernetes_sandbox_network import approved_peers_from_environment\n"
-                "        self._approved_peers = approved_peers_from_environment()\n"
+                "        import os as _os\n"
+                "        _raw = _os.getenv(\"DEPLOYMENT_K8S_SANDBOX_PEERS\", \"\")\n"
+                "        self._approved_peers = tuple(sorted(\n"
+                "            p.strip() for p in _raw.split(\",\") if p.strip()))\n"
                 "        if not self._approved_peers:"),
         tests=[NETWORK_TESTS],
     ),
@@ -711,9 +712,18 @@ def main() -> int:
               f"detect these weakenings:")
         for probe in escaped:
             print(f"  - {probe.name}: {probe.description}")
+        # An escape is a release blocker, so it is published as an error
+        # and not merely as a line in a log that cannot be retrieved.
+        print(f"::error title=8.6-A mutation escapes::"
+              f"{len(escaped)}/{len(selected)} Kubernetes bypass probes "
+              f"ESCAPED: {', '.join(p.name for p in escaped)}")
         return 1
     print(f"All {len(selected)} mutations were caught "
           f"({len(selected) - len(redundant)} directly).")
+    print(f"::notice title=8.6-A mutation probes::"
+          f"{len(selected)} Kubernetes bypass probes, "
+          f"{len(selected) - len(redundant)} caught directly, "
+          f"{len(redundant)} absorbed by a sibling defence, 0 ESCAPED.")
     return 0
 
 

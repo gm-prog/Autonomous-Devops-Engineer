@@ -366,8 +366,17 @@ def main() -> int:
               f"detected by the test suite:")
         for probe in escaped:
             print(f"  - {probe.name}: {probe.description}")
+        # An escape is a release blocker, so it is published as an error
+        # and not merely as a line in a log that cannot be retrieved.
+        print(f"::error title=8.5-A mutation escapes::"
+              f"{len(escaped)}/{len(selected)} Terraform bypass probes "
+              f"ESCAPED: {', '.join(p.name for p in escaped)}")
         return 1
     print(f"All {len(selected)} bypass probes were caught by the test suite.")
+    print(f"::notice title=8.5-A mutation probes::"
+          f"{len(selected)} Terraform bypass probes, "
+          f"{len(selected) - len(redundant)} caught directly, "
+          f"{len(redundant)} absorbed by a sibling defence, 0 ESCAPED.")
     return 0
 
 

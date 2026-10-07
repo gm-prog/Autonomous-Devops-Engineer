@@ -631,9 +631,13 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     st.equals("kubernetes validation is NOT_APPLICABLE", "NOT_APPLICABLE", k8s_check)
     st.truthy("kubernetes leg is not reported as a success",
               k8s.get("status") != "PASS", k8s.get("status", "(absent)"))
+    # SKIPPED is deliberately not accepted here. "We did not look" used
+    # to be recorded as a soft result; a leg that is not applicable must
+    # say exactly that, and a legacy SKIPPED must not be able to stand in
+    # for it.
     st.truthy("kubernetes is explicitly marked not applicable",
               k8s.get("kubernetes_applicable") is False
-              or k8s.get("status") in {"NOT_APPLICABLE", "SKIPPED"},
+              or k8s.get("status") == "NOT_APPLICABLE",
               json.dumps(k8s)[:160])
     st.truthy("no cluster access is claimed without a cluster",
               k8s.get("cluster_access") is not True, str(k8s.get("cluster_access")))
