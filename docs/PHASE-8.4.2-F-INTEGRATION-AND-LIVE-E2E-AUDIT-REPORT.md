@@ -621,3 +621,64 @@ audit work.
 **LIVE E2E: NOT VERIFIED** — unchanged. No documentation or CI commit can alter that: it
 requires a real golden-path execution, and no such execution is independently evidenced by
 the GitHub API access available here.
+
+## 16. Current verification snapshot — 2026-10-07
+
+Sections 1–15 above remain a deliberately frozen historical audit of their named heads.
+This section is the **current live engineering snapshot** and must not be substituted into
+the historical facts record.
+
+| Current fact | Observed value |
+|---|---|
+| advanced branch | `arena/b6307a50-autonomous-devops-engineer` |
+| current head | `371fa51bebf549348b474d62ef7fdedfcb407e06` |
+| current-head commit purpose | Phase 8.6-A fix for persisted Kubernetes execution-identity round-trip loss |
+| PR #12 | OPEN, base `main`, current head above, 187 commits / 431 changed files / +79,892 / −765 |
+| PR #13 | OPEN, base `integration/phase-8.2-v1`, current head above, 98 commits / 111 changed files / +31,890 / −319 |
+| current CI run | `37654127333` — completed SUCCESS |
+| second current CI run | `37654128893` — completed SUCCESS |
+| Phase 8.6 live Kind E2E | SUCCESS in current CI run |
+| Phase 8.6 real deployment-service → Kind E2E | SUCCESS in current CI run |
+| Terraform trust-boundary E2E | SUCCESS in current CI run |
+| operational evidence contract | SUCCESS in current CI run |
+| full golden-path staging E2E | **NOT VERIFIED** |
+
+### 16.1 Latest correctness fix
+
+The current head fixes a real HTTP-path defect in Kubernetes approval persistence:
+`workload_identity_policy` was present in the approved identity but was omitted from the
+hand-written reconstruction used after persistence. The boundary therefore rejected valid
+execution because the observed identity was compared with incomplete approved evidence.
+
+The fix adds the missing field to the reconstruction and adds a dataclass-driven
+round-trip test covering every identity field, plus a missing-required-field fail-closed
+test. This is a meaningful correctness improvement: the prior direct-runner tests and live
+Kind E2E did not exercise the persisted HTTP reconstruction path.
+
+### 16.2 What current CI proves
+
+Current CI proves the code and test surfaces at `371fa51b...` are green, including the
+Phase 8.4.2-F audit-truth job, Terraform trust-boundary checks, live Kind Kubernetes
+checks, real deployment-service-to-Kind HTTP execution, incident/RCA/remediation checks,
+API gateway checks, and the operational evidence contract.
+
+It does **not** prove a live execution of the full dispatch-only golden-path staging
+workflow.
+
+### 16.3 Golden-path status remains an external closure item
+
+The golden-path workflow is present on this advanced branch but absent from `main`, so
+GitHub does not register it as a dispatchable workflow from the default branch. The
+previously documented fixture-repository visibility, environment/secret visibility, and
+workflow-dispatch permission limitations remain external prerequisites.
+
+Accordingly, the current platform must be treated as **engineering-complete for the
+verified Phase 8.6 surfaces, but not live-golden-path-verified**. No release claim should
+upgrade this status without a genuine staging run producing an immutable manifest and
+artifact evidence.
+
+### 16.4 Baseline recommendation
+
+`371fa51bebf549348b474d62ef7fdedfcb407e06` is suitable as the **Phase 8.6 integration
+baseline** for subsequent work. It is not a claim that the full golden path has passed.
+
