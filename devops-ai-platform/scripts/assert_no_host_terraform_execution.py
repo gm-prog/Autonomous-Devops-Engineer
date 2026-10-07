@@ -40,12 +40,23 @@ TRUSTED_ADAPTER = (
     "deployment_service/infrastructure/sandbox/container_terraform_sandbox.py"
 )
 
+#: Phase 8.6-A: the equivalent adapter for Kubernetes. Same contract --
+#: it spawns the container runtime, never kubectl on the host.
+TRUSTED_KUBECTL_ADAPTER = (
+    "deployment_service/infrastructure/sandbox/container_kubectl_sandbox.py"
+)
+
 #: Modules that must never spawn a process of any kind.
 NO_EXECUTION_MODULES = (
     "deployment_service/application/services/terraform_runner.py",
     "deployment_service/application/services/terraform_sandbox.py",
     "deployment_service/application/services/plan_artifact.py",
     "deployment_service/application/services/deployment_engine.py",
+    # Phase 8.6-A: Kubernetes execution must leave the host too.
+    "deployment_service/application/services/kubectl_runner.py",
+    "deployment_service/application/services/kubectl_sandbox.py",
+    "deployment_service/application/services/kubeconfig_policy.py",
+    "deployment_service/application/services/kubernetes_manifest_policy.py",
 )
 
 #: Only these may ever be argv[0] of a spawned process, and only in the
@@ -64,7 +75,7 @@ SPAWN_CALLS = frozenset(
     }
 )
 
-FORBIDDEN_TOKENS = ("bash", "sh", "terraform", "/bin/sh", "/bin/bash", "-c")
+FORBIDDEN_TOKENS = ("bash", "sh", "terraform", "kubectl", "/bin/sh", "/bin/bash", "-c")
 
 
 def dotted(node: ast.AST) -> str:
@@ -90,7 +101,7 @@ def literal_strings(node: ast.AST) -> list[str]:
 class Auditor(ast.NodeVisitor):
     def __init__(self, relpath: str) -> None:
         self.relpath = relpath
-        self.is_adapter = relpath == TRUSTED_ADAPTER
+        self.is_adapter = relpath in (TRUSTED_ADAPTER, TRUSTED_KUBECTL_ADAPTER)
         self.violations: list[str] = []
 
     def fail(self, node: ast.AST, message: str) -> None:
@@ -136,6 +147,9 @@ class Auditor(ast.NodeVisitor):
             if lowered in {"terraform", "/usr/local/bin/terraform"}:
                 self.fail(node, "the adapter must launch the container "
                                 "runtime, never terraform directly")
+            if lowered in {"kubectl", "/usr/local/bin/kubectl", "/usr/bin/kubectl"}:
+                self.fail(node, "the adapter must launch the container "
+                                "runtime, never kubectl directly")
             if lowered in {"bash", "sh", "/bin/sh", "/bin/bash", "zsh"}:
                 self.fail(node, f"shell executable {value!r} must not be spawned")
         if strings and strings[0].strip().lower() not in ALLOWED_EXECUTABLES:
@@ -159,7 +173,7 @@ def audit(relpath: str) -> list[str]:
 
     # Belt and braces: the non-adapter modules must not even import a
     # process API, so a future edit cannot quietly start using one.
-    if relpath != TRUSTED_ADAPTER:
+    if relpath not in (TRUSTED_ADAPTER, TRUSTED_KUBECTL_ADAPTER):
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -172,7 +186,7 @@ def audit(relpath: str) -> list[str]:
 
 
 def main() -> int:
-    targets = [TRUSTED_ADAPTER, *NO_EXECUTION_MODULES]
+    targets = [TRUSTED_ADAPTER, TRUSTED_KUBECTL_ADAPTER, *NO_EXECUTION_MODULES]
     violations: list[str] = []
     for relpath in targets:
         found = audit(relpath)
@@ -188,8 +202,9 @@ def main() -> int:
         return 1
     print(f"No host Terraform execution path exists across "
           f"{len(targets)} audited modules.")
-    print(f"Only {TRUSTED_ADAPTER} may spawn a process, and only a "
-          f"container runtime {sorted(ALLOWED_EXECUTABLES)}.")
+    print(f"Only {TRUSTED_ADAPTER} and {TRUSTED_KUBECTL_ADAPTER} may spawn "
+          f"a process, and only a container runtime "
+          f"{sorted(ALLOWED_EXECUTABLES)}.")
     return 0
 
 

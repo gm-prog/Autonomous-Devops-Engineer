@@ -1,188 +1,284 @@
+"""Kubernetes execution authority.
+
+Phase 8.6-A moved kubectl execution off the host. This service no longer
+spawns a process of any kind: it validates the manifest against the
+host-owned policy, sanitizes the kubeconfig, names a closed operation,
+and hands a bounded step to a :class:`KubernetesSandboxPort`
+implementation. The container adapter behind that port is the only code
+that launches a process, and it launches the container runtime, never
+``kubectl`` and never a shell.
+
+There is deliberately no method that accepts a command, a flag, a server
+URL, a kubeconfig path or a filename. Those are all host-owned.
+"""
+
+from __future__ import annotations
 
 import os
-import shutil
-import subprocess
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, Optional, Protocol
+
+from deployment_service.application.services.kubeconfig_policy import (
+    KubeconfigPolicyError,
+    SanitizedKubeconfig,
+    sanitize_kubeconfig,
+)
+from deployment_service.application.services.kubectl_sandbox import (
+    OPERATION_TIMEOUTS,
+    KubectlOperation,
+    KubectlSandboxConfigurationError,
+    KubectlSandboxPolicyViolation,
+    KubectlSandboxStep,
+    build_kubectl_argv,
+    load_spec_from_environment,
+)
+from deployment_service.application.services.kubernetes_manifest_policy import (
+    KubernetesManifestPolicy,
+)
+
+DEFAULT_NAMESPACE = "devops-production-namespace"
+
+
+class KubernetesSandboxPort(Protocol):
+    """Port the runner uses to execute a bounded kubectl step."""
+
+    def execute(
+        self,
+        step: KubectlSandboxStep,
+        *,
+        manifest_yaml: str,
+        kubeconfig_yaml: str,
+        namespace: str,
+    ) -> Any:
+        ...
+
+    def policy_identity(self, namespace: str) -> str:
+        ...
 
 
 class KubectlRunnerService:
-    """Fixed-command Kubernetes runner with explicit cluster credentials."""
+    """Policy-bound Kubernetes runner. Executes only inside the sandbox."""
 
-    def _execution_env(self) -> Dict[str, str]:
-        kubeconfig = os.getenv("DEPLOYMENT_KUBECONFIG_PATH", "").strip()
-        if not kubeconfig:
-            raise RuntimeError(
-                "DEPLOYMENT_KUBECONFIG_PATH must be explicitly configured for cluster execution."
+    def __init__(self, sandbox: Optional[KubernetesSandboxPort] = None) -> None:
+        self._sandbox = sandbox
+        self._manifest_policy = KubernetesManifestPolicy(namespace=self.namespace())
+
+    # ---------------------------------------------------------------- config
+
+    @staticmethod
+    def namespace() -> str:
+        """The single host-owned execution namespace."""
+        return os.getenv("DEPLOYMENT_KUBERNETES_NAMESPACE", DEFAULT_NAMESPACE).strip() \
+            or DEFAULT_NAMESPACE
+
+    def _check_namespace(self, namespace: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Reject any namespace that is not the host-owned one."""
+        owned = self.namespace()
+        if namespace is not None and namespace != owned:
+            return self._blocked(
+                f"Namespace {namespace!r} is not the host-owned execution namespace "
+                f"{owned!r}; cross-namespace execution is refused."
             )
+        return None
 
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL"}
+    @staticmethod
+    def _blocked(reason: str) -> Dict[str, Any]:
+        return {
+            "status": "BLOCKED",
+            "stderr": reason,
+            "stdout": "",
+            "cluster_access": False,
+            "sandboxed": True,
         }
-        env["KUBECONFIG"] = kubeconfig
-        for key in (
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "NO_PROXY",
-            "https_proxy",
-            "http_proxy",
-            "no_proxy",
-        ):
-            if key in os.environ:
-                env[key] = os.environ[key]
-        return env
 
-    def _allowed_namespace(self, namespace: str) -> bool:
-        allowed = {
-            value.strip()
-            for value in os.getenv(
-                "DEPLOYMENT_ALLOWED_NAMESPACES",
-                "devops-production-namespace",
-            ).split(",")
-            if value.strip()
-        }
-        return namespace in allowed
+    # ------------------------------------------------------------ credentials
 
-    def _run(self, args: List[str], env: Dict[str, str], timeout: int) -> Dict[str, Any]:
-        if not shutil.which("kubectl"):
-            return {
-                "status": "TOOL_UNAVAILABLE",
-                "stderr": "kubectl is not installed.",
-                "cluster_access": False,
-            }
+    def _kubeconfig(self) -> SanitizedKubeconfig:
+        path = os.getenv("DEPLOYMENT_KUBECONFIG_PATH", "").strip()
+        if not path:
+            raise KubeconfigPolicyError(
+                "DEPLOYMENT_KUBECONFIG_PATH must be explicitly configured for "
+                "cluster execution."
+            )
         try:
-            result = subprocess.run(
-                args,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-            return {
-                "status": "PASS" if result.returncode == 0 else "FAIL",
-                "exit_code": result.returncode,
-                "command": " ".join(args),
-                "stdout": result.stdout[-12000:],
-                "stderr": result.stderr[-12000:],
-                "cluster_access": True,
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "TIMEOUT",
-                "command": " ".join(args),
+            raw = Path(path).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise KubeconfigPolicyError(f"kubeconfig is unreadable: {exc}") from None
+        return sanitize_kubeconfig(
+            raw,
+            expected_namespace=self.namespace(),
+            credential_profile_id=os.getenv(
+                "DEPLOYMENT_K8S_CREDENTIAL_PROFILE", "ares-k8s-deployer-v1"
+            ).strip() or "ares-k8s-deployer-v1",
+        )
+
+    def _resolve_sandbox(self) -> KubernetesSandboxPort:
+        if self._sandbox is not None:
+            return self._sandbox
+        from deployment_service.infrastructure.sandbox.container_kubectl_sandbox import (
+            ContainerKubectlSandbox,
+        )
+        sandbox = ContainerKubectlSandbox(
+            load_spec_from_environment(),
+            runtime=os.getenv("DEPLOYMENT_CONTAINER_RUNTIME", "docker").strip() or "docker",
+        )
+        self._sandbox = sandbox
+        return sandbox
+
+    # --------------------------------------------------------------- manifest
+
+    def _approved_manifest(self, manifest_path: str) -> tuple:
+        """Validate the manifest and return its canonical, approved form."""
+        try:
+            raw = Path(manifest_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            return None, self._blocked(f"manifest is unreadable: {exc}")
+        result = self._manifest_policy.evaluate(raw)
+        if not result.passed:
+            return None, {
+                "status": "BLOCKED",
                 "stdout": "",
-                "stderr": "kubectl command timed out.",
-                "cluster_access": True,
-            }
-
-    def dry_run(
-        self,
-        manifest_path: str,
-        namespace: str = "devops-production-namespace",
-    ) -> Dict[str, Any]:
-        if not self._allowed_namespace(namespace):
-            return {
-                "status": "BLOCKED",
-                "stderr": f"Namespace {namespace!r} is not allowed.",
+                "stderr": "manifest policy rejected the manifest:\n" + "\n".join(result.errors),
                 "cluster_access": False,
+                "sandboxed": True,
+                "manifest_policy": result.to_dict(),
             }
+        return result, None
 
-        env = os.environ.copy()
-        env["KUBECONFIG"] = "/dev/null"
-        env.pop("KUBERNETES_SERVICE_HOST", None)
-        env.pop("KUBERNETES_SERVICE_PORT", None)
-        return self._run(
-            [
-                "kubectl",
-                "apply",
-                "--dry-run=client",
-                "--validate=false",
-                "-f",
-                manifest_path,
-                "-n",
-                namespace,
-            ],
-            env,
-            120,
-        ) | {"cluster_access": False}
+    # -------------------------------------------------------------- execution
 
-    def apply(
+    def _execute(
         self,
-        manifest_path: str,
-        namespace: str = "devops-production-namespace",
+        operation: KubectlOperation,
+        *,
+        manifest_yaml: str,
+        deployment_name: Optional[str] = None,
+        rollout_timeout_seconds: int = 300,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if not self._allowed_namespace(namespace):
-            return {
-                "status": "BLOCKED",
-                "stderr": f"Namespace {namespace!r} is not allowed.",
-                "cluster_access": False,
-            }
+        namespace = self.namespace()
         try:
-            env = self._execution_env()
-        except RuntimeError as exc:
-            return {"status": "BLOCKED", "stderr": str(exc), "cluster_access": False}
-        return self._run(
-            ["kubectl", "apply", "-f", manifest_path, "-n", namespace],
-            env,
-            300,
+            kubeconfig = self._kubeconfig()
+        except KubeconfigPolicyError as exc:
+            return self._blocked(str(exc))
+
+        try:
+            argv = build_kubectl_argv(
+                operation,
+                namespace=namespace,
+                deployment_name=deployment_name,
+                rollout_timeout_seconds=rollout_timeout_seconds,
+            )
+            step = KubectlSandboxStep(
+                operation=operation,
+                argv=argv,
+                timeout_seconds=OPERATION_TIMEOUTS[operation],
+            )
+        except KubectlSandboxPolicyViolation as exc:
+            return self._blocked(f"command policy refused the operation: {exc}")
+
+        try:
+            sandbox = self._resolve_sandbox()
+        except KubectlSandboxConfigurationError as exc:
+            return self._blocked(f"sandbox is not configured: {exc}")
+
+        try:
+            result = sandbox.execute(
+                step,
+                manifest_yaml=manifest_yaml,
+                kubeconfig_yaml=kubeconfig.content,
+                namespace=namespace,
+            )
+        except (KubectlSandboxPolicyViolation, KubectlSandboxConfigurationError) as exc:
+            return self._blocked(f"sandbox refused the step: {exc}")
+
+        timed_out = bool(getattr(result, "timed_out", False))
+        exit_code = int(getattr(result, "exit_code", 1))
+        payload: Dict[str, Any] = {
+            "status": "TIMEOUT" if timed_out else ("PASS" if exit_code == 0 else "FAIL"),
+            "exit_code": exit_code,
+            "operation": operation.value,
+            "stdout": getattr(result, "stdout", ""),
+            "stderr": getattr(result, "stderr", ""),
+            "cluster_access": True,
+            "sandboxed": True,
+            "namespace": namespace,
+            "truncated": bool(getattr(result, "truncated", False)),
+            "sandbox_policy_identity": getattr(result, "policy_identity", ""),
+            "credential_profile": kubeconfig.to_evidence(),
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    # ----------------------------------------------------------------- public
+
+    def dry_run(self, manifest_path: str, namespace: Optional[str] = None) -> Dict[str, Any]:
+        """Server-side dry run against the real cluster.
+
+        Fails closed. There is no client-side fallback: a client dry run
+        proves nothing about admission, RBAC or schema on the target
+        cluster, so reporting it as a pass would be a false result.
+        """
+        blocked = self._check_namespace(namespace)
+        if blocked:
+            return blocked
+        approved, error = self._approved_manifest(manifest_path)
+        if error:
+            return error
+        return self._execute(
+            KubectlOperation.SERVER_SIDE_DRY_RUN,
+            manifest_yaml=approved.canonical_yaml,
+            extra={
+                "manifest_sha256": approved.manifest_sha256,
+                "manifest_policy_identity": approved.policy_identity,
+                "validation_mode": "server-side-dry-run",
+            },
+        )
+
+    def apply(self, manifest_path: str, namespace: Optional[str] = None) -> Dict[str, Any]:
+        blocked = self._check_namespace(namespace)
+        if blocked:
+            return blocked
+        approved, error = self._approved_manifest(manifest_path)
+        if error:
+            return error
+        return self._execute(
+            KubectlOperation.APPLY,
+            manifest_yaml=approved.canonical_yaml,
+            extra={
+                "manifest_sha256": approved.manifest_sha256,
+                "manifest_policy_identity": approved.policy_identity,
+                "applied_resources": approved.resources,
+            },
         )
 
     def rollout_status(
         self,
         deployment_name: str,
-        namespace: str = "devops-production-namespace",
+        namespace: Optional[str] = None,
         timeout_seconds: int = 300,
     ) -> Dict[str, Any]:
-        if not self._allowed_namespace(namespace):
-            return {
-                "status": "BLOCKED",
-                "stderr": f"Namespace {namespace!r} is not allowed.",
-                "cluster_access": False,
-            }
-        try:
-            env = self._execution_env()
-        except RuntimeError as exc:
-            return {"status": "BLOCKED", "stderr": str(exc), "cluster_access": False}
-        return self._run(
-            [
-                "kubectl",
-                "rollout",
-                "status",
-                f"deployment/{deployment_name}",
-                "-n",
-                namespace,
-                f"--timeout={timeout_seconds}s",
-            ],
-            env,
-            timeout_seconds + 30,
+        blocked = self._check_namespace(namespace)
+        if blocked:
+            return blocked
+        return self._execute(
+            KubectlOperation.ROLLOUT_STATUS,
+            manifest_yaml="",
+            deployment_name=deployment_name,
+            rollout_timeout_seconds=timeout_seconds,
         )
 
     def rollout_undo(
         self,
         deployment_name: str,
-        namespace: str = "devops-production-namespace",
+        namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
-        if not self._allowed_namespace(namespace):
-            return {
-                "status": "BLOCKED",
-                "stderr": f"Namespace {namespace!r} is not allowed.",
-                "cluster_access": False,
-            }
-        try:
-            env = self._execution_env()
-        except RuntimeError as exc:
-            return {"status": "BLOCKED", "stderr": str(exc), "cluster_access": False}
-        return self._run(
-            [
-                "kubectl",
-                "rollout",
-                "undo",
-                f"deployment/{deployment_name}",
-                "-n",
-                namespace,
-            ],
-            env,
-            300,
+        blocked = self._check_namespace(namespace)
+        if blocked:
+            return blocked
+        return self._execute(
+            KubectlOperation.ROLLOUT_UNDO,
+            manifest_yaml="",
+            deployment_name=deployment_name,
         )
