@@ -61,11 +61,14 @@
     "sha256_published_by_job": "48c29beebbcef91d59a21fd56491ea3bd86b24e60bb42f9f5c5445a43515bade"
   },
   "lineage": {
+    "anchor_commit": "80ec0d483e4e56f22c720dfd4a09a56bde49a6f6",
+    "anchor_note": "Every count below is measured at the proof commit, a fixed SHA, so it cannot drift as documentation commits are added. Count later documentation commits with 'git rev-list --count 80ec0d4..HEAD'; they change no code.",
     "commits_since_integration_base": 67,
     "commits_since_phase_8_5_a_base_d4e87a5": 20,
     "commits_since_prior_corrective_4d9283e": 11,
     "diff_vs_integration_base": "87 files changed, 23154 insertions(+), 146 deletions(-)",
     "diff_vs_phase_8_5_a_base": "18 files changed, 3398 insertions(+), 70 deletions(-)",
+    "diff_vs_prior_corrective_base": "10 files changed, 1354 insertions(+), 628 deletions(-)",
     "integration_base_is_ancestor_of_head": true,
     "integration_base_ref": "integration/phase-8.2-v1",
     "integration_base_sha": "a0bf7600a25f2821fc61a8fcf3fba9c408667826",

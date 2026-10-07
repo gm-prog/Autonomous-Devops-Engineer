@@ -21,8 +21,18 @@ report was wrong, the error is named in §6.
 | `merge-base(integration/phase-8.2-v1, HEAD)` | `a0bf7600…` — identical to the integration base head |
 | Commits behind the integration base | **0** |
 | Merge commits since the integration base | **0** (strictly linear) |
-| Commits since the integration base | **67** |
-| Files changed since the integration base | **87** |
+| Commits since the integration base, **at proof commit `80ec0d4`** | **67** |
+| Files changed since the integration base, **at proof commit `80ec0d4`** | **87** |
+| Diff vs integration base at `80ec0d4` | 87 files, +23154 / −146 |
+| Diff vs Phase 8.5-A base `d4e87a5` at `80ec0d4` | 18 files, +3398 / −70 |
+
+All counts in this document are anchored to the **proof commit
+`80ec0d4`**, which is a fixed SHA, so they cannot drift. Documentation
+commits published after the proof (this record among them) are
+deliberately excluded; count them with
+`git rev-list --count 80ec0d4..HEAD` and list them with
+`git log --oneline 80ec0d4..HEAD`. They change no code — verify with
+`git diff --name-only 80ec0d4..HEAD`.
 
 **Consequence.** The branch is already a clean, linear, fast-forwardable
 descendant of `integration/phase-8.2-v1`. A publication branch cut from
@@ -71,6 +81,12 @@ introduced by the implementation commit. Machine-readable form:
 | Evidence file | `docs/phase-8.5-a-closeout-evidence.json` |
 | Evidence sha256 | `48c29beebbcef91d59a21fd56491ea3bd86b24e60bb42f9f5c5445a43515bade` |
 
+The first publication commit `dafd90e` was itself verified: workflow run
+`37603460544` concluded `success` with all 9 jobs green, and the
+containerized live E2E re-passed **39 / 39** on that tree
+(artifact `11474216012`). The proof therefore holds both at the proof
+commit and after the documentation was added.
+
 **Artifact verification limitation — stated plainly.** The artifact
 *download* is unreachable from the build environment (blob storage
 returns `EOF`). The zip bytes were never opened, so the digest above is
@@ -113,9 +129,20 @@ stale against a moving head.
 Exact counts (`git rev-list --count`, exclusive of the base):
 
 ```
-integration/phase-8.2-v1..HEAD  = 67
-d4e87a5..HEAD                   = 20
-4d9283e..HEAD                   = 11
+git rev-list --count integration/phase-8.2-v1..80ec0d4  = 67
+git rev-list --count d4e87a5..80ec0d4                   = 20
+git rev-list --count 4d9283e..80ec0d4                   = 11
+```
+
+Diff accounting at the same fixed anchor:
+
+```
+git diff --shortstat integration/phase-8.2-v1...80ec0d4
+  87 files changed, 23154 insertions(+), 146 deletions(-)
+git diff --shortstat d4e87a5...80ec0d4
+  18 files changed, 3398 insertions(+), 70 deletions(-)
+git diff --shortstat 4d9283e...80ec0d4
+  10 files changed, 1354 insertions(+), 628 deletions(-)
 ```
 
 ---
