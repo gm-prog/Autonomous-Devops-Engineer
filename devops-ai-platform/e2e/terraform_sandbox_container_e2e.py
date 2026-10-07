@@ -670,10 +670,22 @@ def main() -> int:
             for line in trace[-6:]:
                 print(f"::error title=e2e-traceback::{line[:380]}")
     finally:
-        logs = sh(["docker", "logs", "--tail", "60", SERVICE_NAME])
+        logs = sh(["docker", "logs", "--tail", "200", SERVICE_NAME])
         if st.failed and (logs.stdout or logs.stderr):
+            blob = logs.stdout + logs.stderr
             print("\n-- deployment-service logs (tail) --")
-            print((logs.stdout + logs.stderr)[-3000:])
+            print(blob[-6000:])
+            # Job logs are not always retrievable through the API, so the
+            # service's own failure lines are promoted to annotations.
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                lines = [ln.rstrip() for ln in blob.splitlines() if ln.strip()]
+                keep = [
+                    ln for ln in lines
+                    if ("Traceback" in ln or 'File "' in ln or "Error" in ln
+                        or "error" in ln or "raise" in ln or "Exception" in ln)
+                ]
+                for line in (keep or lines)[-10:]:
+                    print(f"::error title=service-log::{line[:380]}")
         sh(["docker", "rm", "-f", SERVICE_NAME])
         if server:
             server.shutdown()
