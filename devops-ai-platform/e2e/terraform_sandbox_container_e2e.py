@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gzip
+import hashlib
 import http.server
 import json
 import os
@@ -838,10 +840,18 @@ def main() -> int:
     # exact evidence bytes are also emitted as annotations. Base64 keeps
     # them byte-identical to the uploaded artifact.
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        blob = base64.b64encode(rendered.encode()).decode()
-        for index in range(0, len(blob), 3000):
-            notice(f"evidence-b64-{index // 3000:03d}", blob[index:index + 3000])
-        notice("evidence-b64-count", str(-(-len(blob) // 3000)))
+        # Annotation messages are truncated at 400 characters and only ten
+        # survive per level per step, so the evidence is gzipped before it
+        # is chunked. The sha256 lets a consumer prove the reassembled
+        # bytes are identical to the uploaded artifact.
+        packed = base64.b64encode(gzip.compress(rendered.encode(), 9)).decode()
+        width = 380
+        count = -(-len(packed) // width)
+        for index in range(count):
+            notice(f"evidence-gz-{index:03d}", packed[index * width:(index + 1) * width])
+        notice("evidence-gz-meta",
+               f"chunks={count} width={width} "
+               f"sha256={hashlib.sha256(rendered.encode()).hexdigest()}")
     notice("container-e2e-summary",
            f"{status} {payload['checks_passed']}/{payload['checks_total']} "
            f"approved={str(evidence.get('approval_plan_hash',''))[:16]} "
