@@ -113,6 +113,16 @@ def notice(title, message):
         print(f"::notice title={title}::{str(message)[:400]}")
 
 
+def detail(title: str, message: str) -> None:
+    """Record an observation in the log only.
+
+    GitHub keeps just ten annotations per level per step, and the evidence
+    bytes must survive that cap. Every value emitted here is also present
+    in the evidence JSON, which is the authoritative record.
+    """
+    print(f"  {title}: {message}")
+
+
 def sh(argv, **kw):
     return subprocess.run(argv, capture_output=True, text=True, **kw)
 
@@ -433,7 +443,7 @@ def observe_sandbox(st: Checks, digest, workspace_root: Path):
     rc, gid = inside("id -g")
     st.record("sandbox GID observed and non-root", "integer != 0", gid,
               rc == 0 and gid.isdigit() and gid != "0")
-    notice("sandbox-uid-gid", f"{uid}:{gid}")
+    detail("sandbox-uid-gid", f"{uid}:{gid}")
 
     # --- capabilities ---------------------------------------------
     rc, caps = inside("grep ^CapEff /proc/self/status | awk '{print $2}'")
@@ -496,7 +506,7 @@ def observe_sandbox(st: Checks, digest, workspace_root: Path):
         ]
         st.record("no host mounts beyond the single workspace bind",
                   "[]", unexpected, unexpected == [])
-        notice("sandbox-mounts", " ".join(points)[:380])
+        detail("sandbox-mounts", " ".join(points)[:380])
 
     # --- terraform runtime version (observed, not declared) --------
     version = sh([
@@ -509,7 +519,7 @@ def observe_sandbox(st: Checks, digest, workspace_root: Path):
     observed_version = observed_version[0] if observed_version else ""
     st.truthy("terraform runtime version observed from the image",
               observed_version.startswith("Terraform v"), "Terraform v...")
-    notice("terraform-runtime-version", observed_version)
+    detail("terraform-runtime-version", observed_version)
     return {"uid": uid, "gid": gid, "cap_eff": caps, "no_new_privs": nnp,
             "rootfs": observed or "", "terraform_version": observed_version}
 
@@ -583,16 +593,16 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     # proven is that the non-root sandbox WROTE into the shared workspace.
     listing = sh(SUDO + ["ls", "-A", str(workspace)])
     contents = " ".join(sorted(listing.stdout.split()))
-    notice("approval-workspace-contents", contents or "(empty)")
-    notice("terraform-dot-dir-present",
+    detail("approval-workspace-contents", contents or "(empty)")
+    detail("terraform-dot-dir-present",
            str(host_test("-d", Path(workspace) / ".terraform")))
     st.truthy("sandbox wrote the plan artifact into the shared workspace",
               host_test("-f", saved) and "terraform.tfplan" in contents,
               contents)
     ws_owner = host_stat(workspace)
     plan_owner = host_stat(saved)
-    notice("approval-workspace-owner-mode", ws_owner or "unreadable")
-    notice("approved-plan-owner-mode", plan_owner or "unreadable")
+    detail("approval-workspace-owner-mode", ws_owner or "unreadable")
+    detail("approved-plan-owner-mode", plan_owner or "unreadable")
     st.truthy("approval workspace is owned by the sandbox identity, not root",
               bool(ws_owner) and not ws_owner.startswith("0:0"), ws_owner)
     st.truthy("approval workspace is not world-accessible",
@@ -658,8 +668,8 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
               lost.get("state") not in {"DEPLOYED", "HEALTH_CHECKING"}
               and not (lost.get("execution") or {}).get("terraform_applied"))
 
-    notice("approved-plan-hash-honest", approved2)
-    notice("applied-plan-hash-honest", str(execution.get("applied_plan_hash")))
+    detail("approved-plan-hash-honest", approved2)
+    detail("applied-plan-hash-honest", str(execution.get("applied_plan_hash")))
     return {
         "approval_plan_hash": approved2,
         "applied_plan_hash": execution.get("applied_plan_hash", ""),
@@ -711,7 +721,7 @@ def main() -> int:
         digest = build_sandbox_image(args.registry, args.base_image,
                                      args.terraform_version)
         print(f"  sandbox digest: {digest}")
-        notice("sandbox-image-digest", digest)
+        detail("sandbox-image-digest", digest)
         st.truthy("sandbox image is digest-pinned", "@sha256:" in digest)
         service_image = build_service_image(args.base_image)
 
