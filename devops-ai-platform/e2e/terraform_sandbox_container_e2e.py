@@ -161,6 +161,46 @@ def host_gateway_ip() -> str:
 
 
 # =====================================================================
+# privileged host inspection
+#
+# The approval workspace is deliberately owned by the sandbox identity
+# with mode 2770, so the unprivileged CI user cannot traverse it. That
+# is the control working as designed -- the harness therefore inspects
+# and tampers with it as a privileged HOST auditor. Nothing here
+# relaxes a permission: no chmod, no chown, no 0777.
+# =====================================================================
+
+
+SUDO = ["sudo", "-n"]
+
+
+def host_priv_available() -> bool:
+    return sh(SUDO + ["true"]).returncode == 0
+
+
+def host_test(flag: str, path) -> bool:
+    """True when `test <flag> <path>` succeeds on the HOST filesystem."""
+    return sh(SUDO + ["test", flag, str(path)]).returncode == 0
+
+
+def host_stat(path) -> str:
+    """'<uid>:<gid> <octal mode>' for a host path, or '' if unreadable."""
+    res = sh(SUDO + ["stat", "-c", "%u:%g %a", str(path)])
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def host_append(path, data: bytes) -> None:
+    res = sh(SUDO + ["tee", "-a", str(path)],
+             input=data.decode("latin-1"))
+    if res.returncode != 0:
+        raise RuntimeError(f"could not tamper {path}: {res.stderr[-300:]}")
+
+
+def host_rmtree(path) -> None:
+    sh(SUDO + ["rm", "-rf", str(path)])
+
+
+# =====================================================================
 # images
 # =====================================================================
 
@@ -526,16 +566,25 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     # process at the same absolute path -- that is the shared-root proof.
     saved = Path(workspace, "terraform.tfplan")
     st.truthy("approval workspace is host-visible at the same path",
-              saved.is_file(), f"{saved} exists on the host")
+              host_test("-f", saved), f"{saved} exists on the host")
     st.truthy("terraform wrote .terraform/ in the shared workspace",
-              (Path(workspace) / ".terraform").exists()
-              or (Path(workspace) / ".terraform.lock.hcl").exists())
+              host_test("-d", Path(workspace) / ".terraform")
+              or host_test("-f", Path(workspace) / ".terraform.lock.hcl"))
+    ws_owner = host_stat(workspace)
+    plan_owner = host_stat(saved)
+    notice("approval-workspace-owner-mode", ws_owner or "unreadable")
+    notice("approved-plan-owner-mode", plan_owner or "unreadable")
+    st.truthy("approval workspace is owned by the sandbox identity, not root",
+              bool(ws_owner) and not ws_owner.startswith("0:0"), ws_owner)
+    st.truthy("approval workspace is not world-accessible",
+              bool(ws_owner) and not ws_owner.endswith("777")
+              and ws_owner.split(" ")[-1][-1] == "0", ws_owner)
 
     api("POST", f"/api/internal/deployments/{run_id}/approve",
         {"approved_by": "ares-e2e", "artifact_hash": dry.get("artifact_hash"),
          "plan_hash": dry.get("plan_hash")})
 
-    saved.write_bytes(saved.read_bytes() + b"\x00tampered")
+    host_append(saved, b"\x00tampered")
     status, tampered = api(
         "POST", f"/api/internal/deployments/{run_id}/execute",
         execute_body(payload, dry))
@@ -573,7 +622,7 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     st.truthy("terraform init ran on the approved workspace",
               (execution.get("terraform_init") or {}).get("status") == "PASS")
     st.truthy("approval workspace removed after a terminal state",
-              not Path(workspace2).exists())
+              not host_test("-e", workspace2))
 
     # ---- durability: approved plan gone -> fail closed --------------
     print("\n-- run 3: approval workspace disappears before execute --")
@@ -583,7 +632,7 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     api("POST", f"/api/internal/deployments/{run3}/approve",
         {"approved_by": "ares-e2e", "artifact_hash": dry3.get("artifact_hash"),
          "plan_hash": dry3.get("plan_hash")})
-    shutil.rmtree(ws3, ignore_errors=True)
+    host_rmtree(ws3)
     status, lost = api("POST", f"/api/internal/deployments/{run3}/execute",
                        execute_body(payload, dry3))
     st.truthy("missing approved plan fails closed (no silent re-plan)",
@@ -661,6 +710,11 @@ def main() -> int:
                   "PRESENT", probe.stdout.strip())
 
         print("\n-- starting the real deployment-service container --")
+        # A probe that cannot observe its property must fail, not skip.
+        st.truthy("privileged host inspection available",
+                  host_priv_available(),
+                  "sudo -n is required to inspect the sandbox-owned "
+                  "approval workspace from the host")
         start_support_stack(args.redis_image)
         start_service(service_image, workspace_root, digest, stub_dir, commit_api)
         health = wait_for_health()
