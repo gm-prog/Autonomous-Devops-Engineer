@@ -282,6 +282,13 @@ def write_kubectl_stub(directory: Path) -> Path:
         encoding="utf-8",
     )
     stub.chmod(0o755)
+    kubeconfig = directory / "kubeconfig"
+    kubeconfig.write_text(
+        "apiVersion: v1\nkind: Config\nclusters: []\n"
+        "contexts: []\nusers: []\ncurrent-context: \"\"\n",
+        encoding="utf-8",
+    )
+    kubeconfig.chmod(0o644)
     return stub
 
 
@@ -326,6 +333,8 @@ def start_service(image, workspace_root: Path, sandbox_digest,
         # daemon resolves the sandbox bind source correctly.
         "-v", f"{workspace_root}:{workspace_root}",
         "-v", f"{stub_dir / 'kubectl'}:/usr/local/bin/kubectl:ro",
+        "-v", f"{stub_dir / 'kubeconfig'}:/etc/ares/kubeconfig:ro",
+        "-e", "DEPLOYMENT_KUBECONFIG_PATH=/etc/ares/kubeconfig",
         "-e", "DEPLOYMENT_EXECUTION_ENABLED=true",
         "-e", f"DEPLOYMENT_WORKSPACE_ROOT={workspace_root}",
         "-e", f"DEPLOYMENT_TERRAFORM_SANDBOX_IMAGE={sandbox_digest}",
@@ -567,9 +576,18 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     saved = Path(workspace, "terraform.tfplan")
     st.truthy("approval workspace is host-visible at the same path",
               host_test("-f", saved), f"{saved} exists on the host")
-    st.truthy("terraform wrote .terraform/ in the shared workspace",
-              host_test("-d", Path(workspace) / ".terraform")
-              or host_test("-f", Path(workspace) / ".terraform.lock.hcl"))
+    # OBSERVED, not assumed: the zero-cloud fixture declares no providers
+    # and the sandbox runs with --network none, so provider installation
+    # cannot occur and `.terraform/` is legitimately absent. What must be
+    # proven is that the non-root sandbox WROTE into the shared workspace.
+    listing = sh(SUDO + ["ls", "-A", str(workspace)])
+    contents = " ".join(sorted(listing.stdout.split()))
+    notice("approval-workspace-contents", contents or "(empty)")
+    notice("terraform-dot-dir-present",
+           str(host_test("-d", Path(workspace) / ".terraform")))
+    st.truthy("sandbox wrote the plan artifact into the shared workspace",
+              host_test("-f", saved) and "terraform.tfplan" in contents,
+              contents)
     ws_owner = host_stat(workspace)
     plan_owner = host_stat(saved)
     notice("approval-workspace-owner-mode", ws_owner or "unreadable")
