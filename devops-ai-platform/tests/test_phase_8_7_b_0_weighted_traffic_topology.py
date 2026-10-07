@@ -25,6 +25,7 @@ clusters.
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import builtins
 import hashlib
@@ -51,6 +52,7 @@ from e2e import traffic_topology_kind_e2e as driver  # noqa: E402
 
 PINS_FILE = PLATFORM_DIR / "e2e" / "pinned-traffic-topology.txt"
 PROBE = PLATFORM_DIR / "e2e" / "traffic-topology" / "mutation_probe.py"
+DRIVER = PLATFORM_DIR / "e2e" / "traffic_topology_kind_e2e.py"
 WORKLOAD_SERVER = PLATFORM_DIR / "e2e" / "traffic-topology" / "workload" / "server.py"
 SAMPLER = PLATFORM_DIR / "e2e" / "traffic-topology" / "sampler" / "sampler.py"
 BOUNDARY = (PLATFORM_DIR / "incident_service" / "application" / "services"
@@ -149,6 +151,21 @@ def unbound_global_names(path: pathlib.Path) -> list:
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
     }
     return sorted(used - bound - allowed)
+
+
+def raw_probe_output_flags(argv) -> list:
+    """The output-selection flags carried by a `kubectl --raw` invocation.
+
+    ``kubectl get --raw=/version -o json`` is rejected by kubectl itself
+    ("--raw and --output are mutually exclusive", exit 1); a raw endpoint
+    already returns JSON, so no output flag may accompany ``--raw``. This
+    predicate is applied to the real call site AND to a deliberately
+    broken sample, so it cannot pass vacuously.
+    """
+    return [
+        item for item in argv
+        if item in ("-o", "--output", "-ojson") or item.startswith("--output=")
+    ]
 
 
 def application_modules() -> list:
@@ -697,6 +714,171 @@ class StaticIntegrityTests(unittest.TestCase):
                       "a retried sampler would double-count traffic")
         self.assertIn("automountServiceAccountToken: false", template)
         self.assertIn("readOnlyRootFilesystem: true", template)
+
+
+class ServerVersionProbeTests(unittest.TestCase):
+    """`kubectl --raw` must never be combined with `-o json`.
+
+    The first live run of the Phase 8.7-B.0 job died on
+
+        kubectl --context kind-ares-topology-e2e get --raw=/version -o json
+
+    with "error: --raw and --output are mutually exclusive": the driver's
+    JSON helper appended ``-o json`` to a RAW endpoint. The API server
+    version is still read from the real cluster; only the way it is asked
+    for changed.
+    """
+
+    COMMIT = "a" * 40
+
+    def setUp(self):
+        self._sh = driver.sh
+        self._saved = {
+            name: list(getattr(driver, name))
+            for name in ("RESULTS", "STATES")
+        }
+        self._saved["DIAGNOSTICS"] = dict(driver.DIAGNOSTICS)
+        self._saved["STACK_INFO"] = dict(driver.STACK_INFO)
+        self._saved["IMAGE_IDENTITIES"] = dict(driver.IMAGE_IDENTITIES)
+        self._saved["DATA_PLANE"] = dict(driver.DATA_PLANE)
+        driver.RESULTS.clear()
+        driver.DIAGNOSTICS.clear()
+        driver.STACK_INFO.clear()
+        driver.IMAGE_IDENTITIES.clear()
+
+    def tearDown(self):
+        driver.sh = self._sh
+        for name, value in self._saved.items():
+            target = getattr(driver, name)
+            target.clear()
+            if isinstance(target, dict):
+                target.update(value)
+            else:
+                target.extend(value)
+
+    def test_kubectl_raw_invokes_kubectl_without_any_output_flag(self):
+        calls = []
+
+        def fake_sh(argv, timeout=300):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, '{"gitVersion": "v1.31.4"}', "")
+
+        driver.sh = fake_sh
+        payload = json.loads(driver.kubectl_raw("ares-topology-e2e", "get",
+                                                "--raw=/version"))
+        self.assertEqual(payload, {"gitVersion": "v1.31.4"})
+        self.assertEqual(calls, [[
+            "kubectl", "--context", "kind-ares-topology-e2e", "get",
+            "--raw=/version",
+        ]], "the raw endpoint is requested without -o json")
+        self.assertEqual(raw_probe_output_flags(calls[0]), [])
+
+    def test_the_output_flag_rule_rejects_the_original_invalid_shape(self):
+        """The negative control for the assertion above."""
+        invalid = ["kubectl", "--context", "kind-ares-topology-e2e", "get",
+                   "--raw=/version", "-o", "json"]
+        self.assertEqual(raw_probe_output_flags(invalid), ["-o"],
+                         "the rejected shape must be recognised as invalid")
+        self.assertNotEqual(raw_probe_output_flags(invalid), [])
+
+    def test_kubectl_raw_raises_on_failure_with_the_stderr_tail(self):
+        driver.sh = lambda argv, timeout=300: subprocess.CompletedProcess(
+            argv, 1, "", "error: --raw and --output are mutually exclusive")
+        with self.assertRaises(RuntimeError) as caught:
+            driver.kubectl_raw("cluster", "get", "--raw=/version")
+        self.assertIn("--raw and --output are mutually exclusive",
+                      str(caught.exception))
+        self.assertIn("--raw=/version", str(caught.exception))
+
+    def test_kubectl_raw_propagates_a_timeout(self):
+        def timing_out(argv, timeout=300):
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        driver.sh = timing_out
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.kubectl_raw("cluster", "get", "--raw=/version")
+
+    def test_run_reads_the_server_version_through_the_raw_helper(self):
+        """The run() path itself, not just the helper, must use `--raw`.
+
+        The stub answers exactly the calls ``run()`` makes before the
+        version check and then makes the image inspection fail, so the
+        driver stops early. What is asserted is the recorded argv of the
+        version probe and the recorded PASS.
+        """
+        calls = []
+        cluster = "cluster"
+
+        def fake_sh(argv, timeout=300):
+            argv = list(argv)
+            calls.append(argv)
+            joined = " ".join(argv)
+            if "rev-parse" in joined:
+                return subprocess.CompletedProcess(argv, 0, self.COMMIT + "\n", "")
+            if "diff" in joined:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if "ls-files" in joined:
+                return subprocess.CompletedProcess(
+                    argv, 0, "\n".join(f"k8s/progressive/{name}" for name in
+                                       ("gateway.yaml", "gatewayclass.yaml",
+                                        "httproute.yaml", "namespace.yaml",
+                                        "services.yaml", "workloads.yaml",
+                                        "envoy-proxy.yaml")) + "\n", "")
+            if argv[0] == "docker" and "inspect" in argv:
+                return subprocess.CompletedProcess(argv, 0, "true\n", "")
+            if "get --raw=/version" in joined:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"gitVersion": "v1.31.4"}), "")
+            if argv[0] == "docker" and "image" in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "Error: no such image")
+            return subprocess.CompletedProcess(argv, 1, "", f"unexpected: {joined}")
+
+        driver.sh = fake_sh
+        args = argparse.Namespace(
+            cluster=cluster, stable_image="ares-traffic-stable:local",
+            canary_image="ares-traffic-canary:local",
+            sampler_image="ares-traffic-sampler:local",
+            expected_commit=self.COMMIT, gateway_api_version="v1.4.1",
+            envoy_gateway_version="v1.6.7", readiness_timeout=30.0,
+            evidence=str(pathlib.Path(tempfile.gettempdir()) / "unused.json"),
+            destroy_cluster=False, keep_workdir=True,
+        )
+        with tempfile.TemporaryDirectory() as workdir:
+            self.assertFalse(driver.run(args, pathlib.Path(workdir)),
+                             "the run stops as soon as the image check fails")
+        probes = [call for call in calls if "--raw=/version" in call]
+        self.assertEqual(len(probes), 1, f"exactly one version probe: {probes}")
+        self.assertEqual(raw_probe_output_flags(probes[0]), [],
+                         f"the run() version probe must not carry -o json: {probes[0]}")
+        self.assertNotIn("json", probes[0])
+        version = [row for row in driver.RESULTS
+                   if row["check"] == "cluster:server-version"]
+        self.assertEqual(len(version), 1)
+        self.assertEqual(version[0]["status"], "PASS")
+        self.assertIn("v1.31.4", version[0]["observed"])
+
+    def test_no_kubectl_json_call_requests_a_raw_endpoint(self):
+        """Supplementary guard: the two shapes may never be re-conflated."""
+        tree = ast.parse(DRIVER.read_text(encoding="utf-8"))
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id == "kubectl_json"):
+                continue
+            for argument in node.args:
+                if (isinstance(argument, ast.Constant)
+                        and isinstance(argument.value, str)
+                        and argument.value.startswith("--raw")):
+                    offenders.append(ast.unparse(node))
+        self.assertEqual(offenders, [],
+                         f"kubectl_json() appends -o json and cannot serve --raw: "
+                         f"{offenders}")
+        source = DRIVER.read_text(encoding="utf-8")
+        self.assertRegex(
+            source, r'kubectl_raw\(cluster,\s*"get",\s*"--raw=/version"\)',
+            "the server version must be read through the raw helper")
 
 
 class PinTests(unittest.TestCase):

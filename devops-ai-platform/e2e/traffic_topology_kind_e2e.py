@@ -152,6 +152,22 @@ def kubectl_json(cluster: str, *args: str, timeout: int = 180) -> Any:
     return json.loads(out.stdout)
 
 
+def kubectl_raw(cluster: str, *args: str, timeout: int = 180) -> str:
+    """Ask kubectl for a RAW endpoint and return its bytes untouched.
+
+    ``-o json`` is not merely unnecessary here, it is invalid: kubectl
+    rejects ``--raw`` combined with ``--output`` ("--raw and --output are
+    mutually exclusive", exit 1). Raw endpoints return JSON themselves, so
+    the caller parses the string. Keeping this separate from
+    ``kubectl_json`` makes the intent explicit and stops the two shapes
+    from being conflated again.
+    """
+    out = sh(["kubectl", "--context", f"kind-{cluster}", *args], timeout=timeout)
+    if out.returncode != 0:
+        raise RuntimeError(f"kubectl {' '.join(args)} failed: {out.stderr[-300:]}")
+    return out.stdout
+
+
 def kubectl_apply(cluster: str, path: Path, what: str) -> str:
     out = kubectl(cluster, "apply", "-f", str(path))
     if out.returncode != 0:
@@ -995,7 +1011,10 @@ def run(args: argparse.Namespace, workdir: Path) -> bool:
     ok &= record("cluster:kind-is-live", "a real Kind control plane is running",
                  f"container={cluster}-control-plane "
                  f"running={alive.stdout.strip()!r}", alive.stdout.strip() == "true")
-    server_version = kubectl_json(cluster, "get", "--raw=/version")
+    # The API server version comes from the raw endpoint: `kubectl get
+    # --raw=/version` already returns JSON, and passing -o json alongside
+    # --raw is rejected by kubectl itself.
+    server_version = json.loads(kubectl_raw(cluster, "get", "--raw=/version"))
     ok &= record("cluster:server-version", "the cluster reports its real version",
                  f"server={server_version.get('gitVersion')}", bool(server_version.get("gitVersion")))
     if not ok:

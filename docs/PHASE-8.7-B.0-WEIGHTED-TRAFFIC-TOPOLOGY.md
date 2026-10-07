@@ -254,7 +254,19 @@ step also mirrors every build/load failure into the step summary and into
 `::error` annotations, because a silent one-second failure with no
 retrievable log is not diagnosable.
 
-A second defect was found while replaying the driver against a stubbed
+The second run of the job reached the cluster and stopped one step
+later: the driver asked for the API server version with
+`kubectl get --raw=/version -o json`, which kubectl rejects outright
+("--raw and --output are mutually exclusive") because `kubectl_json()`
+appends `-o json` and a raw endpoint returns JSON on its own. The version
+probe now goes through a dedicated `kubectl_raw()` that adds no output
+flag, the check itself is unchanged (the real API server version is still
+read from the live cluster and recorded), and
+`ServerVersionProbeTests` pins the argv of the call site — including a
+negative control that proves the rejected `--raw … -o json` shape is
+recognised as invalid.
+
+A third defect was found while replaying the driver against a stubbed
 cluster (`sh`/`kubectl` replaced by an in-memory cluster that answers
 reads and applies patches): the cleanup path called `shutil.rmtree`
 without importing `shutil`, which would have thrown away the sealed
