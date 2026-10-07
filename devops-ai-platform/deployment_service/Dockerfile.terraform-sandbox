@@ -37,12 +37,18 @@ RUN set -eux; \
 
 RUN set -eux; \
     base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"; \
-    curl -fsSLo /tmp/tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
-    curl -fsSLo /tmp/tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
-    (cd /tmp && grep "terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip" tf.sums | sha256sum -c -); \
-    unzip -o /tmp/tf.zip -d /usr/local/bin terraform; \
+    archive="terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
+    cd /tmp; \
+    # The checksum file lists the archive by its CANONICAL name, so the
+    # download must keep that name -- saving it as tf.zip makes
+    # `sha256sum -c` look for a file that does not exist and fail with a
+    # misleading "No such file or directory" instead of a checksum error.
+    curl -fsSLo "${archive}" "${base}/${archive}"; \
+    curl -fsSLo terraform_SHA256SUMS "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
+    grep " ${archive}\$" terraform_SHA256SUMS | sha256sum -c -; \
+    unzip -o "${archive}" -d /usr/local/bin terraform; \
     chmod 0755 /usr/local/bin/terraform; \
-    rm -f /tmp/tf.zip /tmp/tf.sums; \
+    rm -f "${archive}" terraform_SHA256SUMS; \
     /usr/local/bin/terraform version
 
 # ---------------------------------------------------------------------
