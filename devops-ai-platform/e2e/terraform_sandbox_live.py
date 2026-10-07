@@ -79,6 +79,11 @@ class Checks:
         self.rows: list[dict] = []
 
     def record(self, name: str, expected, actual, ok: bool) -> bool:
+        if not ok and os.environ.get("GITHUB_ACTIONS") == "true":
+            # Error annotations survive where logs and artifacts may not
+            # be reachable, so a failure is never a silent mystery.
+            detail = f"expected={expected!r} actual={actual!r}".replace("\n", " ")
+            print(f"::error title=live-check-failed::{name} :: {detail[:400]}")
         self.rows.append(
             {
                 "check": name,
@@ -151,7 +156,12 @@ def build_and_pin_image(args) -> str:
         capture_output=True, text=True,
     )
     if build.returncode != 0:
-        raise RuntimeError(f"sandbox image build failed:\n{build.stderr[-3000:]}")
+        # Keep this short and last-lines-only: it is surfaced as a CI
+        # annotation, which is the one channel always readable.
+        tail = " | ".join(
+            line for line in build.stderr.strip().splitlines()[-8:] if line.strip()
+        )
+        raise RuntimeError(f"sandbox image build failed: {tail[:800]}")
 
     push = subprocess.run(["docker", "push", tag], capture_output=True, text=True)
     if push.returncode != 0:
@@ -373,6 +383,8 @@ def main() -> int:
     blocked = require_runtime()
     if blocked:
         print(f"\nBLOCKED: {blocked}")
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print(f"::error title=live-e2e-blocked::{blocked}")
         print("A live boundary proof requires a real container runtime. "
               "Refusing to report PASS without one.")
         Path(args.evidence).write_text(json.dumps(
@@ -403,8 +415,13 @@ def main() -> int:
 
         evidence = run_approval_flow(st, digest_ref, workspace_root)
     except Exception as exc:  # noqa: BLE001 - must never be silently green
+        import traceback
+        trace = traceback.format_exc().strip().splitlines()
         st.record("live run completed without an internal error", "no exception",
-                  f"{type(exc).__name__}: {exc}", False)
+                  f"{type(exc).__name__}: {str(exc)[:600]}", False)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for line in trace[-6:]:
+                print(f"::error title=live-e2e-traceback::{line[:400]}")
         evidence = {}
 
     status = "PASS" if not st.failed else "FAIL"
