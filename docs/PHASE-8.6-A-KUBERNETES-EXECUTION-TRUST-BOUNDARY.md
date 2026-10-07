@@ -370,3 +370,64 @@ that violate exactly one rule.
 * It does not claim any proof that CI did not actually execute.
 * A green unit suite is **not** the containerized runtime proof; the two
   are reported separately and are separate CI jobs by design.
+
+---
+
+## 17. Observed evidence
+
+All values below were taken verbatim from CI output. Nothing here is
+estimated, and no earlier commit's result is reported for a later head.
+
+### Live Kind E2E — the authoritative Kubernetes proof
+
+| Field | Observed |
+| --- | --- |
+| Proof commit | `cb2b1d0b097e9c4ffc9a2c7c3074ae9611caada2` |
+| Workflow run | `37610865643` |
+| Job id | `112757516528` |
+| Result | **47 / 47 PASS, 0 FAIL** |
+| Cluster | kind `ares-e2e`, server version `v1.31.4` |
+| kubectl | `v1.31.4`, sha256 `298e19e9…5620f` (committed pin) |
+| Sandbox image digest | `sha256:0f53761d99c9def3f285966a608dbd13f420c581554d86853107d39c6cf30ea0` |
+| Sandbox policy identity | `kubernetes-sandbox-v1:96d299019e6b396675c0b6570b145d3e` |
+| Namespace | `devops-production-namespace` |
+| RBAC subject | `system:serviceaccount:devops-production-namespace:ares-deployer` |
+
+The 47 checks cover: PSA `restricted` enforcement, 12 namespaced and 7
+cluster-scoped authorization outcomes via real `kubectl auth can-i`,
+both network directions, plugin and filesystem escape attempts, the
+absence of the Docker socket, 5 kubeconfig attacks, 6 malicious
+manifests, server-side dry run, apply, approved-hash == applied-hash,
+rollout status, live resource existence, rollback, manifest tamper,
+both namespace-switch vectors, rollout-target injection, and
+server-side strict validation of an unknown field.
+
+### Unit gate
+
+`kubernetes-trust-boundary`: 139 tests pass; AST guard clean across 10
+modules; **39 mutation probes, 0 escaped** (36 caught directly, 3
+absorbed by a sibling layer and proven by paired combined probes).
+
+### Regression baseline
+
+`tests/ deployment_service/tests` 910 → **1049 passed / 142 subtests**;
+no pre-existing test was modified or deleted. incident-service **559 OK
+(skipped=3)**, unchanged. Terraform's 20 probes: all caught, unchanged.
+
+### Known failing job
+
+`terraform-sandbox-container-e2e` **FAILS** at this head, at
+`dry run awaits approval :: expected=AWAITING_APPROVAL observed=DRY_RUN_FAILED`,
+with the workspace assertions cascading from it.
+
+This is a direct and intended consequence of removing the false PASS.
+That job's topology has no Kubernetes cluster, and its manifest step
+previously "succeeded" only because `kubectl apply --dry-run=client
+--validate=false` with `KUBECONFIG=/dev/null` succeeds without one — the
+evidence file itself recorded the component as "STUBBED … NOT
+validated". A server-side dry run that fails closed cannot reproduce
+that result.
+
+It was **not** resolved by weakening the boundary. The honest fix is to
+give that job a real cluster, which is outside this phase's scope and is
+the first recommended follow-up. It is reported as FAIL, not waived.
