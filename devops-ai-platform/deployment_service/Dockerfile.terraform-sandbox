@@ -27,10 +27,15 @@ ARG TERRAFORM_VERSION=1.9.8
 ARG TARGETARCH=amd64
 
 # Official release + official SHA256SUMS, verified before use.
-RUN set -eu; \
-    apk add --no-cache curl unzip >/dev/null 2>&1 || \
-      (apt-get update && apt-get install -y --no-install-recommends curl unzip \
-       && rm -rf /var/lib/apt/lists/*); \
+# The pinned base (e2e/pinned-images.txt) is Debian-based, so use its
+# package manager directly rather than guessing at the distro: a build
+# that "tries things" is a build whose failures are hard to read.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl unzip; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
     base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"; \
     curl -fsSLo /tmp/tf.zip "${base}/terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
     curl -fsSLo /tmp/tf.sums "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
@@ -55,13 +60,13 @@ COPY --from=fetch /usr/local/bin/terraform /usr/local/bin/terraform
 # A real, fixed, non-root identity. The control plane creates the
 # workspace owned by exactly this uid:gid so Terraform can write its
 # plan without anyone being tempted to widen permissions or run as root.
-RUN set -eu; \
-    (addgroup -g "${SANDBOX_GID}" -S sandbox 2>/dev/null || \
-     groupadd -g "${SANDBOX_GID}" -r sandbox); \
-    (adduser -u "${SANDBOX_UID}" -S -G sandbox -H -s /sbin/nologin sandbox 2>/dev/null || \
-     useradd -u "${SANDBOX_UID}" -g "${SANDBOX_GID}" -r -M -s /usr/sbin/nologin sandbox); \
+RUN set -eux; \
+    groupadd -g "${SANDBOX_GID}" -r sandbox; \
+    useradd -u "${SANDBOX_UID}" -g "${SANDBOX_GID}" -r -M \
+        -s /usr/sbin/nologin sandbox; \
     mkdir -p /workspace; \
-    chown "${SANDBOX_UID}:${SANDBOX_GID}" /workspace
+    chown "${SANDBOX_UID}:${SANDBOX_GID}" /workspace; \
+    /usr/local/bin/terraform version
 
 # Terraform must never phone home or check for upgrades from inside a
 # network-none sandbox; these keep it from wasting the timeout trying.

@@ -158,10 +158,18 @@ def build_and_pin_image(args) -> str:
     if build.returncode != 0:
         # Keep this short and last-lines-only: it is surfaced as a CI
         # annotation, which is the one channel always readable.
-        tail = " | ".join(
-            line for line in build.stderr.strip().splitlines()[-8:] if line.strip()
-        )
-        raise RuntimeError(f"sandbox image build failed: {tail[:800]}")
+        blob = (build.stderr or "") + "\n" + (build.stdout or "")
+        lines = [ln.strip() for ln in blob.splitlines() if ln.strip()]
+        # BuildKit prints the useful cause on lines mentioning ERROR or
+        # the failing process; the surrounding block is just context.
+        interesting = [
+            ln for ln in lines
+            if "ERROR" in ln or "error:" in ln.lower()
+            or "did not complete successfully" in ln
+            or "E:" == ln[:2] or "not found" in ln.lower()
+        ]
+        tail = " | ".join((interesting or lines)[-6:])
+        raise RuntimeError(f"sandbox image build failed: {tail[:900]}")
 
     push = subprocess.run(["docker", "push", tag], capture_output=True, text=True)
     if push.returncode != 0:
