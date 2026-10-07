@@ -312,19 +312,27 @@ job on an earlier commit is not evidence for a later one.
 the harness measured from inside the running container or from the host.
 Only the observed column is evidence.
 
-| Property | Requested | Observed |
-| --- | --- | --- |
-| Terraform runs non-root | `--user 65532:65532` | `uid=65532 gid=65532` read from the running container |
-| Capabilities dropped | `--cap-drop ALL` | `CapEff=0000000000000000` from `/proc/self/status` |
-| No new privileges | `--security-opt no-new-privileges:true` | `NoNewPrivs: 1` from `/proc/self/status` |
-| Network disabled | `--network none` | `/proc/net/dev` shows loopback only; unreadable ⇒ FAIL, never PASS |
-| Read-only root filesystem | `--read-only` | `ro` flag on the `/` mount in `/proc/self/mountinfo` — a read-only **mount**, not a permission denial |
-| Mounts | workspace only | mountinfo enumerated against a permitted set; unexpected host mounts absent |
-| Docker socket withheld | not passed to the sandbox | absent in the sandbox, present in the control plane |
-| Image identity | digest-pinned, `--pull never` | digest resolved from the registry during the run, never hand-written |
-| Terraform version | label `1.9.8` | `terraform version` output from the running image |
-| Workspace ownership | sandbox identity, `2770` | `65532:65532 2770` observed on the host; the saved plan is `65532:65532 644` |
-| Credentials | none configured | `credentials-disabled`; names only, never values |
+| Property | Requested (policy) | Observed (runtime) | Observation source |
+| --- | --- | --- | --- |
+| Terraform runs non-root (UID) | `--user 65532:65532` | `65532` | `id -u` in the running sandbox |
+| Terraform runs non-root (GID) | `--user 65532:65532` | `65532` | `id -g` in the running sandbox |
+| Capabilities dropped | `--cap-drop ALL` | `0000000000000000` | `CapEff` in `/proc/self/status` |
+| No new privileges | `--security-opt no-new-privileges:true` | `1` | `NoNewPrivs` in `/proc/self/status` |
+| Read-only root filesystem | `--read-only` | `ro` | field 6 of the `/` line in `/proc/self/mountinfo` — a read-only **mount**, not a permission denial |
+| Network disabled | `--network none` | only `lo` | `/proc/net/dev`; if unreadable the check is **FAIL**, never PASS |
+| Host mounts | one workspace bind | no unexpected mount point | every field-5 mount point in `/proc/self/mountinfo` compared against a permitted set |
+| Docker socket withheld from workload | not passed to the sandbox | `ABSENT` | `test -S /var/run/docker.sock` inside the sandbox |
+| Docker socket held by control plane | mounted into the service | `PRESENT` | `test -S /var/run/docker.sock` inside deployment-service |
+| Workspace writable by the sandbox | bind mounted `rw` | `WRITABLE` | `touch /workspace/.probe` executed as uid 65532 |
+| Workspace ownership / mode | sandbox identity, `2770` | `65532:65532 2770` | `stat -c '%u:%g %a'` on the **host** path |
+| Saved plan ownership / mode | sandbox identity | `65532:65532 644` | `stat -c '%u:%g %a'` on the **host** path |
+| Image identity | digest-pinned, `--pull never` | registry-resolved digest | pushed to a registry, tag removed, pulled back by digest during the run |
+| Terraform version | label `1.9.8` | `Terraform v1.9.8` | `terraform version` executed in the running image |
+| Credentials | none configured | `credentials-disabled` | profile derived from env var **names** only; no value is read, logged or hashed |
+
+Every row's "Observed" value was read out of a running container or off
+the host filesystem during the proof. No row is satisfied by a
+configuration flag alone.
 
 ### Scope limits that remain true
 
