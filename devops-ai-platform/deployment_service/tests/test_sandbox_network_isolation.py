@@ -344,3 +344,69 @@ def test_workstream_b_driver_refuses_to_fake_a_cluster():
     for forbidden in ("stub_kubectl", "fake_cluster", "--dry-run=client",
                       "--validate=false"):
         assert forbidden not in source, f"{forbidden} appears on the authoritative path"
+
+
+# ------------------------------- component selection is symmetric (§9)
+
+def _engine_declarations():
+    from deployment_service.application.services.deployment_engine import (
+        DeploymentEngine,
+    )
+    return DeploymentEngine._terraform_is_declared, DeploymentEngine._kubernetes_is_declared
+
+
+@pytest.mark.parametrize("components,tf_declared,k8s_declared", [
+    (["terraform"], True, False),
+    (["kubernetes"], False, True),
+    (["terraform", "kubernetes"], True, True),
+    (["dockerfile", "pipeline"], False, False),
+])
+def test_explicit_component_selection_governs_both_legs(
+        components, tf_declared, k8s_declared):
+    tf, k8s = _engine_declarations()
+    payload = {"components": components,
+               "terraform_tf": "resource x {}", "k8s_yaml": "kind: Deployment"}
+    assert tf(payload) is tf_declared
+    assert k8s(payload) is k8s_declared
+
+
+def test_without_an_explicit_selection_content_decides():
+    """Existing callers that never send components are unaffected."""
+    tf, k8s = _engine_declarations()
+    assert tf({"terraform_tf": "resource x {}"}) is True
+    assert tf({"terraform_tf": "   "}) is False
+    assert k8s({"k8s_yaml": "kind: Deployment"}) is True
+    assert k8s({"k8s_yaml": ""}) is False
+
+
+def test_not_applicable_is_distinguishable_from_blocked():
+    from deployment_service.application.services.deployment_engine import (
+        DeploymentEngine,
+    )
+    tf = DeploymentEngine._terraform_not_applicable()
+    k8s = DeploymentEngine._kubernetes_not_applicable()
+    # The two legs use the vocabulary each already had: Kubernetes
+    # signals SKIPPED with kubernetes_applicable False (unchanged,
+    # frozen by 8.6-A), Terraform signals NOT_APPLICABLE. What matters
+    # is that both are machine-distinguishable from a real outcome and
+    # neither can be mistaken for success or for a blocked boundary.
+    assert tf["status"] == "NOT_APPLICABLE" and tf["terraform_applicable"] is False
+    assert k8s["status"] == "SKIPPED" and k8s["kubernetes_applicable"] is False
+    for leg in (tf, k8s):
+        assert leg["status"] not in ("BLOCKED", "PASS", "FAIL")
+    # and neither claims the cluster or the cloud was touched
+    assert k8s["cluster_access"] is False
+    assert tf["steps"] == []
+
+
+def test_a_requested_but_failing_leg_is_never_not_applicable():
+    """§9: requested-but-unavailable must fail, not be excused."""
+    import inspect
+    from deployment_service.application.services import deployment_engine as mod
+    source = inspect.getsource(mod)
+    # The gate accepts NOT_APPLICABLE only alongside PASS/SKIPPED; it
+    # must never accept BLOCKED or FAIL.
+    gate = source[source.index('if run.terraform_plan["status"] in'):]
+    gate = gate[:gate.index("run.move")]
+    assert "BLOCKED" not in gate and "FAIL" not in gate
+    assert '"NOT_APPLICABLE"' in gate and '"PASS"' in gate

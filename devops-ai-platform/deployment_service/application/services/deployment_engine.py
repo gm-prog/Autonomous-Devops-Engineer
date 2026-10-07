@@ -393,8 +393,13 @@ class DeploymentEngine:
             )
             run.artifact_hash = self._artifact_hash(effective_payload)
             run.plan_hash = self._plan_hash(run.artifact_hash, run.terraform_plan, run.kubernetes_dry_run, run.source_revision, run.repository_name)
-            if run.terraform_plan["status"] == "PASS" and \
-                    run.kubernetes_dry_run["status"] in ("PASS", "SKIPPED"):
+            # A leg that was never requested is NOT_APPLICABLE, which is
+            # a pass for gating purposes in exactly the way SKIPPED
+            # already is for Kubernetes. It is NOT the same as BLOCKED
+            # or FAIL: a requested-but-unavailable leg still fails.
+            if run.terraform_plan["status"] in ("PASS", "NOT_APPLICABLE") and \
+                    run.kubernetes_dry_run["status"] in (
+                        "PASS", "SKIPPED", "NOT_APPLICABLE"):
                 run.move(DeploymentState.DRY_RUN_PASSED)
                 run.move(DeploymentState.AWAITING_APPROVAL)
                 run.add_log("AWAITING_APPROVAL: exact artifact and dry-run hashes are bound to this run.")
@@ -581,14 +586,15 @@ class DeploymentEngine:
             # does not re-plan: a second plan could legitimately differ
             # from the approved one (drift, provider behaviour, time) and
             # the approval would then be meaningless.
-            blocked = self._blocked_terraform(
+            terraform_declared = self._terraform_is_declared(effective_payload)
+            blocked = None if not terraform_declared else self._blocked_terraform(
                 self._verify_approved_plan_recoverable(
                     tf_workspace,
                     approved_plan_hash,
                     approved.get("credential_profile_id", ""),
                 )
             )
-            if blocked is None:
+            if blocked is None and terraform_declared:
                 init = self.terraform.initialize(tf_workspace)
                 run.execution["terraform_init"] = init
                 blocked = (
@@ -619,16 +625,23 @@ class DeploymentEngine:
             run.execution["terraform_plan"] = terraform_plan
             run.execution["approved_plan_hash"] = approved_plan_hash
 
-            terraform_apply = self.terraform.apply_plan(
-                tf_workspace,
-                str(Path(tf_workspace, PLAN_FILENAME)),
-                expected_plan_file_hash=approved_plan_hash,
+            terraform_apply = (
+                self.terraform.apply_plan(
+                    tf_workspace,
+                    str(Path(tf_workspace, PLAN_FILENAME)),
+                    expected_plan_file_hash=approved_plan_hash,
+                )
+                if terraform_declared
+                else self._terraform_not_applicable()
             )
             run.execution["applied_plan_hash"] = terraform_apply.get(
                 "plan_file_hash", ""
             )
             run.execution["terraform_apply"] = terraform_apply
-            run.execution["terraform_applied"] = terraform_apply.get("status") == "PASS"
+            # NOT_APPLICABLE means the deployment never declared
+            # Terraform. A requested-but-failed apply is still a failure.
+            run.execution["terraform_applied"] = terraform_apply.get("status") in (
+                "PASS", "NOT_APPLICABLE")
             if not run.execution["terraform_applied"]:
                 run.error = "Terraform apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
@@ -646,7 +659,8 @@ class DeploymentEngine:
                 else self._kubernetes_not_applicable()
             )
             run.execution["kubernetes_apply"] = kubernetes_apply
-            run.execution["kubernetes_applied"] = kubernetes_apply.get("status") in ("PASS", "SKIPPED")
+            run.execution["kubernetes_applied"] = kubernetes_apply.get("status") in (
+                "PASS", "SKIPPED", "NOT_APPLICABLE")
             if not run.execution["kubernetes_applied"]:
                 run.error = "Kubernetes apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
