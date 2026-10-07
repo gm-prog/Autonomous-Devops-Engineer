@@ -722,7 +722,7 @@ jobs:
           kubectl --context "$CTX" -n envoy-gateway-system get deployments,pods -o wide
           kubectl --context "$CTX" get crd httproutes.gateway.networking.k8s.io \
             -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}{"\n"}'
-      - name: Real weighted stable/canary routing over the Envoy data plane
+      - name: Read-only observation of the live weighted routing
         run: |
           set -euo pipefail
           PINS=e2e/pinned-images.txt

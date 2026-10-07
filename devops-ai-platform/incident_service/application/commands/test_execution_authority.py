@@ -702,6 +702,19 @@ class RepositoryExecutionBoundaryAuditTests(unittest.TestCase):
             "deployment_service/infrastructure/sandbox/"
             "container_terraform_sandbox.py",
             "repo_service/infrastructure/git/git_ssh_client.py",
+            # Phase 8.7-B.1 added the read-only Kubernetes observation
+            # client. It launches kubectl through subprocess.run with a
+            # host-built argv only: the verb is the host-owned constant
+            # `get`, the resource and the optional label key are module
+            # constants, every variable element (namespace, resource
+            # name, app label, context) is validated as a Kubernetes
+            # name/label/context before it reaches the argv, there is no
+            # shell and no `run(argv)` entry point, and tests assert that
+            # no mutating subcommand is reachable. Reading is the only
+            # capability here: the Phase 8.7-A mutation boundary is
+            # untouched and the application still cannot change traffic.
+            "incident_service/infrastructure/traffic/"
+            "kubernetes_read_client.py",
         },
     }
 

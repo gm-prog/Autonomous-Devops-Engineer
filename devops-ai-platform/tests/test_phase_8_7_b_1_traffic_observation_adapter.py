@@ -973,6 +973,25 @@ class ReadOnlyGuardTests(unittest.TestCase):
         self.assertEqual(offenders, [],
                          "the observation package must contain no write call site")
 
+    def test_the_read_client_is_registered_in_the_execution_boundary_audit(self):
+        """The incident service audits every production file that spawns a
+        process: a new one must be recorded in the table with its reason,
+        which is exactly what CI's incident-service job enforces.
+        """
+        import importlib
+        module = importlib.import_module(
+            "incident_service.application.commands.test_execution_authority")
+        allowed = module.RepositoryExecutionBoundaryAuditTests.ALLOWED["subprocess."]
+        self.assertIn(
+            "incident_service/infrastructure/traffic/kubernetes_read_client.py",
+            allowed,
+            "the new process-spawning module must be registered in the "
+            "execution-boundary audit table")
+        spawning = {path.name for path in TRAFFIC_DIR.rglob("*.py")
+                    if "subprocess." in path.read_text(encoding="utf-8")}
+        self.assertEqual(spawning, {"kubernetes_read_client.py"},
+                         "only the read client may spawn a process")
+
     def test_the_read_client_spawns_only_built_argvs(self):
         source = _executable_source(READ_CLIENT)
         self.assertIn("build_read_argv", source)

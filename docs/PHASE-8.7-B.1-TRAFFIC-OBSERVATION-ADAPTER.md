@@ -274,6 +274,25 @@ found four real defects in the drift-then-test gap before any CI run:
 
 Each is now covered by the control that found it.
 
+## 12.1 A defect that reached CI
+
+The incident service audits **every production file that spawns a
+process**: `incident_service/application/commands/test_execution_authority.py`
+holds a recorded allowlist per side-effect pattern, and its drift test
+fails on anything unrecorded. The new read client was not in it, so the
+incident-service job failed on the phase commit while the platform suite
+was green — `pytest tests/ deployment_service/tests` does not collect
+`incident_service`'s in-package test modules, which is where that audit
+lives.
+
+The fix records the file in the table with the same kind of justification
+the Phase 8.6-A adapters carry (host-built argv, host-owned verb, no shell,
+no `run(argv)`, no mutating subcommand reachable), and this phase's own
+tests now assert the registration and that nothing else in the observation
+package spawns a process. The lesson is the one this repository keeps
+re-learning: a green local suite over the directories you remembered is
+not a green build.
+
 ## 13. Next step
 
 Phase 8.7-B.2 is the trusted mutation provider (apply/rollback through an
