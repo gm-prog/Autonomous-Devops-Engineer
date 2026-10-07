@@ -384,7 +384,9 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
     record("http:dry-run-accepted",
            "the real service accepts a dry run over HTTP",
            f"status={status} state={dry.get('state')} run_id={run_id or 'ABSENT'} "
-           f"detail={json.dumps(dry)[:200] if status not in (200, 201) else ''}",
+           f"validation={json.dumps(dry.get('validation') or {})[:300]} "
+           f"terraform={json.dumps(dry.get('terraform_plan') or {})[:120]} "
+           f"logs={json.dumps((dry.get('logs') or [])[-3:])[:260]}",
            status in (200, 201) and dry.get("state") == "AWAITING_APPROVAL"
            and bool(run_id) and bool(dry.get("plan_hash")))
     if not run_id:
@@ -629,7 +631,9 @@ def check_sandbox_runtime_posture(watcher: "SandboxWatcher",
     binds = snap.get("binds", "")
     record("sandbox:no-docker-socket",
            "the untrusted sandbox never receives daemon authority",
-           f"binds={binds[:220]!r} privileged={snap.get('privileged')!r}",
+           f"privileged={snap.get('privileged')!r} "
+           f"socket_in_binds={'docker.sock' in binds or 'containerd.sock' in binds} "
+           f"binds={binds[:200]!r}",
            bool(binds) and "docker.sock" not in binds
            and "containerd.sock" not in binds and snap.get("privileged") == "false")
     user = snap.get("user", "")
