@@ -1,0 +1,39 @@
+# Phase 8.7-B.0 — the weighted route. THIS is the traffic split.
+#
+# Gateway API `weight` is a PROPORTIONAL weight, not a percentage: for a
+# rule, Envoy distributes requests in the ratio
+#
+#     backend_weight / sum(all backend weights in that rule)
+#
+# so stable 95 / canary 5 means 95/100 = 95% stable and 5/100 = 5%
+# canary. The numbers below are the committed INITIAL state: the first
+# progressive rollout stage (5% canary). They are not themselves
+# percentages, and nothing in the application computes or mutates them.
+#
+# Only the E2E driver changes these weights, and only to establish proof
+# states (100/0, 95/5, 0/100) inside a disposable cluster. The Phase
+# 8.7-A mutation boundary is not imported by that driver.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ares-route
+  namespace: ares-traffic
+  labels:
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  parentRefs:
+    - name: ares-gateway
+      sectionName: http
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: ares-stable
+          port: 80
+          weight: 95
+        - name: ares-canary
+          port: 80
+          weight: 5

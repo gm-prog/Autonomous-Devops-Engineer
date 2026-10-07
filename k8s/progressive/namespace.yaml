@@ -1,0 +1,26 @@
+# Phase 8.7-B.0 — weighted stable/canary ROUTING SUBSTRATE (E2E overlay).
+#
+# This directory is NOT part of the production deployment path. Nothing
+# in the application control plane reads, applies or mutates these
+# resources; `kubectl apply -f k8s/deployment.yaml` keeps working on a
+# cluster with no Gateway API CRDs installed, because this overlay is
+# never referenced from there. The E2E harness applies it to a
+# disposable Kind cluster to prove the substrate exists and routes.
+#
+# Resource graph (names are deterministic; one namespace):
+#
+#   GatewayClass ares-gatewayclass   (controllerName: gateway.envoyproxy.io/...)
+#     └── Gateway ares-gateway       (listener: HTTP :80)
+#           └── HTTPRoute ares-route (weights: stable 95 / canary 5)
+#                 ├── Service ares-stable -> Deployment ares-stable (track=stable)
+#                 └── Service ares-canary -> Deployment ares-canary (track=canary)
+#
+# Phase 8.7-A's mutation boundary is untouched: the application still has
+# no provider, and this overlay is applied/mutated only by the E2E driver.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ares-traffic
+  labels:
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"

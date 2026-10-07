@@ -1,0 +1,139 @@
+# Phase 8.7-B.0 — the stable/canary workloads.
+#
+# Two INDEPENDENT Deployments, two independent pod sets. This is the
+# whole point of the phase: `track=stable` and `track=canary` select
+# genuinely different workloads, never two labels over one pod set, one
+# container pretending to be two versions, or an application-level
+# router. The respective Services (services.yaml) select on
+# {app, track} so their endpoint sets cannot overlap.
+#
+# Image identities are substituted by the E2E driver from locally built,
+# pinned-base images and recorded as OBSERVED in the evidence; the
+# tokens below are refused at run time if they survive rendering.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ares-stable
+  namespace: ares-traffic
+  labels:
+    app: ares-traffic
+    track: stable
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ares-traffic
+      track: stable
+  template:
+    metadata:
+      labels:
+        app: ares-traffic
+        track: stable
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: workload
+          image: __STABLE_IMAGE__
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ARES_TRACK
+              value: stable
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ares-canary
+  namespace: ares-traffic
+  labels:
+    app: ares-traffic
+    track: canary
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ares-traffic
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: ares-traffic
+        track: canary
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: workload
+          image: __CANARY_IMAGE__
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ARES_TRACK
+              value: canary
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

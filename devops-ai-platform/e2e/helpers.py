@@ -53,7 +53,27 @@ BASE_IMAGE_KEYS: Sequence[str] = (
 REGISTRY_IMAGE_KEY = "REGISTRY_IMAGE"
 KIND_NODE_IMAGE_KEY = "NODE_IMAGE"
 
+#: The exact set of external YAML artifacts the weighted-traffic
+#: topology stack may download (Phase 8.7-B.0). Pinned by digest in
+#: e2e/pinned-traffic-topology.txt, exactly like the image pins.
+ARTIFACT_PIN_KEYS: Sequence[str] = (
+    "GATEWAY_API_CRDS_URL",
+    "ENVOY_GATEWAY_CRDS_URL",
+    "ENVOY_GATEWAY_INSTALL_URL",
+)
+
 _PIN_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+#: Path segments that must never appear in a pinned artifact URL: a
+#: branch or a `latest` alias is a moving target even when the digest is
+#: committed beside it, and the pin file is supposed to make the source
+#: itself unambiguous.
+_FLOATING_URL_SEGMENTS = frozenset({"latest", "main", "master", "head", "trunk"})
+#: An artifact pin must be an https URL to a .yaml file. Deliberately
+#: narrow: no query strings, no fragments, no archives, no bare hostnames.
+_ARTIFACT_URL = re.compile(
+    r"^https://[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?"
+    r"(?:/[A-Za-z0-9._-]+)*/[A-Za-z0-9._-]+\.yaml$"
+)
 _PIN_SOURCE = re.compile(
     r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*"
     r":[A-Za-z0-9][A-Za-z0-9._-]*$"
@@ -219,6 +239,93 @@ def parse_pinned_images(text: str) -> List[Dict[str, str]]:
             f"pin file must define exactly {expected}, got {sorted(seen_keys)}"
         )
     return records
+
+
+def parse_pinned_artifacts(text: str) -> List[Dict[str, str]]:
+    """Parse the committed artifact pin file — fail closed.
+
+    Grammar, one record per non-comment line::
+
+        <https-url-to-a-yaml-file> sha256:<64hex> <ENV_KEY>
+
+    ``ValueError`` is raised for ANY deviation: a non-https or non-.yaml
+    source, a missing or malformed digest, a bad env key, a duplicate key
+    or source, or a key set that is not exactly :data:`ARTIFACT_PIN_KEYS`.
+    There is no fallback, no tag resolution and no compatibility mode, so
+    the same commit can never consume different bytes tomorrow.
+    """
+    records: List[Dict[str, str]] = []
+    seen_keys: Dict[str, int] = {}
+    seen_urls: Dict[str, int] = {}
+    for lineno, raw in enumerate(str(text or "").splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3:
+            raise ValueError(
+                f"line {lineno}: expected '<https-url> sha256:<64hex> "
+                f"<ENV_KEY>', got {line!r}"
+            )
+        url, pin, key = parts
+        if not _ARTIFACT_URL.fullmatch(url):
+            raise ValueError(
+                f"line {lineno}: artifact source must be an https URL to a "
+                f".yaml file: {url!r}"
+            )
+        floating = sorted(segment.lower() for segment in url.split("/")
+                          if segment.lower() in _FLOATING_URL_SEGMENTS)
+        if floating:
+            raise ValueError(
+                f"line {lineno}: artifact source must not float on {floating}; "
+                f"pin an exact release instead: {url!r}"
+            )
+        if not _PIN_DIGEST.fullmatch(pin):
+            raise ValueError(
+                f"line {lineno}: pin for {url!r} is not an immutable "
+                f"sha256:<64hex> digest: {pin!r}"
+            )
+        if not _ENV_KEY.fullmatch(key):
+            raise ValueError(f"line {lineno}: invalid env key {key!r}")
+        if key in seen_keys:
+            raise ValueError(
+                f"line {lineno}: duplicate env key {key!r} (first seen on "
+                f"line {seen_keys[key]})"
+            )
+        if url in seen_urls:
+            raise ValueError(
+                f"line {lineno}: duplicate artifact source {url!r} (first "
+                f"seen on line {seen_urls[url]})"
+            )
+        seen_keys[key] = lineno
+        seen_urls[url] = lineno
+        records.append({"url": url, "pin": pin, "key": key})
+    if not records:
+        raise ValueError("no artifact pins found")
+    found = {record["key"] for record in records}
+    expected = set(ARTIFACT_PIN_KEYS)
+    if found != expected:
+        missing = sorted(expected - found)
+        extra = sorted(found - expected)
+        raise ValueError(
+            f"artifact pin key set mismatch: missing={missing} "
+            f"unexpected={extra}"
+        )
+    return records
+
+
+def artifact_pin_exports(records: Sequence[Mapping[str, str]]) -> Dict[str, str]:
+    """``<KEY>_URL`` and ``<KEY>_SHA256`` for ``$GITHUB_ENV``.
+
+    ``_SHA256`` is the bare 64-hex digest so a shell can feed it straight
+    to ``sha256sum -c`` after downloading ``_URL``.
+    """
+    exports: Dict[str, str] = {}
+    for record in records:
+        key = str(record["key"])
+        exports[f"{key}_URL"] = str(record["url"])
+        exports[f"{key}_SHA256"] = str(record["pin"]).split(":", 1)[1]
+    return exports
 
 
 def format_scalar_mapping(mapping: Mapping[str, str]) -> str:

@@ -1,0 +1,30 @@
+# Phase 8.7-B.0 — the GatewayClass the topology attaches to.
+#
+# Envoy Gateway is the concrete Gateway API implementation used by the
+# E2E. It accepts ANY GatewayClass whose spec.controllerName is
+# `gateway.envoyproxy.io/gatewayclass-controller` (its own test fixtures
+# declare their own classes the same way), so the class is declared here
+# rather than relying on a name the controller might choose: the name in
+# this file is the name the Gateway attaches to, and the E2E asserts the
+# cluster's class with that controllerName is exactly this one.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: ares-gatewayclass
+  labels:
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  # Data-plane shape for the E2E cluster, declared explicitly instead of
+  # inheriting Envoy Gateway's LoadBalancer default: Kind has no cloud
+  # load balancer, and the sampler runs in-cluster, so a ClusterIP data
+  # plane is both sufficient and deterministic. See envoy-proxy.yaml.
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: ares-envoy-proxy
+    namespace: envoy-gateway-system
+  description: >-
+    ARES weighted stable/canary topology (Phase 8.7-B.0). Declared for
+    the repository's Kind E2E; not a production ingress configuration.

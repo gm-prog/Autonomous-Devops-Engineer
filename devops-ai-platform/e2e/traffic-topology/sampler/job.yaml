@@ -1,0 +1,56 @@
+# Phase 8.7-B.0 — the sampler Job template (E2E only).
+#
+# Rendered by the driver with __SAMPLER_IMAGE__, __SAMPLER_URL__,
+# __SAMPLER_COUNT__ substituted, then applied into the topology
+# namespace. The driver refuses to run if any token survives rendering.
+#
+# The Job is deliberately rigid: no service account token, no
+# privileges, one container, no retries (a retried sampler would let a
+# failed measurement look like a successful one and would also
+# double-count traffic).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __SAMPLER_NAME__
+  namespace: ares-traffic
+  labels:
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: ares-traffic-sampler
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: sampler
+          image: __SAMPLER_IMAGE__
+          imagePullPolicy: Never
+          env:
+            - name: ARES_SAMPLER_URL
+              value: "__SAMPLER_URL__"
+            - name: ARES_SAMPLER_COUNT
+              value: "__SAMPLER_COUNT__"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

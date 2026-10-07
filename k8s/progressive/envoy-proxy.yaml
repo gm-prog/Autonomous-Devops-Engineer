@@ -1,0 +1,28 @@
+# Phase 8.7-B.0 — data-plane provider config for the E2E topology.
+#
+# Envoy Gateway defaults its managed data-plane Service to type
+# LoadBalancer (KubernetesServiceSpec.Type, kubebuilder default
+# "LoadBalancer"). Kind ships no load-balancer controller, so that
+# default would leave the data plane with a permanently pending
+# external address and make readiness non-deterministic. The E2E samples
+# from inside the cluster, so the data plane is declared ClusterIP:
+#
+#   * no cloud load balancer, no external address, no production
+#     credential is involved anywhere in this topology;
+#   * the route is still reached through the real Envoy data plane --
+#     this changes how the Service is exposed, not whether traffic
+#     traverses it.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: ares-envoy-proxy
+  namespace: envoy-gateway-system
+  labels:
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: ClusterIP

@@ -1,0 +1,38 @@
+# Phase 8.7-B.0 — immutable pins for the weighted-traffic topology stack.
+#
+# format: <https-url-to-a-yaml-artifact> sha256:<64hex> <ENV_KEY>
+#
+# Same discipline as e2e/pinned-images.txt: the middle column is the
+# authoritative immutable identity of the externally downloaded artifact,
+# the workflow NEVER resolves a moving target, and any missing,
+# malformed, duplicated or unknown pin is a hard error
+# (`python3 -m e2e.traffic_topology_pins`, parser
+# `e2e.helpers.parse_pinned_artifacts`). There is no tag, no branch, no
+# `latest` and no fallback mode.
+#
+# Digest authority (fetched 2026-10-08 from the GitHub releases API
+# `digest` field, recorded verbatim — never invented; the download host
+# is not reachable from the development sandbox, so CI downloads the
+# bytes and checks them against these committed digests before use):
+#
+#   kubernetes-sigs/gateway-api v1.4.1  experimental-install.yaml
+#     https://api.github.com/repos/kubernetes-sigs/gateway-api/releases/tags/v1.4.1
+#     (the EXPERIMENTAL channel, which is exactly what Envoy Gateway v1.6.7
+#      itself ships and tests against: its chart bundles
+#      charts/gateway-helm/crds/gatewayapi-crds.yaml at 1198859 bytes — the
+#      same byte size as this asset — so the CRDs the topology runs on are
+#      the release Envoy Gateway was built with, not a lookalike)
+#   envoyproxy/gateway v1.6.7  envoy-gateway-crds.yaml / install.yaml
+#     https://api.github.com/repos/envoyproxy/gateway/releases/tags/v1.6.7
+#
+# Version choice (both facts read from the projects' own source, not
+# assumed): Envoy Gateway v1.6.7 is the newest v1.6.x patch, and its
+# `tools/make/kube.mk` still tests Kubernetes 1.30.3/1.31.0/1.32.0/1.33.0
+# — 1.31 is the version this repository already pins for Kind
+# (kindest/node:v1.31.4), while v1.7.0 and later no longer test 1.31.
+# Envoy Gateway v1.6.7's go.mod pins sigs.k8s.io/gateway-api v1.4.1, so
+# the CRDs installed here are the exact Gateway API release that
+# controller was built against.
+https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.4.1/experimental-install.yaml sha256:553327e0ff32a1a2be446bf93823c8413cf9253ac6a6d5407eebd1e8d269f69e GATEWAY_API_CRDS_URL
+https://github.com/envoyproxy/gateway/releases/download/v1.6.7/envoy-gateway-crds.yaml sha256:d6abf4c247e12d05d8b38f324708642d993fabca86daeec28aec575330dd8d70 ENVOY_GATEWAY_CRDS_URL
+https://github.com/envoyproxy/gateway/releases/download/v1.6.7/install.yaml sha256:9a250c698d78b92c670d9d2bd6bd54615f1dee41ddd520ece9704edf63088df8 ENVOY_GATEWAY_INSTALL_URL

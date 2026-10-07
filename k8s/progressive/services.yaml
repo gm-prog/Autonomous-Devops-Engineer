@@ -1,0 +1,48 @@
+# Phase 8.7-B.0 — the two backend Services.
+#
+# Each Service selects on {app, track}. Because `track` is unique to one
+# Deployment, the two endpoint sets are disjoint by construction, and
+# the static topology tests assert that no selector can match the other
+# Deployment's pod template (a selector that matched both would make the
+# "two backends" claim untrue without changing any weight).
+apiVersion: v1
+kind: Service
+metadata:
+  name: ares-stable
+  namespace: ares-traffic
+  labels:
+    app: ares-traffic
+    track: stable
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  type: ClusterIP
+  selector:
+    app: ares-traffic
+    track: stable
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ares-canary
+  namespace: ares-traffic
+  labels:
+    app: ares-traffic
+    track: canary
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  type: ClusterIP
+  selector:
+    app: ares-traffic
+    track: canary
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

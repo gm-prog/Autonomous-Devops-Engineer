@@ -1,0 +1,25 @@
+# Phase 8.7-B.0 — the Gateway that fronts the two backends.
+#
+# One HTTP listener, port 80, on the class declared in gatewayclass.yaml.
+# No TLS, no hostname restriction, no production credential: the E2E
+# reaches this listener from inside the cluster through the real Envoy
+# Gateway data plane.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: ares-gateway
+  namespace: ares-traffic
+  labels:
+    app.kubernetes.io/part-of: ares-traffic-topology
+    ares.dev/phase: "8.7-B.0"
+spec:
+  gatewayClassName: ares-gatewayclass
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      # The route below lives in this namespace; no cross-namespace
+      # attachment is needed or granted.
+      allowedRoutes:
+        namespaces:
+          from: Same
