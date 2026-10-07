@@ -1,0 +1,267 @@
+{
+  "applied_plan_hash": "d15eb94d59253bd524179bee21d0da70ceb7883e1c93abe34813740a0c5747ac",
+  "approval_plan_hash": "d15eb94d59253bd524179bee21d0da70ceb7883e1c93abe34813740a0c5747ac",
+  "base_commit": "d4e87a5",
+  "checks": [
+    {
+      "check": "sandbox image is digest-pinned",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "control-plane image contains NO terraform binary",
+      "expected": "ABSENT",
+      "observed": "ABSENT",
+      "result": "PASS"
+    },
+    {
+      "check": "control-plane image contains the docker CLI",
+      "expected": "PRESENT",
+      "observed": "PRESENT",
+      "result": "PASS"
+    },
+    {
+      "check": "privileged host inspection available",
+      "expected": "sudo -n is required to inspect the sandbox-owned approval workspace from the host",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "deployment-service container started",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "deployment-service health reports the service",
+      "expected": "deployment-service",
+      "observed": "deployment-service",
+      "result": "PASS"
+    },
+    {
+      "check": "execution is enabled in the running service",
+      "expected": "True",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "docker CLI usable INSIDE deployment-service",
+      "expected": "Docker version 29.8.2, build 7fc2dff",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "docker socket present INSIDE deployment-service (trusted)",
+      "expected": "PRESENT",
+      "observed": "PRESENT",
+      "result": "PASS"
+    },
+    {
+      "check": "no terraform binary inside the running control plane",
+      "expected": "ABSENT",
+      "observed": "ABSENT",
+      "result": "PASS"
+    },
+    {
+      "check": "workspace root visible inside deployment-service",
+      "expected": "PRESENT",
+      "observed": "PRESENT",
+      "result": "PASS"
+    },
+    {
+      "check": "sandbox UID observed and non-root",
+      "expected": "integer != 0",
+      "observed": "65532",
+      "result": "PASS"
+    },
+    {
+      "check": "sandbox GID observed and non-root",
+      "expected": "integer != 0",
+      "observed": "65532",
+      "result": "PASS"
+    },
+    {
+      "check": "effective capabilities are empty",
+      "expected": "0000000000000000",
+      "observed": "0000000000000000",
+      "result": "PASS"
+    },
+    {
+      "check": "NoNewPrivs is set",
+      "expected": "1",
+      "observed": "1",
+      "result": "PASS"
+    },
+    {
+      "check": "root filesystem is mounted read-only (kernel mountinfo)",
+      "expected": "ro",
+      "observed": "ro",
+      "result": "PASS"
+    },
+    {
+      "check": "only loopback exists inside the sandbox",
+      "expected": "[]",
+      "observed": "[]",
+      "result": "PASS"
+    },
+    {
+      "check": "docker socket absent inside the sandbox",
+      "expected": "ABSENT",
+      "observed": "ABSENT",
+      "result": "PASS"
+    },
+    {
+      "check": "workspace writable by the non-root sandbox user",
+      "expected": "WRITABLE",
+      "observed": "WRITABLE",
+      "result": "PASS"
+    },
+    {
+      "check": "no host mounts beyond the single workspace bind",
+      "expected": "[]",
+      "observed": "[]",
+      "result": "PASS"
+    },
+    {
+      "check": "terraform runtime version observed from the image",
+      "expected": "Terraform v...",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "dry-run API accepted (HTTP 200)",
+      "expected": "200",
+      "observed": "200",
+      "result": "PASS"
+    },
+    {
+      "check": "terraform plan PASS inside the sandbox",
+      "expected": "PASS",
+      "observed": "PASS",
+      "result": "PASS"
+    },
+    {
+      "check": "dry run awaits approval",
+      "expected": "AWAITING_APPROVAL",
+      "observed": "AWAITING_APPROVAL",
+      "result": "PASS"
+    },
+    {
+      "check": "approved plan hash recorded (64 hex)",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "approval workspace is host-visible at the same path",
+      "expected": "/tmp/ares-e2e-tf-workspaces/approved-run_0ecc378b3c91/terraform.tfplan exists on the host",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "sandbox wrote the plan artifact into the shared workspace",
+      "expected": "Dockerfile ci.yml deployment.yaml main.tf terraform.tfplan",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "approval workspace is owned by the sandbox identity, not root",
+      "expected": "65532:65532 2770",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "approval workspace is not world-accessible",
+      "expected": "65532:65532 2770",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "tampered plan execution fails closed",
+      "expected": "not DEPLOYED",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "tampered run applied no terraform",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "deployment reached DEPLOYED",
+      "expected": "DEPLOYED",
+      "observed": "DEPLOYED",
+      "result": "PASS"
+    },
+    {
+      "check": "approved_plan_hash == applied_plan_hash",
+      "expected": "d15eb94d59253bd524179bee21d0da70ceb7883e1c93abe34813740a0c5747ac",
+      "observed": "d15eb94d59253bd524179bee21d0da70ceb7883e1c93abe34813740a0c5747ac",
+      "result": "PASS"
+    },
+    {
+      "check": "execution recorded the approved hash",
+      "expected": "d15eb94d59253bd524179bee21d0da70ceb7883e1c93abe34813740a0c5747ac",
+      "observed": "d15eb94d59253bd524179bee21d0da70ceb7883e1c93abe34813740a0c5747ac",
+      "result": "PASS"
+    },
+    {
+      "check": "execution did not re-plan after approval",
+      "expected": "False",
+      "observed": "False",
+      "result": "PASS"
+    },
+    {
+      "check": "execution applied the approved plan artifact",
+      "expected": "approved",
+      "observed": "approved",
+      "result": "PASS"
+    },
+    {
+      "check": "terraform init ran on the approved workspace",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "approval workspace removed after a terminal state",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    },
+    {
+      "check": "missing approved plan fails closed (no silent re-plan)",
+      "expected": "truthy",
+      "observed": "True",
+      "result": "PASS"
+    }
+  ],
+  "checks_failed": 0,
+  "checks_passed": 39,
+  "checks_total": 39,
+  "credential_profile_id": "credentials-disabled",
+  "duration_seconds": 44.9,
+  "e2e_kind": "containerized-deployment-service",
+  "e2e_status": "PASS",
+  "image_digest": "localhost:5001/ares/terraform-sandbox@sha256:c3571e5e1306e17eb7299b9c9a4de68e09825c43c18b332fa90f8ae9308c4d4e",
+  "job": "terraform-sandbox-container-e2e",
+  "kubernetes": "STUBBED at the test topology \u2014 NOT validated",
+  "missing_plan_run_state": "DEPLOYMENT_FAILED",
+  "observed_runtime": {
+    "cap_eff": "0000000000000000",
+    "gid": "65532",
+    "no_new_privs": "1",
+    "rootfs": "ro",
+    "terraform_version": "Terraform v1.9.8",
+    "uid": "65532"
+  },
+  "proof_commit": "246a7f3ecf7e01e36a057f9c09247065462d00a4",
+  "sandbox_uid_gid": "65532:65532",
+  "tampered_run_state": "DEPLOYMENT_FAILED",
+  "terraform_runtime_version": "Terraform v1.9.8",
+  "workflow_run_attempt": "1",
+  "workflow_run_id": "37594770921",
+  "workspace_root": "/tmp/ares-e2e-tf-workspaces"
+}
