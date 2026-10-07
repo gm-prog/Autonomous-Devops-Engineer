@@ -199,6 +199,31 @@ class DeploymentEngine:
         )
 
     @staticmethod
+    def _terraform_is_declared(payload) -> bool:
+        """True when the deployment actually has a Terraform component.
+
+        The mirror of _kubernetes_is_declared. Component selection was
+        introduced for Kubernetes but the Terraform leg still planned
+        unconditionally, so a deployment that declared no Terraform was
+        sent to the Terraform sandbox anyway and BLOCKED on a sandbox
+        it was never meant to use. Not applicable is not the same as
+        blocked, and neither is the same as allowed through.
+        """
+        components = payload.get("components")
+        if components is not None:
+            return "terraform" in components
+        return bool(str(payload.get("terraform_tf", "") or "").strip())
+
+    @staticmethod
+    def _terraform_not_applicable() -> Dict[str, Any]:
+        return {
+            "status": "NOT_APPLICABLE",
+            "terraform_applicable": False,
+            "steps": [],
+            "reason": "terraform is not a requested component",
+        }
+
+    @staticmethod
     def _kubernetes_not_applicable() -> Dict[str, Any]:
         return {
             "status": "SKIPPED",
@@ -345,10 +370,14 @@ class DeploymentEngine:
         temp_dir = self._approval_workspace(run.id)
         try:
             paths = self._write_iac(effective_payload, temp_dir)
-            run.terraform_plan = self.terraform.run_plan(
-                temp_dir,
-                execution=False,
-                plan_output_path=paths["terraform_plan"],
+            run.terraform_plan = (
+                self.terraform.run_plan(
+                    temp_dir,
+                    execution=False,
+                    plan_output_path=paths["terraform_plan"],
+                )
+                if self._terraform_is_declared(effective_payload)
+                else self._terraform_not_applicable()
             )
             run.terraform_plan["credential_profile_id"] = credential_profile_identity()
             run.terraform_plan["approval_workspace"] = temp_dir

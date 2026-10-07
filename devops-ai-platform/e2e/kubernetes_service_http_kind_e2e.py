@@ -567,16 +567,6 @@ class SandboxWatcher:
         self._thread = None
 
     def _poll(self) -> None:
-        fields = {
-            "binds": "{{json .HostConfig.Binds}}",
-            "user": "{{.Config.User}}",
-            "readonly": "{{.HostConfig.ReadonlyRootfs}}",
-            "secopt": "{{json .HostConfig.SecurityOpt}}",
-            "capdrop": "{{json .HostConfig.CapDrop}}",
-            "networks": "{{json .NetworkSettings.Networks}}",
-            "image": "{{.Config.Image}}",
-            "privileged": "{{.HostConfig.Privileged}}",
-        }
         while not self._stop:
             found = subprocess.run(
                 ["docker", "ps", "-a", "--filter", "name=ares-kubectl-",
@@ -585,12 +575,33 @@ class SandboxWatcher:
             names = [n for n in found.stdout.split() if n.startswith("ares-kubectl-")]
             if names and not self.snapshot:
                 target = names[0]
-                captured = {"container": target}
-                for key, fmt in fields.items():
-                    out = subprocess.run(["docker", "inspect", "-f", fmt, target],
-                                         capture_output=True, text=True, timeout=30)
-                    captured[key] = out.stdout.strip() if out.returncode == 0 else ""
-                if captured.get("user"):
+                # One inspect, not eight: the container is --rm and can
+                # vanish mid-sequence, which previously produced a
+                # snapshot with some fields read and others blank.
+                out = subprocess.run(
+                    ["docker", "inspect", target], capture_output=True,
+                    text=True, timeout=30)
+                if out.returncode != 0:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    raw = json.loads(out.stdout)[0]
+                except Exception:  # noqa: BLE001
+                    continue
+                host = raw.get("HostConfig") or {}
+                captured = {
+                    "container": target,
+                    "binds": json.dumps(host.get("Binds") or []),
+                    "user": str((raw.get("Config") or {}).get("User", "")),
+                    "readonly": str(host.get("ReadonlyRootfs")).lower(),
+                    "secopt": json.dumps(host.get("SecurityOpt") or []),
+                    "capdrop": json.dumps(host.get("CapDrop") or []),
+                    "networks": json.dumps(
+                        (raw.get("NetworkSettings") or {}).get("Networks") or {}),
+                    "image": str((raw.get("Config") or {}).get("Image", "")),
+                    "privileged": str(host.get("Privileged")).lower(),
+                }
+                if captured["user"]:
                     self.snapshot = captured
                     return
             time.sleep(0.15)
