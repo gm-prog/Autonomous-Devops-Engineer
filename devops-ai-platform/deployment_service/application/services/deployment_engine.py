@@ -196,6 +196,7 @@ class DeploymentEngine:
             manifest_policy_identity=stored["manifest_policy_identity"],
             sandbox_policy_identity=stored["sandbox_policy_identity"],
             network_identity=stored.get("network_identity", ""),
+            workload_identity_policy=stored.get("workload_identity_policy", ""),
         )
 
     @staticmethod

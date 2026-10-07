@@ -410,3 +410,46 @@ def test_a_requested_but_failing_leg_is_never_not_applicable():
     gate = gate[:gate.index("run.move")]
     assert "BLOCKED" not in gate and "FAIL" not in gate
     assert '"NOT_APPLICABLE"' in gate and '"PASS"' in gate
+
+
+# ------------------- the approval identity must survive persistence
+
+def test_every_identity_field_survives_the_persistence_round_trip():
+    """A field added to the identity must not be dropped on reload.
+
+    The identity is persisted at approval and rebuilt at execution by
+    a hand-written constructor call. When network_identity and
+    workload_identity_policy were added, the rebuild kept returning ""
+    for the new field, so the observed identity never matched the
+    approved one and every mutation was refused -- a defence failing
+    closed for the wrong reason. Only the HTTP path reaches that
+    rebuild, which is why the direct-runner tests stayed green.
+    """
+    import dataclasses
+    from deployment_service.application.services.deployment_engine import (
+        DeploymentEngine,
+    )
+    values = {f.name: f"value-for-{f.name}"
+              for f in dataclasses.fields(KubernetesExecutionIdentity)}
+    approved = KubernetesExecutionIdentity(**values)
+
+    class _Run:
+        execution = {"kubernetes_execution_identity": approved.to_dict()}
+
+    rebuilt = DeploymentEngine._approved_kubernetes_identity(_Run())
+    assert rebuilt is not None, "a fully populated identity failed to rebuild"
+    assert rebuilt.digest() == approved.digest(), (
+        f"persistence dropped a field: {approved.differences(rebuilt)}")
+    for field in dataclasses.fields(KubernetesExecutionIdentity):
+        assert getattr(rebuilt, field.name) == values[field.name], field.name
+
+
+def test_an_identity_missing_a_required_field_refuses_to_rebuild():
+    from deployment_service.application.services.deployment_engine import (
+        DeploymentEngine,
+    )
+
+    class _Run:
+        execution = {"kubernetes_execution_identity": {"namespace": "n"}}
+
+    assert DeploymentEngine._approved_kubernetes_identity(_Run()) is None
