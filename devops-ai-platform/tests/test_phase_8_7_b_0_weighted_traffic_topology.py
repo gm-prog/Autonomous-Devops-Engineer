@@ -26,12 +26,14 @@ clusters.
 from __future__ import annotations
 
 import ast
+import builtins
 import hashlib
 import http.server
 import importlib.util
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -63,6 +65,9 @@ PRODUCTION_MANIFEST = REPO_ROOT / "k8s" / "deployment.yaml"
 #: grow a Gateway API capability.
 KUBECTL_AWARE_PREFIXES = ("deployment_service/",)
 
+#: ``${VAR}`` / ``$VAR`` expansions inside a Dockerfile instruction.
+VARIABLE_USE = re.compile(r"\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)")
+
 
 def fixture_digest() -> str:
     """sha256 over the whole committed fixture, file names included."""
@@ -92,6 +97,58 @@ def executable_code(path: pathlib.Path) -> str:
                     and isinstance(body[0].value.value, str)):
                 node.body = body[1:] or [ast.Pass()]
     return ast.unparse(tree)
+
+
+def unbound_global_names(path: pathlib.Path) -> list:
+    """Names loaded anywhere in the module but bound nowhere in it.
+
+    This is the ``undefined name`` lint (F821) restricted to module level,
+    computed with the standard library only so the CI job needs no extra
+    dependency: every import alias, class, function, argument, assignment
+    target, ``global``/``nonlocal`` declaration, exception binding and
+    match binding counts as bound. A name that appears in NONE of those
+    sets cannot resolve at run time -- it is a NameError on that path.
+    """
+    allowed = set(dir(builtins)) | {
+        "__file__", "__name__", "__doc__", "__package__", "__spec__",
+        "__loader__", "__builtins__", "__annotations__",
+    }
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    bound: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arguments = node.args
+                for argument in (*arguments.posonlyargs, *arguments.args,
+                                  *arguments.kwonlyargs):
+                    bound.add(argument.arg)
+                for extra in (arguments.vararg, arguments.kwarg):
+                    if extra is not None:
+                        bound.add(extra.arg)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchStar) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+    used = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    }
+    return sorted(used - bound - allowed)
 
 
 def application_modules() -> list:
@@ -507,6 +564,98 @@ class ContainerFixtureTests(unittest.TestCase):
     instead of editing a frozen count.
     """
 
+    def test_build_arguments_are_declared_in_the_stage_that_uses_them(self):
+        """A variable must be declared in the SCOPE that expands it.
+
+        BuildKit's ``dockerfile2llb/validations.go`` reports
+        ``UndefinedVar`` when a word expands a variable that is absent from
+        ``d.buildArgs`` — the ARGs declared *inside the current stage* — so
+        a global ``ARG`` written above ``FROM`` is undefined once the stage
+        begins, even when the value was passed on the command line. Both
+        fixtures carry ``# check=error=true``, which promotes that warning
+        to a hard build failure. Phase 8.7-B.0 lost its first CI run to
+        exactly this shape (``ARG TRACK`` before ``FROM``, used by ``ENV``
+        inside the stage), so the rule is asserted here rather than
+        discovered again in CI.
+        """
+        for path, expected_stage_args in (
+            (WORKLOAD_DIR / "Dockerfile", {"TRACK"}),
+            (SAMPLER_DIR / "Dockerfile", set()),
+        ):
+            with self.subTest(dockerfile=path.name):
+                lines = path.read_text(encoding="utf-8").splitlines()
+                stage_args: set[str] = set()
+                in_stage = False
+                for number, line in enumerate(lines, 1):
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    keyword = stripped.split(None, 1)[0].upper()
+                    if keyword == "FROM":
+                        in_stage = True
+                        stage_args = set()
+                        continue
+                    if not in_stage:
+                        continue
+                    if keyword == "ARG":
+                        for item in stripped.split(None, 1)[1].split():
+                            stage_args.add(item.split("=", 1)[0])
+                        continue
+                    if keyword in {"RUN", "CMD", "ENTRYPOINT"}:
+                        continue  # shell form: the shell expands these
+                    used = set(VARIABLE_USE.findall(stripped))
+                    undeclared = used - stage_args
+                    self.assertFalse(
+                        undeclared,
+                        f"{path.name}:{number} expands {sorted(undeclared)} but "
+                        f"this stage declares only {sorted(stage_args)}")
+                self.assertTrue(
+                    expected_stage_args <= stage_args,
+                    f"{path.name} must declare {sorted(expected_stage_args)} "
+                    f"inside the stage; found {sorted(stage_args)}")
+
+
+class StaticIntegrityTests(unittest.TestCase):
+    """Cheap executable guards for code that only ever runs inside CI.
+
+    The E2E driver, the sampler and the fixture server cannot execute in
+    this test process (no cluster, no container runtime), so their control
+    flow is only ever exercised by the dedicated CI job. Phase 8.7-B.0's
+    first CI run was lost to a defect exactly in that blind spot, so these
+    tests read the sources and assert the properties a linter would.
+    """
+
+    def test_new_e2e_modules_have_no_unbound_global_names(self):
+        """A name used but bound nowhere in the module is a crash waiting.
+
+        ``e2e/traffic_topology_kind_e2e.py`` called ``shutil.rmtree`` in
+        its cleanup path without importing ``shutil``; nothing local could
+        see it, and in CI it would have thrown away the sealed evidence of
+        an otherwise complete run. This is a stdlib-only restatement of the
+        ``undefined name`` lint over the modules the CI job executes.
+        """
+        for path in (
+            PLATFORM_DIR / "e2e" / "traffic_topology_kind_e2e.py",
+            PLATFORM_DIR / "e2e" / "traffic_topology.py",
+            PLATFORM_DIR / "e2e" / "traffic_topology_pins.py",
+            PLATFORM_DIR / "e2e" / "traffic-topology" / "mutation_probe.py",
+            PLATFORM_DIR / "e2e" / "traffic-topology" / "workload" / "server.py",
+            PLATFORM_DIR / "e2e" / "traffic-topology" / "sampler" / "sampler.py",
+        ):
+            with self.subTest(module=path.name):
+                self.assertEqual(unbound_global_names(path), [])
+
+    def test_the_unbound_name_detector_rejects_a_known_bad_module(self):
+        """The detector above must not be vacuous."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sample = pathlib.Path(tmp) / "sample.py"
+            sample.write_text("import json\n\n\ndef run():\n"
+                              "    json.dumps({})\n"
+                              "    shutil.rmtree('/tmp')\n"
+                              "    return None\n", encoding="utf-8")
+            self.assertEqual(unbound_global_names(sample), ["shutil"])
+
+
     def test_dockerfiles_are_fail_closed_and_pinned(self):
         for path in (WORKLOAD_DIR / "Dockerfile", SAMPLER_DIR / "Dockerfile"):
             with self.subTest(dockerfile=path.name):
@@ -612,7 +761,6 @@ class SamplerContractTests(unittest.TestCase):
 
             class Disagreeing(module.Handler):
                 def do_GET(self):  # noqa: N802 - http.server API
-                    parse = json.loads
                     payload = json.dumps({"track": body_track}).encode()
                     self._send(200, payload, "application/json")
 

@@ -64,6 +64,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import subprocess  # noqa: S404 - E2E driver: orchestrates kind/kubectl
 import sys
 import tempfile
@@ -277,7 +278,6 @@ def condition_observed_generations(conditions: Optional[Sequence[Mapping[str, An
 
 def configured_backend_refs(route: Mapping[str, Any]) -> List[Dict[str, Any]]:
     refs = ((route.get("spec") or {}).get("rules") or [{}])[0].get("backendRefs") or []
-    weights = [int(ref.get("weight", 1)) for ref in refs]
     return [
         {
             "name": ref.get("name"),

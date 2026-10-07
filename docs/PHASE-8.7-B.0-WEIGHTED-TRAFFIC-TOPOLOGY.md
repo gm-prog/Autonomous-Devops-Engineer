@@ -239,3 +239,27 @@ still cannot touch them.**
   *Phase 8.7-B.0 weighted traffic topology E2E* CI job, whose sealed
   artifact carries the per-state configured/controller/observed records,
   the tolerance methodology and the run's diagnostics.
+
+**What the first CI run caught.** The job's first execution failed one
+second into the build step, before the driver existed on the timeline:
+the workload fixture declared `ARG TRACK` above `FROM` and used it inside
+the stage. BuildKit resolves a variable against the *stage's* build args
+(`dockerfile2llb/validations.go`, `reportUnmatchedVariables`), so that is
+an `UndefinedVar` warning — and the fixture carries `# check=error=true`,
+which makes it fatal. The declaration now lives in the stage that uses
+it, and
+`ContainerFixtureTests.test_build_arguments_are_declared_in_the_stage_that_uses_them`
+asserts the rule for both fixtures so it cannot come back silently. The
+step also mirrors every build/load failure into the step summary and into
+`::error` annotations, because a silent one-second failure with no
+retrievable log is not diagnosable.
+
+A second defect was found while replaying the driver against a stubbed
+cluster (`sh`/`kubectl` replaced by an in-memory cluster that answers
+reads and applies patches): the cleanup path called `shutil.rmtree`
+without importing `shutil`, which would have thrown away the sealed
+evidence of a complete run. It is fixed, `StaticIntegrityTests` now fails
+on any name used but bound nowhere in the CI-only modules, and the same
+harness confirms the driver returns 0 with 34/34 checks on a healthy
+topology, 1 when a sampler report is unparseable, and 1 when a single
+response leaks from a weight-0 backend.

@@ -15,8 +15,15 @@
 # and BuildKit refuses the build. Compose's required-value operator is
 # NOT valid in a Dockerfile parser, so it must never appear here.
 ARG BASE_IMAGE
-ARG TRACK
 FROM ${BASE_IMAGE}
+# TRACK is declared INSIDE the stage on purpose. BuildKit's UndefinedVar
+# check resolves a variable against the STAGE's build args
+# (dockerfile2llb/validations.go reportUnmatchedVariables -> d.buildArgs),
+# so a global `ARG TRACK` written above FROM is undefined here even though
+# it was declared on the command line, and `# check=error=true` promotes
+# that warning to a build failure. The declaration belongs to the scope
+# that uses it.
+ARG TRACK
 WORKDIR /srv
 COPY server.py /srv/server.py
 # The track is baked at build time: it is the image's identity, not

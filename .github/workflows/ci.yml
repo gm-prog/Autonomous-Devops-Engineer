@@ -506,21 +506,78 @@ jobs:
             [ -n "${KEY:-}" ] || continue
             export "$KEY=$REF"
           done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          # The loop above reads from a process substitution, which cannot
+          # fail the step by itself: the one build input this step depends
+          # on is therefore checked explicitly instead of failing later as
+          # an unset variable.
+          if [ -z "${E2E_PYTHON_BASE_IMAGE:-}" ]; then
+            printf '::error title=8.7-B.0 build input::%s\n' \
+              'e2e/pinned-images.txt did not export E2E_PYTHON_BASE_IMAGE'
+            exit 1
+          fi
+          # Artifact and raw-log retrieval is unreliable for this
+          # repository, so EVERY failure below is mirrored into the step
+          # summary and into ::error annotations. A build or load that
+          # fails silently (or in under a second) is otherwise
+          # undiagnosable, which is exactly how the first run of this job
+          # was lost.
+          build_image() {
+            local tag="$1"; shift
+            local logfile="/tmp/build-${tag%%:*}.log"
+            local code=0
+            docker build --progress=plain "$@" -t "$tag" >"$logfile" 2>&1 || code=$?
+            tail -n 25 "$logfile"
+            if [ "$code" != "0" ]; then
+              printf '::error title=8.7-B.0 image build failed (%s)::exit %s: %s\n' \
+                "$tag" "$code" "$(tail -n 1 "$logfile")"
+              {
+                echo "### Phase 8.7-B.0 image build failed: ${tag} (exit ${code})"
+                echo '```'
+                tail -c 6000 "$logfile"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit "$code"
+            fi
+            printf '::notice title=8.7-B.0 image built::%s id=%s\n' \
+              "$tag" "$(docker image inspect --format '{{.Id}}' "$tag")"
+          }
+          load_image() {
+            local image="$1"
+            local logfile="/tmp/load-${image%%:*}.log"
+            local code=0
+            kind load docker-image "$image" --name ares-topology-e2e \
+              >"$logfile" 2>&1 || code=$?
+            tail -n 10 "$logfile"
+            if [ "$code" != "0" ]; then
+              printf '::error title=8.7-B.0 image load failed (%s)::exit %s: %s\n' \
+                "$image" "$code" "$(tail -n 1 "$logfile")"
+              {
+                echo "### Phase 8.7-B.0 image load failed: ${image} (exit ${code})"
+                echo '```'
+                tail -c 4000 "$logfile"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit "$code"
+            fi
+          }
           # Two builds of ONE workload fixture with different tracks: the
           # stable and canary backends differ in image identity as well as
           # in Deployment, so "two real workloads" is observable.
-          docker build -f e2e/traffic-topology/workload/Dockerfile \
+          build_image ares-traffic-stable:local \
+            -f e2e/traffic-topology/workload/Dockerfile \
             --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" --build-arg TRACK=stable \
-            -t ares-traffic-stable:local e2e/traffic-topology/workload
-          docker build -f e2e/traffic-topology/workload/Dockerfile \
+            e2e/traffic-topology/workload
+          build_image ares-traffic-canary:local \
+            -f e2e/traffic-topology/workload/Dockerfile \
             --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" --build-arg TRACK=canary \
-            -t ares-traffic-canary:local e2e/traffic-topology/workload
-          docker build -f e2e/traffic-topology/sampler/Dockerfile \
+            e2e/traffic-topology/workload
+          build_image ares-traffic-sampler:local \
+            -f e2e/traffic-topology/sampler/Dockerfile \
             --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" \
-            -t ares-traffic-sampler:local e2e/traffic-topology/sampler
+            e2e/traffic-topology/sampler
           for IMAGE in ares-traffic-stable:local ares-traffic-canary:local \
                        ares-traffic-sampler:local; do
-            kind load docker-image "$IMAGE" --name ares-topology-e2e
+            load_image "$IMAGE"
           done
           # Artifact and raw-log retrieval is unreliable for this
           # repository, so the driver's output is mirrored into the step
