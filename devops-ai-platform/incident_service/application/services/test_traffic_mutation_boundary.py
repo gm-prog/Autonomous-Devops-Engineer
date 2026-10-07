@@ -428,18 +428,204 @@ class TrafficMutationValidationTests(unittest.TestCase):
 
 
 class TrafficMutationResultTests(unittest.TestCase):
-    def test_unverified_result_is_representable_and_preserved(self):
-        result = TrafficMutationResult(
-            provider="some-provider",
-            request_digest=_request().digest(),
-            operation=OP_APPLY,
-            remote_percentage=None,
-            verified=False,
-            detail="provider call returned, remote state not confirmed",
+    """The result is bound to ONE request, and verification is a claim
+    about that request's requested percentage and nothing else."""
+
+    def _result(self, request=None, **overrides):
+        kwargs = {
+            "provider": "some-provider",
+            "operation": OP_APPLY,
+            "remote_percentage": None,
+            "verified": False,
+        }
+        kwargs.update(overrides)
+        return TrafficMutationResult.from_request(request or _request(), **kwargs)
+
+    # ---- binding -----------------------------------------------------
+
+    def test_result_created_from_a_request_carries_that_request_digest(self):
+        request = _request()
+        result = self._result(request)
+        self.assertEqual(result.request_digest, request.digest())
+        self.assertIs(result.request, request)
+
+    def test_both_construction_paths_bind_identically(self):
+        request = _request()
+        direct = TrafficMutationResult(
+            request=request, provider="some-provider", operation=OP_APPLY,
+            remote_percentage=25, verified=True,
         )
+        factory = TrafficMutationResult.from_request(
+            request, provider="some-provider", operation=OP_APPLY,
+            remote_percentage=25, verified=True,
+        )
+        self.assertEqual(direct, factory)
+        self.assertEqual(direct.request_digest, factory.request_digest)
+        self.assertEqual(direct.to_dict(), factory.to_dict())
+
+    def test_no_construction_path_accepts_a_freestanding_digest(self):
+        """The Finding-A attack — request A plus request B's digest — is
+        unrepresentable, not merely rejected: there is no parameter for
+        a digest to arrive through."""
+        for constructor in (
+            TrafficMutationResult,
+            TrafficMutationResult.from_request,
+        ):
+            parameters = set(inspect.signature(constructor).parameters)
+            self.assertNotIn(
+                "request_digest", parameters,
+                f"{constructor} must not take a supplied digest",
+            )
+            self.assertIn("request", parameters)
+
+        with self.assertRaises(TypeError):
+            TrafficMutationResult(
+                request=_request(),
+                provider="some-provider",
+                operation=OP_APPLY,
+                remote_percentage=25,
+                verified=True,
+                request_digest=_request(requested_percentage=50).digest(),
+            )
+        with self.assertRaises(TypeError):
+            TrafficMutationResult.from_request(
+                _request(),
+                provider="some-provider",
+                operation=OP_APPLY,
+                remote_percentage=25,
+                verified=True,
+                request_digest="a" * 64,
+            )
+
+    def test_a_result_cannot_be_bound_to_request_a_while_answering_b(self):
+        request_a = _request()
+        request_b = _request(requested_percentage=50)
+        result_b = self._result(
+            request_b, remote_percentage=50, verified=True
+        )
+        self.assertEqual(result_b.request_digest, request_b.digest())
+        self.assertNotEqual(result_b.request_digest, request_a.digest())
+        # No attribute assignment can re-point the binding.
+        with self.assertRaises(Exception):
+            result_b.request = request_a  # type: ignore[misc]
+
+    def test_the_bound_request_must_be_a_real_request(self):
+        with self.assertRaises(InvalidTrafficMutationRequest):
+            TrafficMutationResult(
+                request=_request().digest(),  # a bare digest is not a request
+                provider="some-provider",
+                operation=OP_APPLY,
+                remote_percentage=None,
+                verified=False,
+            )
+        with self.assertRaises(InvalidTrafficMutationRequest):
+            TrafficMutationResult(
+                request=None,
+                provider="some-provider",
+                operation=OP_APPLY,
+                remote_percentage=None,
+                verified=False,
+            )
+
+    def test_result_digest_tracks_every_identity_critical_request_field(self):
+        base = _request()
+        base_digest = self._result(base).request_digest
+        self.assertEqual(base_digest, base.digest())
+        for field, override in (
+            ("deployment_run_id", {"deployment_run_id": "run-other"}),
+            ("source_sha", {"source_sha": "b" * 40}),
+            ("gate_evaluation_id", {"gate_evaluation_id": "gate-eval-2"}),
+            ("intent_id", {"intent_id": "ti_ffffffffffffffffffffffff"}),
+            ("stable_target", {"stable_target": "svc-stable-2"}),
+            ("canary_target", {"canary_target": "svc-canary-2"}),
+            ("expected_current_percentage",
+             {"expected_current_percentage": 25, "observed_percentage": 25,
+              "requested_percentage": 50}),
+            ("requested_percentage",
+             {"expected_current_percentage": 25, "observed_percentage": 25,
+              "requested_percentage": 50}),
+            ("observed_percentage",
+             {"expected_current_percentage": 25, "observed_percentage": 25,
+              "requested_percentage": 50}),
+            ("observed_at", {"observed_at": OBSERVED_AT
+                             + timedelta(seconds=1)}),
+        ):
+            with self.subTest(field=field):
+                other = _request(**override)
+                self.assertNotEqual(
+                    self._result(other).request_digest, base_digest
+                )
+                self.assertEqual(
+                    self._result(other).request_digest, other.digest()
+                )
+
+    def test_same_request_same_result_digest_different_request_different(self):
+        first = self._result(_request())
+        same = self._result(_request())
+        other = self._result(_request(requested_percentage=50))
+        self.assertEqual(first.request_digest, same.request_digest)
+        self.assertNotEqual(first.request_digest, other.request_digest)
+
+    # ---- verification semantics --------------------------------------
+
+    def test_unverified_result_without_an_observation_is_valid(self):
+        result = self._result(remote_percentage=None, verified=False)
         self.assertFalse(result.verified)
         self.assertIsNone(result.remote_percentage)
-        self.assertFalse(result.to_dict()["verified"])
+        self.assertEqual(result.request_digest, _request().digest())
+
+    def test_unverified_result_may_still_report_an_observation(self):
+        """Finding C: an informative but unproven observation stays
+        representable — including the requested value itself."""
+        for remote in (0, 5, 25, 50, 100):
+            with self.subTest(remote=remote):
+                result = self._result(
+                    remote_percentage=remote, verified=False
+                )
+                self.assertEqual(result.remote_percentage, remote)
+                self.assertFalse(result.verified)
+                self.assertEqual(
+                    result.request_digest, _request().digest()
+                )
+
+    def test_verified_without_an_observation_is_rejected(self):
+        with self.assertRaises(InvalidTrafficMutationRequest):
+            self._result(remote_percentage=None, verified=True)
+
+    def test_verified_with_a_different_remote_percentage_is_rejected(self):
+        """Finding B: verified=True means the requested state was
+        observed — not some other state."""
+        for remote in (0, 5, 24, 26, 50, 100):
+            with self.subTest(remote=remote):
+                with self.assertRaises(InvalidTrafficMutationRequest):
+                    self._result(remote_percentage=remote, verified=True)
+
+    def test_verified_with_the_requested_percentage_is_valid(self):
+        request = _request()
+        result = self._result(
+            request, remote_percentage=request.requested_percentage,
+            verified=True, external_operation_id="op-1",
+        )
+        self.assertTrue(result.verified)
+        self.assertEqual(
+            result.remote_percentage, request.requested_percentage
+        )
+        self.assertEqual(result.request_digest, request.digest())
+
+    def test_verification_is_per_request_not_global(self):
+        """25 verifies request A (asked for 25) and not request B (asked
+        for 50), even though the observation is identical."""
+        request_a = _request()
+        request_b = _request(
+            expected_current_percentage=25, observed_percentage=25,
+            requested_percentage=50,
+        )
+        self.assertTrue(self._result(
+            request_a, remote_percentage=25, verified=True).verified)
+        with self.assertRaises(InvalidTrafficMutationRequest):
+            self._result(request_b, remote_percentage=25, verified=True)
+        self.assertFalse(self._result(
+            request_b, remote_percentage=25, verified=False).verified)
 
     def test_verified_result_requires_an_explicit_flag(self):
         signature = inspect.signature(TrafficMutationResult)
@@ -453,152 +639,82 @@ class TrafficMutationResultTests(unittest.TestCase):
             "verified must be explicit, never defaulted",
         )
 
-    def test_verified_false_is_not_converted_to_success(self):
-        result = TrafficMutationResult(
-            provider="some-provider",
-            request_digest=_request().digest(),
-            operation=OP_APPLY,
-            remote_percentage=25,
-            verified=False,
-            external_operation_id="op-1",
-            detail="remote reports 25 but could not be re-observed",
-        )
-        self.assertEqual(result.remote_percentage, 25)
-        self.assertFalse(result.verified)
-
-    def test_fully_verified_result_is_expressible(self):
-        result = TrafficMutationResult(
-            provider="some-provider",
-            request_digest=_request().digest(),
-            operation=OP_APPLY,
-            remote_percentage=25,
-            verified=True,
-            external_operation_id="op-2",
-        )
-        self.assertTrue(result.verified)
-        self.assertEqual(result.remote_percentage, 25)
-
     def test_invalid_operation_is_rejected(self):
         for operation in ("SET", "apply", "", "MUTATE", None, 1):
             with self.subTest(operation=operation):
                 with self.assertRaises(InvalidTrafficMutationRequest):
-                    TrafficMutationResult(
-                        provider="some-provider",
-                        request_digest=_request().digest(),
-                        operation=operation,
-                        remote_percentage=25,
-                        verified=False,
-                    )
+                    self._result(operation=operation)
 
     def test_both_operations_are_accepted(self):
         for operation in TRAFFIC_MUTATION_OPERATIONS:
             with self.subTest(operation=operation):
-                TrafficMutationResult(
-                    provider="some-provider",
-                    request_digest=_request().digest(),
-                    operation=operation,
-                    remote_percentage=None,
-                    verified=False,
+                self.assertFalse(
+                    self._result(operation=operation).verified
                 )
-        self.assertEqual(set(TRAFFIC_MUTATION_OPERATIONS), {OP_APPLY, OP_ROLLBACK})
+        self.assertEqual(
+            set(TRAFFIC_MUTATION_OPERATIONS), {OP_APPLY, OP_ROLLBACK}
+        )
 
     def test_non_boolean_verified_is_rejected(self):
         for value in ("false", 0, 1, None):
             with self.subTest(value=value):
                 with self.assertRaises(InvalidTrafficMutationRequest):
-                    TrafficMutationResult(
-                        provider="some-provider",
-                        request_digest=_request().digest(),
-                        operation=OP_APPLY,
-                        remote_percentage=25,
-                        verified=value,
-                    )
+                    self._result(verified=value)
 
     def test_out_of_range_remote_percentage_is_rejected(self):
-        with self.assertRaises(InvalidTrafficMutationRequest):
-            TrafficMutationResult(
-                provider="some-provider",
-                request_digest=_request().digest(),
-                operation=OP_APPLY,
-                remote_percentage=101,
-                verified=True,
-            )
-
-    def test_blank_provider_or_digest_is_rejected(self):
-        with self.assertRaises(InvalidTrafficMutationRequest):
-            TrafficMutationResult(
-                provider="",
-                request_digest=_request().digest(),
-                operation=OP_APPLY,
-                remote_percentage=25,
-                verified=False,
-            )
-        for digest in ("", "not-a-digest", "a" * 63, "A" * 64, "z" * 64):
-            with self.subTest(digest=digest[:12]):
+        for value in (-1, 101, 1000):
+            with self.subTest(value=value):
                 with self.assertRaises(InvalidTrafficMutationRequest):
-                    TrafficMutationResult(
-                        provider="some-provider",
-                        request_digest=digest,
-                        operation=OP_APPLY,
-                        remote_percentage=25,
-                        verified=False,
-                    )
+                    self._result(remote_percentage=value, verified=False)
 
-    def test_verification_without_an_observed_percentage_is_rejected(self):
-        """verified=True is a claim about an observed remote state; a
-        claim with no observed value proves nothing."""
+    def test_boolean_remote_percentage_is_rejected(self):
         with self.assertRaises(InvalidTrafficMutationRequest):
-            TrafficMutationResult(
-                provider="some-provider",
-                request_digest=_request().digest(),
-                operation=OP_APPLY,
-                remote_percentage=None,
-                verified=True,
-            )
+            self._result(remote_percentage=True, verified=False)
+
+    def test_blank_provider_is_rejected(self):
+        for provider in ("", "   ", None):
+            with self.subTest(provider=provider):
+                with self.assertRaises(InvalidTrafficMutationRequest):
+                    self._result(provider=provider)
 
     def test_a_verified_result_cannot_be_attributed_to_the_unavailable_provider(self):
         with self.assertRaises(InvalidTrafficMutationRequest):
-            TrafficMutationResult(
-                provider=UNAVAILABLE_PROVIDER,
-                request_digest=_request().digest(),
-                operation=OP_APPLY,
-                remote_percentage=25,
+            self._result(
+                provider=UNAVAILABLE_PROVIDER, remote_percentage=25,
                 verified=True,
             )
         # …but an honest unverified result from it is expressible.
-        result = TrafficMutationResult(
-            provider=UNAVAILABLE_PROVIDER,
-            request_digest=_request().digest(),
-            operation=OP_APPLY,
-            remote_percentage=None,
+        result = self._result(
+            provider=UNAVAILABLE_PROVIDER, remote_percentage=None,
             verified=False,
         )
         self.assertFalse(result.verified)
 
-    def test_result_digest_correlates_with_the_request(self):
-        """A result can only be tied to one exact request."""
-        first = _request()
-        second = _request(requested_percentage=50)
-        result = TrafficMutationResult(
-            provider="some-provider",
-            request_digest=first.digest(),
-            operation=OP_APPLY,
-            remote_percentage=25,
-            verified=True,
-        )
-        self.assertEqual(result.request_digest, first.digest())
-        self.assertNotEqual(result.request_digest, second.digest())
-
     def test_over_long_detail_is_rejected(self):
         with self.assertRaises(InvalidTrafficMutationRequest):
-            TrafficMutationResult(
-                provider="some-provider",
-                request_digest=_request().digest(),
-                operation=OP_APPLY,
-                remote_percentage=25,
-                verified=False,
-                detail="d" * 513,
-            )
+            self._result(detail="d" * 513)
+
+    def test_audit_representation_exposes_the_required_fields(self):
+        request = _request()
+        result = self._result(
+            request, remote_percentage=25, verified=True,
+            external_operation_id="op-9", detail="observed 25% remote",
+        )
+        payload = result.to_dict()
+        self.assertEqual(
+            set(payload),
+            {
+                "provider", "request_digest", "operation",
+                "remote_percentage", "verified", "external_operation_id",
+                "detail",
+            },
+        )
+        self.assertEqual(payload["request_digest"], request.digest())
+        self.assertEqual(len(payload["request_digest"]), 64)
+        self.assertEqual(payload["verified"], True)
+        self.assertEqual(payload["remote_percentage"], 25)
+        import json
+        self.assertEqual(json.loads(json.dumps(payload)), payload)
 
 
 # ------------------------------------------------- provider / port surface
@@ -660,19 +776,22 @@ class UnavailableProviderTests(unittest.TestCase):
         self.assertEqual(provider.apply_calls, [])
 
     def test_the_boundary_hands_a_provider_the_request_unchanged(self):
+        request = _request()
         provider = RecordingMutationProvider(
-            result=TrafficMutationResult(
+            result=TrafficMutationResult.from_request(
+                request,
                 provider="recording",
-                request_digest=_request().digest(),
                 operation=OP_APPLY,
                 remote_percentage=None,
                 verified=False,
             )
         )
-        request = _request()
-        provider.apply(request)
+        result = provider.apply(request)
         self.assertEqual(provider.apply_calls, [request])
         self.assertEqual(provider.apply_calls[0].digest(), request.digest())
+        # The provider's answer is bound to the same exact request.
+        self.assertIs(result.request, provider.apply_calls[0])
+        self.assertEqual(result.request_digest, request.digest())
 
 
 class TrafficMutationPortTests(unittest.TestCase):
@@ -712,9 +831,59 @@ class TrafficMutationPortTests(unittest.TestCase):
             def apply(self, request):  # pragma: no cover
                 raise AssertionError
 
+        class NonCallableSurface:
+            apply = 5
+
+            def rollback(self, request):  # pragma: no cover
+                raise AssertionError
+
         self.assertFalse(is_traffic_mutation_port(BroadenedProvider()))
         self.assertFalse(is_traffic_mutation_port(IncompleteProvider()))
+        self.assertFalse(is_traffic_mutation_port(NonCallableSurface()))
         self.assertTrue(is_traffic_mutation_port(RecordingMutationProvider()))
+
+    def test_structural_witness_rejects_every_forbidden_verb(self):
+        for verb in FORBIDDEN_PORT_MEMBERS:
+            with self.subTest(verb=verb):
+                broadened = type(
+                    "Broadened",
+                    (),
+                    {
+                        "apply": lambda self, request: None,
+                        "rollback": lambda self, request: None,
+                        verb: lambda self, *args: None,
+                    },
+                )
+                self.assertFalse(is_traffic_mutation_port(broadened()))
+
+    def test_structural_witness_claim_is_exactly_what_it_proves(self):
+        """The helper rejects extra public CALLABLES. It says nothing
+        about non-callable public data, and does not claim to — the
+        default provider's own ``provider_name`` is such an attribute."""
+        class WithPublicData:
+            provider_name = "a-provider"
+
+            def apply(self, request):  # pragma: no cover - never called
+                raise AssertionError
+
+            def rollback(self, request):  # pragma: no cover
+                raise AssertionError
+
+        self.assertTrue(is_traffic_mutation_port(WithPublicData()))
+        self.assertEqual(
+            UnavailableTrafficMutationProvider.provider_name,
+            UNAVAILABLE_PROVIDER,
+        )
+        self.assertTrue(
+            is_traffic_mutation_port(UnavailableTrafficMutationProvider()),
+            "the default provider's public data attribute is not mechanism",
+        )
+
+    def test_reachability_and_the_structural_witness_agree_by_default(self):
+        provider = UnavailableTrafficMutationProvider()
+        self.assertIsInstance(provider, TrafficMutationPort)
+        self.assertTrue(is_traffic_mutation_port(provider))
+        self.assertFalse(isinstance(object(), TrafficMutationPort))
 
     def test_planning_port_was_not_turned_into_a_mutation_interface(self):
         """Phase 6.7.1's port stays inspect/plan only — phase 8.7-A is a

@@ -26,9 +26,12 @@ What is here
   — a deterministic SHA-256 over a canonical, stable-order payload, for
   auditability, idempotency and evidence correlation.
 * :class:`TrafficMutationResult` — the outcome vocabulary, in which
-  "the call returned", "the provider accepted it" and "the remote state
-  is now verified at the requested percentage" are three different
-  things and are never collapsed into one.
+  "the call returned", "the provider reported a value", "the provider
+  accepted it" and "the remote state is now verified at the requested
+  percentage" are four different things and are never collapsed into
+  one. A result carries the :class:`TrafficMutationRequest` it answers
+  and derives ``request_digest`` from it, so request A can never be
+  paired with request B's digest.
 * :class:`TrafficMutationPort` — exactly ``apply()`` and ``rollback()``.
 * :class:`UnavailableTrafficMutationProvider` — the default provider,
   which raises :class:`TrafficMutationProviderUnavailable` and never
@@ -136,22 +139,6 @@ def validate_source_sha(value: Any) -> str:
     if any(char not in "0123456789abcdef" for char in value):
         raise InvalidTrafficMutationRequest(
             "source_sha must be lowercase hexadecimal"
-        )
-    return value
-
-
-def validate_request_digest(value: Any) -> str:
-    """A request digest is one of *our* digests: 64 lowercase hex.
-
-    The field exists so a result can be correlated with the exact
-    request it answers; a truncated or invented value cannot correlate
-    with anything and is refused.
-    """
-    if not isinstance(value, str):
-        raise InvalidTrafficMutationRequest("request_digest must be a string")
-    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-        raise InvalidTrafficMutationRequest(
-            "request_digest must be a 64-character lowercase sha256 hex digest"
         )
     return value
 
@@ -349,17 +336,36 @@ class TrafficMutationRequest:
 
 @dataclass(frozen=True)
 class TrafficMutationResult:
-    """What a provider reports afterwards — with verification kept honest.
+    """What a provider reports afterwards — bound to the exact request.
+
+    A result does not carry a digest the caller supplies; it carries the
+    :class:`TrafficMutationRequest` it answers, and
+    :attr:`request_digest` is DERIVED from that request. There is
+    therefore no construction path that can pair request A with request
+    B's digest, and no path that can pair them by accident: the pairing
+    is structural, not conventional.
 
     ``verified`` is the only field that claims the remote state is now
-    the requested one. A provider call that returned, a provider that
-    accepted the request, and a remote state that actually changed are
-    three different facts; ``verified=False`` is a normal, representable
-    outcome and is never rewritten into success.
+    the requested one, and it is only permitted when the bound request's
+    ``requested_percentage`` is exactly what was observed remotely. A
+    provider call that returned, a provider that accepted the request,
+    and a remote state that actually changed remain three different
+    facts:
+
+    * ``verified=False`` with ``remote_percentage=None`` — nothing was
+      observed (or the observation is unavailable);
+    * ``verified=False`` with a percentage — the provider reported a
+      value, and it is recorded, but it was not proven to the standard a
+      verified claim requires;
+    * ``verified=True`` — the remote observation equals the requested
+      percentage for this exact request.
+
+    ``verified=False`` is a normal, representable outcome and is never
+    rewritten into success.
     """
 
+    request: TrafficMutationRequest
     provider: str
-    request_digest: str
     operation: str
     remote_percentage: Optional[int]
     verified: bool
@@ -367,8 +373,13 @@ class TrafficMutationResult:
     detail: str = ""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.request, TrafficMutationRequest):
+            raise InvalidTrafficMutationRequest(
+                "request must be the TrafficMutationRequest this result "
+                "answers; a result is bound to a request, never to a "
+                "freestanding digest"
+            )
         validate_identifier(self.provider, "provider")
-        validate_request_digest(self.request_digest)
         if self.operation not in TRAFFIC_MUTATION_OPERATIONS:
             allowed = ", ".join(TRAFFIC_MUTATION_OPERATIONS)
             raise InvalidTrafficMutationRequest(
@@ -378,13 +389,26 @@ class TrafficMutationResult:
             raise InvalidTrafficMutationRequest("verified must be a boolean")
         if self.remote_percentage is not None:
             validate_percentage(self.remote_percentage, "remote_percentage")
-        # Verification means the remote state was actually observed at the
-        # requested percentage. Claiming it without stating the observed
-        # value would be a claim about nothing.
+        # Verification is a claim about ONE exact remote state: the
+        # percentage the bound request asked for. An observation of
+        # anything else cannot verify this request, whatever the
+        # provider reported.
         if self.verified and self.remote_percentage is None:
             raise InvalidTrafficMutationRequest(
                 "verified=True requires the observed remote_percentage; a "
                 "verification with no observed value proves nothing"
+            )
+        if (
+            self.verified
+            and self.remote_percentage != self.request.requested_percentage
+        ):
+            raise InvalidTrafficMutationRequest(
+                "verified=True requires remote_percentage to equal the "
+                f"bound request's requested_percentage "
+                f"(remote={self.remote_percentage}, "
+                f"requested={self.request.requested_percentage}); an "
+                "observation of a different state verifies nothing about "
+                "this request"
             )
         # The unavailable provider raises rather than returning, so a
         # result attributed to it that also claims verification is a
@@ -404,7 +428,43 @@ class TrafficMutationResult:
                 f"detail must be at most {MAX_DETAIL_LENGTH} characters"
             )
 
+    # ---- binding -----------------------------------------------------
+
+    @property
+    def request_digest(self) -> str:
+        """The digest of the bound request — derived, never supplied."""
+        return self.request.digest()
+
+    @classmethod
+    def from_request(
+        cls,
+        request: TrafficMutationRequest,
+        *,
+        provider: str,
+        operation: str,
+        remote_percentage: Optional[int],
+        verified: bool,
+        external_operation_id: Optional[str] = None,
+        detail: str = "",
+    ) -> "TrafficMutationResult":
+        """The documented construction path: bind a result to a request.
+
+        There is deliberately no ``request_digest`` parameter to pass: a
+        provider returning an outcome states which request it answers,
+        and the digest follows from that.
+        """
+        return cls(
+            request=request,
+            provider=provider,
+            operation=operation,
+            remote_percentage=remote_percentage,
+            verified=verified,
+            external_operation_id=external_operation_id,
+            detail=detail,
+        )
+
     def to_dict(self) -> Dict[str, Any]:
+        """Serialisable audit record; ``request_digest`` is derived."""
         return {
             "provider": self.provider,
             "request_digest": self.request_digest,
@@ -432,6 +492,10 @@ class TrafficMutationPort(Protocol):
     A small surface is the point: every future provider must be
     auditable against this list and nothing else.
 
+    ``FORBIDDEN_PORT_MEMBERS`` names the widening this surface must
+    never grow; the structural tests assert the protocol exposes exactly
+    these two members.
+
     ``rollback(request)`` undoes the approved forward transition
     described by ``request`` — it is not handed a separately-shaped
     "backward" request, because a request can only ever describe a
@@ -447,7 +511,11 @@ class TrafficMutationPort(Protocol):
     ) -> TrafficMutationResult: ...
 
 
-#: Members no mutation provider may add to this boundary.
+#: The vocabulary of widening this boundary exists to prevent: verbs a
+#: mutation provider must never grow alongside ``apply``/``rollback``.
+#: The authoritative statement of the surface is ``TrafficMutationPort``
+#: itself (exactly ``apply`` and ``rollback``), asserted structurally in
+#: the tests; this tuple names the class of addition that would break it.
 FORBIDDEN_PORT_MEMBERS: Tuple[str, ...] = (
     "inspect",
     "plan",
@@ -483,22 +551,39 @@ class UnavailableTrafficMutationProvider:
         )
 
 
-#: Structural witness that an object satisfies the boundary contract.
+#: Structural witness for the MECHANISM surface of a candidate provider.
 def is_traffic_mutation_port(candidate: Any) -> bool:
-    """True only when ``candidate`` exposes exactly the port contract.
+    """True when ``candidate`` offers exactly the port's callable surface.
 
-    The check is member-based rather than isinstance-based so it also
-    rejects a candidate that has grown extra mutation verbs
-    (``execute``, ``mutate``, ``apply_percentage``, ...) — broadening the
-    surface is the failure mode this boundary exists to prevent.
+    What this proves, precisely:
+
+    * ``apply`` and ``rollback`` exist and are callable; and
+    * no OTHER public name on the candidate is callable.
+
+    What it does not prove, and does not claim: anything about
+    non-callable public attributes (``provider_name`` is data, not
+    mechanism), nor that the candidate may not have private helpers.
+    Broadening the mechanism surface — growing ``execute``, ``mutate``,
+    ``apply_percentage`` or a provider-specific verb — is what this
+    rejects, and that is the failure mode this boundary exists to
+    prevent.
+
+    ``TrafficMutationPort`` remains the authoritative interface; a
+    caller that only needs reachability can use ``isinstance`` against
+    it (it is runtime-checkable). This helper adds the negative check
+    that reachability alone cannot make.
     """
     if not callable(getattr(candidate, "apply", None)):
         return False
     if not callable(getattr(candidate, "rollback", None)):
         return False
-    return not any(
-        hasattr(candidate, member) for member in FORBIDDEN_PORT_MEMBERS
-    )
+    public_callables = {
+        name
+        for name in dir(candidate)
+        if not name.startswith("_")
+        and callable(getattr(candidate, name, None))
+    }
+    return not (public_callables - {"apply", "rollback"})
 
 
 #: Public surface of this module (import * must stay explicit).
@@ -520,7 +605,6 @@ __all__ = [
     "UnavailableTrafficMutationProvider",
     "is_traffic_mutation_port",
     "validate_identifier",
-    "validate_request_digest",
     "validate_percentage",
     "validate_source_sha",
 ]

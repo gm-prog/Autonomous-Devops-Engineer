@@ -113,7 +113,18 @@ class TrafficMutationPort(Protocol):
 Exactly two members. Deliberately absent: `inspect`, `plan` (those stay
 on the planning port), `execute`, `mutate`, `apply_percentage`, and any
 provider-specific member. `FORBIDDEN_PORT_MEMBERS` names the class of
-widening that is not allowed.
+widening that is not allowed, and `TrafficMutationPort` is the
+authoritative statement of the surface — a structural test asserts the
+protocol exposes exactly `apply` and `rollback`.
+
+`is_traffic_mutation_port(candidate)` is the runtime witness, and its
+claim is exactly this: `apply` and `rollback` exist and are callable,
+and no *other public callable* exists on the candidate. It deliberately
+makes no claim about non-callable public data — the default provider's
+`provider_name` is data, not mechanism — and none about private
+helpers. Callers that only need reachability can use `isinstance`
+against the runtime-checkable protocol; this helper adds the negative
+check that reachability alone cannot make.
 
 `rollback(request)` undoes the approved forward transition described by
 `request`. It is not handed a separately-shaped "backward" request,
@@ -124,21 +135,55 @@ negative `apply`.
 
 ### 2.5 Verification semantics
 
+A result is **bound to the exact request it answers**: it carries the
+`TrafficMutationRequest` object and derives `request_digest` from it.
+There is no constructor parameter for a digest, so "request A plus
+request B's digest" is not rejected — it is *unrepresentable*. The
+digest is not a syntactically valid SHA-256 string a caller supplies; it
+is the digest of the bound request.
+
 `TrafficMutationResult.verified` is mandatory and explicit — there is no
-default. Three facts that are often conflated are kept apart:
+default. The four facts that are commonly conflated are kept apart:
 
 1. the provider call returned,
-2. the provider accepted the request,
-3. the remote state is now verified at the requested percentage.
+2. the provider reported a remote value,
+3. the provider accepted the request,
+4. the remote state is now verified at the requested percentage.
 
-Only (3) is `verified=True`. A result with `verified=False` (and
-therefore no claimed `remote_percentage`) is a first-class outcome and
-is never rewritten into success anywhere in this phase. Two integrity
-rules keep the claim meaningful: `request_digest` must be one of *our*
-sha256 digests (64 lowercase hex) so a result can only correlate with a
-real request, and `verified=True` requires an explicit
-`remote_percentage` — a verification with no observed value proves
-nothing.
+Only (4) is `verified=True`, and it is permitted only when all three of
+these hold:
+
+```
+remote_percentage == request.requested_percentage
+AND the result is bound to that exact request
+AND verified is explicitly true
+```
+
+**Unverified (valid).** A provider may report a remote percentage
+without enough evidence to claim the requested state is verified. The
+observation is recorded and the claim is not made:
+
+```python
+remote_percentage = 25
+verified = false          # still valid, still informative
+```
+
+`remote_percentage = None` with `verified = false` is equally valid: it
+says nothing was observed (or the observation was unavailable).
+
+**Verified (requires the requested state).** A remote observation of
+*any other* percentage cannot verify this request, however confident the
+provider is:
+
+```
+requested = 25, remote_percentage = 50, verified = true   →  rejected
+requested = 25, remote_percentage = 25, verified = true   →  accepted
+```
+
+Two further integrity rules keep the claim meaningful: a result may not
+claim verification while naming the unavailable provider, and
+`verified=True` requires an explicit `remote_percentage` at all — a
+verification with no observed value proves nothing.
 
 ### 2.6 Fail-closed default
 
