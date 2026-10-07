@@ -50,7 +50,7 @@ class RemediationWorkspaceServiceTests(unittest.TestCase):
     def test_prepare_pins_checkout_and_creates_controlled_branch(self):
         service = RemediationWorkspaceService()
 
-        def fake_git(args, cwd=None):
+        def fake_git(args, cwd=None, **kwargs):
             command = list(args)
             if command[:3] == ["git", "rev-parse", "HEAD"]:
                 return Mock(stdout="a" * 40 + "\n")

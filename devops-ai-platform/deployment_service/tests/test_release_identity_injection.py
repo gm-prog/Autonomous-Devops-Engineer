@@ -166,7 +166,7 @@ class RecordingKubectl(FakeKubectl):
         )
         return super().dry_run(manifest_path, namespace)
 
-    def apply(self, manifest_path, namespace):
+    def apply(self, manifest_path, namespace=None, approved_identity=None):
         self.applied_manifests.append(
             Path(manifest_path).read_text(encoding="utf-8")
         )

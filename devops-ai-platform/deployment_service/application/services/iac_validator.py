@@ -6,15 +6,51 @@ import yaml
 class IaCValidator:
     """Static safety and syntax checks performed before any Terraform/Kubernetes command."""
 
-    def validate(self, dockerfile: str, k8s_yaml: str, terraform_tf: str, pipeline_yaml: str) -> Dict[str, Any]:
-        checks = {
-            "dockerfile": self._dockerfile(dockerfile),
-            "kubernetes": self._kubernetes(k8s_yaml),
-            "terraform": self._terraform(terraform_tf),
-            "pipeline": self._yaml_document("pipeline", pipeline_yaml),
-        }
+    #: Content field backing each component, used to reject a payload that
+    #: supplies content for a component it did not request.
+    _CONTENT_FIELD = {
+        "dockerfile": "dockerfile", "kubernetes": "k8s_yaml",
+        "terraform": "terraform_tf", "pipeline": "pipeline_yaml",
+    }
+
+    def validate(self, dockerfile: str, k8s_yaml: str, terraform_tf: str, pipeline_yaml: str,
+                 components: Any = None) -> Dict[str, Any]:
+        """Validate every REQUESTED component.
+
+        A component that was not requested is NOT_APPLICABLE: it is
+        neither validated nor executed. Supplying content for a
+        component that was not requested is a contradiction and is
+        rejected -- a malformed payload must never reach "not
+        applicable".
+        """
+        content = {"dockerfile": dockerfile, "kubernetes": k8s_yaml,
+                   "terraform": terraform_tf, "pipeline": pipeline_yaml}
+        requested = list(content) if components is None else list(components)
+
+        checks: Dict[str, Any] = {}
+        for name in content:
+            if name in requested:
+                continue
+            if str(content[name] or "").strip():
+                checks[name] = {"status": "FAIL", "errors": [
+                    f"{name} content was supplied but {name} is not a requested "
+                    f"component; refusing an ambiguous payload."]}
+            else:
+                checks[name] = {"status": "NOT_APPLICABLE", "errors": [], "warnings": [],
+                                "reason": f"{name} is not a requested component"}
+
+        runners = {"dockerfile": lambda: self._dockerfile(dockerfile),
+                   "kubernetes": lambda: self._kubernetes(k8s_yaml),
+                   "terraform": lambda: self._terraform(terraform_tf),
+                   "pipeline": lambda: self._yaml_document("pipeline", pipeline_yaml)}
+        for name in requested:
+            if name in runners:
+                checks[name] = runners[name]()
+
+        checks = {name: checks[name] for name in content}
         blocking = [name for name, result in checks.items() if result["status"] == "FAIL"]
-        return {"status": "FAIL" if blocking else "PASS", "checks": checks, "blocking_checks": blocking}
+        return {"status": "FAIL" if blocking else "PASS", "checks": checks,
+                "blocking_checks": blocking, "requested_components": list(requested)}
 
     def _dockerfile(self, content: str) -> Dict[str, Any]:
         if not content.strip():

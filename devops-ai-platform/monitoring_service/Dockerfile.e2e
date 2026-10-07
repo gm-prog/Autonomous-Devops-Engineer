@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# check=skip=InvalidDefaultArgInFrom;error=true
+
+# Phase 8.4.2-D — E2E-only monitoring_service image (§6.2).
+# Byte-equivalent to ./monitoring_service/Dockerfile except for the base image: the
+# golden-path compose build MUST consume a content-addressed base, so the
+# production file stays tag-based (and unbuilt by the E2E workflow) while
+# this variant is digest-controlled.
+# Immutable build input (Phase 8.4.2-E1): BASE_IMAGE must be a
+# <name>@sha256:<64hex> reference. It is supplied by the committed pin
+# file (e2e/pinned-images.txt) through the compose build argument
+# BASE_IMAGE, where E2E_PYTHON_BASE_IMAGE is interpolated with Compose's
+# required-value operator. That operator is valid in COMPOSE ONLY; the
+# Dockerfile parser does not implement it, so this file must never carry
+# it — the supported forms here are plain ${VAR}, :- , - , :+ and + .
+# There is no default and no fallback here: omitting the build argument
+# leaves the base name blank and BuildKit refuses the build. Both facts
+# are proved against real BuildKit by the Dockerfile contract gate in
+# .github/workflows/ci.yml.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+
+EXPOSE 8040
+
+CMD ["uvicorn", "monitoring_service.main:app", "--host", "0.0.0.0", "--port", "8040"]

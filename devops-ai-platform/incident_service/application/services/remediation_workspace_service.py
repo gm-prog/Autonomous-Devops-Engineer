@@ -69,6 +69,7 @@ class RemediationWorkspaceService:
         git_timeout_seconds: float = DEFAULT_GIT_TIMEOUT_SECONDS,
         workspace_prefix: str = WORKSPACE_PREFIX,
         remote_url_factory=None,
+        workspace_root: str | None = None,
     ):
         if git_timeout_seconds <= 0:
             raise ValueError("git_timeout_seconds must be greater than zero")
@@ -77,6 +78,26 @@ class RemediationWorkspaceService:
         if remote_url_factory is not None and not callable(remote_url_factory):
             raise ValueError("remote_url_factory must be callable")
 
+        # Phase 8.4.2-C §6: explicit workspace root for host-visible
+        # workspaces (E2E sibling-sandbox bind mounts resolve paths on the
+        # Docker daemon host). Source: constructor argument, else the
+        # REMEDIATION_WORKSPACE_ROOT environment variable. Unset (the
+        # production default) keeps the historical private system-tmp
+        # behaviour — never silently E2E-specific. When set it must be an
+        # absolute directory; every workspace and every cleanup stays
+        # strictly beneath it.
+        if workspace_root is None:
+            workspace_root = os.getenv("REMEDIATION_WORKSPACE_ROOT", "").strip()
+        if workspace_root:
+            root = Path(workspace_root)
+            if not root.is_absolute():
+                raise ValueError("REMEDIATION_WORKSPACE_ROOT must be an absolute path")
+            if not root.is_dir():
+                raise ValueError("REMEDIATION_WORKSPACE_ROOT does not exist")
+            self._workspace_root: str = str(root)
+        else:
+            self._workspace_root = ""
+
         self.git_timeout_seconds = git_timeout_seconds
         self.workspace_prefix = workspace_prefix
         # Composition-time seam for tests (e.g. a local bare origin); the
@@ -84,6 +105,11 @@ class RemediationWorkspaceService:
         # validated slug. Never influenced by request/model input.
         self._remote_url_factory = remote_url_factory
         self._active_workspaces: set[Path] = set()
+
+    @property
+    def workspace_root(self) -> str:
+        """Configured absolute workspace root ('' = legacy system tmp)."""
+        return self._workspace_root
 
     @staticmethod
     def validate_repository_slug(repository_slug: str) -> str:
@@ -162,9 +188,40 @@ class RemediationWorkspaceService:
         self.validate_head_branch(branch, base_branch)
 
         cleanup_root = Path(
-            tempfile.mkdtemp(prefix=self.workspace_prefix)
+            tempfile.mkdtemp(
+                prefix=self.workspace_prefix,
+                dir=self._workspace_root or None,
+            )
         ).resolve()
+        if self._workspace_root and not cleanup_root.is_relative_to(
+            Path(self._workspace_root).resolve()
+        ):
+            raise RemediationWorkspaceError(
+                "workspace escaped the configured workspace root"
+            )
         workspace_path = cleanup_root / "repository"
+
+        # Phase 8.4.2-C §7: authenticated fixture acquisition.
+        # Credentials travel ONLY through the per-process GIT_CONFIG_*
+        # environment (an http.extraHeader value) — never in the remote
+        # URL, never as a command argument, never persisted to .git/config,
+        # never logged (failures surface as generic bounded-command errors).
+        # In workspace-root (E2E) mode the private fixture repository is
+        # the contract, so a missing token fails closed BEFORE any clone.
+        oauth_token = os.getenv("GITHUB_OAUTH_TOKEN", "").strip()
+        if self._workspace_root and not oauth_token:
+            self._cleanup_path(cleanup_root)
+            raise RemediationWorkspaceError(
+                "GITHUB_OAUTH_TOKEN is required to acquire the private "
+                "fixture repository in workspace-root mode"
+            )
+        credential_env: dict[str, str] = {}
+        if oauth_token:
+            credential_env = {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "http.extraHeader",
+                "GIT_CONFIG_VALUE_0": f"Authorization: Bearer {oauth_token}",
+            }
 
         try:
             if self._remote_url_factory is not None:
@@ -180,11 +237,13 @@ class RemediationWorkspaceService:
                     "--no-tags",
                     remote_url,
                     str(workspace_path),
-                ]
+                ],
+                extra_env=credential_env,
             )
             self._run_git(
                 ["git", "fetch", "--no-tags", "origin", sha],
                 cwd=workspace_path,
+                extra_env=credential_env,
             )
             self._run_git(
                 ["git", "checkout", "--detach", sha],
@@ -387,10 +446,21 @@ class RemediationWorkspaceService:
                 "Git command arguments must not contain NUL bytes"
             )
 
+        # Phase 8.4.2-D P2: the raw credential is NEVER inherited by a Git
+        # child process. Commands that need authentication receive it as an
+        # explicit per-call `extra_env` (`GIT_CONFIG_*` http.extraHeader);
+        # commands that do not (checkout / rev-parse / switch / status) run
+        # with no token material in their environment at all.
         env = {
             key: value
             for key, value in os.environ.items()
-            if key not in {"GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+            if key
+            not in {
+                "GIT_SSH_COMMAND",
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+                "GITHUB_OAUTH_TOKEN",
+            }
         }
         env["GIT_TERMINAL_PROMPT"] = "0"
         if extra_env:
@@ -413,5 +483,14 @@ class RemediationWorkspaceService:
 
     def _cleanup_path(self, cleanup_root: Path) -> None:
         resolved = cleanup_root.resolve()
+        if self._workspace_root:
+            # workspace-root mode: deletion is only ever permitted for
+            # directories strictly beneath the configured root (Phase
+            # 8.4.2-C §6 — cleanup cannot escape the allowed root).
+            root = Path(self._workspace_root).resolve()
+            if not resolved.is_relative_to(root) or resolved == root:
+                raise RemediationWorkspaceError(
+                    "refusing to clean a path outside the workspace root"
+                )
         if resolved.name.startswith(self.workspace_prefix):
             shutil.rmtree(resolved, ignore_errors=True)

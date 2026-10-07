@@ -1,4 +1,6 @@
 
+import hashlib
+from pathlib import Path
 import pytest
 
 from deployment_service.application.services.deployment_engine import DeploymentActionError, DeploymentEngine
@@ -65,16 +67,60 @@ class FakeStore:
 
 
 class FakeTerraform:
+    """Docker-free stand-in that honours the real runner contract.
+
+    Phase 8.5-A corrective: it writes an actual saved plan and returns
+    the hash of those exact bytes, so engine tests exercise the genuine
+    approve-then-apply binding instead of a hash that was handed to them.
+    It also counts plan operations, which is what proves the engine does
+    not re-plan after approval.
+    """
+
+    def __init__(self):
+        self.plan_calls = 0
+        self.init_calls = 0
+        self.applied_with_hash = None
+        self.applied_from = None
+
     def run_plan(self, iac_dir, execution=False, plan_output_path=None):
-        return {"status": "PASS", "execution": execution, "plan": {"stdout": "plan-ok"}, "plan_file_hash": "a" * 64 if execution else ""}
-    def apply_plan(self, iac_dir, plan_output_path): return {"status": "PASS", "stdout": "apply-ok"}
+        self.plan_calls += 1
+        plan_file_hash = ""
+        if plan_output_path:
+            body = f"tfplan::{self.plan_calls}::{iac_dir}".encode()
+            Path(plan_output_path).write_bytes(body)
+            plan_file_hash = hashlib.sha256(body).hexdigest()
+        return {
+            "status": "PASS",
+            "execution": execution,
+            "plan": {"stdout": "plan-ok"},
+            "plan_file_hash": plan_file_hash,
+            "sandbox": {"sandbox_policy_identity": "fake-sandbox-v1"},
+        }
+
+    def initialize(self, iac_dir):
+        self.init_calls += 1
+        return {"status": "PASS", "operation": "init", "stdout": "init-ok"}
+
+    def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash=""):
+        # The engine re-verifies the saved plan's hash at the apply
+        # boundary; mirror that so a mismatch cannot pass unnoticed.
+        self.applied_with_hash = expected_plan_file_hash
+        self.applied_from = plan_output_path
+        actual = hashlib.sha256(Path(plan_output_path).read_bytes()).hexdigest()
+        if not expected_plan_file_hash or actual != expected_plan_file_hash:
+            return {
+                "status": "BLOCKED",
+                "error_code": "PLAN_ARTIFACT_MISMATCH",
+                "plan_file_hash": actual,
+            }
+        return {"status": "PASS", "stdout": "apply-ok", "plan_file_hash": actual}
 
 
 class FakeKubectl:
     def dry_run(self, manifest_path, namespace="devops-production-namespace"): return {"status": "PASS", "stdout": "dry-run-ok", "cluster_access": False}
-    def apply(self, manifest_path, namespace): return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
+    def apply(self, manifest_path, namespace=None, approved_identity=None): return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
     def rollout_status(self, deployment_name, namespace): return {"status": "PASS", "stdout": "rollout-ok", "cluster_access": True}
-    def rollout_undo(self, deployment_name, namespace): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
+    def rollout_undo(self, deployment_name, namespace=None, approved_identity=None): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
 
 
 class FakeHealth:

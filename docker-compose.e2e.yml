@@ -1,0 +1,120 @@
+# Phase 8.4.2 — E2E-only override. Never part of the default contract:
+#   docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml up -d
+# Image refs are digest-resolved by the harness before `up` (§8); the
+# defaults below only exist so `compose config` validation can run.
+services:
+  postgres:
+    image: ${E2E_POSTGRES_IMAGE:?E2E_POSTGRES_IMAGE must be a name@sha256:<64hex> reference}
+  redis:
+    image: ${E2E_REDIS_IMAGE:?E2E_REDIS_IMAGE must be a name@sha256:<64hex> reference}
+  qdrant:
+    image: ${E2E_QDRANT_IMAGE:?E2E_QDRANT_IMAGE must be a name@sha256:<64hex> reference}
+
+  # §6.2: every service the golden-path `compose build` actually builds is
+  # redirected to an E2E-only Dockerfile whose base is the digest-pinned
+  # BASE_IMAGE. Production Dockerfiles stay tag-based BY DESIGN and are
+  # never built by this workflow.
+  api-gateway:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./api_gateway/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+
+  repo-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./repo_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+
+  monitoring-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./monitoring_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+
+  incident-event-worker:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./incident_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+
+  agent-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./agent_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+    environment:
+      - E2E_DETERMINISTIC_RCA=true
+
+  deployment-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./deployment_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+    environment:
+      - DEPLOYMENT_EXECUTION_ENABLED=true
+      - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
+      - DEPLOYMENT_KUBECONFIG_PATH=/etc/deployment/kubeconfig
+      - DEPLOYMENT_ALLOWED_NAMESPACES=devops-production-namespace
+      - HEALTHCHECK_ALLOWED_HOSTS=${E2E_HEALTHCHECK_ALLOWED_HOSTS:-}
+      # Phase 8.5-A corrective (Workstream A): the Terraform sandbox image
+      # must be digest-pinned and must already exist locally -- the
+      # control plane runs it with --pull never and refuses a tag.
+      - DEPLOYMENT_TERRAFORM_SANDBOX_IMAGE=${TERRAFORM_SANDBOX_IMAGE:?E2E requires a digest-pinned terraform sandbox image}
+      - DEPLOYMENT_TERRAFORM_SANDBOX_VERSION=${E2E_TERRAFORM_VERSION:-1.9.8}
+      # Workstream C: the identity the sandbox runs as. The control plane
+      # creates each workspace owned by it. Never 0.
+      - DEPLOYMENT_TERRAFORM_SANDBOX_UID=65532
+      - DEPLOYMENT_TERRAFORM_SANDBOX_GID=65532
+      # Workstream B: the workspace root, mounted at the SAME absolute
+      # path on the host and in this container (see volumes below).
+      - DEPLOYMENT_WORKSPACE_ROOT=/tmp/ares-e2e-tf-workspaces
+      # Workstream F: v1 forwards no credentials into Terraform at all.
+      - DEPLOYMENT_CREDENTIAL_ENV_KEYS=
+    volumes:
+      - ${E2E_KUBECONFIG_HOST_PATH:-/tmp/ares-e2e-kubeconfig}:/etc/deployment/kubeconfig:ro
+      # TRUST BOUNDARY NOTE. The socket is mounted into the deployment
+      # service because that service IS the trusted control plane: it
+      # launches the sandbox. It is NEVER passed into the sandbox
+      # container itself -- the Terraform workload gets --network none,
+      # no socket, and only its own workspace. Mounting the socket here
+      # grants this container control-plane authority over the daemon,
+      # which is exactly the privilege it already needs and must be
+      # treated as such when reviewing changes to this service.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace root bind-mounted at an IDENTICAL absolute path on both
+      # sides. This is required, not cosmetic: the control plane asks the
+      # daemon to bind-mount a workspace path, and the daemon resolves
+      # that path on the HOST. A path that exists only inside this
+      # container would silently mount the wrong thing.
+      - /tmp/ares-e2e-tf-workspaces:/tmp/ares-e2e-tf-workspaces
+
+  incident-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./incident_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+    environment:
+      - REMEDIATION_SANDBOX_IMAGE=${REMEDIATION_SANDBOX_IMAGE:?E2E requires a digest-pinned sandbox image}
+      - REMEDIATION_VALIDATION_PROFILE=e2e_fixture
+      - REMEDIATION_PROPOSAL_TTL_SECONDS=${REMEDIATION_PROPOSAL_TTL_SECONDS:-600}
+      - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
+      - GITHUB_DEFAULT_BASE_BRANCH=main
+      - REMEDIATION_WORKSPACE_ROOT=/tmp/ares-e2e-workspaces
+    volumes:
+      # Sandbox runs as sibling containers of this service; there is no
+      # host-process fallback (Phase 6.2.2) — docker.sock is the only
+      # execution channel and the profile/argv remain code-owned.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # §6 host-visible workspace root: mounted at the SAME absolute path
+      # on the runner host and inside this container, so the daemon-side
+      # bind source the sandbox requests exists on the daemon host.
+      # Dedicated single directory only — never all of /tmp.
+      - /tmp/ares-e2e-workspaces:/tmp/ares-e2e-workspaces

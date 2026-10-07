@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# check=skip=InvalidDefaultArgInFrom;error=true
+
+# Phase 8.4.2 — E2E-only deployment-service image (§6).
+# Production Dockerfile untouched: this variant adds exactly the pinned
+# Terraform + kubectl toolchain the zero-cloud/kind execution path needs,
+# with official checksum verification on every download.
+# Immutable build input (Phase 8.4.2-E1): BASE_IMAGE must be a
+# <name>@sha256:<64hex> reference. It is supplied by the committed pin
+# file (e2e/pinned-images.txt) through the compose build argument
+# BASE_IMAGE, where E2E_PYTHON_BASE_IMAGE is interpolated with Compose's
+# required-value operator. That operator is valid in COMPOSE ONLY; the
+# Dockerfile parser does not implement it, so this file must never carry
+# it — the supported forms here are plain ${VAR}, :- , - , :+ and + .
+# There is no default and no fallback here: omitting the build argument
+# leaves the base name blank and BuildKit refuses the build. Both facts
+# are proved against real BuildKit by the Dockerfile contract gate in
+# .github/workflows/ci.yml.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Terraform version is declared for evidence only: it is the version the
+# SANDBOX image is built from (Dockerfile.terraform-sandbox). It is
+# intentionally unused here -- see the assertion below.
+ARG TERRAFORM_VERSION=1.9.8
+ARG KUBECTL_VERSION=v1.31.4
+ARG TARGETARCH=amd64
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Phase 8.5-A corrective (Workstream A) — NO TERRAFORM BINARY HERE.
+#
+# This container is the TRUSTED CONTROL PLANE. Untrusted Terraform runs in
+# a separate, locked-down sandbox container, so the control plane needs
+# the ability to LAUNCH containers, not the ability to run Terraform.
+#
+# Deliberately omitting the binary turns "the code must never exec host
+# terraform" from a rule into a physical fact: there is nothing to exec.
+# The build asserts that below.
+#
+# The Docker CLI is installed from Docker's official apt repository with
+# its signing key, so the package is cryptographically verified by apt.
+# Only the CLI (docker-ce-cli) is installed -- no daemon, no containerd.
+RUN set -eu; \
+    install -m 0755 -d /etc/apt/keyrings; \
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+        -o /etc/apt/keyrings/docker.asc; \
+    chmod a+r /etc/apt/keyrings/docker.asc; \
+    echo "deb [arch=${TARGETARCH} signed-by=/etc/apt/keyrings/docker.asc] \
+https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        > /etc/apt/sources.list.d/docker.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends docker-ce-cli; \
+    rm -rf /var/lib/apt/lists/*; \
+    docker --version
+
+# Fail the build if a Terraform binary is ever reintroduced into the
+# control plane: that would re-open the host-execution path this phase
+# exists to close.
+RUN set -eu; \
+    if command -v terraform >/dev/null 2>&1; then \
+        echo "FATAL: terraform must not exist in the control-plane image" >&2; \
+        exit 1; \
+    fi; \
+    echo "verified: no terraform binary in the control-plane image"
+
+# kubectl: official release + official .sha256, verified (§6).
+RUN set -eu; \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl"; \
+    curl -fsSLo /tmp/kubectl.sha256 "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl.sha256"; \
+    DIGEST="$(tr -d " \t\r\n" < /tmp/kubectl.sha256)"; \
+    printf '%s' "$DIGEST" | grep -Eq '^[0-9a-f]{64}$' || { \
+        echo "kubectl checksum file is not a bare 64-hex digest" >&2; \
+        exit 1; \
+    }; \
+    printf '%s  %s\n' "$DIGEST" /usr/local/bin/kubectl | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/kubectl; \
+    rm -f /tmp/kubectl.sha256; \
+    kubectl version --client
+
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
+
+EXPOSE 8030
+CMD ["sh", "-c", "celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info & exec uvicorn deployment_service.main:app --host 0.0.0.0 --port 8030"]

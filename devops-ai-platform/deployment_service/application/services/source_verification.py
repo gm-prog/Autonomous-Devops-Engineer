@@ -63,12 +63,31 @@ class GitHubSourceVerifier:
 
     METHOD = "github-commit-lookup"
 
+    #: Host-owned override for the canonical commit API. It exists so a
+    #: self-hosted GitHub (or a hermetic E2E topology) can be pointed at
+    #: the right endpoint WITHOUT weakening verification: the lookup
+    #: still happens, the response must still echo the exact requested
+    #: SHA, and a mismatch is still a hard failure. It is deployment
+    #: configuration, at the same trust level as the sandbox image
+    #: reference -- it is never influenced by an API request or by
+    #: repository content.
+    API_BASE_URL_VAR = "DEPLOYMENT_SOURCE_API_BASE_URL"
+
     def __init__(
         self,
-        api_base_url: str = "https://api.github.com",
+        api_base_url: str | None = None,
         token: str | None = None,
         timeout_seconds: float = _TIMEOUT_SECONDS,
     ):
+        if api_base_url is None:
+            api_base_url = (
+                os.getenv(self.API_BASE_URL_VAR, "").strip()
+                or "https://api.github.com"
+            )
+        if not re.match(r"^https?://[^\s]+$", api_base_url):
+            raise ValueError(
+                "source verification API base must be an absolute http(s) URL"
+            )
         self.api_base_url = api_base_url.rstrip("/")
         # token=None → read the environment once at construction; the token
         # is only ever attached to the Authorization header below.

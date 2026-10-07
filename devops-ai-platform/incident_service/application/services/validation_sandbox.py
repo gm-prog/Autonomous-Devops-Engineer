@@ -16,6 +16,7 @@ fail-closed error handled by the execution classification that already
 exists. Nothing in this module executes commands.
 """
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -224,6 +225,24 @@ def build_run_plan(
         raise SandboxPolicyViolation(
             "sandbox workspace mount source must be an absolute path"
         )
+    # Host-visible workspace confinement (Phase 8.4.2-C, §6): when the
+    # platform is configured with REMEDIATION_WORKSPACE_ROOT, the bind
+    # source must EXIST beneath that root (Docker would otherwise silently
+    # bind an empty directory, validating nothing) — there is no fallback
+    # to any other host path. With the root unset (pure unit contexts) the
+    # absolute-path rule above remains the enforced contract.
+    configured_root = os.environ.get("REMEDIATION_WORKSPACE_ROOT", "")
+    if configured_root:
+        if not workspace.is_dir():
+            raise SandboxPolicyViolation(
+                "sandbox workspace mount source does not exist "
+                "(fail-closed; no host fallback)"
+            )
+        if not workspace.is_relative_to(Path(configured_root)):
+            raise SandboxPolicyViolation(
+                "sandbox workspace mount source must be beneath "
+                "REMEDIATION_WORKSPACE_ROOT (fail-closed)"
+            )
 
     # Exactly one host bind: the ephemeral per-attempt workspace, and it
     # is READ-ONLY — the untrusted validation workload may observe the

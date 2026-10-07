@@ -676,8 +676,31 @@ class RepositoryExecutionBoundaryAuditTests(unittest.TestCase):
             "remediation_workspace_service.py",
             "incident_service/infrastructure/sandbox/"
             "container_validation_sandbox.py",
-            "deployment_service/application/services/kubectl_runner.py",
-            "deployment_service/application/services/terraform_runner.py",
+            # Phase 8.6-A moved Kubernetes execution authority out of
+            # kubectl_runner.py (which now orchestrates only, through the
+            # sandbox port) and into this trusted host-side adapter, whose
+            # subprocess calls launch the container runtime -- never
+            # kubectl, never a shell, never untrusted input.
+            "deployment_service/infrastructure/sandbox/"
+            "container_kubectl_sandbox.py",
+            # Phase 8.6-A final corrective. The sandbox must run on a
+            # dedicated network carrying only the approved Kubernetes
+            # endpoint, because an --internal network removes the NAT
+            # route but does not isolate its own members. Creating and
+            # inspecting that network is container-runtime work, so it
+            # lives in the trusted adapter layer beside the sandbox
+            # itself rather than in application/services. Its subprocess
+            # calls invoke `docker network` with host-built argv only --
+            # never a shell, never untrusted input.
+            "deployment_service/infrastructure/sandbox/"
+            "kubernetes_sandbox_network.py",
+            # Phase 8.5-A moved Terraform execution authority out of
+            # terraform_runner.py (which now orchestrates only, through the
+            # sandbox port) and into this trusted host-side adapter, whose
+            # subprocess calls launch the docker CLI -- never terraform, and
+            # never untrusted input -- to run Terraform inside the sandbox.
+            "deployment_service/infrastructure/sandbox/"
+            "container_terraform_sandbox.py",
             "repo_service/infrastructure/git/git_ssh_client.py",
         },
     }

@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .core.auth import GatewaySettings  # noqa: F401  (emits dev-secret warning)
 from .routers.control_plane import router as control_plane_router
+from .routers.evidence import router as evidence_router
 from .routers.gateway_router import router as gateway_router
 
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +47,7 @@ app.add_middleware(
 
 app.include_router(gateway_router)
 app.include_router(control_plane_router)
+app.include_router(evidence_router)
 
 
 @app.get("/health")

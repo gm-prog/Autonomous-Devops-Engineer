@@ -432,3 +432,103 @@ def control_plane_change_rollout_plan(
     return _forward_get(
         "incident", f"/changes/{deployment_run_id}/rollout-plan?{query}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Incident read + evidence/RCA/proposal-generation control plane
+# (Phase 8.4 minimum gateway seams — see docs/PHASE-8.4 audit)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/incidents")
+def control_plane_list_incidents(
+    request: Request,
+    user: dict = Depends(verify_token),
+):
+    """List active incidents (any authenticated user; read-only §3).
+
+    The downstream list contains evidence and proposal payloads, but no
+    caller-privileged action is exposed here — mutation routes below are
+    operator-gated and identity-stamped from the JWT.
+    """
+    _rate_limit_or_429(request)
+    return _forward_get("incident", "/incidents")
+
+
+@router.get("/incidents/{incident_id}")
+def control_plane_get_incident(
+    incident_id: str,
+    request: Request,
+    user: dict = Depends(verify_token),
+):
+    """Read one incident by id (any authenticated user; read-only §3).
+
+    Unknown ids are relayed as the downstream's 404 — the gateway never
+    invents success and knowing the internal incident URL grants nothing.
+    """
+    _rate_limit_or_429(request)
+    return _forward_get("incident", f"/incidents/{incident_id}")
+
+
+@router.post("/incidents/{incident_id}/deployment-evidence")
+def control_plane_attach_deployment_evidence(
+    incident_id: str,
+    payload: Dict,
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Attach authoritative deployment evidence to an incident (operator, §4).
+
+    The body carries only ``deployment_run_id``. Repository, source SHA,
+    state, provenance and hashes are never caller-supplied — the
+    downstream collector fetches them from the deployment service and
+    fails closed on anything non-authoritative. No identity string from
+    the request body is trusted or forwarded as identity.
+    """
+    _rate_limit_or_429(request)
+    return _forward_post(
+        "incident",
+        f"/incidents/{incident_id}/deployment-evidence",
+        dict(payload),
+    )
+
+
+@router.post("/incidents/{incident_id}/rca")
+def control_plane_investigate_rca(
+    incident_id: str,
+    payload: Optional[Dict],
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Run RCA for an incident (operator §3: mutates incident lifecycle).
+
+    Forwards to the incident service, which builds the real evidence pack
+    and calls the agent-service RCA boundary over the private network.
+    """
+    _rate_limit_or_429(request)
+    return _forward_post(
+        "incident",
+        f"/incidents/{incident_id}/rca",
+        dict(payload or {}),
+    )
+
+
+@router.post("/incidents/{incident_id}/proposal")
+def control_plane_generate_proposal(
+    incident_id: str,
+    payload: Optional[Dict],
+    request: Request,
+    user: dict = Depends(require_operator),
+):
+    """Generate a remediation proposal (operator §3; proposal-only).
+
+    Generation never executes remediation; approval and execution remain
+    the separate operator-gated routes below. No caller-supplied identity
+    is forwarded — this path records none.
+    """
+    _rate_limit_or_429(request)
+    return _forward_post(
+        "incident",
+        f"/incidents/{incident_id}/proposal",
+        dict(payload or {}),
+    )
