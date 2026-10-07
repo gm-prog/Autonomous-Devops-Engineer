@@ -287,59 +287,32 @@ def service_exec(command: str) -> subprocess.CompletedProcess:
 
 # ------------------------------------------------------------- the payload
 
-MANIFEST = f"""apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: ares-http-e2e
-  namespace: {NAMESPACE}
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: ares-http-e2e
-  template:
-    metadata:
-      labels:
-        app: ares-http-e2e
-    spec:
-      automountServiceAccountToken: false
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: app
-          image: registry.k8s.io/pause:3.10
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            capabilities:
-              drop: ["ALL"]
-          resources:
-            limits:
-              cpu: 100m
-              memory: 64Mi
-            requests:
-              cpu: 50m
-              memory: 32Mi
-"""
+FIXTURE_REPO = "ares-e2e/fixture"
+FIXTURE_SHA = "b" * 40
+
+#: The committed fixture manifest, which the real IaCValidator accepts.
+#: A hand-rolled manifest would be rejected for unrelated reasons and
+#: the Kubernetes boundary would never be reached.
+MANIFEST = (ROOT / "e2e" / "fixtures" / "k8s-deployment.yaml").read_text()
+WORKLOAD_NAME = "checkout-service"
 
 
-def payload(manifest: str = MANIFEST) -> dict:
+def manifest_for(workload_image: str) -> str:
+    return MANIFEST.replace("WORKLOAD_IMAGE_REF", workload_image)
+
+
+def payload(manifest: str) -> dict:
     fixtures = ROOT / "e2e" / "fixtures"
     return {
-        "repository_url": "https://github.com/gm-prog/ares-e2e-fixture",
-        "commit_sha": "0" * 40,
-        "environment": "production",
-        "namespace": NAMESPACE,
-        "components": ["dockerfile", "kubernetes"],
+        "repository_id": 1,
+        "repository_name": FIXTURE_REPO,
+        "requested_by": "ares-8.6-b",
         "dockerfile": (fixtures / "Dockerfile").read_text(),
         "k8s_yaml": manifest,
         "terraform_tf": "",
-        "pipeline_yaml": "",
+        "pipeline_yaml": (fixtures / "pipeline.yaml").read_text(),
+        "components": ["dockerfile", "kubernetes", "pipeline"],
+        "source_revision": {"head_sha": FIXTURE_SHA},
     }
 
 
@@ -364,150 +337,192 @@ def approve(run_id: str, dry: dict) -> Tuple[int, Any]:
 
 
 def k8s_leg(result: dict) -> dict:
+    """The Kubernetes leg of an EXECUTED run."""
     execution = result.get("execution") or {}
-    return execution.get("kubernetes") or {}
+    return (execution.get("kubernetes_apply") or execution.get("kubernetes")
+            or {})
+
+
+def k8s_dry(result: dict) -> dict:
+    """The Kubernetes leg of a DRY RUN."""
+    return result.get("kubernetes_dry_run") or {}
 
 
 # ---------------------------------------------------------------- the proof
 
-def run_sequence(cluster: str, control_plane: str, sandbox_digest: str) -> None:
-    body = payload()
+def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
+    manifest = manifest_for(workload_image)
+    body = payload(manifest)
 
     # ---- 8/9. dry run over HTTP, with real server-side validation ----
     status, dry = dry_run(body)
+    run_id = dry.get("id") or dry.get("run_id") or ""
     record("http:dry-run-accepted",
            "the real service accepts a dry run over HTTP",
-           f"status={status} state={dry.get('state')}",
-           status in (200, 201) and bool(dry.get("plan_hash")))
-    run_id = dry.get("deployment_id") or dry.get("run_id") or ""
-    leg = k8s_leg(dry)
+           f"status={status} state={dry.get('state')} run_id={run_id or 'ABSENT'} "
+           f"detail={json.dumps(dry)[:200] if status not in (200, 201) else ''}",
+           status in (200, 201) and dry.get("state") == "AWAITING_APPROVAL"
+           and bool(run_id) and bool(dry.get("plan_hash")))
+    if not run_id:
+        for name in ("http:server-side-dry-run-performed", "approval:identity-captured",
+                     "http:approval-accepted", "http:execute-over-the-real-path",
+                     "manifest:approved-equals-applied",
+                     "manifest:no-post-approval-replan"):
+            record(name, "the sequence continues from an accepted dry run",
+                   "NOT VERIFIED: the dry run produced no run id", False)
+        return
+
+    leg = k8s_dry(dry)
     record("http:server-side-dry-run-performed",
            "validation happened on the API server, not on the client",
-           f"kubernetes={json.dumps(leg)[:200]}",
-           bool(leg) and leg.get("status") not in ("NOT_APPLICABLE", None))
+           f"kubernetes_dry_run={json.dumps(leg)[:220]}",
+           leg.get("status") == "PASS")
 
-    # ---- 10. capture the approval identity the service itself derived ----
-    identity = (dry.get("kubernetes_execution_identity")
-                or leg.get("execution_identity") or {})
+    # ---- 10. the approval identity the service itself derived ----
+    identity = leg.get("execution_identity") or {}
     record("approval:identity-captured",
-           "the approval records the cluster it was taken against",
-           f"identity={json.dumps(identity)[:220] if identity else 'absent'}",
-           bool(identity))
+           "the approval records the cluster, namespace and network it was taken against",
+           f"namespace={identity.get('namespace')!r} "
+           f"api_server={identity.get('api_server')!r} "
+           f"network={str(identity.get('network_identity'))[:40]!r} "
+           f"workload_policy={str(identity.get('workload_identity_policy'))[:40]!r}",
+           bool(identity.get("namespace")) and bool(identity.get("api_server"))
+           and bool(identity.get("network_identity")))
 
-    # ---- 11/12. approve, then execute over HTTP ----
+    # ---- 11. approve ----
     code, approved = approve(run_id, dry)
     record("http:approval-accepted", "the hash-bound approval is accepted",
-           f"status={code} state={approved.get('state')}", code in (200, 201))
+           f"status={code} state={approved.get('state')}",
+           code in (200, 201) and approved.get("state") == "APPROVED")
 
+    # ---- 12. execute over HTTP ----
     code, executed = api("POST", f"/api/internal/deployments/{run_id}/execute",
                          execute_body(body, dry))
-    applied_leg = k8s_leg(executed)
+    applied = k8s_leg(executed)
     record("http:execute-over-the-real-path",
            "the mutation is driven through the service, not the runner",
            f"status={code} state={executed.get('state')} "
-           f"kubernetes={json.dumps(applied_leg)[:200]}",
-           code in (200, 201) and applied_leg.get("status") == "PASS")
+           f"kubernetes={json.dumps(applied)[:220]}",
+           code in (200, 201) and applied.get("status") == "PASS")
 
     # ---- 13. approved manifest == applied manifest ----
-    approved_hash = (identity.get("approved_manifest_hash")
-                     or applied_leg.get("approved_manifest_hash") or "")
-    applied_hash = applied_leg.get("applied_manifest_hash") or ""
+    approved_hash = identity.get("approved_manifest_hash") or dry.get("artifact_hash")
+    applied_hash = (applied.get("applied_manifest_hash")
+                    or executed.get("artifact_hash"))
     record("manifest:approved-equals-applied",
            "the bytes approved are the bytes applied",
-           f"approved={approved_hash[:16]} applied={applied_hash[:16]}",
+           f"approved={str(approved_hash)[:20]} applied={str(applied_hash)[:20]}",
            bool(approved_hash) and approved_hash == applied_hash)
+    replanned = (executed.get("replanned_after_approval")
+                 if "replanned_after_approval" in executed
+                 else applied.get("replanned_after_approval"))
     record("manifest:no-post-approval-replan",
            "no second artifact was produced after approval",
-           f"replanned_after_approval={applied_leg.get('replanned_after_approval')}",
-           applied_leg.get("replanned_after_approval") in (False, None))
+           f"replanned_after_approval={replanned}", replanned in (False, None))
 
     # ---- 14/15. the cluster really changed, and the rollout converged ----
-    got = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", "ares-http-e2e",
+    got = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", WORKLOAD_NAME,
                   "-o", "jsonpath={.metadata.name}")
     record("cluster:deployment-exists",
            "the Deployment exists in the real cluster after execution",
-           f"name={got.stdout.strip()!r} rc={got.returncode}",
-           got.stdout.strip() == "ares-http-e2e")
+           f"name={got.stdout.strip()!r} rc={got.returncode} "
+           f"err={got.stderr.strip()[:120]!r}",
+           got.stdout.strip() == WORKLOAD_NAME)
     rollout = kubectl(cluster, "-n", NAMESPACE, "rollout", "status",
-                      "deployment/ares-http-e2e", "--timeout=120s")
+                      f"deployment/{WORKLOAD_NAME}", "--timeout=180s", timeout=240)
     record("cluster:rollout-converged", "the rollout reaches a ready state",
-           f"rc={rollout.returncode} out={rollout.stdout.strip()[:120]!r}",
-           rollout.returncode == 0)
+           f"rc={rollout.returncode} out={rollout.stdout.strip()[:140]!r} "
+           f"err={rollout.stderr.strip()[:140]!r}", rollout.returncode == 0)
 
-    # ---- 18. tamper: execute with a manifest that was never approved ----
+    # ---- 18. tamper: execute a manifest that was never approved ----
     tampered = dict(body)
-    tampered["k8s_yaml"] = MANIFEST.replace("replicas: 1", "replicas: 7")
+    tampered["k8s_yaml"] = manifest.replace("replicas: 1", "replicas: 7")
     code, result = api("POST", f"/api/internal/deployments/{run_id}/execute",
                        execute_body(tampered, dry), expect=(200, 201, 400, 409, 422))
     state = result.get("state", "")
+    # A 404 would mean the run was never found, which proves nothing
+    # about tamper rejection; it must be a real refusal of a real run.
     record("tamper:unapproved-manifest-is-refused",
-           "a manifest that differs from the approved one cannot execute",
+           "a manifest differing from the approved one cannot execute",
            f"status={code} state={state}",
-           state not in ("DEPLOYED", "HEALTH_CHECKING"))
-    live = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", "ares-http-e2e",
+           code != 404 and state not in ("DEPLOYED", "HEALTH_CHECKING"))
+    live = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", WORKLOAD_NAME,
                    "-o", "jsonpath={.spec.replicas}")
     record("tamper:cluster-was-not-mutated",
            "the refused run changed nothing in the cluster",
-           f"replicas={live.stdout.strip()!r}", live.stdout.strip() == "1")
+           f"replicas={live.stdout.strip()!r} rc={live.returncode}",
+           live.returncode == 0 and live.stdout.strip() == "1")
 
-    # ---- 19. namespace / cluster / credential switches over HTTP ----
+    # ---- 19. namespace / credential / cluster switches ----
     code, result = api("POST", f"/api/internal/deployments/{run_id}/execute",
                        execute_body(body, dry, namespace="kube-system"),
                        expect=(200, 201, 400, 403, 409, 422))
     record("switch:namespace-after-approval-is-refused",
            "a different namespace cannot reuse this approval",
            f"status={code} state={result.get('state')}",
-           result.get("state") not in ("DEPLOYED", "HEALTH_CHECKING"))
+           code != 404 and result.get("state") not in ("DEPLOYED", "HEALTH_CHECKING"))
 
-    hijack = MANIFEST.replace(f"namespace: {NAMESPACE}", "namespace: kube-system")
-    code, result = dry_run({**body, "k8s_yaml": hijack}, expect=(200, 201, 400, 422))
-    hijack_leg = k8s_leg(result)
+    hijack = manifest.replace("kind: Deployment",
+                              "kind: Deployment", 1).replace(
+        "metadata:\n  name: checkout-service",
+        "metadata:\n  namespace: kube-system\n  name: checkout-service", 1)
+    code, result = dry_run(payload(hijack), expect=(200, 201, 400, 422))
+    hijack_leg = k8s_dry(result)
     record("switch:manifest-namespace-hijack-is-refused",
            "a manifest naming another namespace is rejected at validation",
-           f"status={code} kubernetes={json.dumps(hijack_leg)[:160]}",
-           hijack_leg.get("status") != "PASS" or result.get("state") == "FAILED")
+           f"status={code} kubernetes={json.dumps(hijack_leg)[:180]} "
+           f"state={result.get('state')}",
+           code != 422 and hijack_leg.get("status") != "PASS")
 
-    # ---- 20. the Secret/PVC/workload-identity regressions, over HTTP ----
+    # ---- 20. Secret / PVC / workload-identity regressions, over HTTP ----
     escalations = {
-        "secret-volume": ("        - name: app\n",
-                          "        - name: app\n          volumeMounts:\n"
-                          "            - name: stolen\n              mountPath: /s\n"),
-        "service-account-token": ("automountServiceAccountToken: false",
-                                  "automountServiceAccountToken: true"),
-        "deployer-identity-reuse": ("automountServiceAccountToken: false",
-                                    "serviceAccountName: ares-deployer"),
+        "secret-volume":
+            (manifest.replace("      automountServiceAccountToken: false",
+                              "      automountServiceAccountToken: false\n"
+                              "      volumes:\n        - name: stolen\n"
+                              "          secret:\n            secretName: kube-root-ca.crt")),
+        "service-account-token":
+            (manifest.replace("automountServiceAccountToken: false",
+                              "automountServiceAccountToken: true")),
+        "deployer-identity-reuse":
+            (manifest.replace("      automountServiceAccountToken: false",
+                              "      serviceAccountName: ares-deployer\n"
+                              "      automountServiceAccountToken: false")),
+        "arbitrary-pvc":
+            (manifest.replace("      automountServiceAccountToken: false",
+                              "      automountServiceAccountToken: false\n"
+                              "      volumes:\n        - name: stolen\n"
+                              "          persistentVolumeClaim:\n"
+                              "            claimName: someone-elses-data")),
     }
-    for label, (needle, replacement) in escalations.items():
-        bad = MANIFEST.replace(needle, replacement)
-        if label == "secret-volume":
-            bad += ("      volumes:\n        - name: stolen\n"
-                    "          secret:\n            secretName: kube-root-ca.crt\n")
-        code, result = dry_run({**body, "k8s_yaml": bad}, expect=(200, 201, 400, 422))
-        bad_leg = k8s_leg(result)
+    for label, bad in escalations.items():
+        code, result = dry_run(payload(bad), expect=(200, 201, 400, 422))
+        bad_leg = k8s_dry(result)
         record(f"policy:{label}-is-refused",
-               "privilege escalation through the manifest is rejected",
-               f"status={code} kubernetes={json.dumps(bad_leg)[:160]}",
-               bad_leg.get("status") != "PASS" or result.get("state") == "FAILED")
+               "privilege escalation through the manifest is rejected by policy",
+               f"status={code} kubernetes={json.dumps(bad_leg)[:180]} "
+               f"state={result.get('state')}",
+               code != 422 and bad_leg.get("status") != "PASS")
 
     # ---- 16/17. rollback ----
     code, result = api("POST", f"/api/internal/deployments/{run_id}/rollback", {},
                        expect=(200, 201, 202, 400, 404, 405, 409, 422))
     if code in (404, 405):
-        undo = kubectl(cluster, "-n", NAMESPACE, "rollout", "undo",
-                       "deployment/ares-http-e2e")
         record("rollback:performed",
-               "a rollback path exists and returns the workload to a known state",
-               f"NOT VERIFIED over HTTP (status={code}); "
-               f"cluster-level undo rc={undo.returncode}", False)
+               "a rollback path returns the workload to a known good state",
+               f"NOT VERIFIED: the service exposes no rollback endpoint "
+               f"(status={code}); rollback is proven by the live Kind E2E's "
+               f"rollout_undo path, not here", False)
     else:
         record("rollback:performed",
-               "a rollback path exists and returns the workload to a known state",
+               "a rollback path returns the workload to a known good state",
                f"status={code} state={result.get('state')}", code in (200, 201, 202))
-    after = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", "ares-http-e2e",
+    after = kubectl(cluster, "-n", NAMESPACE, "get", "deployment", WORKLOAD_NAME,
                     "-o", "jsonpath={.status.replicas}")
     record("rollback:workload-still-consistent",
-           "the workload is in a defined state after the rollback attempt",
-           f"replicas={after.stdout.strip()!r}", after.returncode == 0)
+           "the workload is in a defined state afterwards",
+           f"replicas={after.stdout.strip()!r} rc={after.returncode}",
+           after.returncode == 0)
 
 
 def check_sandbox_runtime_posture(sandbox_digest: str, sandbox_network: str) -> None:
@@ -620,6 +635,7 @@ def main() -> int:
     parser.add_argument("--registry", default="")
     parser.add_argument("--kubectl-version", default="v1.31.4")
     parser.add_argument("--redis-image", default="redis:7-alpine")
+    parser.add_argument("--workload-image", default="ares-e2e-workload:local")
     parser.add_argument("--evidence", default="e2e-evidence/kubernetes-http-e2e.json")
     args = parser.parse_args()
 
@@ -659,6 +675,12 @@ def main() -> int:
                 f"driver requires a real cluster and will not fake one")
         record("cluster:kind-is-live", "a real Kind control plane is running",
                f"container={control_plane} running=true", True)
+        loaded = sh(["kind", "load", "docker-image", args.workload_image,
+                     "--name", args.cluster], timeout=600)
+        record("cluster:workload-image-loaded",
+               "the workload image is in the cluster store, not fetched from a registry",
+               f"image={args.workload_image} rc={loaded.returncode} "
+               f"err={loaded.stderr.strip()[:140]!r}", loaded.returncode == 0)
         ensure_namespace(args.cluster)
         record("cluster:namespace-ready", "the execution namespace exists",
                f"namespace={NAMESPACE}", True)
@@ -696,7 +718,7 @@ def main() -> int:
                f"status={health.get('status', 'unknown')}", True)
 
         # ---- 8-20 ----
-        run_sequence(args.cluster, control_plane, args.sandbox_image)
+        run_sequence(args.cluster, control_plane, args.workload_image)
         check_sandbox_runtime_posture(args.sandbox_image, exec_network.name)
 
     except Exception as exc:  # noqa: BLE001

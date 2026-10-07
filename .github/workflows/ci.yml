@@ -322,9 +322,14 @@ jobs:
           # repository, so the driver's output is mirrored into
           # annotations here. Without this a crash that happens before
           # the driver can write evidence is invisible.
+          # the workload the Deployment actually runs, loaded into kind
+          docker build -f e2e/workload/Dockerfile \
+            --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" \
+            -t ares-e2e-workload:local e2e/workload
           set +e
           PYTHONPATH=. python e2e/kubernetes_service_http_kind_e2e.py \
             --cluster ares-http-e2e \
+            --workload-image ares-e2e-workload:local \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \
             --redis-image "$E2E_REDIS_IMAGE" \
             --registry localhost:5002 \
