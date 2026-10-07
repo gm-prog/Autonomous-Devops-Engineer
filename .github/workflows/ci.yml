@@ -156,6 +156,110 @@ jobs:
           path: devops-ai-platform/terraform-container-e2e-evidence.json
           if-no-files-found: warn
 
+  kubernetes-trust-boundary:
+    name: Phase 8.6-A Kubernetes trust boundary (unit)
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: devops-ai-platform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: devops-ai-platform/requirements.txt }
+      - run: pip install -r requirements.txt pytest pytest-subtests
+      - name: Kubernetes trust-boundary suite
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -m pytest \
+            deployment_service/tests/test_kubernetes_trust_boundary.py \
+            -q --no-header | tee k8s-unit.txt
+      - name: No host kubectl execution path exists
+        run: PYTHONPATH=. python scripts/assert_no_host_terraform_execution.py
+      - name: Kubernetes bypass mutation probes
+        run: |
+          set -euo pipefail
+          # A green security suite proves nothing on its own. Each probe
+          # weakens one control on a throwaway copy and the suite must
+          # notice. Any ESCAPED mutation fails this gate.
+          PYTHONPATH=. python scripts/mutation_probe_kubernetes_boundary.py \
+            | tee k8s-probes.txt
+      - name: Publish unit evidence
+        if: always()
+        run: |
+          set +e
+          {
+            echo '### Phase 8.6-A Kubernetes trust boundary (unit)'
+            echo '```'
+            tail -3 k8s-unit.txt 2>/dev/null
+            tail -4 k8s-probes.txt 2>/dev/null
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  kubernetes-kind-e2e:
+    name: Phase 8.6-A live Kind Kubernetes E2E
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: devops-ai-platform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: devops-ai-platform/requirements.txt }
+      - run: pip install -r requirements.txt
+      - name: Record runtime prerequisites
+        run: |
+          set -euo pipefail
+          docker --version
+          kind --version
+          docker info --format 'daemon: {{.ServerVersion}}'
+      - name: Fetch kubectl against the committed checksum
+        run: |
+          set -euo pipefail
+          # dl.k8s.io publishes a bare digest with no filename, so the
+          # checksum line is synthesised here and bound to the path we
+          # actually downloaded. The expected digest is committed.
+          read -r KVER KSHA < <(grep -v '^#' e2e/pinned-kubectl.txt | grep -v '^$' | head -1)
+          echo "pinned kubectl $KVER"
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+          echo "${KSHA}  /tmp/kubectl" | sha256sum -c -
+          chmod 0755 /tmp/kubectl
+          echo "ARES_KUBECTL_BINARY=/tmp/kubectl" >> "$GITHUB_ENV"
+          echo "ARES_KUBECTL_VERSION=${KVER}" >> "$GITHUB_ENV"
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      - name: Live Kubernetes execution trust boundary proof
+        run: |
+          set -euo pipefail
+          PINS=e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          # the workload the Deployment actually runs, loaded into kind
+          docker build -f e2e/workload/Dockerfile \
+            --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" \
+            -t ares-e2e-workload:local e2e/workload
+          PYTHONPATH=. python e2e/kubernetes_sandbox_kind_e2e.py \
+            --node-image "$NODE_IMAGE" \
+            --base-image "$E2E_PYTHON_BASE_IMAGE" \
+            --workload-image ares-e2e-workload:local \
+            --kubectl-version "$ARES_KUBECTL_VERSION" \
+            --evidence kubernetes-kind-e2e-evidence.json
+      - name: Publish live evidence
+        if: always()
+        run: |
+          set +e
+          if [ -f kubernetes-kind-e2e-evidence.json ]; then
+            {
+              echo '### Phase 8.6-A live Kind E2E evidence'
+              echo '```json'
+              cat kubernetes-kind-e2e-evidence.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kubernetes-kind-e2e-evidence
+          path: devops-ai-platform/kubernetes-kind-e2e-evidence.json
+          if-no-files-found: warn
+
   api-gateway:
     name: API gateway checks
     runs-on: ubuntu-latest
