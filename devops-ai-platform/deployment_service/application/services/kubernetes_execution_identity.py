@@ -58,6 +58,18 @@ class KubernetesExecutionIdentity:
         ])
         return hashlib.sha256(material.encode()).hexdigest()
 
+    def to_dict_fields(self) -> Dict[str, str]:
+        """The constructor kwargs, for building a deliberately stale copy."""
+        return {
+            "namespace": self.namespace,
+            "api_server": self.api_server,
+            "ca_fingerprint_sha256": self.ca_fingerprint_sha256,
+            "credential_profile_id": self.credential_profile_id,
+            "manifest_policy_identity": self.manifest_policy_identity,
+            "sandbox_policy_identity": self.sandbox_policy_identity,
+            "network_identity": self.network_identity,
+        }
+
     def to_dict(self) -> Dict[str, Any]:
         """Evidence-safe view. Contains no credential material."""
         return {

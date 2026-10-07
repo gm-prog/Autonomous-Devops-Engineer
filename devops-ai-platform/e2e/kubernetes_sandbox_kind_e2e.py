@@ -25,6 +25,12 @@ Exit codes
 
 from __future__ import annotations
 
+try:
+    from e2e.evidence_provenance import provenance, seal
+except ImportError:  # executed as a script from inside e2e/
+    from evidence_provenance import provenance, seal
+
+
 import argparse
 import base64
 import json
@@ -446,7 +452,18 @@ def check_deploy_and_rollback(runner: KubectlRunnerService, workdir: Path,
            dry["status"] == "PASS")
     approved_hash = dry.get("manifest_sha256", "")
 
-    applied = runner.apply(str(manifest))
+    # Phase 8.6-A corrective, Workstream B. The approval binds the live
+    # cluster's identity; execution must present exactly that identity.
+    approved_identity = runner.execution_identity()
+    record("approval:binds-the-live-cluster-identity",
+           "approval carries endpoint, CA, namespace, credential, policy and network",
+           f"digest={approved_identity.digest()[:16]} "
+           f"ns={approved_identity.namespace} "
+           f"ca={approved_identity.ca_fingerprint_sha256[:12]}",
+           bool(approved_identity.digest()) and approved_identity.namespace == NAMESPACE
+           and bool(approved_identity.ca_fingerprint_sha256))
+
+    applied = runner.apply(str(manifest), approved_identity=approved_identity)
     record("deploy:apply-through-sandbox",
            "the approved manifest is applied inside the sandbox",
            f"status={applied['status']} "
@@ -480,7 +497,8 @@ def check_deploy_and_rollback(runner: KubectlRunnerService, workdir: Path,
                    "-n", NAMESPACE, "--timeout=120s"],
                   kubeconfig=kubeconfig_path, check=False)
 
-    undo = runner.rollout_undo("checkout-service")
+    undo = runner.rollout_undo("checkout-service",
+                               approved_identity=approved_identity)
     record("rollback:through-the-same-sandbox-and-namespace",
            "rollback uses the same sandbox, namespace and credential path",
            f"status={undo['status']} ns={undo.get('namespace')} "
@@ -496,7 +514,7 @@ def check_tamper_and_switch(runner: KubectlRunnerService, workdir: Path,
     tampered = workdir / "tampered.yaml"
     tampered.write_text(base.replace("allowPrivilegeEscalation: false",
                                      "allowPrivilegeEscalation: true", 1))
-    result = runner.apply(str(tampered))
+    result = runner.apply(str(tampered), approved_identity=runner.execution_identity())
     record("tamper:manifest-modified-after-approval",
            "BLOCKED before execution",
            f"status={result['status']}", result["status"] == "BLOCKED")
@@ -505,20 +523,62 @@ def check_tamper_and_switch(runner: KubectlRunnerService, workdir: Path,
     switched.write_text(base.replace("  name: checkout-service\n",
                                      "  name: checkout-service\n"
                                      "  namespace: kube-system\n", 1))
-    result = runner.apply(str(switched))
+    result = runner.apply(str(switched), approved_identity=runner.execution_identity())
     record("switch:namespace-declared-in-manifest",
            "BLOCKED: the manifest may not choose its namespace",
            f"status={result['status']}", result["status"] == "BLOCKED")
 
-    result = runner.apply(str(workdir / "deployment.yaml"), namespace="kube-system")
+    result = runner.apply(str(workdir / "deployment.yaml"), namespace="kube-system",
+                          approved_identity=runner.execution_identity())
     record("switch:namespace-requested-by-caller",
            "BLOCKED: the caller may not choose the namespace",
            f"status={result['status']}", result["status"] == "BLOCKED")
 
-    result = runner.rollout_undo("--all")
+    result = runner.rollout_undo("--all", approved_identity=runner.execution_identity())
     record("escape:rollout-target-is-not-a-free-string",
            "BLOCKED: '--all' is not a valid rollout target",
            f"status={result['status']}", result["status"] == "BLOCKED")
+
+
+def check_live_cluster_identity_binding(runner: KubectlRunnerService, workdir: Path,
+                                        image_ref: str) -> None:
+    """Workstream B, proven against the real cluster rather than a double.
+
+    The approval is taken against the live Kind endpoint. Each attack
+    then moves one element of the execution target and must be refused
+    before the sandbox is invoked -- so nothing reaches the cluster.
+    """
+    from deployment_service.application.services.kubernetes_execution_identity import (
+        KubernetesExecutionIdentity,
+    )
+    fixture = (PLATFORM_ROOT / "e2e" / "fixtures" / "k8s-deployment.yaml").read_text()
+    manifest = workdir / "identity-probe.yaml"
+    manifest.write_text(fixture.replace("WORKLOAD_IMAGE_REF", image_ref))
+
+    live = runner.execution_identity()
+
+    record("identity:mutation-without-approval-is-refused",
+           "BLOCKED: an unbound mutation never reaches the live cluster",
+           f"status={runner.apply(str(manifest))['status']}",
+           runner.apply(str(manifest))["status"] == "BLOCKED")
+
+    for field, value, label in (
+        ("api_server", "https://attacker.invalid:6443", "endpoint"),
+        ("ca_fingerprint_sha256", "00" * 32, "CA fingerprint"),
+        ("namespace", "kube-system", "namespace"),
+        ("credential_profile_id", "some-other-profile", "credential profile"),
+        ("manifest_policy_identity", "kubernetes-manifest-policy-v1:weakened",
+         "manifest policy"),
+        ("sandbox_policy_identity", "kubernetes-sandbox-v1:weakened", "sandbox policy"),
+        ("network_identity", "some-shared-network", "sandbox network"),
+    ):
+        stale = KubernetesExecutionIdentity(**{**live.to_dict_fields(), field: value})
+        result = runner.apply(str(manifest), approved_identity=stale)
+        record(f"identity:{label.replace(' ', '-')}-switch-is-refused",
+               f"BLOCKED: a moved {label} must not reach the live cluster",
+               f"status={result['status']} "
+               f"detail={(result.get('stderr') or '')[:120]!r}",
+               result["status"] == "BLOCKED")
 
 
 def check_server_side_validation_failure(runner: KubectlRunnerService,
@@ -660,6 +720,7 @@ def main() -> int:
 
         print("\n== tamper / switch ==", flush=True)
         check_tamper_and_switch(runner, workdir, args.workload_image)
+        check_live_cluster_identity_binding(runner, workdir, args.workload_image)
         check_server_side_validation_failure(runner, workdir, args.workload_image)
 
         # ---- evidence ----------------------------------------------
@@ -668,9 +729,10 @@ def main() -> int:
         evidence = {
             "phase": "8.6-A",
             "proof_class": "live-kind-e2e",
-            "commit": os.environ.get("GITHUB_SHA", "unknown"),
-            "run_id": os.environ.get("GITHUB_RUN_ID", "unknown"),
-            "job": os.environ.get("GITHUB_JOB", "unknown"),
+            # Workstream G: every distinct commit under its own name.
+            # GITHUB_SHA is the PR *merge* commit and is never the proof
+            # commit; see e2e/evidence_provenance.py.
+            "provenance": provenance(),
             "cluster": {
                 "name": CLUSTER,
                 "server_version": fixture["server_version"],
@@ -687,7 +749,9 @@ def main() -> int:
             "counts": {"total": len(CHECKS), "passed": passed, "failed": failed},
             "duration_seconds": round(time.time() - _START, 1),
         }
-        Path(args.evidence).write_text(json.dumps(evidence, indent=2, sort_keys=True))
+        sealed = seal(evidence, args.evidence)
+        print(f"evidence artifact_sha256={sealed['artifact_sha256']} "
+              f"head_sha={sealed['head_sha'] or '(unresolved)'}", flush=True)
         for check in CHECKS:
             if check["result"] == "FAIL":
                 print(f"::error::8.6-A FAIL {check['case']} :: "

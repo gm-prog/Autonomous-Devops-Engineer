@@ -40,6 +40,12 @@ pass. Exit code 0 only if every check passed.
 
 from __future__ import annotations
 
+try:
+    from e2e.evidence_provenance import provenance, seal
+except ImportError:  # executed as a script from inside e2e/
+    from evidence_provenance import provenance, seal
+
+
 import argparse
 import base64
 import gzip
@@ -856,12 +862,10 @@ def main() -> int:
     payload = {
         "e2e_status": status,
         "e2e_kind": "containerized-deployment-service",
-        # The commit whose tree this proof actually executed.
-        "proof_commit": os.environ.get("GITHUB_SHA", ""),
+        # Workstream G: one unambiguous provenance block. No bare
+        # `proof_commit`, which silently became the PR merge SHA.
+        "provenance": provenance(),
         "base_commit": os.environ.get("E2E_BASE_COMMIT", ""),
-        "workflow_run_id": os.environ.get("GITHUB_RUN_ID", ""),
-        "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-        "job": os.environ.get("GITHUB_JOB", ""),
         "terraform_runtime_version": runtime.get("terraform_version", ""),
         "sandbox_uid_gid": f"{runtime.get('uid','?')}:{runtime.get('gid','?')}",
         "checks_total": len(st.rows),
@@ -879,8 +883,12 @@ def main() -> int:
         **evidence,
         "checks": st.rows,
     }
-    rendered = json.dumps(payload, indent=2, sort_keys=True)
-    Path(args.evidence).write_text(rendered)
+    sealed = seal(payload, args.evidence)
+    # Read back the exact bytes that were written, so the base64
+    # annotation and the recorded digest describe the same artifact.
+    rendered = Path(args.evidence).read_text(encoding="utf-8")
+    print(f"evidence artifact_sha256={sealed['artifact_sha256']} "
+          f"head_sha={sealed['head_sha'] or '(unresolved)'}", flush=True)
     # Artifact downloads are not reachable from every environment, so the
     # exact evidence bytes are also emitted as annotations. Base64 keeps
     # them byte-identical to the uploaded artifact.
