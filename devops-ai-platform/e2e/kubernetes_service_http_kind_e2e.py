@@ -781,8 +781,8 @@ def main() -> int:
     }
     out = Path(args.evidence)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(evidence, indent=2))
-    seal(out)
+    # seal() writes the file and records its own digest alongside it.
+    seal(evidence, out)
     notice(f"{passed}/{total} PASS -- evidence at {out}")
     print(f"::notice title=8.6-B::service->HTTP->Kind E2E: {passed}/{total} PASS, "
           f"{total - passed} FAIL")
