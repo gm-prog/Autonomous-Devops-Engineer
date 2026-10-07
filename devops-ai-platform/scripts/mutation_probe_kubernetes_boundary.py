@@ -36,6 +36,8 @@ MANIFEST = "deployment_service/application/services/kubernetes_manifest_policy.p
 KUBECONFIG = "deployment_service/application/services/kubeconfig_policy.py"
 SANDBOX = "deployment_service/application/services/kubectl_sandbox.py"
 RUNNER = "deployment_service/application/services/kubectl_runner.py"
+POLICY = "deployment_service/application/services/kubernetes_manifest_policy.py"
+IDENTITY = "deployment_service/application/services/kubernetes_execution_identity.py"
 ADAPTER = "deployment_service/infrastructure/sandbox/container_kubectl_sandbox.py"
 
 BOUNDARY_TESTS = "deployment_service/tests/test_kubernetes_trust_boundary.py"
@@ -338,6 +340,94 @@ PROBES: list[Probe] = [
                 '        env = os.environ.copy()\n        env |= {\n'
                 '            "PATH": "/usr/local/bin:/usr/bin:/bin",'),
     ),
+
+    # -----------------------------------------------------------------
+    # Phase 8.6-A corrective. Workstream B: cluster identity binding.
+    # -----------------------------------------------------------------
+    Probe(
+        "accept-any-execution-target",
+        "stop comparing the approved and observed execution identity",
+        replace(IDENTITY, "if approved.digest() != observed.digest():", "if False:"),
+    ),
+    Probe(
+        "allow-unbound-mutation",
+        "let a mutation run with no approved identity at all",
+        replace(IDENTITY, "    if approved is None:", "    if False:"),
+    ),
+    Probe(
+        "skip-binding-for-mutations",
+        "never verify the binding on APPLY / ROLLOUT_UNDO",
+        replace(RUNNER, "if operation in self.MUTATING_OPERATIONS:", "if False:"),
+    ),
+    Probe(
+        "empty-mutating-operation-set",
+        "declare that no operation mutates the cluster",
+        replace(RUNNER, "MUTATING_OPERATIONS = (KubectlOperation.APPLY, "
+                        "KubectlOperation.ROLLOUT_UNDO)",
+                        "MUTATING_OPERATIONS = ()"),
+    ),
+    Probe(
+        "unpin-the-api-server",
+        "stop constraining the kubeconfig to the host-owned endpoint",
+        replace(RUNNER, "expected_server=expected_api_server(),", "expected_server=None,"),
+    ),
+    Probe(
+        "unpin-the-ca-fingerprint",
+        "accept any cluster CA even when a fingerprint is pinned",
+        replace(RUNNER, "if pinned_ca and sanitized.cluster_identity."
+                        "ca_fingerprint_sha256 != pinned_ca:", "if False:"),
+    ),
+    Probe(
+        "verify-after-the-sandbox",
+        "move the binding check so the sandbox is called first",
+        replace(RUNNER, "            verify_binding(approved_identity, observed_identity)\n"
+                        "            elif approved_identity is not None:",
+                        "            pass\n"
+                        "            elif approved_identity is not None:"),
+    ),
+    # -----------------------------------------------------------------
+    # Workstream C: Secret / PVC / ConfigMap reference escalation.
+    # -----------------------------------------------------------------
+    Probe(
+        "allow-any-named-reference",
+        "treat every Secret/PVC/ConfigMap reference as permitted",
+        replace(POLICY, "if name not in allowed:", "if False:"),
+    ),
+    Probe(
+        "skip-volume-reference-checks",
+        "stop inspecting volume sources for privileged references",
+        replace(POLICY, "errors.extend(self._check_volume_reference(",
+                        "errors.extend([] or self._skip_volume_reference("),
+    ),
+    Probe(
+        "skip-env-reference-checks",
+        "stop inspecting env / envFrom for secret references",
+        replace(POLICY, "errors.extend(self._check_env_references(",
+                        "errors.extend([] or self._skip_env_references("),
+    ),
+    Probe(
+        "permit-service-account-token-projection",
+        "allow a projected API token regardless of configuration",
+        replace(POLICY, 'elif key == "serviceAccountToken":\n'
+                        "                        if not self.allow_service_account_tokens:",
+                        'elif key == "serviceAccountToken":\n'
+                        "                        if False:"),
+    ),
+    # -----------------------------------------------------------------
+    # Workstream D: deployment identity vs workload identity.
+    # -----------------------------------------------------------------
+    Probe(
+        "workload-may-be-the-deployer",
+        "let a workload run as the ARES deployment identity",
+        replace(POLICY, "if declared_sa == self.deployment_service_account:", "if False:"),
+    ),
+    Probe(
+        "automount-may-be-implicit",
+        "allow a workload to inherit the namespace default token silently",
+        replace(POLICY, 'automount = pod_spec.get("automountServiceAccountToken")',
+                        'automount = pod_spec.get("automountServiceAccountToken", False)'),
+    ),
+
 ]
 
 
