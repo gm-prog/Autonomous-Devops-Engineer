@@ -118,9 +118,9 @@ class FakeTerraform:
 
 class FakeKubectl:
     def dry_run(self, manifest_path, namespace="devops-production-namespace"): return {"status": "PASS", "stdout": "dry-run-ok", "cluster_access": False}
-    def apply(self, manifest_path, namespace): return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
+    def apply(self, manifest_path, namespace=None, approved_identity=None): return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
     def rollout_status(self, deployment_name, namespace): return {"status": "PASS", "stdout": "rollout-ok", "cluster_access": True}
-    def rollout_undo(self, deployment_name, namespace): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
+    def rollout_undo(self, deployment_name, namespace=None, approved_identity=None): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
 
 
 class FakeHealth:

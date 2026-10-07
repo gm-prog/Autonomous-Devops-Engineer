@@ -598,7 +598,8 @@ def test_runner_module_cannot_spawn_a_process():
 
 def test_apply_goes_through_the_sandbox_with_the_canonical_manifest(wired):
     runner, sandbox, manifest = wired
-    result = runner.apply(str(manifest))
+    result = runner.apply(str(manifest),
+                          approved_identity=runner.execution_identity())
     assert result["status"] == "PASS"
     assert result["sandboxed"] is True
     assert len(sandbox.calls) == 1
@@ -627,24 +628,28 @@ def test_dry_run_never_falls_back_to_client_validation(wired, monkeypatch):
 
 def test_namespace_switch_is_refused(wired):
     runner, sandbox, manifest = wired
-    result = runner.apply(str(manifest), namespace="kube-system")
+    result = runner.apply(str(manifest), namespace="kube-system",
+                          approved_identity=runner.execution_identity())
     assert result["status"] == "BLOCKED"
     assert sandbox.calls == [], "a refused namespace must not reach the sandbox"
 
 
 def test_tampered_manifest_is_refused_before_execution(wired):
     runner, sandbox, manifest = wired
+    approved = runner.execution_identity()
     manifest.write_text(_mutate("allowPrivilegeEscalation: false",
                                 "allowPrivilegeEscalation: true"))
-    result = runner.apply(str(manifest))
+    result = runner.apply(str(manifest), approved_identity=approved)
     assert result["status"] == "BLOCKED"
     assert sandbox.calls == []
 
 
 def test_cluster_scoped_manifest_is_refused_before_execution(wired):
     runner, sandbox, manifest = wired
+    approved = runner.execution_identity()
     manifest.write_text(ATTACKS["cluster_role"])
-    assert runner.apply(str(manifest))["status"] == "BLOCKED"
+    assert runner.apply(str(manifest),
+                        approved_identity=approved)["status"] == "BLOCKED"
     assert sandbox.calls == []
 
 
@@ -674,7 +679,8 @@ def test_hostile_kubeconfig_fails_closed(tmp_path, monkeypatch):
 
 def test_rollout_target_cannot_be_an_arbitrary_string(wired):
     runner, sandbox, _ = wired
-    assert runner.rollout_undo("--all")["status"] == "BLOCKED"
+    assert runner.rollout_undo(
+        "--all", approved_identity=runner.execution_identity())["status"] == "BLOCKED"
     assert runner.rollout_status("x;whoami")["status"] == "BLOCKED"
     assert sandbox.calls == []
 
@@ -682,7 +688,8 @@ def test_rollout_target_cannot_be_an_arbitrary_string(wired):
 def test_rollback_uses_the_same_sandbox_and_namespace(wired):
     """§79: rollback is not a privileged side door."""
     runner, sandbox, _ = wired
-    result = runner.rollout_undo("checkout-service")
+    result = runner.rollout_undo("checkout-service",
+                                 approved_identity=runner.execution_identity())
     assert result["status"] == "PASS"
     assert result["namespace"] == NAMESPACE
     assert sandbox.calls[0]["step"].argv[:3] == ("kubectl", "rollout", "undo")
@@ -690,7 +697,8 @@ def test_rollback_uses_the_same_sandbox_and_namespace(wired):
 
 def test_runner_evidence_never_leaks_credentials(wired):
     runner, _, manifest = wired
-    blob = repr(runner.apply(str(manifest)))
+    blob = repr(runner.apply(str(manifest),
+                             approved_identity=runner.execution_identity()))
     for secret in ("redacted-test-token", "BEGIN CERTIFICATE", CA_B64):
         assert secret not in blob
 
@@ -736,3 +744,352 @@ def test_skipping_cannot_be_reached_with_a_manifest_present(tmp_path, monkeypatc
     result = KubectlRunnerService(sandbox=sandbox).apply(str(manifest))
     assert result["status"] == "BLOCKED"
     assert result["status"] != "SKIPPED"
+
+
+# =====================================================================
+# 7. Cluster identity is bound at approval and re-verified at execution
+# =====================================================================
+
+from deployment_service.application.services.kubernetes_execution_identity import (  # noqa: E402
+    KubernetesExecutionIdentity,
+)
+
+OTHER_CA = base64.b64encode(
+    b"-----BEGIN CERTIFICATE-----\nMIIdifferent\n-----END CERTIFICATE-----\n").decode()
+APPROVED_SERVER = "https://api.ares-e2e.local:6443"
+
+
+@pytest.fixture()
+def bound(tmp_path, monkeypatch):
+    """A runner whose execution target is pinned by host configuration."""
+    kc = tmp_path / "kubeconfig"
+    kc.write_text(kubeconfig())
+    monkeypatch.setenv("DEPLOYMENT_KUBECONFIG_PATH", str(kc))
+    monkeypatch.setenv("DEPLOYMENT_KUBERNETES_NAMESPACE", NAMESPACE)
+    monkeypatch.setenv("DEPLOYMENT_K8S_API_SERVER", APPROVED_SERVER)
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_SANDBOX_NETWORK", "ares-k8s-sandbox")
+    manifest = tmp_path / "k8s.yaml"
+    manifest.write_text(real_manifest())
+    sandbox = RecordingSandbox()
+    runner = KubectlRunnerService(sandbox=sandbox)
+    return runner, sandbox, manifest, kc
+
+
+def test_legitimate_execution_against_the_approved_target_succeeds(bound):
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    result = runner.apply(str(manifest), approved_identity=approved)
+    assert result["status"] == "PASS", result.get("stderr")
+    assert len(sandbox.calls) == 1
+
+
+def test_apply_without_an_approved_identity_is_refused(bound):
+    """Fail closed: an unbound mutation never reaches the cluster."""
+    runner, sandbox, manifest, _ = bound
+    result = runner.apply(str(manifest))
+    assert result["status"] == "BLOCKED"
+    assert "no approved" in result["stderr"].lower()
+    assert sandbox.calls == []
+
+
+def test_endpoint_switch_after_approval_is_refused(bound):
+    runner, sandbox, manifest, kc = bound
+    approved = runner.execution_identity()
+    kc.write_text(kubeconfig(cluster={"server": "https://attacker.invalid:6443"}))
+    result = runner.apply(str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == [], "a moved endpoint must never reach the sandbox"
+
+
+def test_ca_switch_after_approval_is_refused(bound):
+    runner, sandbox, manifest, kc = bound
+    approved = runner.execution_identity()
+    kc.write_text(kubeconfig(cluster={"certificate-authority-data": OTHER_CA}))
+    result = runner.apply(str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert "ca_fingerprint" in result["stderr"] or "CA" in result["stderr"]
+    assert sandbox.calls == []
+
+
+def test_namespace_switch_after_approval_is_refused(bound, monkeypatch):
+    runner, sandbox, manifest, kc = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_KUBERNETES_NAMESPACE", "other-namespace")
+    kc.write_text(kubeconfig(context={"cluster": "c", "user": "u",
+                                      "namespace": "other-namespace"}))
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_credential_profile_switch_after_approval_is_refused(bound, monkeypatch):
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_K8S_CREDENTIAL_PROFILE", "a-different-profile")
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_network_identity_switch_after_approval_is_refused(bound, monkeypatch):
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_KUBECTL_SANDBOX_NETWORK", "some-shared-network")
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_manifest_policy_identity_switch_after_approval_is_refused(bound, monkeypatch):
+    """A weakened policy cannot inherit a stricter policy's approval."""
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_K8S_ALLOWED_SECRETS", "suddenly-everything")
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_unapproved_endpoint_is_refused_even_at_approval_time(tmp_path, monkeypatch):
+    """The host-owned endpoint is a hard constraint, not a comparison."""
+    kc = tmp_path / "kubeconfig"
+    kc.write_text(kubeconfig(cluster={"server": "https://attacker.invalid:6443"}))
+    monkeypatch.setenv("DEPLOYMENT_KUBECONFIG_PATH", str(kc))
+    monkeypatch.setenv("DEPLOYMENT_KUBERNETES_NAMESPACE", NAMESPACE)
+    monkeypatch.setenv("DEPLOYMENT_K8S_API_SERVER", APPROVED_SERVER)
+    manifest = tmp_path / "k8s.yaml"
+    manifest.write_text(real_manifest())
+    sandbox = RecordingSandbox()
+    result = KubectlRunnerService(sandbox=sandbox).dry_run(str(manifest))
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_pinned_ca_fingerprint_is_enforced(tmp_path, monkeypatch):
+    kc = tmp_path / "kubeconfig"
+    kc.write_text(kubeconfig())
+    monkeypatch.setenv("DEPLOYMENT_KUBECONFIG_PATH", str(kc))
+    monkeypatch.setenv("DEPLOYMENT_KUBERNETES_NAMESPACE", NAMESPACE)
+    monkeypatch.setenv("DEPLOYMENT_K8S_CA_FINGERPRINT", "00" * 32)
+    manifest = tmp_path / "k8s.yaml"
+    manifest.write_text(real_manifest())
+    sandbox = RecordingSandbox()
+    result = KubectlRunnerService(sandbox=sandbox).dry_run(str(manifest))
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_execution_identity_digest_is_deterministic_and_canonical():
+    a = KubernetesExecutionIdentity(
+        namespace="n", api_server="https://a:6443", ca_fingerprint_sha256="ab",
+        credential_profile_id="p", manifest_policy_identity="m",
+        sandbox_policy_identity="s", network_identity="net")
+    b = KubernetesExecutionIdentity(
+        namespace="n", api_server="https://a:6443", ca_fingerprint_sha256="ab",
+        credential_profile_id="p", manifest_policy_identity="m",
+        sandbox_policy_identity="s", network_identity="net")
+    assert a.digest() == b.digest()
+    assert a.differences(b) == {}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("namespace", "other"), ("api_server", "https://b:6443"),
+    ("ca_fingerprint_sha256", "cd"), ("credential_profile_id", "q"),
+    ("manifest_policy_identity", "m2"), ("sandbox_policy_identity", "s2"),
+    ("network_identity", "net2"),
+])
+def test_every_identity_field_participates_in_the_digest(field, value):
+    base = dict(namespace="n", api_server="https://a:6443",
+                ca_fingerprint_sha256="ab", credential_profile_id="p",
+                manifest_policy_identity="m", sandbox_policy_identity="s",
+                network_identity="net")
+    a = KubernetesExecutionIdentity(**base)
+    b = KubernetesExecutionIdentity(**{**base, field: value})
+    assert a.digest() != b.digest(), f"{field} does not affect the identity"
+    assert field in a.differences(b)
+
+
+def test_execution_identity_evidence_carries_no_credential(bound):
+    runner, _, _, _ = bound
+    blob = repr(runner.execution_identity().to_dict())
+    assert "redacted-test-token" not in blob
+    assert "BEGIN CERTIFICATE" not in blob
+    assert CA_B64 not in blob
+
+
+# =====================================================================
+# 8. Workstream C -- Secret / PVC / ConfigMap reference escalation
+# =====================================================================
+
+def _pod_manifest(*, volumes=None, containers=None, sa=None, automount=False):
+    """A minimal admissible Deployment, mutated per attack."""
+    container = {
+        "name": "app", "image": "registry.internal/app@sha256:" + "a" * 64,
+        "resources": {"limits": {"cpu": "500m", "memory": "256Mi"},
+                      "requests": {"cpu": "100m", "memory": "128Mi"}},
+        "securityContext": {
+            "runAsNonRoot": True, "runAsUser": 10001,
+            "allowPrivilegeEscalation": False, "readOnlyRootFilesystem": True,
+            "privileged": False, "capabilities": {"drop": ["ALL"]},
+        },
+    }
+    if containers:
+        container.update(containers)
+    spec = {
+        "securityContext": {"runAsNonRoot": True, "runAsUser": 10001,
+                            "seccompProfile": {"type": "RuntimeDefault"}},
+        "containers": [container],
+        "automountServiceAccountToken": automount,
+    }
+    if sa is not None:
+        spec["serviceAccountName"] = sa
+    if volumes is not None:
+        spec["volumes"] = volumes
+    return yaml.safe_dump({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "checkout-service", "namespace": NAMESPACE},
+        "spec": {"replicas": 1,
+                 "selector": {"matchLabels": {"app": "checkout-service"}},
+                 "template": {"metadata": {"labels": {"app": "checkout-service"}},
+                              "spec": spec}},
+    })
+
+
+def _policy(**kw):
+    return KubernetesManifestPolicy(namespace=NAMESPACE, **kw)
+
+
+def _rejects(manifest, **kw):
+    """Assert the policy denies the manifest; return the joined reasons."""
+    result = _policy(**kw).evaluate(manifest)
+    assert not result.passed, "manifest was ADMITTED but must be denied"
+    return " ".join(result.errors)
+
+
+def _accepts(manifest, **kw):
+    result = _policy(**kw).evaluate(manifest)
+    assert result.passed, f"legitimate manifest denied: {result.errors}"
+    return result
+
+
+def test_baseline_admissible_workload_is_still_accepted():
+    """The hardening must not break a legitimate workload."""
+    _accepts(_pod_manifest())
+
+
+def test_arbitrary_secret_volume_is_denied():
+    m = _pod_manifest(volumes=[{"name": "v", "secret": {"secretName": "cluster-admin-token"}}])
+    assert "secret" in _rejects(m).lower()
+
+
+def test_allowlisted_secret_volume_is_permitted():
+    m = _pod_manifest(volumes=[{"name": "v", "secret": {"secretName": "app-tls"}}])
+    _accepts(m, allowed_secret_names=["app-tls"])
+
+
+def test_arbitrary_pvc_is_denied():
+    m = _pod_manifest(volumes=[{"name": "v", "persistentVolumeClaim": {"claimName": "etcd-backup"}}])
+    assert "persistentvolumeclaim" in _rejects(m).lower() or "pvc" in _rejects(m).lower()
+
+
+def test_env_secret_key_ref_is_denied():
+    m = _pod_manifest(containers={"env": [
+        {"name": "T", "valueFrom": {"secretKeyRef": {"name": "cluster-admin-token", "key": "token"}}}]})
+    assert "secret" in _rejects(m).lower()
+
+
+def test_env_from_secret_ref_is_denied():
+    m = _pod_manifest(containers={"envFrom": [{"secretRef": {"name": "cluster-admin-token"}}]})
+    assert "secret" in _rejects(m).lower()
+
+
+def test_projected_secret_volume_is_denied():
+    m = _pod_manifest(volumes=[{"name": "v", "projected": {"sources": [
+        {"secret": {"name": "cluster-admin-token"}}]}}])
+    assert "secret" in _rejects(m).lower()
+
+
+def test_service_account_token_projection_is_denied():
+    m = _pod_manifest(volumes=[{"name": "v", "projected": {"sources": [
+        {"serviceAccountToken": {"path": "token", "audience": "api"}}]}}])
+    assert "serviceaccounttoken" in _rejects(m).lower().replace(" ", "")
+
+
+def test_cross_namespace_secret_selection_is_denied():
+    """A name carrying a namespace separator is an escape attempt."""
+    m = _pod_manifest(volumes=[{"name": "v", "secret": {"secretName": "kube-system/admin"}}])
+    assert _rejects(m, allowed_secret_names=["kube-system/admin"])
+
+
+def test_arbitrary_configmap_is_denied():
+    m = _pod_manifest(volumes=[{"name": "v", "configMap": {"name": "kubelet-config"}}])
+    assert "configmap" in _rejects(m).lower()
+
+
+def test_downward_api_volume_does_not_bypass_reference_checks():
+    m = _pod_manifest(volumes=[{"name": "v", "projected": {"sources": [
+        {"configMap": {"name": "not-allowlisted"}}]}}])
+    assert "configmap" in _rejects(m).lower()
+
+
+def test_csi_and_ephemeral_volumes_are_denied():
+    for vol in ({"name": "v", "csi": {"driver": "secrets-store.csi.k8s.io"}},
+                {"name": "v", "ephemeral": {"volumeClaimTemplate": {"spec": {}}}}):
+        assert _rejects(_pod_manifest(volumes=[vol])), f"{vol} was admitted"
+
+
+# =====================================================================
+# 9. Workstream D -- deployment identity vs workload identity
+# =====================================================================
+
+def test_workload_running_as_the_deployment_identity_is_denied():
+    m = _pod_manifest(sa="ares-deployer")
+    msg = _rejects(m)
+    assert "ares-deployer" in msg and "deployment" in msg.lower()
+
+
+def test_omitted_service_account_is_accepted_with_automount_false():
+    _accepts(_pod_manifest(sa=None, automount=False))
+
+
+def test_automount_must_be_explicit():
+    """Silence must not inherit the namespace default SA token."""
+    m = yaml.safe_load(_pod_manifest())
+    m["spec"]["template"]["spec"].pop("automountServiceAccountToken")
+    assert "automount" in _rejects(yaml.safe_dump(m)).lower()
+
+
+def test_automount_true_without_an_approved_workload_sa_is_denied():
+    m = _pod_manifest(sa=None, automount=True)
+    assert "automount" in _rejects(m).lower()
+
+
+def test_automount_true_with_the_deployment_sa_is_denied():
+    m = _pod_manifest(sa="ares-deployer", automount=True)
+    assert _rejects(m, service_account="ares-deployer",
+                    allow_service_account_tokens=True)
+
+
+def test_automount_true_with_an_approved_distinct_workload_sa_is_permitted():
+    m = _pod_manifest(sa="checkout-workload", automount=True)
+    _accepts(m, service_account="checkout-workload",
+             allow_service_account_tokens=True)
+
+
+def test_unapproved_workload_sa_is_denied_even_without_automount():
+    m = _pod_manifest(sa="some-other-sa", automount=False)
+    assert _rejects(m, service_account="checkout-workload")
+
+
+def test_policy_identity_binds_every_new_allowlist():
+    base = _policy().identity()
+    for kw in ({"allowed_secret_names": ["x"]}, {"allowed_pvc_names": ["x"]},
+               {"allowed_configmap_names": ["x"]},
+               {"allow_service_account_tokens": True},
+               {"deployment_service_account": "other-deployer"},
+               {"service_account": "wl"}):
+        assert _policy(**kw).identity() != base, f"{kw} not bound into identity"
