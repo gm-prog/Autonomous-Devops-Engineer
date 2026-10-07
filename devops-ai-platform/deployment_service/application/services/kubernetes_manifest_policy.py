@@ -128,6 +128,11 @@ class ManifestPolicyResult:
         }
 
 
+def _parse_name_list(raw: str) -> Tuple[str, ...]:
+    """Parse a comma-separated host-owned allowlist of resource names."""
+    return tuple(sorted({v.strip() for v in (raw or "").split(",") if v.strip()}))
+
+
 def _parse_allowed_resources(raw: str) -> Tuple[Tuple[str, str], ...]:
     """Parse ``apiVersion=Kind`` pairs, comma separated."""
     pairs: List[Tuple[str, str]] = []
@@ -160,6 +165,11 @@ class KubernetesManifestPolicy:
         service_account: Optional[str] = None,
         allowed_resources: Optional[Sequence[Tuple[str, str]]] = None,
         require_resource_limits: bool = True,
+        deployment_service_account: Optional[str] = None,
+        allowed_secret_names: Optional[Sequence[str]] = None,
+        allowed_pvc_names: Optional[Sequence[str]] = None,
+        allowed_configmap_names: Optional[Sequence[str]] = None,
+        allow_service_account_tokens: bool = False,
     ) -> None:
         self.namespace = (
             namespace
@@ -175,9 +185,37 @@ class KubernetesManifestPolicy:
                 f"configured namespace {self.namespace!r} is not a valid Kubernetes name"
             )
 
+        # The identity ARES itself authenticates to Kubernetes with. A
+        # generated workload may NEVER run as it: that would hand the
+        # deployment control-plane's own rights to untrusted content.
+        if deployment_service_account is None:
+            deployment_service_account = os.getenv(
+                "DEPLOYMENT_K8S_DEPLOYER_SERVICE_ACCOUNT", "ares-deployer").strip()
+        self.deployment_service_account = deployment_service_account or "ares-deployer"
+
+        # The identity generated workloads may run as. None (the default)
+        # means "no workload may choose an identity at all".
         if service_account is None:
             service_account = os.getenv("DEPLOYMENT_K8S_SERVICE_ACCOUNT", "").strip() or None
         self.service_account = service_account
+
+        # Workload creation is an INDIRECT path to Secret access: a pod
+        # that mounts a Secret reads it without the author holding
+        # `get secrets`. Secret and PVC references are therefore
+        # deny-by-default and must be named explicitly by the host.
+        self.allowed_secret_names = frozenset(
+            allowed_secret_names if allowed_secret_names is not None
+            else _parse_name_list(os.getenv("DEPLOYMENT_K8S_ALLOWED_SECRETS", ""))
+        )
+        self.allowed_pvc_names = frozenset(
+            allowed_pvc_names if allowed_pvc_names is not None
+            else _parse_name_list(os.getenv("DEPLOYMENT_K8S_ALLOWED_PVCS", ""))
+        )
+        self.allowed_configmap_names = frozenset(
+            allowed_configmap_names if allowed_configmap_names is not None
+            else _parse_name_list(os.getenv("DEPLOYMENT_K8S_ALLOWED_CONFIGMAPS", ""))
+        )
+        self.allow_service_account_tokens = allow_service_account_tokens
 
         if allowed_resources is None:
             raw = os.getenv("DEPLOYMENT_K8S_ALLOWED_RESOURCES", "").strip()
@@ -204,6 +242,11 @@ class KubernetesManifestPolicy:
             f"volumes={';'.join(sorted(ALLOWED_VOLUME_TYPES))}",
             f"service_types={';'.join(sorted(ALLOWED_SERVICE_TYPES))}",
             f"require_limits={self.require_resource_limits}",
+            f"deployment_sa={self.deployment_service_account}",
+            f"secrets={';'.join(sorted(self.allowed_secret_names))}",
+            f"pvcs={';'.join(sorted(self.allowed_pvc_names))}",
+            f"configmaps={';'.join(sorted(self.allowed_configmap_names))}",
+            f"sa_tokens={self.allow_service_account_tokens}",
         ])
         return f"{self.POLICY_VERSION}:{hashlib.sha256(material.encode()).hexdigest()[:32]}"
 
@@ -365,16 +408,52 @@ class KubernetesManifestPolicy:
         # --- service account -------------------------------------------
         declared_sa = pod_spec.get("serviceAccountName") or pod_spec.get("serviceAccount")
         if declared_sa is not None:
-            if self.service_account is None:
+            declared_sa = str(declared_sa).strip()
+            # The deployment control-plane identity is never a workload
+            # identity. Inheriting it would give untrusted content the
+            # rights ARES uses to mutate the cluster.
+            if declared_sa == self.deployment_service_account:
+                errors.append(
+                    f"{where} selects serviceAccountName {declared_sa!r}, which is the "
+                    f"ARES deployment identity; a generated workload may never run as "
+                    f"the identity that performs deployments."
+                )
+            elif self.service_account is None:
                 errors.append(
                     f"{where} selects serviceAccountName {declared_sa!r}; generated "
                     f"manifests may not choose a workload identity."
                 )
-            elif str(declared_sa).strip() != self.service_account:
+            elif declared_sa != self.service_account:
                 errors.append(
                     f"{where} selects serviceAccountName {declared_sa!r} but the only "
                     f"permitted workload identity is {self.service_account!r}."
                 )
+
+        # Token automounting is an API identity. It is opt-in, explicit,
+        # and never relies on the namespace default service account.
+        automount = pod_spec.get("automountServiceAccountToken")
+        if automount is None:
+            errors.append(
+                f"{where} does not set automountServiceAccountToken; it must be "
+                f"explicit so the workload never silently inherits the namespace "
+                f"default service account token."
+            )
+        elif automount is True:
+            if not self.allow_service_account_tokens:
+                errors.append(
+                    f"{where} sets automountServiceAccountToken: true, but Kubernetes "
+                    f"API identity is not enabled for generated workloads."
+                )
+            elif self.service_account is None or declared_sa is None:
+                errors.append(
+                    f"{where} sets automountServiceAccountToken: true without an "
+                    f"explicitly approved workload serviceAccountName."
+                )
+        elif automount is not False:
+            errors.append(
+                f"{where} has a malformed automountServiceAccountToken value "
+                f"{automount!r}; it must be a boolean."
+            )
 
         # --- pod-level security context --------------------------------
         pod_sc = pod_spec.get("securityContext") or {}
@@ -427,6 +506,9 @@ class KubernetesManifestPolicy:
                         f"{where} volume {vol_name!r} uses unrecognised volume source "
                         f"{source!r}; the policy admits only {sorted(ALLOWED_VOLUME_TYPES)}."
                     )
+                else:
+                    errors.extend(self._check_volume_reference(
+                        source, volume.get(source), f"{where} volume {vol_name!r}"))
 
         # --- every container list, not just `containers` ---------------
         found_container = False
@@ -453,10 +535,137 @@ class KubernetesManifestPolicy:
 
         return errors
 
+    def _check_named_reference(self, kind: str, name: Any, where: str) -> List[str]:
+        """Deny-by-default check of one Secret/PVC/ConfigMap reference.
+
+        Workload creation is an indirect path to Secret access: a pod
+        that mounts a Secret reads it even though the manifest author
+        holds no `get secrets` permission. Every reference must
+        therefore be named by the host, not chosen by the manifest.
+        """
+        allowed = {
+            "Secret": self.allowed_secret_names,
+            "PersistentVolumeClaim": self.allowed_pvc_names,
+            "ConfigMap": self.allowed_configmap_names,
+        }[kind]
+        if not isinstance(name, str) or not name.strip():
+            return [f"{where} references a {kind} with no usable name."]
+        name = name.strip()
+        # A reference is resolved inside the pod's own namespace, so a
+        # name carrying a separator is an attempt to escape it.
+        if "/" in name or ":" in name:
+            return [f"{where} references {kind} {name!r} with a namespace-qualified "
+                    f"name; references are resolved in {self.namespace!r} only."]
+        if not _DNS_1123.match(name):
+            return [f"{where} references {kind} {name!r}, which is not a valid name."]
+        if name not in allowed:
+            permitted = sorted(allowed)
+            detail = (f"the host-owned allowlist {permitted}" if permitted
+                      else f"no {kind} reference is permitted at all")
+            return [f"{where} references {kind} {name!r}, which is not in {detail}."]
+        return []
+
+    def _check_volume_reference(self, source: str, body: Any, where: str) -> List[str]:
+        """Validate the names a permitted volume source resolves to."""
+        errors: List[str] = []
+        body = body if isinstance(body, dict) else {}
+        if source == "secret":
+            errors += self._check_named_reference(
+                "Secret", body.get("secretName"), where)
+        elif source == "persistentVolumeClaim":
+            errors += self._check_named_reference(
+                "PersistentVolumeClaim", body.get("claimName"), where)
+        elif source == "configMap":
+            errors += self._check_named_reference(
+                "ConfigMap", body.get("name"), where)
+        elif source == "projected":
+            sources = body.get("sources")
+            if not isinstance(sources, list):
+                return errors + [f"{where} has a malformed projected volume."]
+            for entry in sources:
+                if not isinstance(entry, dict):
+                    errors.append(f"{where} has a malformed projected source.")
+                    continue
+                for key, value in entry.items():
+                    inner = value if isinstance(value, dict) else {}
+                    if key == "secret":
+                        errors += self._check_named_reference(
+                            "Secret", inner.get("name"), f"{where} projected")
+                    elif key == "configMap":
+                        errors += self._check_named_reference(
+                            "ConfigMap", inner.get("name"), f"{where} projected")
+                    elif key == "serviceAccountToken":
+                        if not self.allow_service_account_tokens:
+                            errors.append(
+                                f"{where} projects a serviceAccountToken, which grants "
+                                f"the workload a Kubernetes API identity; this is not "
+                                f"enabled for generated workloads.")
+                    elif key == "downwardAPI":
+                        continue
+                    else:
+                        errors.append(
+                            f"{where} uses unrecognised projected source {key!r}.")
+        elif source in ("emptyDir", "downwardAPI"):
+            return errors
+        return errors
+
+    def _check_env_references(self, container: Dict[str, Any], where: str) -> List[str]:
+        """Secret/ConfigMap reached through env, not through a volume."""
+        errors: List[str] = []
+        env = container.get("env")
+        if env is not None and not isinstance(env, list):
+            errors.append(f"{where} has a malformed env list.")
+            env = []
+        for entry in env or []:
+            if not isinstance(entry, dict):
+                errors.append(f"{where} has a malformed env entry.")
+                continue
+            value_from = entry.get("valueFrom")
+            if not isinstance(value_from, dict):
+                continue
+            name = entry.get("name", "<unnamed>")
+            for key, kind in (("secretKeyRef", "Secret"),
+                              ("configMapKeyRef", "ConfigMap")):
+                ref = value_from.get(key)
+                if ref is not None:
+                    ref = ref if isinstance(ref, dict) else {}
+                    errors += self._check_named_reference(
+                        kind, ref.get("name"), f"{where} env {name!r} {key}")
+            for key in value_from:
+                if key not in ("secretKeyRef", "configMapKeyRef",
+                               "fieldRef", "resourceFieldRef"):
+                    errors.append(
+                        f"{where} env {name!r} uses unrecognised valueFrom source {key!r}.")
+
+        env_from = container.get("envFrom")
+        if env_from is not None and not isinstance(env_from, list):
+            errors.append(f"{where} has a malformed envFrom list.")
+            env_from = []
+        for entry in env_from or []:
+            if not isinstance(entry, dict):
+                errors.append(f"{where} has a malformed envFrom entry.")
+                continue
+            matched = False
+            for key, kind in (("secretRef", "Secret"),
+                              ("configMapRef", "ConfigMap")):
+                ref = entry.get(key)
+                if ref is not None:
+                    matched = True
+                    ref = ref if isinstance(ref, dict) else {}
+                    errors += self._check_named_reference(
+                        kind, ref.get("name"), f"{where} envFrom {key}")
+            if not matched:
+                errors.append(f"{where} has an envFrom entry with no known source.")
+        return errors
+
     def _check_container(self, container: Dict[str, Any], where: str) -> List[str]:
         errors: List[str] = []
         name = container.get("name") or "<unnamed>"
         where = f"{where} {name!r}"
+
+        # Secret/ConfigMap reached through the environment rather than a
+        # volume is the same escalation by a different route.
+        errors.extend(self._check_env_references(container, where))
 
         image = container.get("image")
         if not isinstance(image, str) or not image.strip():
