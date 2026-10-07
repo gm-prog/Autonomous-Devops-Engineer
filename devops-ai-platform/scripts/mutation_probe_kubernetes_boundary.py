@@ -38,9 +38,11 @@ SANDBOX = "deployment_service/application/services/kubectl_sandbox.py"
 RUNNER = "deployment_service/application/services/kubectl_runner.py"
 POLICY = "deployment_service/application/services/kubernetes_manifest_policy.py"
 IDENTITY = "deployment_service/application/services/kubernetes_execution_identity.py"
+NETWORK = "deployment_service/application/services/kubernetes_sandbox_network.py"
 ADAPTER = "deployment_service/infrastructure/sandbox/container_kubectl_sandbox.py"
 
 BOUNDARY_TESTS = "deployment_service/tests/test_kubernetes_trust_boundary.py"
+NETWORK_TESTS = "deployment_service/tests/test_sandbox_network_isolation.py"
 
 
 class MutationNotApplied(RuntimeError):
@@ -369,7 +371,11 @@ PROBES: list[Probe] = [
     Probe(
         "unpin-the-api-server",
         "stop constraining the kubeconfig to the host-owned endpoint",
-        replace(RUNNER, "expected_server=expected_api_server(),", "expected_server=None,"),
+        # The pinning moved into the immutable config snapshot
+        # (Workstream C); the probe follows the defence rather than
+        # being retired alongside it.
+        replace(RUNNER, "expected_server=self._config.expected_api_server or None,",
+                "expected_server=None,"),
     ),
     Probe(
         "unpin-the-ca-fingerprint",
@@ -428,8 +434,86 @@ PROBES: list[Probe] = [
                         'automount = pod_spec.get("automountServiceAccountToken", False)'),
     ),
 
+    Probe(
+        "network-accept-unapproved-cotenant",
+        "let an unrelated container share the sandbox network",
+        replace(NETWORK, "if unexpected:", "if False:"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-allow-external-routing",
+        "accept a non-internal network that NATs to the Internet",
+        replace(NETWORK, "if not observed.internal:", "if False:"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-accept-any-driver",
+        "accept a driver whose segment we cannot reason about",
+        replace(NETWORK, "if observed.driver not in ALLOWED_DRIVERS:", "if False:"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-accept-missing-destination",
+        "proceed when the approved Kubernetes endpoint is absent",
+        replace(NETWORK, "if missing:", "if False:"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-accept-rebuilt-same-name",
+        "treat a same-name rebuilt network as the approved one",
+        replace(NETWORK, "if approved_digest and approved_digest != observed.digest():",
+                "if False:"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-identity-is-just-a-name",
+        "collapse the network identity down to its name",
+        replace(NETWORK, '"network_id": self.network_id,', '"network_id": "",'),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-inspection-failure-is-a-pass",
+        "treat an uninspectable network as acceptable",
+        replace(NETWORK, "if result.returncode != 0:", "if False:"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "sandbox-skip-network-verification",
+        "launch the sandbox without re-validating its network",
+        replace(ADAPTER, "self._validate_network()", "pass"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "config-reread-environment-mid-run",
+        "re-read the namespace from the environment instead of the snapshot",
+        replace(RUNNER, "return self._config.namespace",
+                'return os.getenv("DEPLOYMENT_KUBERNETES_NAMESPACE", '
+                '"devops-production-namespace")'),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "identity-drop-network",
+        "stop binding the network identity to the approval",
+        replace(IDENTITY, 'f"network={self.network_identity}",', 'f"network=",'),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "identity-drop-workload-identity-policy",
+        "stop binding the workload identity policy to the approval",
+        replace(IDENTITY, 'f"workload_identity={self.workload_identity_policy}",',
+                'f"workload_identity=",'),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "workload-policy-ignores-sa-token-posture",
+        "let the SA-token posture change without changing the policy identity",
+        replace(POLICY,
+                'f"sa_tokens={self.allow_service_account_tokens}",\n'
+                '            f"namespace={self.namespace}",',
+                'f"sa_tokens=",\n            f"namespace={self.namespace}",'),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
 ]
-
 
 def _copy_platform(destination: Path) -> Path:
     root = destination / "platform"

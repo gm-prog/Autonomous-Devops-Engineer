@@ -1093,3 +1093,63 @@ def test_policy_identity_binds_every_new_allowlist():
                {"deployment_service_account": "other-deployer"},
                {"service_account": "wl"}):
         assert _policy(**kw).identity() != base, f"{kw} not bound into identity"
+
+
+# =====================================================================
+# 10. Final corrective: network identity and workload identity policy
+#     are bound to the approval exactly like every other field.
+# =====================================================================
+
+def test_canonical_network_identity_switch_after_approval_is_refused(bound, monkeypatch):
+    """A rebuilt network under the same name must not inherit approval."""
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY",
+                       "kubernetes-sandbox-network-v1:0000rebuilt0000")
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_workload_identity_policy_switch_after_approval_is_refused(bound, monkeypatch):
+    """Relaxing the SA/automount posture must not inherit approval."""
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_K8S_DEPLOYER_SERVICE_ACCOUNT", "some-other-deployer")
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert "workload_identity_policy" in result["stderr"] or "changed after approval" in result["stderr"]
+    assert sandbox.calls == []
+
+
+def test_enabling_service_account_tokens_after_approval_is_refused(bound, monkeypatch):
+    runner, sandbox, manifest, _ = bound
+    approved = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_K8S_ALLOW_SA_TOKENS", "true")
+    monkeypatch.setenv("DEPLOYMENT_K8S_WORKLOAD_SERVICE_ACCOUNT", "suddenly-allowed")
+    result = KubectlRunnerService(sandbox=sandbox).apply(
+        str(manifest), approved_identity=approved)
+    assert result["status"] == "BLOCKED"
+    assert sandbox.calls == []
+
+
+def test_runner_uses_one_config_snapshot_for_the_whole_run(bound, monkeypatch):
+    """TOCTOU: the environment moving mid-run must not change decisions."""
+    runner, _, _, _ = bound
+    first = runner.execution_identity()
+    monkeypatch.setenv("DEPLOYMENT_KUBERNETES_NAMESPACE", "moved-underneath")
+    monkeypatch.setenv("DEPLOYMENT_K8S_CREDENTIAL_PROFILE", "moved-too")
+    second = runner.execution_identity()
+    assert first.digest() == second.digest(), \
+        "the runner re-read the environment instead of using its snapshot"
+    assert second.namespace == NAMESPACE
+
+
+def test_execution_identity_evidence_includes_the_new_fields(bound):
+    runner, _, _, _ = bound
+    body = runner.execution_identity().to_dict()
+    assert "network_identity" in body
+    assert "workload_identity_policy" in body
+    assert body["workload_identity_policy"].startswith("kubernetes-workload-identity-v1:")

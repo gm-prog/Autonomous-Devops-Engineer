@@ -36,6 +36,7 @@ from deployment_service.application.services.kubernetes_execution_identity impor
     KubernetesExecutionIdentity,
     KubernetesExecutionIdentityError,
     expected_api_server,
+    KubernetesExecutionConfig,
     expected_ca_fingerprint,
     verify_binding,
 )
@@ -66,17 +67,21 @@ class KubernetesSandboxPort(Protocol):
 class KubectlRunnerService:
     """Policy-bound Kubernetes runner. Executes only inside the sandbox."""
 
-    def __init__(self, sandbox: Optional[KubernetesSandboxPort] = None) -> None:
+    def __init__(self, sandbox: Optional[KubernetesSandboxPort] = None,
+                 config: Optional[KubernetesExecutionConfig] = None) -> None:
         self._sandbox = sandbox
-        self._manifest_policy = KubernetesManifestPolicy(namespace=self.namespace())
+        # Workstream C: one immutable snapshot for the whole run. Every
+        # decision below reads THIS object, never the environment, so
+        # configuration cannot drift between check and use.
+        self._config = config or KubernetesExecutionConfig.from_environment()
+        self._manifest_policy = KubernetesManifestPolicy(
+            namespace=self._config.namespace)
 
     # ---------------------------------------------------------------- config
 
-    @staticmethod
-    def namespace() -> str:
-        """The single host-owned execution namespace."""
-        return os.getenv("DEPLOYMENT_KUBERNETES_NAMESPACE", DEFAULT_NAMESPACE).strip() \
-            or DEFAULT_NAMESPACE
+    def namespace(self) -> str:
+        """The single host-owned execution namespace, from the snapshot."""
+        return self._config.namespace
 
     def _check_namespace(self, namespace: Optional[str]) -> Optional[Dict[str, Any]]:
         """Reject any namespace that is not the host-owned one."""
@@ -101,7 +106,7 @@ class KubectlRunnerService:
     # ------------------------------------------------------------ credentials
 
     def _kubeconfig(self) -> SanitizedKubeconfig:
-        path = os.getenv("DEPLOYMENT_KUBECONFIG_PATH", "").strip()
+        path = self._config.kubeconfig_path
         if not path:
             raise KubeconfigPolicyError(
                 "DEPLOYMENT_KUBECONFIG_PATH must be explicitly configured for "
@@ -114,15 +119,13 @@ class KubectlRunnerService:
         sanitized = sanitize_kubeconfig(
             raw,
             expected_namespace=self.namespace(),
-            credential_profile_id=os.getenv(
-                "DEPLOYMENT_K8S_CREDENTIAL_PROFILE", "ares-k8s-deployer-v1"
-            ).strip() or "ares-k8s-deployer-v1",
+            credential_profile_id=self._config.credential_profile_id,
             # The host-owned endpoint. Without this the runner would
             # accept any syntactically valid https cluster, which makes
             # the approved target a suggestion rather than a binding.
-            expected_server=expected_api_server(),
+            expected_server=self._config.expected_api_server or None,
         )
-        pinned_ca = expected_ca_fingerprint()
+        pinned_ca = self._config.expected_ca_fingerprint
         if pinned_ca and sanitized.cluster_identity.ca_fingerprint_sha256 != pinned_ca:
             raise KubeconfigPolicyError(
                 "the cluster CA does not match the host-owned fingerprint; "
@@ -138,7 +141,7 @@ class KubectlRunnerService:
         )
         sandbox = ContainerKubectlSandbox(
             load_spec_from_environment(),
-            runtime=os.getenv("DEPLOYMENT_CONTAINER_RUNTIME", "docker").strip() or "docker",
+            runtime=self._config.container_runtime,
         )
         self._sandbox = sandbox
         return sandbox
@@ -163,8 +166,8 @@ class KubectlRunnerService:
             credential_profile_id=kubeconfig.credential_profile_id,
             manifest_policy_identity=self._manifest_policy.identity(),
             sandbox_policy_identity=sandbox_identity,
-            network_identity=os.getenv(
-                "DEPLOYMENT_KUBECTL_SANDBOX_NETWORK", "").strip(),
+            network_identity=self._config.network_identity,
+            workload_identity_policy=self._manifest_policy.workload_identity_policy(),
         )
 
     # --------------------------------------------------------------- manifest

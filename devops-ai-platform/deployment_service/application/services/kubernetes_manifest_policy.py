@@ -169,7 +169,7 @@ class KubernetesManifestPolicy:
         allowed_secret_names: Optional[Sequence[str]] = None,
         allowed_pvc_names: Optional[Sequence[str]] = None,
         allowed_configmap_names: Optional[Sequence[str]] = None,
-        allow_service_account_tokens: bool = False,
+        allow_service_account_tokens: Optional[bool] = None,
     ) -> None:
         self.namespace = (
             namespace
@@ -196,7 +196,11 @@ class KubernetesManifestPolicy:
         # The identity generated workloads may run as. None (the default)
         # means "no workload may choose an identity at all".
         if service_account is None:
-            service_account = os.getenv("DEPLOYMENT_K8S_SERVICE_ACCOUNT", "").strip() or None
+            service_account = (
+                os.getenv("DEPLOYMENT_K8S_WORKLOAD_SERVICE_ACCOUNT", "").strip()
+                or os.getenv("DEPLOYMENT_K8S_SERVICE_ACCOUNT", "").strip()
+                or None
+            )
         self.service_account = service_account
 
         # Workload creation is an INDIRECT path to Secret access: a pod
@@ -215,7 +219,16 @@ class KubernetesManifestPolicy:
             allowed_configmap_names if allowed_configmap_names is not None
             else _parse_name_list(os.getenv("DEPLOYMENT_K8S_ALLOWED_CONFIGMAPS", ""))
         )
-        self.allow_service_account_tokens = allow_service_account_tokens
+        # Host-owned, off by default. Made configurable so the posture is
+        # part of the approved identity: a run that enables API identity
+        # for workloads must not inherit an approval taken while it was
+        # disabled.
+        if allow_service_account_tokens is None:
+            allow_service_account_tokens = (
+                os.getenv("DEPLOYMENT_K8S_ALLOW_SA_TOKENS", "").strip().lower()
+                in ("1", "true", "yes")
+            )
+        self.allow_service_account_tokens = bool(allow_service_account_tokens)
 
         if allowed_resources is None:
             raw = os.getenv("DEPLOYMENT_K8S_ALLOWED_RESOURCES", "").strip()
@@ -226,6 +239,24 @@ class KubernetesManifestPolicy:
     # ------------------------------------------------------------------
     # identity
     # ------------------------------------------------------------------
+    def workload_identity_policy(self) -> str:
+        """Identity of the workload-identity posture alone.
+
+        Separate from identity() so an approval can bind the
+        deployment/workload service-account separation and the
+        automount posture specifically: relaxing them must not be able
+        to inherit a stricter policy's approval.
+        """
+        material = "|".join([
+            "kubernetes-workload-identity-v1",
+            f"deployment_sa={self.deployment_service_account}",
+            f"workload_sa={self.service_account or ''}",
+            f"sa_tokens={self.allow_service_account_tokens}",
+            f"namespace={self.namespace}",
+        ])
+        return ("kubernetes-workload-identity-v1:"
+                + hashlib.md5(material.encode()).hexdigest())
+
     def identity(self) -> str:
         """Deterministic, non-secret identity of this policy configuration.
 

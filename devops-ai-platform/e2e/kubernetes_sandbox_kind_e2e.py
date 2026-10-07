@@ -54,6 +54,9 @@ from deployment_service.application.services.kubeconfig_policy import (  # noqa:
 from deployment_service.application.services.kubectl_runner import (  # noqa: E402
     KubectlRunnerService,
 )
+from deployment_service.application.services.kubernetes_sandbox_network import (  # noqa: E402
+    PerExecutionNetwork,
+)
 from deployment_service.application.services.kubectl_sandbox import (  # noqa: E402
     KubectlOperation,
     KubectlSandboxSpec,
@@ -291,7 +294,7 @@ def check_network_reachability(sandbox: ContainerKubectlSandbox,
 def check_unrelated_destination_blocked(spec: KubectlSandboxSpec) -> None:
     """Egress must be destination-controlled, not open Internet."""
     probe = [
-        "docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+        "docker", "run", "--rm", "--network", spec.network,
         "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges:true", "--pull", "never",
         "--entrypoint", "kubectl", spec.image,
@@ -346,7 +349,7 @@ def check_docker_socket_denied(spec: KubectlSandboxSpec) -> None:
            not sock and not privileged and len(argv) > 5)
 
     probe = [
-        "docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+        "docker", "run", "--rm", "--network", spec.network,
         "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges:true", "--pull", "never",
         "--entrypoint", "sh", spec.image, "-c",
@@ -360,68 +363,137 @@ def check_docker_socket_denied(spec: KubectlSandboxSpec) -> None:
            "SOCKET_ABSENT" in combined)
 
 
-def check_same_network_peer(spec: KubectlSandboxSpec) -> None:
-    """`--internal` proves no Internet; it does NOT isolate peers.
+def check_peer_isolation(spec: KubectlSandboxSpec, network: str) -> None:
+    """The sandbox network carries ONLY approved destinations.
 
-    An unrelated container attached to the same network is a co-tenant.
-    This measures reachability honestly: whatever the answer is, it is
-    recorded as observed rather than assumed.
+    `--internal` removes the NAT route but does not isolate a bridge's
+    own members, so a co-tenant used to be fully reachable. The sandbox
+    now runs on a dedicated per-execution network containing only the
+    Kubernetes endpoint. An unrelated peer lives on its own network and
+    must be unreachable from the sandbox.
+
+    A positive control runs first: the peer is proven reachable from
+    its OWN network. Without it, "unreachable" could simply mean the
+    peer never started, and the isolation result would prove nothing.
     """
     peer = "ares-e2e-unrelated-peer"
-    subprocess.run(["docker", "rm", "-f", peer],
+    peer_net = "ares-e2e-peer-net"
+    subprocess.run(["docker", "rm", "-f", peer], capture_output=True,
+                   text=True, timeout=60)
+    subprocess.run(["docker", "network", "create", "--internal", peer_net],
                    capture_output=True, text=True, timeout=60)
     started = subprocess.run(
-        ["docker", "run", "-d", "--name", peer, "--network", SANDBOX_NETWORK,
+        ["docker", "run", "-d", "--name", peer, "--network", peer_net,
          "--pull", "never", "--entrypoint", "sh", spec.image, "-c",
-         # a trivial listener on 9999, using only what the image has
          "while true; do nc -l -p 9999 >/dev/null 2>&1 || sleep 1; done"],
         capture_output=True, text=True, timeout=120)
     if started.returncode != 0:
         record("network:adversarial-peer-started",
-               "an unrelated peer joins the sandbox network",
+               "an unrelated peer is running on its own network",
                f"NOT VERIFIED: {started.stderr.strip()[:160]!r}", False)
         return
     record("network:adversarial-peer-started",
-           "an unrelated peer joins the sandbox network", "started", True)
+           "an unrelated peer is running on its own network", "started", True)
+
+    def probe(from_network: str) -> tuple[int, str]:
+        out = subprocess.run(
+            ["docker", "run", "--rm", "--network", from_network,
+             "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
+             "--security-opt", "no-new-privileges:true", "--pull", "never",
+             "--entrypoint", "kubectl", spec.image,
+             "--server", f"https://{peer}:9999", "--insecure-skip-tls-verify=true",
+             "--token", "peer-probe-not-a-credential",
+             "--request-timeout=8s", "get", "namespaces"],
+            capture_output=True, text=True, timeout=90)
+        return out.returncode, f"{out.stdout}\n{out.stderr}".lower()
+
+    # Semantics, stated once and applied to both probes.
+    REACHED = ("connection refused", "connection reset", "tls", "x509",
+               "server gave http response", "eof")
+    ISOLATED = ("no such host", "could not resolve", "i/o timeout",
+                "no route to host", "network is unreachable", "context deadline")
+
     try:
-        probe = [
-            "docker", "run", "--rm", "--network", SANDBOX_NETWORK,
-            "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
-            "--security-opt", "no-new-privileges:true", "--pull", "never",
-            "--entrypoint", "kubectl", spec.image,
-            "--server", f"https://{peer}:9999", "--insecure-skip-tls-verify=true",
-            "--token", "peer-probe-not-a-credential",
-            "--request-timeout=8s", "get", "namespaces",
-        ]
-        out = subprocess.run(probe, capture_output=True, text=True, timeout=90)
-        combined = f"{out.stdout}\n{out.stderr}".lower()
-        # "connection refused" means the SYN REACHED the peer and was
-        # reset: that is reachability, not isolation. Only an absent
-        # route or an unresolvable name proves the peer cannot be
-        # addressed. Classifying a refusal as "blocked" would be a
-        # probe that cannot observe its own property.
-        isolated = ("no such host", "could not resolve", "i/o timeout",
-                    "no route to host", "network is unreachable",
-                    "context deadline")
-        reachable = ("connection refused", "connection reset",
-                     "tls", "x509", "server gave http response")
-        prompted = "please enter username" in combined
-        was_reachable = any(m in combined for m in reachable)
-        denied = (out.returncode != 0 and not prompted and not was_reachable
-                  and any(m in combined for m in isolated))
+        # --- positive control: reachable from its own network ---
+        _, ctl = probe(peer_net)
+        ctl_prompted = "please enter username" in ctl
+        ctl_reached = any(m in ctl for m in REACHED) and not ctl_prompted
+        record("network:peer-reachable-from-its-own-network",
+               "positive control: the peer really is listening and addressable",
+               f"reached={ctl_reached} detail={ctl.strip()[:180]!r}",
+               ctl_reached)
+
+        # --- the actual isolation claim ---
+        code, out = probe(network)
+        prompted = "please enter username" in out
+        reached = any(m in out for m in REACHED)
+        isolated = (code != 0 and not prompted and not reached
+                    and any(m in out for m in ISOLATED))
         if prompted:
-            combined += " [PROBE DEFECT: kubectl prompted instead of connecting]"
-        if was_reachable:
-            combined += (" [PEER REACHABLE: the connection was answered or reset, "
-                         "so the co-tenant is addressable from the sandbox]")
-        record("network:same-network-peer-not-reachable",
-               "a co-tenant on the sandbox network is unreachable",
-               f"exit={out.returncode} reachable={was_reachable} "
-               f"detail={combined.strip()[:220]!r}",
-               denied)
+            out += " [PROBE DEFECT: kubectl prompted instead of connecting]"
+        if reached:
+            out += " [PEER REACHABLE: the connection was answered or reset]"
+        record("network:unrelated-peer-not-reachable-from-sandbox",
+               "a container outside the approved destination set is unreachable",
+               f"exit={code} reached={reached} detail={out.strip()[:200]!r}",
+               isolated)
     finally:
-        subprocess.run(["docker", "rm", "-f", peer],
+        subprocess.run(["docker", "rm", "-f", peer], capture_output=True,
+                       text=True, timeout=60)
+        subprocess.run(["docker", "network", "rm", peer_net],
                        capture_output=True, text=True, timeout=60)
+
+
+def check_unapproved_cotenant_rejected(network: str, peers: list) -> None:
+    """A co-tenant that joins the approved network fails the run closed."""
+    from deployment_service.application.services.kubernetes_sandbox_network import (
+        KubernetesSandboxNetworkError, validate_network,
+    )
+    squatter = "ares-e2e-squatter"
+    subprocess.run(["docker", "rm", "-f", squatter], capture_output=True,
+                   text=True, timeout=60)
+    # Clean membership must validate.
+    try:
+        identity = validate_network(network, approved_identity=None,
+                                    approved_peers=peers)
+        record("network:approved-membership-validates",
+               "the dedicated network carries only approved destinations",
+               f"driver={identity.driver} internal={identity.internal} "
+               f"peers={list(identity.approved_peers)}", True)
+    except KubernetesSandboxNetworkError as exc:
+        record("network:approved-membership-validates",
+               "the dedicated network carries only approved destinations",
+               f"BLOCKED: {exc}", False)
+        return
+
+    started = subprocess.run(
+        ["docker", "run", "-d", "--name", squatter, "--network", network,
+         "--pull", "never", "--entrypoint", "sh", "alpine:3.20", "-c", "sleep 300"],
+        capture_output=True, text=True, timeout=120)
+    if started.returncode != 0:
+        # Fall back to any image already present locally.
+        started = subprocess.run(
+            ["docker", "run", "-d", "--name", squatter, "--network", network,
+             "--entrypoint", "sleep", "registry:2", "300"],
+            capture_output=True, text=True, timeout=180)
+    if started.returncode != 0:
+        record("network:unapproved-cotenant-rejected",
+               "an unexpected member fails the execution closed",
+               f"NOT VERIFIED: could not start a co-tenant: "
+               f"{started.stderr.strip()[:160]!r}", False)
+        return
+    try:
+        try:
+            validate_network(network, approved_identity=None, approved_peers=peers)
+            rejected, detail = False, "validation ACCEPTED an unapproved co-tenant"
+        except KubernetesSandboxNetworkError as exc:
+            rejected, detail = True, str(exc)[:200]
+        record("network:unapproved-cotenant-rejected",
+               "an unexpected member fails the execution closed",
+               f"rejected={rejected} detail={detail!r}", rejected)
+    finally:
+        subprocess.run(["docker", "rm", "-f", squatter], capture_output=True,
+                       text=True, timeout=60)
 
 
 def check_malicious_manifests(runner: KubectlRunnerService, workdir: Path) -> None:
@@ -498,7 +570,7 @@ def check_kubeconfig_attacks(fixture: Dict[str, Any]) -> None:
 def check_plugin_execution(spec: KubectlSandboxSpec) -> None:
     """A kubectl plugin must not be reachable inside the sandbox."""
     out = subprocess.run(
-        ["docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+        ["docker", "run", "--rm", "--network", spec.network,
          "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
          "--security-opt", "no-new-privileges:true", "--pull", "never",
          "--entrypoint", "kubectl", spec.image, "plugin", "list"],
@@ -513,7 +585,7 @@ def check_plugin_execution(spec: KubectlSandboxSpec) -> None:
 def check_filesystem_and_process_escape(spec: KubectlSandboxSpec) -> None:
     """Read-only rootfs and the absence of a shell / Docker socket."""
     writable = subprocess.run(
-        ["docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+        ["docker", "run", "--rm", "--network", spec.network,
          "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
          "--security-opt", "no-new-privileges:true", "--pull", "never",
          "--entrypoint", "kubectl", spec.image,
@@ -526,7 +598,7 @@ def check_filesystem_and_process_escape(spec: KubectlSandboxSpec) -> None:
            writable.returncode != 0)
 
     sock = subprocess.run(
-        ["docker", "run", "--rm", "--network", SANDBOX_NETWORK,
+        ["docker", "run", "--rm", "--network", spec.network,
          "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
          "--security-opt", "no-new-privileges:true", "--pull", "never",
          "--entrypoint", "kubectl", spec.image,
@@ -775,12 +847,32 @@ def main() -> int:
         # control-plane is attached below; nothing else is reachable.
         # A plain user-defined bridge would NAT to the Internet, which
         # the trust boundary forbids.
-        run(["docker", "network", "create", "--internal", SANDBOX_NETWORK],
-            check=False)
-        run(["docker", "network", "connect", SANDBOX_NETWORK,
-             f"{CLUSTER}-control-plane"], check=False)
+        # Workstream A: a DEDICATED network for this execution carrying
+        # only the Kubernetes endpoint. A shared --internal network has
+        # no NAT route but does not isolate its own members, so every
+        # co-tenant on it was reachable. This one has exactly one
+        # approved destination and its membership is validated before
+        # the sandbox runs.
+        approved_peers = [f"{CLUSTER}-control-plane"]
+        exec_network = PerExecutionNetwork(approved_peers=tuple(approved_peers))
+        network_identity = exec_network.create()
+        sandbox_network = exec_network.name
+        os.environ["DEPLOYMENT_KUBECTL_SANDBOX_NETWORK"] = sandbox_network
+        os.environ["DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY"] = network_identity.digest()
+        notice(f"8.6-A network: {sandbox_network} "
+               f"identity={network_identity.digest()} "
+               f"internal={network_identity.internal} "
+               f"driver={network_identity.driver} "
+               f"peers={list(network_identity.approved_peers)}")
+        record("network:dedicated-per-execution-network",
+               "a dedicated internal network carrying only approved destinations",
+               f"name={sandbox_network} internal={network_identity.internal} "
+               f"driver={network_identity.driver} "
+               f"peers={list(network_identity.approved_peers)}",
+               network_identity.internal and network_identity.driver == "bridge"
+               and list(network_identity.approved_peers) == approved_peers)
 
-        spec = KubectlSandboxSpec(image=pinned, network=SANDBOX_NETWORK,
+        spec = KubectlSandboxSpec(image=pinned, network=sandbox_network,
                                   kubectl_version=args.kubectl_version)
         policy_id = sandbox_policy_identity(spec, NAMESPACE)
         notice(f"8.6-A sandbox: image_digest={image_id} "
@@ -807,7 +899,8 @@ def main() -> int:
         check_network_reachability(sandbox, sanitized.content)
         check_unrelated_destination_blocked(spec)
         check_docker_socket_denied(spec)
-        check_same_network_peer(spec)
+        check_peer_isolation(spec, spec.network)
+        check_unapproved_cotenant_rejected(spec.network, approved_peers)
 
         print("\n== sandbox runtime ==", flush=True)
         check_plugin_execution(spec)
@@ -877,6 +970,10 @@ def main() -> int:
         if created_cluster:
             subprocess.run(["kind", "delete", "cluster", "--name", CLUSTER],
                            capture_output=True, timeout=300)
+        try:
+            exec_network.destroy()
+        except Exception:
+            pass
         subprocess.run(["docker", "network", "rm", SANDBOX_NETWORK],
                        capture_output=True, timeout=60)
         shutil.rmtree(workdir, ignore_errors=True)

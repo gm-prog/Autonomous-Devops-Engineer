@@ -22,6 +22,7 @@ profile name, the endpoint, and a fingerprint of the CA bundle.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -44,6 +45,10 @@ class KubernetesExecutionIdentity:
     manifest_policy_identity: str
     sandbox_policy_identity: str
     network_identity: str
+    #: Identity of the workload-identity policy (deployment SA, allowed
+    #: workload SA, automount posture). A relaxation must not be able to
+    #: inherit a stricter policy's approval.
+    workload_identity_policy: str = ""
 
     def digest(self) -> str:
         material = "|".join([
@@ -55,6 +60,7 @@ class KubernetesExecutionIdentity:
             f"manifest_policy={self.manifest_policy_identity}",
             f"sandbox_policy={self.sandbox_policy_identity}",
             f"network={self.network_identity}",
+            f"workload_identity={self.workload_identity_policy}",
         ])
         return hashlib.sha256(material.encode()).hexdigest()
 
@@ -68,6 +74,7 @@ class KubernetesExecutionIdentity:
             "manifest_policy_identity": self.manifest_policy_identity,
             "sandbox_policy_identity": self.sandbox_policy_identity,
             "network_identity": self.network_identity,
+            "workload_identity_policy": self.workload_identity_policy,
         }
 
     def to_dict(self) -> Dict[str, Any]:
@@ -81,6 +88,7 @@ class KubernetesExecutionIdentity:
             "manifest_policy_identity": self.manifest_policy_identity,
             "sandbox_policy_identity": self.sandbox_policy_identity,
             "network_identity": self.network_identity,
+            "workload_identity_policy": self.workload_identity_policy,
             "execution_identity": self.digest(),
         }
 
@@ -89,11 +97,80 @@ class KubernetesExecutionIdentity:
         changed: Dict[str, str] = {}
         for field in ("namespace", "api_server", "ca_fingerprint_sha256",
                       "credential_profile_id", "manifest_policy_identity",
-                      "sandbox_policy_identity", "network_identity"):
+                      "sandbox_policy_identity", "network_identity",
+                      "workload_identity_policy"):
             mine, theirs = getattr(self, field), getattr(other, field)
             if mine != theirs:
                 changed[field] = f"approved={mine!r} observed={theirs!r}"
         return changed
+
+
+@dataclass(frozen=True)
+class KubernetesExecutionConfig:
+    """An immutable snapshot of host-owned Kubernetes execution config.
+
+    Workstream C. Previously each value was read with ``os.getenv``
+    independently, whenever the code happened to need it. That is a
+    time-of-check/time-of-use gap: the namespace could be read before
+    approval and the endpoint after it, with nothing guaranteeing the
+    two described the same world.
+
+    The snapshot is taken ONCE and carried for the whole run, so every
+    decision in that run is made against the same configuration. It
+    holds identities only -- never a token, key or kubeconfig body.
+    """
+
+    namespace: str
+    kubeconfig_path: str
+    credential_profile_id: str
+    expected_api_server: str
+    expected_ca_fingerprint: str
+    sandbox_network: str
+    sandbox_network_identity: str
+    container_runtime: str
+
+    @classmethod
+    def from_environment(cls) -> "KubernetesExecutionConfig":
+        """Read every host-owned value in a single pass."""
+        return cls(
+            namespace=(os.getenv("DEPLOYMENT_KUBERNETES_NAMESPACE", "").strip()
+                       or "devops-production-namespace"),
+            kubeconfig_path=os.getenv("DEPLOYMENT_KUBECONFIG_PATH", "").strip(),
+            credential_profile_id=(os.getenv("DEPLOYMENT_K8S_CREDENTIAL_PROFILE",
+                                             "").strip() or "default"),
+            expected_api_server=os.getenv("DEPLOYMENT_K8S_API_SERVER", "").strip(),
+            expected_ca_fingerprint=os.getenv("DEPLOYMENT_K8S_CA_FINGERPRINT",
+                                              "").strip().lower(),
+            sandbox_network=os.getenv("DEPLOYMENT_KUBECTL_SANDBOX_NETWORK", "").strip(),
+            # A bare name is not an identity: a network can be deleted
+            # and rebuilt wider under the same name. This canonical
+            # digest, published by whoever created the isolated network,
+            # detects that.
+            sandbox_network_identity=os.getenv(
+                "DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY", "").strip(),
+            container_runtime=(os.getenv("DEPLOYMENT_CONTAINER_RUNTIME", "").strip()
+                               or "docker"),
+        )
+
+    @property
+    def network_identity(self) -> str:
+        """Prefer the canonical identity; fall back to the bare name."""
+        return self.sandbox_network_identity or self.sandbox_network
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "namespace": self.namespace,
+            "credential_profile_id": self.credential_profile_id,
+            "expected_api_server": self.expected_api_server,
+            "expected_ca_fingerprint": self.expected_ca_fingerprint,
+            "sandbox_network": self.sandbox_network,
+            "sandbox_network_identity": self.sandbox_network_identity,
+            "container_runtime": self.container_runtime,
+        }
+
+    def digest(self) -> str:
+        blob = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def expected_api_server() -> Optional[str]:
