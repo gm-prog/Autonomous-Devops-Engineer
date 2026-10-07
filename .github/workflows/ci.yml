@@ -318,13 +318,32 @@ jobs:
             [ -n "${KEY:-}" ] || continue
             export "$KEY=$REF"
           done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          # Artifact and raw-log retrieval is unreliable for this
+          # repository, so the driver's output is mirrored into
+          # annotations here. Without this a crash that happens before
+          # the driver can write evidence is invisible.
+          set +e
           PYTHONPATH=. python e2e/kubernetes_service_http_kind_e2e.py \
             --cluster ares-http-e2e \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \
             --redis-image "$E2E_REDIS_IMAGE" \
             --registry localhost:5002 \
             --kubectl-version "$ARES_KUBECTL_VERSION" \
-            --evidence kubernetes-http-e2e-evidence.json
+            --evidence kubernetes-http-e2e-evidence.json 2>&1 | tee /tmp/8.6-b.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE" != "0" ]; then
+            {
+              echo '### Phase 8.6-A Workstream B output (tail)'
+              echo '```'
+              tail -c 12000 /tmp/8.6-b.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            tail -n 25 /tmp/8.6-b.log | while IFS= read -r LINE; do
+              printf '::error title=8.6-B output::%s\n' "${LINE//$'\r'/}"
+            done
+          fi
+          exit "$CODE"
       - name: Publish live evidence
         if: always()
         run: |
