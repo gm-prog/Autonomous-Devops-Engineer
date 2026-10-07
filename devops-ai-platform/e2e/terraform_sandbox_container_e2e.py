@@ -41,6 +41,7 @@ pass. Exit code 0 only if every check passed.
 from __future__ import annotations
 
 import argparse
+import base64
 import http.server
 import json
 import os
@@ -801,8 +802,14 @@ def main() -> int:
     payload = {
         "e2e_status": status,
         "e2e_kind": "containerized-deployment-service",
-        "commit_sha": os.environ.get("GITHUB_SHA", ""),
+        # The commit whose tree this proof actually executed.
+        "proof_commit": os.environ.get("GITHUB_SHA", ""),
+        "base_commit": os.environ.get("E2E_BASE_COMMIT", ""),
         "workflow_run_id": os.environ.get("GITHUB_RUN_ID", ""),
+        "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        "job": os.environ.get("GITHUB_JOB", ""),
+        "terraform_runtime_version": runtime.get("terraform_version", ""),
+        "sandbox_uid_gid": f"{runtime.get('uid','?')}:{runtime.get('gid','?')}",
         "checks_total": len(st.rows),
         "checks_passed": len(st.rows) - len(st.failed),
         "checks_failed": len(st.failed),
@@ -815,7 +822,16 @@ def main() -> int:
         **evidence,
         "checks": st.rows,
     }
-    Path(args.evidence).write_text(json.dumps(payload, indent=2, sort_keys=True))
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
+    Path(args.evidence).write_text(rendered)
+    # Artifact downloads are not reachable from every environment, so the
+    # exact evidence bytes are also emitted as annotations. Base64 keeps
+    # them byte-identical to the uploaded artifact.
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        blob = base64.b64encode(rendered.encode()).decode()
+        for index in range(0, len(blob), 3000):
+            notice(f"evidence-b64-{index // 3000:03d}", blob[index:index + 3000])
+        notice("evidence-b64-count", str(-(-len(blob) // 3000)))
     notice("container-e2e-summary",
            f"{status} {payload['checks_passed']}/{payload['checks_total']} "
            f"approved={str(evidence.get('approval_plan_hash',''))[:16]} "

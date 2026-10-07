@@ -129,6 +129,7 @@ jobs:
             [ -n "${KEY:-}" ] || continue
             export "$KEY=$REF"
           done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          export E2E_BASE_COMMIT=d4e87a5
           python e2e/terraform_sandbox_container_e2e.py \
             --registry localhost:5001 \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \

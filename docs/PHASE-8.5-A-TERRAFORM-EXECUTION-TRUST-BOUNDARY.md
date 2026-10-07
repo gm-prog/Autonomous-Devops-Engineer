@@ -1,7 +1,7 @@
 # Phase 8.5-A — Terraform Execution Trust Boundary v1
 
-**Status:** implemented and unit-verified. Live E2E execution of the
-sandbox is **NOT VERIFIED** (see §7).
+**Status:** see the single authoritative status section (§7). No other
+section in this document states a status.
 
 ## 1. The problem this closes
 
@@ -288,37 +288,64 @@ anchor; the live E2E is what confirms the delivered runtime. The default
 Docker seccomp profile is relied upon as-is — no custom seccomp profile
 exists and none is claimed.
 
-## 7. Operational status — honest scope
+## 7. Operational status — the one authoritative status section
+
+**LIVE E2E: PASS**
+
+This is the only status statement in this document. Any status wording
+elsewhere is historical narrative and is not authoritative.
+
+The proof is the CI job **"Phase 8.5-A containerized deployment-service
+E2E"** (`e2e/terraform_sandbox_container_e2e.py`). It never imports the
+application. It builds the control-plane and sandbox images, pushes the
+sandbox to a registry to obtain a real digest, pulls it back by digest,
+starts the **real deployment-service container** together with the Redis
+it depends on, and drives the whole deployment through HTTP only:
+`POST /api/internal/deployments/dry-run`, `/{run_id}/approve`,
+`/{run_id}/execute`, `GET /{run_id}`. The machine-readable result for the
+commit under review is `docs/phase-8.5-a-closeout-evidence.json`; a green
+job on an earlier commit is not evidence for a later one.
+
+### REQUESTED versus OBSERVED
+
+"Requested" is what the policy asks the daemon for. "Observed" is what
+the harness measured from inside the running container or from the host.
+Only the observed column is evidence.
+
+| Property | Requested | Observed |
+| --- | --- | --- |
+| Terraform runs non-root | `--user 65532:65532` | `uid=65532 gid=65532` read from the running container |
+| Capabilities dropped | `--cap-drop ALL` | `CapEff=0000000000000000` from `/proc/self/status` |
+| No new privileges | `--security-opt no-new-privileges:true` | `NoNewPrivs: 1` from `/proc/self/status` |
+| Network disabled | `--network none` | `/proc/net/dev` shows loopback only; unreadable ⇒ FAIL, never PASS |
+| Read-only root filesystem | `--read-only` | `ro` flag on the `/` mount in `/proc/self/mountinfo` — a read-only **mount**, not a permission denial |
+| Mounts | workspace only | mountinfo enumerated against a permitted set; unexpected host mounts absent |
+| Docker socket withheld | not passed to the sandbox | absent in the sandbox, present in the control plane |
+| Image identity | digest-pinned, `--pull never` | digest resolved from the registry during the run, never hand-written |
+| Terraform version | label `1.9.8` | `terraform version` output from the running image |
+| Workspace ownership | sandbox identity, `2770` | `65532:65532 2770` observed on the host; the saved plan is `65532:65532 644` |
+| Credentials | none configured | `credentials-disabled`; names only, never values |
+
+### Scope limits that remain true
 
 * The sandbox image is **host-configured** via
   `DEPLOYMENT_TERRAFORM_SANDBOX_IMAGE` and **must** be digest-pinned;
-  anything else is refused. `DEPLOYMENT_TERRAFORM_SANDBOX_VERSION` records
-  the Terraform version in evidence. The repository's established
-  Terraform version is **1.9.8** (`deployment_service/Dockerfile.e2e`) and
-  was not changed.
-* **Live execution status: PASS** (workflow run `37588703539`, 19/19
-  checks). Proved against a real container runtime, with the approved
-  plan hash equal to the applied plan hash
-  (`6b91f375073911a5...`), the Terraform container running non-root
-  (uid 1001 on that runner), `CapEff=0000000000000000`, no network
-  interfaces beyond loopback, no Docker socket inside the sandbox, a
-  read-only root filesystem, and no post-approval re-plan. The image
-  digest was produced by a registry during the run, never hand-written.
-  Kubernetes was stubbed: its hardening is a separate phase and is not
-  validated by this result.
-* Live execution is proved by the `terraform-sandbox-live-e2e` CI job
-  (`e2e/terraform_sandbox_live.py`), which builds the sandbox image,
-  pushes it to a registry to obtain a real digest, pulls it by digest and
-  runs the full chain. It interrogates the running container from the
-  inside (uid, interfaces, socket, rootfs, capabilities, NoNewPrivs)
-  rather than trusting the flags that were requested, and proves
-  `approved_plan_hash == applied_plan_hash` with no post-approval
-  re-plan. If the runtime is unavailable it reports **BLOCKED** and never
-  PASS. The authoritative result is the job's published evidence
-  artifact for the commit under review -- a green job on an earlier
-  commit is not evidence for a later one.
+  anything else is refused. `DEPLOYMENT_TERRAFORM_SANDBOX_VERSION` is a
+  label recorded in evidence, not a measurement of the binary; the
+  observed version comes from the running image.
+* `.terraform/` is **legitimately absent** from the approval workspace.
+  The zero-cloud fixture declares no providers and the sandbox runs with
+  `--network none`, so provider installation cannot occur. The harness
+  records this as an observation and instead asserts that the non-root
+  sandbox wrote the plan artifact into the shared workspace.
+* Kubernetes is **stubbed** at the test topology and is **not** validated
+  by this result. Its hardening is a separate phase.
+* The control plane holds the Docker socket. That is the documented v1
+  residual risk (§6): the deployment-service container is **not**
+  host-isolated, and this phase does not claim it is.
 * This agent's own sandbox has **no Docker CLI and no daemon**, so the
-  live driver was exercised here only along its BLOCKED path.
+  driver reports BLOCKED when run here. All container evidence comes from
+  CI.
 * Docker runtime availability remains a trusted-infrastructure dependency
   of the host orchestration side.
 * This phase does **not** make the platform "production-ready autonomous
