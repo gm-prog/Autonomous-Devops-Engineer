@@ -1,0 +1,79 @@
+{
+  "phase": "8.5-A corrective — Terraform execution trust boundary",
+  "repository": "gm-prog/Autonomous-Devops-Engineer",
+  "base_commit": "d4e87a5186f39c2f0a38aad7860934bf677f299f",
+  "authoritative_phase_start": "e44d6c6fd8522eee2eddff35a423aa11edcd5bd9",
+  "branch": "arena/b6307a50-autonomous-devops-engineer",
+  "branch_deviation": {
+    "requested": "phase-8.5-a-corrective",
+    "used": "arena/b6307a50-autonomous-devops-engineer",
+    "reason": "the agent session is pinned to this branch; work on any other branch is not tracked. Disclosed, not silently substituted."
+  },
+
+  "unit_evidence": {
+    "note": "Measured locally with PYTHONPATH=. python -m pytest, on a FULL (non-shallow) clone.",
+    "commands": [
+      {
+        "command": "python -m pytest deployment_service/tests -q",
+        "passed": 262, "failed": 0, "skipped": 0, "subtests_passed": 34
+      },
+      {
+        "command": "python -m pytest tests/ deployment_service/tests -q",
+        "passed": 893, "failed": 0, "skipped": 0, "subtests_passed": 142
+      },
+      {
+        "command": "python -m pytest api_gateway/tests -q",
+        "passed": 95, "failed": 0, "skipped": 0, "subtests_passed": 78
+      },
+      {
+        "command": "python -m unittest <incident CI list>",
+        "ran": 559, "result": "OK", "skipped": 3
+      }
+    ],
+    "shallow_checkout_caveat": "tests/test_audit_phase_8_4_2_f.py skips one topology test when the checkout is shallow ('needs fetch-depth: 0'). actions/checkout@v4 defaults to depth 1, so the SAME suite reports one fewer passed and one skipped in CI than on a full local clone. This is the documented cause of the previously reported 851-vs-850 discrepancy; the test total is identical."
+  },
+
+  "mutation_evidence": {
+    "harness": "devops-ai-platform/scripts/mutation_probe_terraform_boundary.py",
+    "probes_total": 20,
+    "probes_caught": 17,
+    "probes_absorbed_by_a_sibling_layer": 3,
+    "probes_escaped": 0,
+    "note": "Each probe weakens one control in an ISOLATED COPY of the tree; the working tree is never mutated. The 3 'layered' probes are single layers of a deliberately redundant defence and are covered by combined probes that strip every layer at once.",
+    "defect_found_by_the_harness": "the workspace-confinement test was passing on the filename check, so all confinement layers could be deleted unnoticed; the test was tightened and the combined probe now fails without them."
+  },
+
+  "static_guard": {
+    "script": "devops-ai-platform/scripts/assert_no_host_terraform_execution.py",
+    "audited_modules": 5,
+    "result": "no host Terraform execution path",
+    "allowed_exception": "the trusted container adapter may spawn docker/podman only",
+    "guard_mutation_tests_caught": 4
+  },
+
+  "live_e2e": {
+    "status": "PASS",
+    "workflow_run_id": 37588703539,
+    "job": "Phase 8.5-A live terraform sandbox E2E",
+    "head_sha": "f2c39f4",
+    "driver": "devops-ai-platform/e2e/terraform_sandbox_live.py",
+    "checks_total": 19,
+    "checks_passed": 19,
+    "checks_failed": 0,
+    "approval_plan_hash": "6b91f375073911a5dc991df81be0f949750715e744b77ebb6a6abe790470cdd6",
+    "applied_plan_hash": "6b91f375073911a5dc991df81be0f949750715e744b77ebb6a6abe790470cdd6",
+    "approved_equals_applied": true,
+    "replan_after_approval": false,
+    "terraform_container_uid_gid": "1001:1001",
+    "terraform_container_is_root": false,
+    "effective_capabilities": "0000000000000000",
+    "credential_profile_id": "credentials-disabled",
+    "image_digest_observed": "localhost:5001/ares/terraform-sandbox@sha256:b4ccf0a98c5f85620b793075af282f5d6af5812b1062613efce69bba7eaf0f2e",
+    "image_digest_note": "The sandbox image is built and pushed to a local registry during the run, so the digest is computed by the registry (never invented) and differs per build. The digest above is the one observed in run 37588703539.",
+    "terraform_runtime_version_declared": "1.9.8",
+    "uid_note": "The GitHub runner's control-plane process is uid 1001 (non-root), so the sandbox reuses that identity by design. On a root control plane it would be 65532:65532 and the workspace is chowned.",
+    "kubernetes_note": "Kubernetes is stubbed in the live driver. Kubernetes execution hardening is a separate phase and is NOT validated here."
+  },
+
+  "secrets": "No secret values are recorded. The credential profile is derived from credential NAMES only."
+}

@@ -296,6 +296,16 @@ exists and none is claimed.
   the Terraform version in evidence. The repository's established
   Terraform version is **1.9.8** (`deployment_service/Dockerfile.e2e`) and
   was not changed.
+* **Live execution status: PASS** (workflow run `37588703539`, 19/19
+  checks). Proved against a real container runtime, with the approved
+  plan hash equal to the applied plan hash
+  (`6b91f375073911a5...`), the Terraform container running non-root
+  (uid 1001 on that runner), `CapEff=0000000000000000`, no network
+  interfaces beyond loopback, no Docker socket inside the sandbox, a
+  read-only root filesystem, and no post-approval re-plan. The image
+  digest was produced by a registry during the run, never hand-written.
+  Kubernetes was stubbed: its hardening is a separate phase and is not
+  validated by this result.
 * Live execution is proved by the `terraform-sandbox-live-e2e` CI job
   (`e2e/terraform_sandbox_live.py`), which builds the sandbox image,
   pushes it to a registry to obtain a real digest, pulls it by digest and
