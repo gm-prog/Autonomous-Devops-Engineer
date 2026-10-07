@@ -344,9 +344,15 @@ jobs:
               tail -c 12000 /tmp/8.6-b.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            tail -n 25 /tmp/8.6-b.log | while IFS= read -r LINE; do
-              printf '::error title=8.6-B output::%s\n' "${LINE//$'\r'/}"
-            done
+            # Only annotate from the shell when the driver produced no
+            # evidence of its own; otherwise its compact result
+            # annotation is the better record and should not be
+            # crowded out of the ten-annotation budget.
+            if [ ! -f kubernetes-http-e2e-evidence.json ]; then
+              tail -n 8 /tmp/8.6-b.log | while IFS= read -r LINE; do
+                printf '::error title=8.6-B crash::%s\n' "${LINE//$'\r'/}"
+              done
+            fi
           fi
           exit "$CODE"
       - name: Publish live evidence

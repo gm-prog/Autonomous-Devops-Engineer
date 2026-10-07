@@ -786,10 +786,19 @@ def main() -> int:
     notice(f"{passed}/{total} PASS -- evidence at {out}")
     print(f"::notice title=8.6-B::service->HTTP->Kind E2E: {passed}/{total} PASS, "
           f"{total - passed} FAIL")
-    for row in RESULTS:
+    # GitHub keeps only ten annotations per step and raw log download
+    # is unreliable for this repository, so the full result table also
+    # goes out as one compact, self-describing annotation.
+    import gzip as _gzip
+    packed = base64.b64encode(_gzip.compress(
+        json.dumps(RESULTS, separators=(",", ":")).encode())).decode()
+    for index in range(0, len(packed), 900):
+        print(f"::notice title=8.6-B results {index // 900}::"
+              f"{packed[index:index + 900]}")
+    for row in RESULTS[:6]:
         if row["status"] != "PASS":
             print(f"::error title=8.6-B FAIL::{row['check']} :: "
-                  f"requested={row['requested']} :: observed={row['observed']}")
+                  f"observed={row['observed'][:280]}")
     return 0 if passed == total and total > 0 else 1
 
 
