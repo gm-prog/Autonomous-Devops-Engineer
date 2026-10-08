@@ -91,10 +91,10 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     var isCheckingConnection by mutableStateOf(false)
     var isSettingsSheetOpen by mutableStateOf(false)
 
-    // Phase 8.7-D: gateway access token (platform-issued JWT, operator-
-    // supplied). Never a Gemini key — the Gemini credential stays
-    // server-side. Blank by default: no token means live analysis is off.
-    var gatewayJwtToken by mutableStateOf(prefs.getString("gateway_jwt_token", "") ?: "")
+    // Phase 8.7-D: gateway access token (platform-issued JWT).
+    // Deliberately MEMORY-ONLY: bearer credentials are never persisted in
+    // plaintext SharedPreferences. Blank by default disables live analysis.
+    var gatewayJwtToken by mutableStateOf("")
         private set
 
     // Last analysis source, surfaced honestly in the header badge:
@@ -125,7 +125,6 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateGatewayJwtToken(newToken: String) {
         gatewayJwtToken = newToken.trim()
-        prefs.edit().putString("gateway_jwt_token", gatewayJwtToken).apply()
         connectionStatus = "UNCHECKED"
     }
 
