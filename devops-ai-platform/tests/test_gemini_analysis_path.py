@@ -133,6 +133,11 @@ def _downstream_http_error(status: int) -> requests.HTTPError:
     return requests.HTTPError(response=resp)
 
 
+@pytest.fixture(autouse=True)
+def agent_internal_token(monkeypatch):
+    monkeypatch.setenv("AGENT_INTERNAL_TOKEN", "test-agent-internal-token-0123456789abcdef0123456789abcdef")
+
+
 def _agent_app(llm=None):
     from platform_pkg.agent.main import create_app
 
@@ -295,7 +300,7 @@ class TestAgentAnalysisBoundary:
         """No server key => 503, and NEVER a fabricated analysis."""
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
         with TestClient(_agent_app()) as client:
-            resp = client.post(INTERNAL_PATH, json=GOOD_BODY)
+            resp = client.post(INTERNAL_PATH, json=GOOD_BODY, headers={"X-Gateway-Identity": "agent-test", "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef"})
         assert resp.status_code == 503
         assert "analysis" not in resp.json()
 
@@ -331,9 +336,34 @@ class TestAgentAnalysisBoundary:
         payload = dict(GOOD_BODY)
         payload["gemini_api_key"] = "AIzaFAKE"
         with TestClient(_agent_app(llm=fake)) as client:
-            resp = client.post(INTERNAL_PATH, json=payload)
+            resp = client.post(INTERNAL_PATH, json=payload, headers={"X-Gateway-Identity": "agent-test", "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef"})
         assert resp.status_code == 422
         assert fake.calls == 0  # no provider interaction at all
+
+    def test_internal_boundary_rejects_missing_token(self):
+        fake = FakeLLM(response=GOOD_ASSETS)
+        with TestClient(_agent_app(llm=fake)) as client:
+            resp = client.post(
+                INTERNAL_PATH,
+                json=GOOD_BODY,
+                headers={"X-Gateway-Identity": "agent-test"},
+            )
+        assert resp.status_code == 401
+        assert fake.calls == 0
+
+    def test_internal_boundary_rejects_invalid_token(self):
+        fake = FakeLLM(response=GOOD_ASSETS)
+        with TestClient(_agent_app(llm=fake)) as client:
+            resp = client.post(
+                INTERNAL_PATH,
+                json=GOOD_BODY,
+                headers={
+                    "X-Gateway-Identity": "agent-test",
+                    "X-Agent-Internal-Token": "wrong-token",
+                },
+            )
+        assert resp.status_code == 401
+        assert fake.calls == 0
 
     def test_invalid_input_422(self):
         fake = FakeLLM()
