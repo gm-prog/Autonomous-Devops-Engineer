@@ -144,23 +144,25 @@ class DevOpsRepository(private val dao: DevOpsDao) {
     }
 
     /**
-     * Executes Repository Analysis & Asset generation via live Gemini AI or remote FastAPI Gateway.
+     * Executes Repository Analysis & Asset generation.
+     *
+     * Phase 8.7-C.1: offline-only on this branch. Analysis always runs the
+     * non-secret offline template engine in [GeminiClient] — no provider
+     * credential and no network round-trip. This branch does not contain a
+     * verified live server-side analysis backend; a remote AI path (if one
+     * is ever integrated) belongs to a later backend integration phase and
+     * must land together with a real, authenticated backend implementation.
      */
-    suspend fun analyzeRepoAsync(repoId: Int, isRemote: Boolean = false, remoteUrl: String = "") {
+    suspend fun analyzeRepoAsync(repoId: Int) {
         val repo = dao.getRepositoryById(repoId) ?: return
         dao.insertRepository(repo.copy(status = "Analyzing"))
 
         try {
-            // Phase 8.7-C: the app never holds a Gemini provider secret.
-            // When a remote gateway is configured (non-secret URL), the AI
-            // request is carried server-side by the authenticated backend.
-            // Otherwise the non-secret offline template engine is used.
             val result = GeminiClient.analyzeRepository(
                 repoName = repo.name,
                 repoUrl = repo.url,
                 framework = repo.framework,
-                technology = repo.technology,
-                backendBaseUrl = if (isRemote) remoteUrl else null
+                technology = repo.technology
             )
 
             val updatedRepo = repo.copy(

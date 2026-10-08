@@ -104,7 +104,6 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
         Column(modifier = Modifier.fillMaxSize()) {
             // High-fidelity Neon Header Bar
             WebOpsHeader(
-                remoteAiEnabled = viewModel.isRemoteGatewayEnabled,
                 onOpenSettings = { viewModel.isSettingsSheetOpen = true }
             )
 
@@ -176,7 +175,7 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
 
 // --- Header Component ---
 @Composable
-fun WebOpsHeader(remoteAiEnabled: Boolean, onOpenSettings: () -> Unit) {
+fun WebOpsHeader(onOpenSettings: () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0F111E)),
         shape = RoundedCornerShape(0.dp),
@@ -229,13 +228,16 @@ fun WebOpsHeader(remoteAiEnabled: Boolean, onOpenSettings: () -> Unit) {
                 )
             }
 
-            // Live status tag
+            // Status tag — Phase 8.7-C.1: this branch has no verified live
+            // server-side AI backend, so repository analysis always runs the
+            // non-secret offline engine. Do not re-introduce a state that
+            // claims live AI without the backend integration phase.
             Card(
                 colors = CardDefaults.cardColors(
-                    containerColor = if (remoteAiEnabled) ColorNeonGreen.copy(alpha = 0.15f) else ColorNeonPink.copy(alpha = 0.15f)
+                    containerColor = ColorNeonPink.copy(alpha = 0.15f)
                 ),
                 shape = RoundedCornerShape(6.dp),
-                border = BorderStroke(1.dp, if (remoteAiEnabled) ColorNeonGreen.copy(alpha = 0.4f) else ColorNeonPink.copy(alpha = 0.4f)),
+                border = BorderStroke(1.dp, ColorNeonPink.copy(alpha = 0.4f)),
                 modifier = Modifier.padding(start = 8.dp)
             ) {
                 Row(
@@ -245,16 +247,16 @@ fun WebOpsHeader(remoteAiEnabled: Boolean, onOpenSettings: () -> Unit) {
                     Box(
                         modifier = Modifier
                             .size(6.dp)
-                            .background(if (remoteAiEnabled) ColorNeonGreen else ColorNeonPink, shape = CircleShape)
+                            .background(ColorNeonPink, shape = CircleShape)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (remoteAiEnabled) "REMOTE_AI" else "OFFLINE_SIM",
+                        text = "OFFLINE_SIM",
                         style = TextStyle(
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.sp,
-                            color = if (remoteAiEnabled) ColorNeonGreen else ColorNeonPink
+                            color = ColorNeonPink
                         )
                     )
                 }
@@ -1858,13 +1860,13 @@ fun ConnectivitySettingsDialog(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            "Connect to Remote Backend",
+                            "Gateway Reachability Probe",
                             color = Color.White,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            "Queries active API services instead of simulated presets.",
+                            "Diagnostics only: pings a configured gateway URL. Repository analysis always runs on-device on this branch.",
                             color = ColorMutedGray,
                             fontSize = 10.sp
                         )

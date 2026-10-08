@@ -7,26 +7,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Phase 8.7-C: the Android client must function without any Gemini provider
- * secret.  These tests run under `gradle test` (JDK + Android SDK required).
+ * Phase 8.7-C.1: the Android client is offline-only and must function
+ * without any Gemini provider secret or any remote AI backend.  These tests
+ * run under `gradle test` (JDK + Android SDK required).
  *
- * The build-time structural guarantee (no BuildConfig.GEMINI_API_KEY etc.) is
- * enforced by the CI job `android-secret-guards` over the repository source.
+ * The build-time structural guarantees (no BuildConfig.GEMINI_API_KEY, no
+ * `?key=` request path, no fictitious remote analysis path) are enforced by
+ * the CI job `android-secret-guards` over the repository source.
  */
 class GeminiClientSecretPolicyTest {
-
-  @Test
-  fun no_remote_configured_means_offline_fallback_available() {
-    // Without a backend URL the client is in the keyless, offline state.
-    assertFalse(GeminiClient.isRemoteAnalysisConfigured(null))
-    assertFalse(GeminiClient.isRemoteAnalysisConfigured("   "))
-  }
-
-  @Test
-  fun remote_configured_state_is_a_non_secret_configuration() {
-    // A backend URL (non-secret configuration) switches to server-side AI.
-    assertTrue(GeminiClient.isRemoteAnalysisConfigured("http://10.0.2.2:8000"))
-  }
 
   @Test
   fun offline_template_engine_produces_assets_without_any_credential() {
@@ -46,6 +35,15 @@ class GeminiClientSecretPolicyTest {
     for (asset in all) {
       assertFalse(asset.contains("AIza"))
     }
+  }
+
+  @Test
+  fun analyze_repository_is_offline_and_credential_free() {
+    // analyzeRepository must be a plain (non-suspend, network-free) call to
+    // the offline engine: the same deterministic result as the engine alone.
+    val viaEngine = GeminiClient.generateSimulatedAssets("x", "Node.js", "React")
+    val viaAnalyze = GeminiClient.analyzeRepository("x", "url", "React", "Node.js")
+    assertEquals(viaEngine, viaAnalyze)
   }
 
   @Test

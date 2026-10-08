@@ -130,77 +130,164 @@ def test_no_secret_relocated_into_app_storage():
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — the app functions without a Gemini key (non-secret fallback)
+# Test 4 — the app functions via the non-secret offline path
 # ---------------------------------------------------------------------------
 
 
-def test_offline_fallback_path_is_unconditional():
-    """Without a backend the app uses the offline template engine — a
-    truthful non-secret fallback, no credential involved.
+def test_offline_analysis_path_is_unconditional():
+    """Repository analysis ALWAYS runs the offline template engine —
+    deterministic, non-secret, no credential, no network call.
 
     (Behavioral execution of the Kotlin path lives in
     app/src/test/.../GeminiClientSecretPolicyTest.kt and runs under
-    `gradle test`; here the guard verifies the structure statically.)
+    `gradle test`; here the contract is verified structurally.)
     """
     client_src = GEMINI_CLIENT.read_text(encoding="utf-8")
     code = android_guard._strip_kotlin_comments(client_src)
 
-    # The offline engine still exists and is the final, unconditional return.
+    # The offline engine exists and is what analyzeRepository returns.
     assert "fun generateSimulatedAssets" in code
-    assert code.count("generateSimulatedAssets(") >= 2  # definition + call sites
-    # analyzeRepository returns the offline result when no backend is set:
-    assert re.search(
-        r"fun\s+analyzeRepository\([^)]*backendBaseUrl", code, re.DOTALL
-    ), "analyzeRepository must take the (non-secret) backend base URL"
+    assert "fun analyzeRepository" in code
+    analyze_body = code.split("fun analyzeRepository", 1)[1]
+    assert "generateSimulatedAssets(" in analyze_body
+    # No remote selection of any kind inside the analysis path.
+    assert "backendBaseUrl" not in code
+    assert "isRemoteAnalysisConfigured" not in code
+    assert "BackendGatewayClient" not in code, (
+        "the analysis engine must not depend on a remote backend client"
+    )
     # No key presence concept remains (no isApiKeyPresent / BuildConfig read).
     assert "isApiKeyPresent" not in code
     assert "BuildConfig" not in code
 
-
-def test_repository_wires_remote_path_and_offline_fallback():
-    repo_src = REPOSITORY.read_text(encoding="utf-8")
-    code = android_guard._strip_kotlin_comments(repo_src)
-    # Analysis goes through GeminiClient with the backend URL only when the
-    # user configured a remote gateway (non-secret config in prefs).
-    assert "backendBaseUrl = if (isRemote) remoteUrl else null" in code
-    # The old direct-call fallback branch is gone.
-    assert "Live Gemini API Analysis" not in code
+    # The repository layer calls the offline engine without remote selection.
+    repo_code = android_guard._strip_kotlin_comments(REPOSITORY.read_text(encoding="utf-8"))
+    assert "GeminiClient.analyzeRepository" in repo_code
+    assert "isRemote" not in repo_code
+    assert "remoteUrl" not in repo_code
+    assert "queryRemoteAnalysis" not in repo_code
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — the backend path carries the AI request server-side
+# Test 5 — no fictitious remote-analysis path exists
 # ---------------------------------------------------------------------------
 
 
-def test_backend_path_carries_ai_request_server_side():
-    client_src = android_guard._strip_kotlin_comments(GEMINI_CLIENT.read_text(encoding="utf-8"))
-    backend_src = BACKEND_CLIENT.read_text(encoding="utf-8")
+def check_offline_only_contract(repo_root: Path) -> list:
+    """Structural checker for the truthful Phase 8.7-C.1 Android contract.
 
-    # When a backend URL is configured, the client delegates to the
-    # authenticated backend (server-side Gemini).
-    assert "BackendGatewayClient.queryRemoteAnalysis" in client_src
-    assert "baseUrlStr = backendBaseUrl" in client_src
-    # The backend endpoint the app calls:
-    assert "/api/v1/repository/analyze" in backend_src
-    # The app sends only non-secret repository metadata to the backend.
-    payload_block = client_src.split("queryRemoteAnalysis", 1)[1]
-    for field in ("repoName", "repoUrl", "framework", "technology"):
-        assert field in payload_block
-    # And no secret ever crosses the app -> backend boundary.
-    assert "apiKey" not in client_src.lower()
-    assert "API_KEY" not in client_src
+    Returns a list of violation strings (empty == contract holds).  The
+    contract: the app contains no remote repository-analysis client, no
+    client for an unimplemented analyze endpoint, no fake client-side
+    authentication, and no BuildConfig provider secret.  Used by the
+    contract tests and by the adversarial mutation tests (must turn red when
+    the fictitious remote path is reintroduced).
+    """
+    violations: list = []
+    app_src = Path(repo_root) / "app" / "src" / "main"
+    for kt in sorted(app_src.rglob("*.kt")):
+        rel = kt.name
+        code = android_guard._strip_kotlin_comments(kt.read_text(encoding="utf-8"))
+        if "queryRemoteAnalysis" in code:
+            violations.append(
+                f"{rel}: remote-analysis client method 'queryRemoteAnalysis' "
+                "present — this branch has no implemented, authenticated "
+                "analysis backend"
+            )
+        if "backendBaseUrl" in code:
+            violations.append(
+                f"{rel}: analysis path selects a remote backend URL "
+                "(parameter 'backendBaseUrl') — repository analysis must be "
+                "offline-only on this branch"
+            )
+        if "/api/v1/repository/analyze" in code:
+            violations.append(
+                f"{rel}: request to the unimplemented /api/v1/repository/analyze "
+                "endpoint — fictitious remote analysis path"
+            )
+        if re.search(r'addHeader\s*\(\s*["\']\s*Authorization', code) or re.search(
+            r'["\']\s*Bearer', code
+        ):
+            violations.append(
+                f"{rel}: client-side authentication header construction — "
+                "no fake/placeholder auth may be introduced"
+            )
+    # GeminiClient specifically must not reference the backend client.
+    gemini = app_src / "java" / "com" / "example" / "data" / "GeminiClient.kt"
+    if gemini.is_file():
+        gcode = android_guard._strip_kotlin_comments(gemini.read_text(encoding="utf-8"))
+        if "BackendGatewayClient" in gcode:
+            violations.append(
+                "GeminiClient.kt: depends on BackendGatewayClient — the "
+                "offline analysis engine must not call remote backends"
+            )
+    return violations
 
 
-def test_documentation_states_the_secret_model():
-    """Acceptance test 6 (documentation): the docs must not claim the
-    opposite of the corrected trust model."""
-    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    security_md = (REPO_ROOT / "devops-ai-platform" / "SECURITY.md").read_text(encoding="utf-8")
+def test_no_fictitious_remote_analysis_path():
+    violations = check_offline_only_contract(REPO_ROOT)
+    assert violations == [], "\n".join(violations)
+    # Explicitly: the removed client method and its endpoint are gone.
+    backend_code = android_guard._strip_kotlin_comments(BACKEND_CLIENT.read_text(encoding="utf-8"))
+    assert "queryRemoteAnalysis" not in backend_code
+    assert "/api/v1/repository/analyze" not in backend_code
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — no fake authentication mechanism is introduced
+# ---------------------------------------------------------------------------
+
+
+def test_no_fake_authentication_in_app():
+    for kt in _main_kotlin_sources():
+        code = android_guard._strip_kotlin_comments(kt.read_text(encoding="utf-8"))
+        assert not re.search(r'addHeader\s*\(\s*["\']\s*Authorization', code), kt.name
+        assert not re.search(r'["\']\s*Bearer', code), (
+            f"{kt.name}: Bearer-token construction — no fake client-side "
+            "authentication may be presented as real security"
+        )
+        assert "GEMINI_API_KEY" not in code, f"{kt.name}: provider secret reference"
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — documentation matches the actual branch
+# ---------------------------------------------------------------------------
+
+
+def test_documentation_states_the_offline_truth():
+    """The current docs must state the truthful contract AND must not claim
+    a verified authenticated backend path that does not exist."""
+    readme = re.sub(r"[*`\s]+", " ", (REPO_ROOT / "README.md").read_text(encoding="utf-8")).lower()
+    security_md = re.sub(r"[*`\s]+", " ", (REPO_ROOT / "devops-ai-platform" / "SECURITY.md").read_text(encoding="utf-8")).lower()
+
     for doc in (readme, security_md):
-        assert "cannot keep" in doc.lower() or "cannot keep a reusable" in doc.lower(), (
+        # Android apps cannot keep a reusable provider secret confidential.
+        assert "cannot keep a reusable provider secret" in doc, (
             "documentation must state that Android apps cannot keep a "
             "reusable provider secret confidential"
         )
+        # The branch does not expose a verified live Gemini backend for the app.
+        assert "does not" in doc and "verified live gemini backend integration" in doc, (
+            "documentation must state that this branch does not expose a "
+            "verified live Gemini backend integration"
+        )
+        # The Android path is offline / non-secret.
+        assert "offline" in doc
+        # No false claim of an authenticated backend carrying Gemini.
+        # (The docs may state, as a FUTURE condition, that a remote path
+        # requires a real implemented authenticated backend; they must not
+        # claim such a path currently exists.)
+        for bad_claim in (
+            "authenticated platform backend",
+            "server-side by the authenticated backend",
+            "authenticated backend, which calls gemini",
+            "carries the ai request server-side",
+            "/api/v1/repository/analyze",
+        ):
+            assert bad_claim not in doc, (
+                f"documentation must not make the false current claim: {bad_claim!r}"
+            )
+
     # The retired BuildConfig-based instructions must not remain in the
     # current README.
     assert "BuildConfig.GEMINI_API_KEY" not in readme

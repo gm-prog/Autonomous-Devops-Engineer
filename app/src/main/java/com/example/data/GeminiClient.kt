@@ -1,13 +1,9 @@
 package com.example.data
 
-import android.util.Log
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-
 /**
- * AI repository-analysis client (Phase 8.7-C security correction).
+ * Repository-analysis engine (Phase 8.7-C.1 — offline-only, truthful contract).
  *
- * SECURITY MODEL — read this before adding a "quick key" here:
+ * SECURITY MODEL — read this before adding a "quick key" or "quick backend":
  *
  * Android-distributed applications CANNOT keep a reusable provider secret
  * confidential. Any credential shipped inside an APK (BuildConfig, string
@@ -16,71 +12,46 @@ import kotlinx.coroutines.withContext
  * Embedding GEMINI_API_KEY in the app is therefore a credential leak, not a
  * configuration option.
  *
- * The app accordingly NEVER holds a Gemini provider secret:
+ * TRUTHFUL BEHAVIOR ON THIS BRANCH:
  *
- *  * When the platform backend/gateway is configured (a non-secret endpoint
- *    URL), analysis requests are sent to the authenticated backend and Gemini
- *    is called SERVER-SIDE, where GEMINI_API_KEY stays server-side.
- *  * When no backend is configured (or the backend is unreachable), the app
- *    falls back to the non-secret offline template engine below — a truthful
- *    "no live AI" state, not a disguised bundled credential.
+ * This branch does NOT expose a verified live server-side Gemini backend
+ * integration for the Android app. Repository analysis therefore ALWAYS runs
+ * the deterministic, non-secret offline template engine below — the app
+ * works completely without any provider credential and without a network
+ * round-trip.
  *
- * Do not reintroduce `BuildConfig.GEMINI_API_KEY`, `?key=` query parameters,
- * or any other device-side secret on the Gemini request path. The static
- * security guards (devops-ai-platform/tests + CI job `android-secret-guards`)
- * fail the build if they reappear.
+ * Live server-side AI (Android -> authenticated platform backend -> Gemini,
+ * with the key kept server-side) belongs to a later backend integration
+ * phase. Until that phase lands in this branch:
+ *
+ *  * do not add a `?key=` request path or any BuildConfig provider secret;
+ *  * do not add fake/placeholder authentication headers presented as real
+ *    security;
+ *  * do not claim the app performs server-side Gemini analysis.
+ *
+ * The CI job `android-secret-guards` fails the build if a Gemini secret or a
+ * fictitious remote analysis path reappears.
  */
 object GeminiClient {
-    private const val TAG = "GeminiClient"
-
-    /**
-     * True when a non-secret backend endpoint is configured and live AI
-     * analysis can be carried out server-side. This is a configuration
-     * status, not a credential status.
-     */
-    fun isRemoteAnalysisConfigured(backendBaseUrl: String?): Boolean =
-        backendBaseUrl != null && backendBaseUrl.isNotBlank()
 
     /**
      * Analyzes a repository for DevOps asset generation.
      *
-     * @param backendBaseUrl Optional, NON-SECRET platform backend base URL.
-     *   When present, the request is carried server-side by the authenticated
-     *   backend (which holds the Gemini key). When absent or when the remote
-     *   call fails, the non-secret offline template engine is used.
+     * Offline-only on this branch: deterministic template engine, no provider
+     * credential, no network call. See the object-level security model note.
      */
-    suspend fun analyzeRepository(
+    fun analyzeRepository(
         repoName: String,
         repoUrl: String,
         framework: String,
-        technology: String,
-        backendBaseUrl: String? = null
-    ): DevOpsAnalysisResult = withContext(Dispatchers.IO) {
-        if (isRemoteAnalysisConfigured(backendBaseUrl)) {
-            // Authenticated platform backend carries the AI request
-            // server-side. The app sends only non-secret repository metadata.
-            val remoteResult = BackendGatewayClient.queryRemoteAnalysis(
-                baseUrlStr = backendBaseUrl!!,
-                repoName = repoName,
-                repoUrl = repoUrl,
-                framework = framework,
-                technology = technology
-            )
-            if (remoteResult != null) {
-                return@withContext remoteResult
-            }
-            Log.w(TAG, "Remote backend analysis unavailable; falling back to the offline template engine.")
-        } else {
-            Log.w(TAG, "No backend configured for AI analysis; using the offline template engine (no live AI, no bundled credentials).")
-        }
-
-        // Truthful non-secret fallback: template-generated assets only.
-        generateSimulatedAssets(repoName, technology, framework)
+        technology: String
+    ): DevOpsAnalysisResult {
+        return generateSimulatedAssets(repoName, technology, framework)
     }
 
     /**
      * Offline template engine. Pure, non-secret, deterministic fallback used
-     * whenever live server-side AI is not configured or not reachable.
+     * for ALL repository analysis on this branch.
      */
     fun generateSimulatedAssets(
         repoName: String,

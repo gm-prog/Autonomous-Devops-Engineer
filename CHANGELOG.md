@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-C.1] — Android Remote-Analysis Contract Correction (2026-10-08)
+
+### Corrected
+
+* **Root cause:** Phase 8.7-C removed the Android provider secret correctly,
+  but `GeminiClient.kt` then routed analysis through
+  `BackendGatewayClient.queryRemoteAnalysis()` — an **unauthenticated**
+  request to `/api/v1/repository/analyze`, an endpoint that is not
+  implemented (nor authenticated) anywhere in this branch. The code and the
+  current documentation therefore claimed an authenticated server-side
+  Gemini path that did not exist.
+* **Fix (offline-only, truthful contract):**
+  * `GeminiClient.analyzeRepository` is now offline-only: no
+    `backendBaseUrl` parameter, no network call, no provider credential —
+    it always runs the deterministic non-secret template engine.
+  * Removed `BackendGatewayClient.queryRemoteAnalysis()` (client for the
+    fictitious endpoint); the baseline `testConnection` reachability
+    diagnostic is retained and is now clearly labeled diagnostics-only.
+  * `DevOpsRepository.analyzeRepoAsync` no longer selects a remote path;
+    the ViewModel passes no remote selection; the header badge always
+    reflects the offline engine (`OFFLINE_SIM`) instead of claiming live AI.
+  * `SECURITY.md` / `README.md` now state exactly: this branch does not
+    expose a verified live Gemini backend integration for the app; Android
+    uses the non-secret offline analysis path; server-side Gemini
+    integration belongs to a later backend integration phase.
+* **Tests/guards:** the Android contract tests now verify the offline-only
+  truth (no fictitious remote path, no fake client-side authentication,
+  documentation makes no false backend claim); a new mutation test proves
+  reintroducing the fictitious unauthenticated remote path turns the suite
+  red. No telemetry/JWT/gateway changes.
+
 ## [8.7-C] — Security Integrity Corrections (2026-10-08)
 
 ### Fixed

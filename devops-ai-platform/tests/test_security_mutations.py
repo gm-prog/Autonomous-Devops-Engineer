@@ -15,6 +15,10 @@ M1. Telemetry: restore the generic user-facing dispatcher into the gateway.
 M2. Telemetry: disable producer authentication on the ingestion boundary.
 M3. Android:   reintroduce BuildConfig.GEMINI_API_KEY on the request path.
 M4. JWT:       restore the hard-coded fallback as the production default.
+M5. Android:   reintroduce the fictitious remote Gemini execution path
+               (unauthenticated backend request to an endpoint that does not
+               exist in this branch) — the false "authenticated backend
+               exists" regression.
 """
 
 from __future__ import annotations
@@ -296,3 +300,97 @@ def test_mutation_m4_jwt_fallback_restoration_detected(mutated_repo):
         token, config_mod.GatewaySettings.JWT_SECRET, algorithms=["HS256"]
     )
     assert claims["roles"] == ["ClusterAdmin"]
+
+
+# ---------------------------------------------------------------------------
+# M5 — reintroduce the fictitious remote Gemini execution path
+# ---------------------------------------------------------------------------
+
+_FICTITIOUS_REMOTE_BACKEND_METHOD = '''
+
+    /**
+     * Fictitious remote analysis (regression probe): unauthenticated request
+     * to an endpoint that does not exist in this branch.
+     */
+    suspend fun queryRemoteAnalysis(
+        baseUrlStr: String,
+        repoName: String,
+        repoUrl: String,
+        framework: String,
+        technology: String
+    ): DevOpsAnalysisResult? {
+        val cleanUrl = baseUrlStr.trim().removeSuffix("/")
+        val endpoint = "$cleanUrl/api/v1/repository/analyze"
+        val request = okhttp3.Request.Builder()
+            .url(endpoint)
+            .post(okhttp3.RequestBody.create(null, "{}".toByteArray()))
+            .build()
+        client.newCall(request).execute().use { response ->
+            return null
+        }
+    }
+'''
+
+
+def _apply_fictitious_remote_mutation(repo: Path) -> None:
+    """Reintroduce the pre-correction shape: GeminiClient delegates analysis
+    to an unauthenticated backend client that targets an endpoint no
+    implemented, authenticated backend serves in this branch."""
+    backend_client = repo / "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+    src = backend_client.read_text(encoding="utf-8")
+    # Insert the fictitious remote-analysis method before the object's end.
+    src = src.rstrip()
+    assert src.endswith("}")
+    src = src[:-1].rstrip() + "\n" + _FICTITIOUS_REMOTE_BACKEND_METHOD.strip("\n") + "\n}\n"
+    backend_client.write_text(src, encoding="utf-8")
+
+    gemini = repo / "app/src/main/java/com/example/data/GeminiClient.kt"
+    src = gemini.read_text(encoding="utf-8")
+    old_sig = """    fun analyzeRepository(
+        repoName: String,
+        repoUrl: String,
+        framework: String,
+        technology: String
+    ): DevOpsAnalysisResult {
+        return generateSimulatedAssets(repoName, technology, framework)
+    }"""
+    new_sig = """    fun analyzeRepository(
+        repoName: String,
+        repoUrl: String,
+        framework: String,
+        technology: String,
+        backendBaseUrl: String? = null
+    ): DevOpsAnalysisResult {
+        if (backendBaseUrl != null) {
+            return BackendGatewayClient.queryRemoteAnalysis(
+                baseUrlStr = backendBaseUrl,
+                repoName = repoName,
+                repoUrl = repoUrl,
+                framework = framework,
+                technology = technology
+            ) ?: generateSimulatedAssets(repoName, technology, framework)
+        }
+        return generateSimulatedAssets(repoName, technology, framework)
+    }"""
+    assert old_sig in src, "mutation target not found in GeminiClient.kt"
+    src = src.replace(old_sig, new_sig, 1)
+    gemini.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m5_fictitious_remote_path_detected(mutated_repo):
+    from test_android_secret_guards import check_offline_only_contract
+
+    _apply_fictitious_remote_mutation(mutated_repo)
+
+    violations = check_offline_only_contract(mutated_repo)
+    assert violations, (
+        "contract test stayed green after the fictitious unauthenticated "
+        "remote analysis path was reintroduced"
+    )
+    joined = "\n".join(violations)
+    assert "queryRemoteAnalysis" in joined
+    assert "backendBaseUrl" in joined
+    assert "/api/v1/repository/analyze" in joined
+    assert "BackendGatewayClient" in joined
+    for v in violations:
+        print("  violation:", v)

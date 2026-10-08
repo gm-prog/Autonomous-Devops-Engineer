@@ -215,11 +215,10 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     fun startAnalysis(repoId: Int) {
         viewModelScope.launch {
             isAnalyzing = true
-            repository.analyzeRepoAsync(
-                repoId = repoId,
-                isRemote = isRemoteGatewayEnabled,
-                remoteUrl = apiUrlGateway
-            )
+            // Phase 8.7-C.1: repository analysis is offline-only on this
+            // branch (no verified live server-side analysis backend exists
+            // here), so no remote selection is passed.
+            repository.analyzeRepoAsync(repoId = repoId)
             isAnalyzing = false
         }
     }
