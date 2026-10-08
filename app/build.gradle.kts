@@ -113,6 +113,12 @@ dependencies {
   testImplementation(libs.androidx.junit)
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
+  // The real org.json on the unit-test classpath: in pure-JVM unit tests the
+  // org.json classes come from the mockable android.jar, whose methods return
+  // default values (null), so a JSONObject payload's toString() would be null
+  // and NPE the request builder. The real implementation (which shadows the
+  // mockable stub) makes the transport-failure test reach the network layer.
+  testImplementation("org.json:json:20231013")
   testImplementation(libs.robolectric)
   testImplementation(libs.roborazzi)
   testImplementation(libs.roborazzi.compose)
