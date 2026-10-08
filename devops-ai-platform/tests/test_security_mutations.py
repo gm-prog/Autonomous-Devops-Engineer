@@ -23,6 +23,10 @@ M6. Android:   reintroduce stale live-Gemini UI claims (the UI again says it
                compiles live blueprints via Gemini AI and presents the
                simulator as a "Gemini Resilient API Cockpit") — the false
                "live Gemini telemetry" regression.
+M7. Docs:      reintroduce the stale roadmap architecture claim (pinging/
+               configuring the gateway makes the repository generator route
+               analysis to the remote server instead of simulation) — the
+               false "remote analysis transport" documentation regression.
 """
 
 from __future__ import annotations
@@ -439,5 +443,55 @@ def test_mutation_m6_stale_live_gemini_ui_detected(mutated_repo):
     joined = "\n".join(violations)
     assert "live blueprints via gemini" in joined
     assert "gemini resilient api cockpit" in joined
+    for v in violations:
+        print("  violation:", v)
+
+
+# ---------------------------------------------------------------------------
+# M7 — reintroduce the stale roadmap remote-analysis claim
+# ---------------------------------------------------------------------------
+
+
+def _apply_stale_roadmap_mutation(repo: Path) -> None:
+    """Take the corrected roadmap and reintroduce the pre-correction claim:
+    toggling/pinging the gateway makes the repository generator route
+    analyze tasks to the remote server instead of simulation."""
+    roadmap = repo / "VS_CODE_AND_VERCEL_ROADMAP.md"
+    src = roadmap.read_text(encoding="utf-8")
+
+    targets = (
+        "3.  Open the **Gateway Reachability Probe** section (toggle it on).",
+        "6.  **That is the entire effect.** The result only indicates whether the",
+        "    configured endpoint is reachable. **Repository analysis remains",
+    )
+    assert all(t in src for t in targets), "mutation targets not found in roadmap"
+
+    replacements = (
+        ("3.  Open the **Gateway Reachability Probe** section (toggle it on).",
+         "3.  Toggle **Connect to Remote Backend** -> **On**."),
+        ("6.  **That is the entire effect.** The result only indicates whether the",
+         "6.  Tap **Ping Endpoint**: The status pill will glow green (**CONNECTED**) as soon as it receives a successful handshake, and the repository generator will"),
+        ("    configured endpoint is reachable. **Repository analysis remains",
+         "    route analyze tasks directly to your remote edge server instead of using simulation!"),
+    )
+    for old, new in replacements:
+        src = src.replace(old, new, 1)
+    roadmap.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m7_stale_roadmap_claim_detected(mutated_repo):
+    from test_android_secret_guards import check_roadmap_truthfulness
+
+    _apply_stale_roadmap_mutation(mutated_repo)
+
+    violations = check_roadmap_truthfulness(mutated_repo)
+    assert violations, (
+        "roadmap truthfulness contract stayed green after the stale "
+        "remote-analysis claim was reintroduced"
+    )
+    joined = "\n".join(violations)
+    assert "route analyze tasks directly to your remote edge server" in joined
+    assert "instead of using simulation" in joined
+    assert "connect to remote backend" in joined
     for v in violations:
         print("  violation:", v)

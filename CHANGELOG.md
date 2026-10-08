@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-C.3] — Roadmap & Documentation Truthfulness Reconciliation (2026-10-08)
+
+### Corrected
+
+* **Root cause:** `VS_CODE_AND_VERCEL_ROADMAP.md` still told developers that
+  toggling "Connect to Remote Backend" and pinging the gateway made "the
+  repository generator route analyze tasks directly to your remote edge
+  server instead of using simulation" — a flow that does not exist on this
+  branch.
+* **Fix (documentation-only, no implementation change):**
+  * Added a "Current Branch Architecture" statement: Android repository
+    analysis is offline and deterministic; the configured gateway URL is
+    diagnostics-only and does not route repository analysis, Gemini
+    requests, deployments, or execution through the remote server.
+  * Separated the two independent flows (on-device analysis vs gateway
+    reachability probe) and marked Step 1/Step 2 as backend-infrastructure
+    documentation (running/deploying the backend is not proof that Android
+    consumes it for analysis).
+  * "Step 3: Connecting Your Android App" rewritten as "Android Gateway
+    Diagnostics": probe result is reachability status only; repository
+    analysis remains offline.
+  * `GEMINI_API_KEY` instructions explicitly marked server-side only —
+    never in the APK, `BuildConfig`, resources, preferences, or source
+    literals.
+  * Future backend integration (authenticated Android → typed endpoint →
+    analysis service → server-side Gemini) explicitly labeled **future /
+    not implemented on this branch**; the existing cockpit is documented as
+    local simulation, not provider telemetry.
+* **Tests:** new roadmap truthfulness contract (stale remote-analysis
+  claims forbidden; offline/diagnostics-only/future-boundary language
+  required) plus mutation M7, which reintroduces the stale claim and proves
+  the guard detects it. No security control changed.
+
 ## [8.7-C.2] — Android UI Truthfulness & Offline Gemini Contract (2026-10-08)
 
 ### Corrected

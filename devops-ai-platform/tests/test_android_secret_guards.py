@@ -378,3 +378,73 @@ def test_no_stale_live_gemini_ui_claims():
 def test_ai_cockpit_and_analysis_labeled_as_simulation():
     violations = check_ui_truthfulness(REPO_ROOT)
     assert violations == [], "\n".join(violations)
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-C.3 — documentation truthfulness: the roadmap must not claim
+# that the gateway probe enables remote repository analysis
+# ---------------------------------------------------------------------------
+
+ROADMAP = REPO_ROOT / "VS_CODE_AND_VERCEL_ROADMAP.md"
+
+# Stale claims that would describe the gateway as a remote-analysis
+# transport (the pre-correction roadmap wording).
+_FORBIDDEN_ROADMAP_CLAIMS = (
+    "route analyze tasks directly to your remote edge server",
+    "instead of using simulation",
+    "connect to remote backend",
+)
+
+# Semantic markers the roadmap must carry: offline analysis,
+# diagnostics-only gateway, gateway does not route analysis, a future
+# integration boundary, and the server-side credential boundary.
+_REQUIRED_ROADMAP_MARKERS = (
+    "offline",
+    "diagnostics-only",
+    "does not route",
+    "repository analysis",
+    "not implemented on this branch",
+    "server-side only",
+)
+
+
+def _normalized_roadmap() -> str:
+    return re.sub(r"\s+", " ", ROADMAP.read_text(encoding="utf-8")).lower()
+
+
+def check_roadmap_truthfulness(repo_root: Path) -> list:
+    """Semantic contract checker for the deployment roadmap (Phase 8.7-C.3).
+
+    Returns a list of violation strings (empty == contract holds).  The
+    contract: the roadmap never claims that configuring/pinging the gateway
+    routes repository analysis to a remote server, and it explicitly states
+    the current offline architecture, the diagnostics-only gateway role,
+    the future (unimplemented) integration boundary, and the server-side
+    Gemini credential boundary.  Used by the contract test and by M7.
+    """
+    violations: list = []
+    roadmap = Path(repo_root) / "VS_CODE_AND_VERCEL_ROADMAP.md"
+    if not roadmap.is_file():
+        return ["VS_CODE_AND_VERCEL_ROADMAP.md: missing — roadmap truthfulness contract cannot be verified"]
+    norm = re.sub(r"\s+", " ", roadmap.read_text(encoding="utf-8")).lower()
+
+    for phrase in _FORBIDDEN_ROADMAP_CLAIMS:
+        if phrase in norm:
+            violations.append(
+                f"VS_CODE_AND_VERCEL_ROADMAP.md: stale remote-analysis claim "
+                f"present: {phrase!r} — on this branch the gateway is "
+                "diagnostics-only and never routes repository analysis"
+            )
+    for marker in _REQUIRED_ROADMAP_MARKERS:
+        if marker not in norm:
+            violations.append(
+                f"VS_CODE_AND_VERCEL_ROADMAP.md: required architecture "
+                f"language missing: {marker!r} — the roadmap must state the "
+                "current offline/diagnostics-only/future-boundary truth"
+            )
+    return violations
+
+
+def test_roadmap_matches_offline_architecture():
+    violations = check_roadmap_truthfulness(REPO_ROOT)
+    assert violations == [], "\n".join(violations)
