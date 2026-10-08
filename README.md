@@ -145,6 +145,8 @@ To build and experience DevOps.AI as a fully functional platform:
 
 ### Platform (server-side) environment
 
+* `AGENT_INTERNAL_TOKEN` — server-only shared credential for the fixed gateway → agent-service analysis hop. It is never sent to Android and must be at least 32 characters.
+
 The `devops-ai-platform` services follow the contract in
 [`devops-ai-platform/SECURITY.md`](devops-ai-platform/SECURITY.md):
 
