@@ -87,7 +87,11 @@ jobs:
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "17" # AGP 9.x documented minimum JDK
+          # JDK 21: AGP 9.x supports 17+, and the Robolectric tests target
+          # SDK 36, whose android-all jars are Java 21 bytecode — they cannot
+          # load under JDK 17 (Phase 8.7-D.1-CORRECTION, CI evidence
+          # run 37825860227).
+          java-version: "21"
       - uses: android-actions/setup-android@v4
       - name: Install Gradle 9.3.1 (pinned to the AGP 9.1.1 documented minimum, official page 2026-10-08)
         run: |

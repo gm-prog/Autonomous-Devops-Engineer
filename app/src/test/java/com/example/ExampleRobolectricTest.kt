@@ -16,6 +16,9 @@ class ExampleRobolectricTest {
   fun `read string from context`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val appName = context.getString(R.string.app_name)
-    assertEquals("My Application", appName)
+    // The actual application name (res/values/strings.xml) — the template
+    // expectation "My Application" was corrected in Phase 8.7-D.1-CORRECTION
+    // when this suite first ran under the real Gradle toolchain.
+    assertEquals("DevOps Agent", appName)
   }
 }
