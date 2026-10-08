@@ -1,158 +1,87 @@
 package com.example.data
 
 import android.util.Log
-import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.IOException
-import java.util.concurrent.TimeUnit
 
+/**
+ * AI repository-analysis client (Phase 8.7-C security correction).
+ *
+ * SECURITY MODEL — read this before adding a "quick key" here:
+ *
+ * Android-distributed applications CANNOT keep a reusable provider secret
+ * confidential. Any credential shipped inside an APK (BuildConfig, string
+ * resources, assets, SharedPreferences defaults, obfuscated or base64-wrapped
+ * constants) is recoverable by anyone who can decompile the artifact.
+ * Embedding GEMINI_API_KEY in the app is therefore a credential leak, not a
+ * configuration option.
+ *
+ * The app accordingly NEVER holds a Gemini provider secret:
+ *
+ *  * When the platform backend/gateway is configured (a non-secret endpoint
+ *    URL), analysis requests are sent to the authenticated backend and Gemini
+ *    is called SERVER-SIDE, where GEMINI_API_KEY stays server-side.
+ *  * When no backend is configured (or the backend is unreachable), the app
+ *    falls back to the non-secret offline template engine below — a truthful
+ *    "no live AI" state, not a disguised bundled credential.
+ *
+ * Do not reintroduce `BuildConfig.GEMINI_API_KEY`, `?key=` query parameters,
+ * or any other device-side secret on the Gemini request path. The static
+ * security guards (devops-ai-platform/tests + CI job `android-secret-guards`)
+ * fail the build if they reappear.
+ */
 object GeminiClient {
     private const val TAG = "GeminiClient"
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
-        .build()
-
-    // Key evaluation: uses live key or warns/falls back to simulated templates
-    val isApiKeyPresent: Boolean
-        get() = BuildConfig.GEMINI_API_KEY.isNotEmpty() && BuildConfig.GEMINI_API_KEY != "MY_GEMINI_API_KEY"
 
     /**
-     * Sends a direct REST call to gemini-3.5-flash to analyze the repo and generate DevOps files.
+     * True when a non-secret backend endpoint is configured and live AI
+     * analysis can be carried out server-side. This is a configuration
+     * status, not a credential status.
+     */
+    fun isRemoteAnalysisConfigured(backendBaseUrl: String?): Boolean =
+        backendBaseUrl != null && backendBaseUrl.isNotBlank()
+
+    /**
+     * Analyzes a repository for DevOps asset generation.
+     *
+     * @param backendBaseUrl Optional, NON-SECRET platform backend base URL.
+     *   When present, the request is carried server-side by the authenticated
+     *   backend (which holds the Gemini key). When absent or when the remote
+     *   call fails, the non-secret offline template engine is used.
      */
     suspend fun analyzeRepository(
         repoName: String,
         repoUrl: String,
         framework: String,
-        technology: String
+        technology: String,
+        backendBaseUrl: String? = null
     ): DevOpsAnalysisResult = withContext(Dispatchers.IO) {
-        val apiKey = BuildConfig.GEMINI_API_KEY
-        if (!isApiKeyPresent) {
-            Log.w(TAG, "API Key is missing or default. Returning simulated high-quality assets.")
-            return@withContext generateSimulatedAssets(repoName, technology, framework)
+        if (isRemoteAnalysisConfigured(backendBaseUrl)) {
+            // Authenticated platform backend carries the AI request
+            // server-side. The app sends only non-secret repository metadata.
+            val remoteResult = BackendGatewayClient.queryRemoteAnalysis(
+                baseUrlStr = backendBaseUrl!!,
+                repoName = repoName,
+                repoUrl = repoUrl,
+                framework = framework,
+                technology = technology
+            )
+            if (remoteResult != null) {
+                return@withContext remoteResult
+            }
+            Log.w(TAG, "Remote backend analysis unavailable; falling back to the offline template engine.")
+        } else {
+            Log.w(TAG, "No backend configured for AI analysis; using the offline template engine (no live AI, no bundled credentials).")
         }
 
-        val prompt = """
-            You are DevOpsAI, a virtual DevOps engineer capable of analyzing repositories and generating production-ready infrastructure configurations.
-            
-            Analyze the following repository description:
-            - Name: $repoName
-            - URL/Description: $repoUrl
-            - Main Tech Stack: $technology
-            - Main Framework: $framework
-            
-            Please provide a production-grade, highly secure setup for this configuration. Generate exactly 4 clean DevOps configurations and a short architectural report.
-            Return them enclosed in specific markup tags so they can be parsed programmatically:
-            
-            <DOCKERFILE>
-            [Add the optimized production Dockerfile content here. Include multi-stage builds, non-root users, security practices, and clean labels.]
-            </DOCKERFILE>
-            
-            <KUBERNETES>
-            [Add production-grade Kubernetes YAML manifests including Deployment, Service, and HorizontalPodAutoscaler. Explicit CPU/Memory resources must be defined.]
-            </KUBERNETES>
-            
-            <TERRAFORM>
-            [Add excellent, production-grade Terraform files defining an AWS VPC, Security Group, and container-running host/service like AWS ECS or EKS.]
-            </TERRAFORM>
-            
-            <CICD>
-            [Add a complete GitHub Actions CI/CD pipeline in YAML configuring security scanning, Docker build, and deployment steps.]
-            </CICD>
-            
-            <REPORT>
-            [Write a highly professional 150-word Repository Analysis and Architectural Discovery Report explaining your secure choices.]
-            </REPORT>
-            
-            Ensure there is NO extra text outside these tags. Do not wrap code blocks inside standard ``` markdown code blocks inside the tags, just write the raw files inside the XML style tags.
-        """.trimIndent()
-
-        try {
-            // Build direct REST API request body
-            val requestBodyJson = JSONObject().apply {
-                put("contents", JSONArray().apply {
-                    put(JSONObject().apply {
-                        put("parts", JSONArray().apply {
-                            put(JSONObject().apply {
-                                put("text", prompt)
-                            })
-                        })
-                    })
-                })
-                // System instructions
-                put("systemInstruction", JSONObject().apply {
-                    put("parts", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("text", "You are an expert enterprise-grade AI DevOps engineer specializing in Docker, K8s, AWS, AWS Terraform, security scanning, and GitHub Actions.")
-                        })
-                    })
-                })
-            }
-
-            val requestBody = requestBodyJson.toString().toRequestBody("application/json".toMediaType())
-            val url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey"
-
-            val request = Request.Builder()
-                .url(url)
-                .post(requestBody)
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    val bodyStr = response.body?.string() ?: ""
-                    Log.e(TAG, "Request failed code: ${response.code}, body: $bodyStr")
-                    return@withContext generateSimulatedAssets(repoName, technology, framework)
-                }
-
-                val responseBody = response.body?.string() ?: throw IOException("Empty response body")
-                val responseJson = JSONObject(responseBody)
-                val text = responseJson.optJSONArray("candidates")
-                    ?.optJSONObject(0)
-                    ?.optJSONObject("content")
-                    ?.optJSONArray("parts")
-                    ?.optJSONObject(0)
-                    ?.optString("text") ?: ""
-
-                if (text.isEmpty()) {
-                    return@withContext generateSimulatedAssets(repoName, technology, framework)
-                }
-
-                // Parse tags
-                DevOpsAnalysisResult(
-                    dockerfile = parseTag(text, "DOCKERFILE").trim(),
-                    k8sYaml = parseTag(text, "KUBERNETES").trim(),
-                    terraformTf = parseTag(text, "TERRAFORM").trim(),
-                    pipelineYaml = parseTag(text, "CICD").trim(),
-                    report = parseTag(text, "REPORT").trim().ifEmpty { "Successfully generated secure deployment structures." }
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error generating assets from Gemini API: ${e.message}", e)
-            generateSimulatedAssets(repoName, technology, framework)
-        }
+        // Truthful non-secret fallback: template-generated assets only.
+        generateSimulatedAssets(repoName, technology, framework)
     }
 
-    private fun parseTag(text: String, tag: String): String {
-        val openTag = "<$tag>"
-        val closeTag = "</$tag>"
-        val startIndex = text.indexOf(openTag)
-        val endIndex = text.indexOf(closeTag)
-        if (startIndex != -1 && endIndex != -1 && endIndex > startIndex) {
-            val content = text.substring(startIndex + openTag.length, endIndex)
-            // Strip any leading/trailing markdown codegen markers e.g. ```yaml or ```dockerfile
-            return content.replace(Regex("^```[a-zA-Z]*\\n"), "").replace(Regex("\\n```$"), "")
-        }
-        return ""
-    }
-
+    /**
+     * Offline template engine. Pure, non-secret, deterministic fallback used
+     * whenever live server-side AI is not configured or not reachable.
+     */
     fun generateSimulatedAssets(
         repoName: String,
         technology: String,
@@ -471,6 +400,7 @@ object GeminiClient {
                           type: ClusterIP
                           ports:
                           - port: 8080
+                            targetPort: 8080
                           selector:
                             app: $repoName
                     """.trimIndent(),

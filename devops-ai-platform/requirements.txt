@@ -10,3 +10,5 @@ prometheus_client>=0.17.1
 websockets>=11.0.3
 structlog>=23.1.0
 python-dotenv>=1.0.0
+# Phase 8.7-C: signed HS256 JWT verification for the API gateway.
+PyJWT>=2.8.0

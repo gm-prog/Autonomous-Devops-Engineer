@@ -151,29 +151,17 @@ class DevOpsRepository(private val dao: DevOpsDao) {
         dao.insertRepository(repo.copy(status = "Analyzing"))
 
         try {
-            val result = if (isRemote && remoteUrl.isNotEmpty()) {
-                // Live FastAPI Gateway Query
-                BackendGatewayClient.queryRemoteAnalysis(
-                    baseUrlStr = remoteUrl,
-                    repoName = repo.name,
-                    repoUrl = repo.url,
-                    framework = repo.framework,
-                    technology = repo.technology
-                ) ?: GeminiClient.analyzeRepository(
-                    repoName = repo.name,
-                    repoUrl = repo.url,
-                    framework = repo.framework,
-                    technology = repo.technology
-                )
-            } else {
-                // Live Gemini API Analysis
-                GeminiClient.analyzeRepository(
-                    repoName = repo.name,
-                    repoUrl = repo.url,
-                    framework = repo.framework,
-                    technology = repo.technology
-                )
-            }
+            // Phase 8.7-C: the app never holds a Gemini provider secret.
+            // When a remote gateway is configured (non-secret URL), the AI
+            // request is carried server-side by the authenticated backend.
+            // Otherwise the non-secret offline template engine is used.
+            val result = GeminiClient.analyzeRepository(
+                repoName = repo.name,
+                repoUrl = repo.url,
+                framework = repo.framework,
+                technology = repo.technology,
+                backendBaseUrl = if (isRemote) remoteUrl else null
+            )
 
             val updatedRepo = repo.copy(
                 dockerfile = result.dockerfile,

@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "dev/**", "arena/**", "integration/**" ]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Phase 8.7-C: mandatory security jobs. A failed security invariant fails CI.
+# There is no optional/warning-only security gate: every job below is a hard
+# requirement and none may be silently skipped (no continue-on-error, no
+# condition that can skip the security steps).
+
+jobs:
+  security-integrity:
+    name: Phase 8.7-C focused security suites
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: devops-ai-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements-test.txt
+      - name: Install security test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: JWT fail-closed contract (Defect C)
+        run: python -m pytest tests/test_jwt_secret_policy.py -v
+
+      - name: Gateway control-plane authorization + dispatch removal (Defect A)
+        run: python -m pytest tests/test_gateway_control_plane.py -v
+
+      - name: Telemetry trust boundary — HMAC, replay, tamper, no side effects (Defect A)
+        run: python -m pytest tests/test_telemetry_ingestion_trust.py -v
+
+      - name: Adversarial mutations — weakening each control must turn the suite red
+        run: python -m pytest tests/test_security_mutations.py -v
+
+      - name: Full Phase 8.7-C security suite (evidence)
+        run: |
+          set -euo pipefail
+          python -m pytest tests/ -q --junitxml=security-tests.xml 2>&1 | tee security-tests.txt
+
+      - name: Publish security test evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo '### Phase 8.7-C security suites'
+            echo '```'
+            tail -5 security-tests.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-tests-evidence
+          path: devops-ai-platform/security-tests.xml
+          if-no-files-found: warn
+
+  android-secret-guards:
+    name: Phase 8.7-C Android embedded-secret static guards
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: devops-ai-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements-test.txt
+      - name: Install security test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: Android secret guards over the actual repository source (Defect B)
+        run: python -m pytest tests/test_android_secret_guards.py -v
+
+      - name: Standalone structural guard runner — android surface
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -c "
+          from pathlib import Path
+          from security_guards import android_check
+          root = Path('.').resolve().parents[1]
+          violations = android_check(root)
+          for v in violations:
+              print('VIOLATION:', v)
+          assert not violations, 'Android secret guard failed'
+          print('android-gemini-secret guard: PASS')
+          " | tee -a "$GITHUB_STEP_SUMMARY"
+
+  structural-guards:
+    name: Phase 8.7-C structural security guards (all surfaces)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: devops-ai-platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements-test.txt
+      - name: Install security test dependencies
+        run: pip install -r requirements-test.txt
+
+      - name: All structural guards over the actual repository source
+        # Exits non-zero on any violation: a failed security invariant fails CI.
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python -m security_guards | tee -a "$GITHUB_STEP_SUMMARY"

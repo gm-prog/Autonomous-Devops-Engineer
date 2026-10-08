@@ -44,7 +44,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.DeploymentLogEntity
-import com.example.data.GeminiClient
 import com.example.data.IncidentEntity
 import com.example.data.RepoEntity
 import com.example.ui.DevOpsViewModel
@@ -105,7 +104,7 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
         Column(modifier = Modifier.fillMaxSize()) {
             // High-fidelity Neon Header Bar
             WebOpsHeader(
-                apiKeyStatus = GeminiClient.isApiKeyPresent,
+                remoteAiEnabled = viewModel.isRemoteGatewayEnabled,
                 onOpenSettings = { viewModel.isSettingsSheetOpen = true }
             )
 
@@ -177,7 +176,7 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
 
 // --- Header Component ---
 @Composable
-fun WebOpsHeader(apiKeyStatus: Boolean, onOpenSettings: () -> Unit) {
+fun WebOpsHeader(remoteAiEnabled: Boolean, onOpenSettings: () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0F111E)),
         shape = RoundedCornerShape(0.dp),
@@ -233,10 +232,10 @@ fun WebOpsHeader(apiKeyStatus: Boolean, onOpenSettings: () -> Unit) {
             // Live status tag
             Card(
                 colors = CardDefaults.cardColors(
-                    containerColor = if (apiKeyStatus) ColorNeonGreen.copy(alpha = 0.15f) else ColorNeonPink.copy(alpha = 0.15f)
+                    containerColor = if (remoteAiEnabled) ColorNeonGreen.copy(alpha = 0.15f) else ColorNeonPink.copy(alpha = 0.15f)
                 ),
                 shape = RoundedCornerShape(6.dp),
-                border = BorderStroke(1.dp, if (apiKeyStatus) ColorNeonGreen.copy(alpha = 0.4f) else ColorNeonPink.copy(alpha = 0.4f)),
+                border = BorderStroke(1.dp, if (remoteAiEnabled) ColorNeonGreen.copy(alpha = 0.4f) else ColorNeonPink.copy(alpha = 0.4f)),
                 modifier = Modifier.padding(start = 8.dp)
             ) {
                 Row(
@@ -246,16 +245,16 @@ fun WebOpsHeader(apiKeyStatus: Boolean, onOpenSettings: () -> Unit) {
                     Box(
                         modifier = Modifier
                             .size(6.dp)
-                            .background(if (apiKeyStatus) ColorNeonGreen else ColorNeonPink, shape = CircleShape)
+                            .background(if (remoteAiEnabled) ColorNeonGreen else ColorNeonPink, shape = CircleShape)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (apiKeyStatus) "GEMINI_LIVE" else "PROTOTYPE_SIM",
+                        text = if (remoteAiEnabled) "REMOTE_AI" else "OFFLINE_SIM",
                         style = TextStyle(
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.sp,
-                            color = if (apiKeyStatus) ColorNeonGreen else ColorNeonPink
+                            color = if (remoteAiEnabled) ColorNeonGreen else ColorNeonPink
                         )
                     )
                 }

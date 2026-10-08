@@ -36,7 +36,15 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/devops_prod
       - REDIS_HOST=redis
+      # Server-side Gemini key for the agent/analysis path only — it never
+      # reaches the Android client (see devops-ai-platform/SECURITY.md).
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # Phase 8.7-C JWT contract: the gateway FAILS CLOSED at startup when
+      # JWT_SECRET is absent outside explicit APP_ENV=development. The
+      # ${JWT_SECRET:?...} form makes compose refuse to start a
+      # misconfigured gateway.
+      - APP_ENV=${APP_ENV:-production}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set — see devops-ai-platform/SECURITY.md}
     depends_on:
       - postgres
       - redis
