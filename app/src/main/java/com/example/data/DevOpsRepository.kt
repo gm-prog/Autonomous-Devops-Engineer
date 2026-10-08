@@ -144,19 +144,69 @@ class DevOpsRepository(private val dao: DevOpsDao) {
     }
 
     /**
-     * Executes Repository Analysis & Asset generation.
+     * Executes Repository Analysis & Asset generation (Phase 8.7-D).
      *
-     * Phase 8.7-C.1: offline-only on this branch. Analysis always runs the
-     * non-secret offline template engine in [GeminiClient] — no provider
-     * credential and no network round-trip. This branch does not contain a
-     * verified live server-side analysis backend; a remote AI path (if one
-     * is ever integrated) belongs to a later backend integration phase and
-     * must land together with a real, authenticated backend implementation.
+     * Two explicitly distinct paths:
+     *
+     *  * LIVE (authenticated): when [backendUrl] and [jwtToken] are both
+     *    provided, analysis runs through the gateway's typed, JWT-authorized
+     *    endpoint; the server calls Gemini with its own server-side key.
+     *    The client carries only the gateway JWT — never a provider key.
+     *  * OFFLINE (default): otherwise the deterministic, non-secret on-device
+     *    template engine in [GeminiClient] is used.
+     *
+     * HONEST FAILURE: a failed live analysis NEVER degrades into a fake
+     * "successful Gemini" result — the repository is marked failed with the
+     * truthful reason, and the caller (UI) is told so.
+     *
+     * @return "LIVE_BACKEND" on successful live analysis, "OFFLINE_SIM" on
+     *   offline analysis, "LIVE_FAILED" when a live attempt failed, or
+     *   "OFFLINE_FAILED" when the on-device engine itself failed (a local
+     *   failure is never labeled as a live failure).
      */
-    suspend fun analyzeRepoAsync(repoId: Int) {
-        val repo = dao.getRepositoryById(repoId) ?: return
+    suspend fun analyzeRepoAsync(repoId: Int, backendUrl: String, jwtToken: String): String {
+        val repo = dao.getRepositoryById(repoId) ?: return "LIVE_FAILED"
         dao.insertRepository(repo.copy(status = "Analyzing"))
 
+        val useLive = backendUrl.isNotBlank() && jwtToken.isNotBlank()
+
+        if (useLive) {
+            when (val outcome = BackendGatewayClient.requestRepositoryAnalysis(
+                baseUrlStr = backendUrl,
+                jwtToken = jwtToken,
+                repoName = repo.name,
+                repoUrl = repo.url,
+                framework = repo.framework,
+                technology = repo.technology
+            )) {
+                is BackendGatewayClient.AnalysisOutcome.Success -> {
+                    val result = outcome.analysis
+                    dao.updateRepository(
+                        repo.copy(
+                            dockerfile = result.dockerfile,
+                            k8sYaml = result.k8sYaml,
+                            terraformTf = result.terraformTf,
+                            pipelineYaml = result.pipelineYaml,
+                            lastAnalysisReport = result.report,
+                            status = "Generated"
+                        )
+                    )
+                    return "LIVE_BACKEND"
+                }
+                is BackendGatewayClient.AnalysisOutcome.Failure -> {
+                    // No silent fallback: the failure is surfaced as-is.
+                    dao.updateRepository(
+                        repo.copy(
+                            status = "Failed",
+                            lastAnalysisReport = "Live backend analysis failed: ${outcome.reason} The offline engine was NOT used as a substitute — enable offline mode to run on-device analysis."
+                        )
+                    )
+                    return "LIVE_FAILED"
+                }
+            }
+        }
+
+        // Explicit offline path (default).
         try {
             val result = GeminiClient.analyzeRepository(
                 repoName = repo.name,
@@ -174,8 +224,10 @@ class DevOpsRepository(private val dao: DevOpsDao) {
                 status = "Generated"
             )
             dao.updateRepository(updatedRepo)
+            return "OFFLINE_SIM"
         } catch (e: Exception) {
-            dao.updateRepository(repo.copy(status = "Failed", lastAnalysisReport = "Analysis failed: ${e.message}"))
+            dao.updateRepository(repo.copy(status = "Failed", lastAnalysisReport = "On-device analysis failed: ${e.message}"))
+            return "OFFLINE_FAILED"
         }
     }
 

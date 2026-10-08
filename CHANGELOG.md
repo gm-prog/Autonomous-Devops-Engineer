@@ -2,6 +2,70 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-D] — Verified Server-Side Gemini Integration (2026-10-08)
+
+### Added
+
+* **Authenticated, typed, role-gated repository-analysis endpoint.**
+  `POST /api/v1/repository/analyze` on the api-gateway: JWT required
+  (401 otherwise), role-gated to Developer / operator / DevOpsLead
+  (403 otherwise), strict Pydantic schemas that validate repository
+  name/URL/framework/technology, reject malformed or oversized input
+  (422), and forbid extra fields — a client-supplied `gemini_api_key`
+  (or any provider key) is rejected, never forwarded, never accepted.
+  The gateway forwards a typed internal call
+  (`POST /api/internal/repository/analyze` on the agent-service) with
+  the verified identity; no generic dispatch was restored.
+* **Agent-service analysis command + Gemini integration.** New
+  `application/commands/analyze_repository.py` and
+  `presentation/rest/analysis_router.py` wired through the existing
+  agent-service boundary with DI around `RemoteLLMInterface` /
+  `GeminiCallerAdapter`. The Gemini credential is read only from the
+  agent-service server environment.
+* **Hardened `GeminiCallerAdapter`** (`infrastructure/llm/gemini_caller.py`):
+  fails closed when `GEMINI_API_KEY` is absent (503, no fabricated
+  response); bounded timeout and bounded retries (transient failures
+  only); circuit breaker with half-open recovery; monthly USD budget
+  ceiling; structured/validated response extraction; typed exceptions
+  distinguishing provider auth failure (401/403), rate limit (429),
+  timeout, upstream failure, and malformed response; the credential
+  never appears in URLs, exceptions, responses, or logs.
+* **Android live analysis path (opt-in, JWT-only).** `analyzeRepoAsync`
+  now runs the live path only when the operator has configured the
+  gateway URL + platform-issued gateway JWT and the probe reports
+  CONNECTED; the client sends a typed analysis request with
+  `Authorization: Bearer <JWT>` only (no provider key). Results are
+  surfaced truthfully as `LIVE_BACKEND` / `OFFLINE_SIM` / `LIVE_FAILED`
+  / `OFFLINE_FAILED` in a header badge; a failed live attempt is never
+  substituted by a fake "successful Gemini" result, and the offline
+  engine remains the default when live analysis is off or the backend
+  is unavailable.
+* **Tests:** new `tests/test_gemini_analysis_path.py` (gateway authz /
+  422 / downstream mapping / no credential leak; agent boundary
+  fail-closed / typed / malformed; caller resilience units; e2e
+  fake-provider path) and five new mutations: M8 (role-gate bypass),
+  M9 (client-supplied key field), M10 (missing-key fail-open),
+  M11 (provider 401 swallowed into fabricated success), M12 (budget
+  bypass). M5/M7 re-anchored to the new transport contract.
+
+### Changed
+
+* **Documentation re-anchored to the new truth** (SECURITY.md §2,
+  README, VS_CODE_AND_VERCEL_ROADMAP.md, `.env.example`): analysis is
+  offline by default; the authenticated server-side path is implemented
+  on this branch (JWT + role-gated, server-side key, fail-closed); the
+  live path has **not** been exercised against the real Gemini API in a
+  production deployment on this branch, and no production-verification
+  claim is made.
+
+### Verification status (honest)
+
+* Backend path verified by the automated gateway / agent / caller /
+  Android test suites in this environment (see CI).
+* **No genuine end-to-end call against the real Gemini API was executed**
+  on this branch (no provider credential is configured in the test or CI
+  environment). This entry does not claim production verification.
+
 ## [8.7-C.3] — Roadmap & Documentation Truthfulness Reconciliation (2026-10-08)
 
 ### Corrected

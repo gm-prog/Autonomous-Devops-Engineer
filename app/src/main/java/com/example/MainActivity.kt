@@ -38,6 +38,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -104,6 +105,7 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
         Column(modifier = Modifier.fillMaxSize()) {
             // High-fidelity Neon Header Bar
             WebOpsHeader(
+                analysisMode = viewModel.analysisSource,
                 onOpenSettings = { viewModel.isSettingsSheetOpen = true }
             )
 
@@ -175,7 +177,7 @@ fun DevOpsAppContent(modifier: Modifier = Modifier, viewModel: DevOpsViewModel =
 
 // --- Header Component ---
 @Composable
-fun WebOpsHeader(onOpenSettings: () -> Unit) {
+fun WebOpsHeader(analysisMode: String, onOpenSettings: () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Color(0xFF0F111E)),
         shape = RoundedCornerShape(0.dp),
@@ -228,16 +230,23 @@ fun WebOpsHeader(onOpenSettings: () -> Unit) {
                 )
             }
 
-            // Status tag — Phase 8.7-C.1: this branch has no verified live
-            // server-side AI backend, so repository analysis always runs the
-            // non-secret offline engine. Do not re-introduce a state that
-            // claims live AI without the backend integration phase.
+            // Status tag — Phase 8.7-D: shows the source of the LAST analysis,
+            // truthfully. OFFLINE_SIM = on-device template engine (default);
+            // LIVE_BACKEND = authenticated server-side analysis succeeded;
+            // LIVE_FAILED = a live attempt failed (never shown as a success);
+            // OFFLINE_FAILED = the on-device engine itself failed (never
+            // labeled as a live failure).
+            val badgeColor = when (analysisMode) {
+                "LIVE_BACKEND" -> ColorNeonGreen
+                "LIVE_FAILED", "OFFLINE_FAILED" -> ColorNeonPink
+                "OFFLINE_SIM", else -> ColorNeonBlue
+            }
             Card(
                 colors = CardDefaults.cardColors(
-                    containerColor = ColorNeonPink.copy(alpha = 0.15f)
+                    containerColor = badgeColor.copy(alpha = 0.15f)
                 ),
                 shape = RoundedCornerShape(6.dp),
-                border = BorderStroke(1.dp, ColorNeonPink.copy(alpha = 0.4f)),
+                border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.4f)),
                 modifier = Modifier.padding(start = 8.dp)
             ) {
                 Row(
@@ -247,16 +256,16 @@ fun WebOpsHeader(onOpenSettings: () -> Unit) {
                     Box(
                         modifier = Modifier
                             .size(6.dp)
-                            .background(ColorNeonPink, shape = CircleShape)
+                            .background(badgeColor, shape = CircleShape)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "OFFLINE_SIM",
+                        text = analysisMode,
                         style = TextStyle(
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.Bold,
                             fontSize = 10.sp,
-                            color = ColorNeonPink
+                            color = badgeColor
                         )
                     )
                 }
@@ -811,9 +820,12 @@ fun RepositoryScreen(
                                 if (viewModel.isAnalyzing) {
                                     CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp))
                                 } else {
-                                    Icon(Icons.Default.Refresh, contentDescription = "Offline AI", tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.Refresh, contentDescription = "Analyze", tint = Color.White, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Analyze (Offline AI)")
+                                    Text(
+                                        if (viewModel.isLiveAnalysisEnabled) "Analyze (Live Backend)"
+                                        else "Analyze (Offline AI)"
+                                    )
                                 }
                             }
 
@@ -1862,13 +1874,13 @@ fun ConnectivitySettingsDialog(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            "Gateway Reachability Probe",
+                            "Live Backend Analysis & Gateway Probe",
                             color = Color.White,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            "Diagnostics only: pings a configured gateway URL. Repository analysis always runs on-device on this branch.",
+                            "Configure the gateway URL and the platform-issued gateway JWT. When the probe is CONNECTED, analysis runs server-side (server-side Gemini, authenticated). Otherwise the on-device offline engine is used. The Gemini key never enters this app.",
                             color = ColorMutedGray,
                             fontSize = 10.sp
                         )
@@ -1890,6 +1902,25 @@ fun ConnectivitySettingsDialog(
                         onValueChange = { viewModel.updateApiUrl(it) },
                         label = { Text("Base Gateway Endpoint URL") },
                         placeholder = { Text("e.g. http://10.0.2.2:8000") },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = ColorLightGray,
+                            focusedBorderColor = ColorNeonBlue,
+                            unfocusedBorderColor = ColorMutedGray
+                        ),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    // Phase 8.7-D: gateway access token (platform-issued JWT).
+                    // Never a Gemini key — the Gemini credential stays
+                    // server-side. Blank token = live analysis stays off.
+                    OutlinedTextField(
+                        value = viewModel.gatewayJwtToken,
+                        onValueChange = { viewModel.updateGatewayJwtToken(it) },
+                        label = { Text("Gateway Access Token (JWT, issued by the platform)") },
+                        placeholder = { Text("Paste the gateway JWT — never a Gemini key") },
+                        visualTransformation = PasswordVisualTransformation(),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedTextColor = Color.White,
                             unfocusedTextColor = ColorLightGray,

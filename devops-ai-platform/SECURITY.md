@@ -80,42 +80,59 @@ a user-chosen downstream service, internal path, or untyped relay payload.
 
 ---
 
-## 2. Android client: no device-side provider secrets, offline-only analysis
+## 2. Android client: no device-side provider secrets; authenticated server-side analysis (offline by default)
 
 **Android-distributed applications cannot keep a reusable provider secret
 confidential.** Any credential shipped inside an APK — BuildConfig, string
 resources, assets, SharedPreferences defaults, obfuscated or base64-wrapped
 constants — is recoverable by anyone who can decompile the artifact.
 
-What this phase does and does not do (truthful contract for this branch):
+What this branch does and does not do (truthful contract for this branch):
 
-* This phase removes the device-side Gemini credential. The current branch
-  does **not** expose a verified live Gemini backend integration for the
-  Android app. Android therefore uses the **non-secret offline analysis
-  path** (deterministic template engine) for all repository analysis — no
-  provider credential, no network round-trip.
-* **Server-side Gemini integration belongs to a later backend integration
-  phase.** It may not be claimed, stubbed, or faked on this branch: no fake
-  or placeholder authentication, no hard-coded service credentials, no
-  client-side secrets. A remote AI path may only appear together with a real,
-  implemented, authenticated backend and its verification.
-* The app **does not treat provider API credentials as device-side secrets**.
-  `GEMINI_API_KEY` is no longer injected into the app (removed from
-  `.env.example`; `BuildConfig.GEMINI_API_KEY` no longer exists or is used).
-* Provider credentials belong **server-side** (platform services such as
-  `agent-service` read `GEMINI_API_KEY` from their own server environment —
-  that is valid server-side code and is not reachable from the APK).
-* The app may know: a gateway URL for the reachability diagnostics in
-  Settings (a baseline probe). It must never ship a reusable privileged
-  Gemini secret, and it does not perform remote analysis.
+* **No device-side provider secret, ever.** The app **does not treat provider
+  API credentials as device-side secrets**. `GEMINI_API_KEY` is no longer
+  injected into the app (removed from `.env.example`; `BuildConfig.GEMINI_API_KEY`
+  no longer exists or is used).
+* **Two explicit analysis paths (implemented in Phase 8.7-D).** Repository analysis runs either on the
+  **non-secret offline path** (deterministic template engine — the default,
+  no network round-trip, no credential) or on the **authenticated server-side
+  Gemini path**: the Android client sends a typed analysis request to
+  `POST /api/v1/repository/analyze` carrying only a
+  `Authorization: Bearer <JWT>` header; the api-gateway verifies the JWT and
+  the caller's role (Developer, operator, DevOpsLead), then forwards a
+  typed internal call to the agent-service, which invokes Gemini using
+  `GEMINI_API_KEY` read **from the agent-service server environment**.
+  Provider credentials belong **server-side** — that is valid server-side
+  code and is not reachable from the APK. The gateway URL in Settings is a
+  configuration the user provides; the reachability check stays diagnostics-only.
+* **Authenticated and role-gated, fail-closed end to end.** The analyze
+  endpoint rejects unauthenticated requests (401), insufficient roles (403),
+  and malformed or oversized payloads (422). A **client-supplied provider key
+  is rejected** (the request schema is strict: `extra="forbid"`; there is no
+  `gemini_api_key` field). The agent-service **fails closed** when
+  `GEMINI_API_KEY` is absent (503, no fabricated response), applies bounded
+  timeout/retry, a circuit breaker, and a monthly budget ceiling, and never
+  echoes the credential in responses or logs.
+* **No silent fabrication on the client.** If the backend is unavailable,
+  the live path is not configured, or the server reports failure, the app
+  records a **typed, truthful failure** (`LIVE_FAILED` with the reason) — it
+  never falls back to a fake "successful Gemini" result, and the analysis
+  screen displays an explicit source badge distinguishing `OFFLINE_SIM`
+  (local simulation) from `LIVE_BACKEND` (server-side provider result).
+* **Honest verification status.** The path above is implemented and verified
+  by the automated gateway/agent/Android test suites on this branch. It has
+  **not** been exercised against the real Gemini API in a production
+  deployment on this branch; no production-verification claim is made.
 
 Regression protection: the `android-gemini-secret` structural guard (and the
 `android-secret-guards` CI job) fails the build if a Gemini secret reappears
 in production Kotlin source, resources, manifest, assets, gradle
 `buildConfigField`, committed env files, or SharedPreferences defaults. The
-Android contract tests additionally fail if a fictitious remote analysis
-path (e.g. a call to an unimplemented, unauthenticated analyze endpoint) or
-any fake client-side authentication is reintroduced.
+Android contract tests additionally fail if the analysis transport contract
+is violated: a call to `/api/v1/repository/analyze` without a Bearer-JWT
+Authorization header, the reintroduction of `queryRemoteAnalysis`, any
+provider-secret literal in production code, or the absence of the truthful
+`OFFLINE_SIM` / `LIVE_BACKEND` / `LIVE_FAILED` state handling.
 
 ---
 

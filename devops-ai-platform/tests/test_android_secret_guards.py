@@ -124,9 +124,10 @@ def test_no_secret_relocated_into_app_storage():
         assert not re.match(r"\s*GEMINI_API_KEY\s*=", line), line
 
     # committed env template: must not carry the stale remote-backend claim
-    # and must state the offline-only truth (Phase 8.7-C.3).  The template
-    # content lives in comment lines, so strip the comment markers before
-    # normalizing (line wraps would otherwise split phrases).
+    # and must state the 8.7-D truth (offline by default; the authenticated
+    # server-side path is implemented; no provider key in the app).  The
+    # template content lives in comment lines, so strip the comment markers
+    # before normalizing (line wraps would otherwise split phrases).
     env_norm = re.sub(
         r"\s+", " ", re.sub(r"(?m)^\s*#\s*", " ", ENV_EXAMPLE.read_text(encoding="utf-8"))
     ).lower()
@@ -139,12 +140,18 @@ def test_no_secret_relocated_into_app_storage():
             f".env.example: stale remote-backend claim still present: "
             f"{stale_claim!r}"
         )
-    for truth_marker in ("offline-only", "not implemented on this branch"):
+    for truth_marker in (
+        "offline by default",
+        "implemented on this branch",
+        "bearer",
+        "no provider key",
+    ):
         assert truth_marker in env_norm, (
             f".env.example: required truth missing: {truth_marker!r} — the "
-            "template must state that Android analysis is offline-only on "
-            "this branch and the future server-side integration is not "
-            "implemented"
+            "template must state that Android analysis is offline by "
+            "default, that the authenticated server-side Gemini path is "
+            "implemented on this branch (Phase 8.7-D), and that the app "
+            "holds no provider key"
         )
 
     # gradle: no buildConfigField for a gemini key
@@ -193,50 +200,73 @@ def test_offline_analysis_path_is_unconditional():
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — no fictitious remote-analysis path exists
+# Test 5 — the analysis transport contract (Phase 8.7-D)
 # ---------------------------------------------------------------------------
 
+# The pre-8.7-D client method for the UNAUTHENTICATED analyze endpoint.
+# It must never come back: the endpoint now exists for real, is JWT-
+# authorized on the gateway, and is reached only through the typed,
+# authenticated client below.
+_FORBIDDEN_APP_TOKENS = ("queryRemoteAnalysis", "GEMINI_API_KEY",
+                         "generativelanguage.googleapis.com")
 
-def check_offline_only_contract(repo_root: Path) -> list:
-    """Structural checker for the truthful Phase 8.7-C.1 Android contract.
+
+def check_analysis_transport_contract(repo_root: Path) -> list:
+    """Structural checker for the Phase 8.7-D Android analysis contract.
 
     Returns a list of violation strings (empty == contract holds).  The
-    contract: the app contains no remote repository-analysis client, no
-    client for an unimplemented analyze endpoint, no fake client-side
-    authentication, and no BuildConfig provider secret.  Used by the
-    contract tests and by the adversarial mutation tests (must turn red when
-    the fictitious remote path is reintroduced).
+    contract:
+
+    1. the old unauthenticated remote-analysis client
+       (``queryRemoteAnalysis``) is absent;
+    2. if the app calls the typed analyze endpoint, the request is
+       Bearer-JWT authenticated with a VARIABLE token (a static token
+       literal or an empty bearer is a violation);
+    3. no provider secret anywhere in the app (GEMINI_API_KEY, direct
+       provider URL);
+    4. the offline engine remains the explicit default (GeminiClient stays
+       pure; the repository uses it and does not synthesize assets itself);
+    5. the UI distinguishes LIVE_BACKEND from OFFLINE_SIM truthfully and a
+       failed live attempt is surfaced as a failure, never as a success.
+
+    Used by the contract tests and by the adversarial mutation tests (M5
+    and friends must turn the suite red when the unauthenticated path or a
+    provider secret is reintroduced).
     """
     violations: list = []
     app_src = Path(repo_root) / "app" / "src" / "main"
     for kt in sorted(app_src.rglob("*.kt")):
         rel = kt.name
         code = android_guard._strip_kotlin_comments(kt.read_text(encoding="utf-8"))
-        if "queryRemoteAnalysis" in code:
-            violations.append(
-                f"{rel}: remote-analysis client method 'queryRemoteAnalysis' "
-                "present — this branch has no implemented, authenticated "
-                "analysis backend"
-            )
-        if "backendBaseUrl" in code:
-            violations.append(
-                f"{rel}: analysis path selects a remote backend URL "
-                "(parameter 'backendBaseUrl') — repository analysis must be "
-                "offline-only on this branch"
-            )
+        for token in _FORBIDDEN_APP_TOKENS:
+            if token in code:
+                violations.append(
+                    f"{rel}: '{token}' present — the old unauthenticated "
+                    "remote path / provider secret must not reappear"
+                )
+        # A remote analyze call is only legitimate when Bearer-authenticated
+        # with a variable token.
         if "/api/v1/repository/analyze" in code:
-            violations.append(
-                f"{rel}: request to the unimplemented /api/v1/repository/analyze "
-                "endpoint — fictitious remote analysis path"
+            authed = re.search(
+                r'addHeader\s*\(\s*["\']Authorization["\']\s*,\s*["\']Bearer\s+\$[A-Za-z_]',
+                code,
             )
-        if re.search(r'addHeader\s*\(\s*["\']\s*Authorization', code) or re.search(
-            r'["\']\s*Bearer', code
-        ):
-            violations.append(
-                f"{rel}: client-side authentication header construction — "
-                "no fake/placeholder auth may be introduced"
-            )
-    # GeminiClient specifically must not reference the backend client.
+            if not authed:
+                violations.append(
+                    f"{rel}: typed analyze endpoint called WITHOUT a "
+                    "Bearer-JWT Authorization header — the pre-8.7-D "
+                    "unauthenticated design must not be restored"
+                )
+            # No static token literals: the token must be a variable.
+            for m in re.finditer(r'Bearer\s+([^"]*)"', code):
+                literal = m.group(1).strip()
+                if literal and "$" not in literal:
+                    violations.append(
+                        f"{rel}: static bearer token literal — the gateway "
+                        "JWT must come from user configuration, never a "
+                        "hard-coded credential"
+                    )
+    # GeminiClient must remain the pure offline engine.
     gemini = app_src / "java" / "com" / "example" / "data" / "GeminiClient.kt"
     if gemini.is_file():
         gcode = android_guard._strip_kotlin_comments(gemini.read_text(encoding="utf-8"))
@@ -245,32 +275,102 @@ def check_offline_only_contract(repo_root: Path) -> list:
                 "GeminiClient.kt: depends on BackendGatewayClient — the "
                 "offline analysis engine must not call remote backends"
             )
+        if "generateSimulatedAssets" not in gcode or "fun analyzeRepository" not in gcode:
+            violations.append(
+                "GeminiClient.kt: offline engine or analyzeRepository entry "
+                "point missing — the offline default must remain"
+            )
+    # The repository layer: offline default, honest live failure.
+    repo = app_src / "java" / "com" / "example" / "data" / "DevOpsRepository.kt"
+    if repo.is_file():
+        rcode = android_guard._strip_kotlin_comments(repo.read_text(encoding="utf-8"))
+        if "generateSimulatedAssets" in rcode:
+            violations.append(
+                "DevOpsRepository.kt: synthesizes simulated assets directly "
+                "— a live failure must never masquerade as offline content"
+            )
+        if not all(state in rcode for state in
+                   ("LIVE_BACKEND", "OFFLINE_SIM", "LIVE_FAILED", "OFFLINE_FAILED")):
+            violations.append(
+                "DevOpsRepository.kt: analysis-source reporting missing — "
+                "live success / offline / live failure / offline failure "
+                "must be distinguishable"
+            )
+        if '"Failed"' not in rcode:
+            violations.append(
+                "DevOpsRepository.kt: failed analyses are not marked "
+                "Failed — honest failure reporting is required"
+            )
+    # The UI flow must distinguish the modes truthfully: all three states
+    # (live success / offline default / live failure) must exist in the UI
+    # layer (header badge source + analysis-source reporting), and the
+    # header must render the state from the ViewModel.
+    main = app_src / "java" / "com" / "example" / "MainActivity.kt"
+    viewmodel = app_src / "java" / "com" / "example" / "ui" / "DevOpsViewModel.kt"
+    if main.is_file() and viewmodel.is_file():
+        ui_code = android_guard._strip_kotlin_comments(main.read_text(encoding="utf-8"))
+        vm_code = android_guard._strip_kotlin_comments(viewmodel.read_text(encoding="utf-8"))
+        # The badge renders the repository's state string verbatim; the
+        # three rendered states must be explicitly handled in the UI layer,
+        # and the fourth (OFFLINE_FAILED) must exist in the repository
+        # (checked above) so a local engine failure can never be labeled
+        # as a live failure.
+        for mode in ('"LIVE_BACKEND"', '"OFFLINE_SIM"', '"LIVE_FAILED"'):
+            if mode not in ui_code and mode not in vm_code:
+                violations.append(
+                    f"UI layer: {mode} state missing — the UI must "
+                    "truthfully distinguish live/offline/failed analysis"
+                )
+        if "analysisMode" not in ui_code or "analysisSource" not in vm_code:
+            violations.append(
+                "UI layer: the header badge must render the analysis source "
+                "from the ViewModel (LIVE_BACKEND / OFFLINE_SIM / LIVE_FAILED)"
+            )
     return violations
 
 
-def test_no_fictitious_remote_analysis_path():
-    violations = check_offline_only_contract(REPO_ROOT)
+def test_analysis_transport_contract():
+    violations = check_analysis_transport_contract(REPO_ROOT)
     assert violations == [], "\n".join(violations)
-    # Explicitly: the removed client method and its endpoint are gone.
+    # Explicitly: the removed unauthenticated client method is gone...
     backend_code = android_guard._strip_kotlin_comments(BACKEND_CLIENT.read_text(encoding="utf-8"))
     assert "queryRemoteAnalysis" not in backend_code
-    assert "/api/v1/repository/analyze" not in backend_code
+    # ...and the typed endpoint call is Bearer-authenticated.
+    assert re.search(
+        r'addHeader\s*\(\s*["\']Authorization["\']\s*,\s*["\']Bearer\s+\$[A-Za-z_]',
+        backend_code,
+    ), "the analyze request must carry a Bearer JWT from a variable"
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — no fake authentication mechanism is introduced
+# Test 6 — app authentication is real JWT bearer, never fake/static
 # ---------------------------------------------------------------------------
 
 
-def test_no_fake_authentication_in_app():
+def test_remote_analysis_authentication_is_real_bearer_jwt():
     for kt in _main_kotlin_sources():
         code = android_guard._strip_kotlin_comments(kt.read_text(encoding="utf-8"))
-        assert not re.search(r'addHeader\s*\(\s*["\']\s*Authorization', code), kt.name
-        assert not re.search(r'["\']\s*Bearer', code), (
-            f"{kt.name}: Bearer-token construction — no fake client-side "
-            "authentication may be presented as real security"
-        )
         assert "GEMINI_API_KEY" not in code, f"{kt.name}: provider secret reference"
+        assert "BuildConfig" not in code or "BuildConfig.GEMINI" not in code, (
+            f"{kt.name}: BuildConfig provider reference"
+        )
+        # Any bearer construction must use a variable token — never a
+        # static literal and never an empty credential.
+        for m in re.finditer(r'Bearer\s+([^"]*)"', code):
+            literal = m.group(1).strip()
+            assert not (literal and "$" not in literal), (
+                f"{kt.name}: static bearer token literal — no hard-coded "
+                "credentials may be presented as real authentication"
+            )
+            assert literal != "", f"{kt.name}: empty bearer credential"
+    # The token flows from user configuration (Settings) into the request.
+    viewmodel = android_guard._strip_kotlin_comments(
+        (REPO_ROOT / "app/src/main/java/com/example/ui/DevOpsViewModel.kt").read_text(encoding="utf-8")
+    )
+    assert "gatewayJwtToken" in viewmodel, (
+        "the gateway JWT must come from user-supplied settings, not a "
+        "hard-coded value"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +379,10 @@ def test_no_fake_authentication_in_app():
 
 
 def test_documentation_states_the_offline_truth():
-    """The current docs must state the truthful contract AND must not claim
-    a verified authenticated backend path that does not exist."""
+    """The current docs must state the truthful 8.7-D contract — offline by
+    default, an implemented authenticated server-side path, and an honest
+    verification status — and must not overclaim production verification
+    or describe any fake/placeholder backend."""
     readme = re.sub(r"[*`\s]+", " ", (REPO_ROOT / "README.md").read_text(encoding="utf-8")).lower()
     security_md = re.sub(r"[*`\s]+", " ", (REPO_ROOT / "devops-ai-platform" / "SECURITY.md").read_text(encoding="utf-8")).lower()
 
@@ -290,26 +392,30 @@ def test_documentation_states_the_offline_truth():
             "documentation must state that Android apps cannot keep a "
             "reusable provider secret confidential"
         )
-        # The branch does not expose a verified live Gemini backend for the app.
-        assert "does not" in doc and "verified live gemini backend integration" in doc, (
-            "documentation must state that this branch does not expose a "
-            "verified live Gemini backend integration"
-        )
-        # The Android path is offline / non-secret.
+        # The Android path is offline / non-secret (the default).
         assert "offline" in doc
-        # No false claim of an authenticated backend carrying Gemini.
-        # (The docs may state, as a FUTURE condition, that a remote path
-        # requires a real implemented authenticated backend; they must not
-        # claim such a path currently exists.)
+        # The authenticated server-side path is documented as implemented
+        # on this branch (Phase 8.7-D).
+        assert "implemented" in doc and "8.7-d" in doc, (
+            "documentation must state that the authenticated server-side "
+            "Gemini analysis path is implemented on this branch (Phase 8.7-D)"
+        )
+        # Verification status is stated honestly: the path has NOT been
+        # exercised against the real Gemini API in production.
+        assert "not been exercised against the real gemini api" in doc, (
+            "documentation must not claim production verification — it "
+            "must state that the path has not been exercised against the "
+            "real Gemini API in a production deployment"
+        )
+        # No claim of a fictitious/placeholder backend carrying Gemini.
         for bad_claim in (
             "authenticated platform backend",
             "server-side by the authenticated backend",
             "authenticated backend, which calls gemini",
             "carries the ai request server-side",
-            "/api/v1/repository/analyze",
         ):
             assert bad_claim not in doc, (
-                f"documentation must not make the false current claim: {bad_claim!r}"
+                f"documentation must not make the false claim: {bad_claim!r}"
             )
 
     # The retired BuildConfig-based instructions must not remain in the
@@ -419,16 +525,20 @@ _FORBIDDEN_ROADMAP_CLAIMS = (
     "connect to remote backend",
 )
 
-# Semantic markers the roadmap must carry: offline analysis,
-# diagnostics-only gateway, gateway does not route analysis, a future
-# integration boundary, and the server-side credential boundary.
+# Semantic markers the roadmap must carry (Phase 8.7-D truth):
+# offline-by-default analysis, diagnostics-only probe, gateway does not
+# route deployments, the implemented authenticated live path, the
+# not-yet-production-verified boundary, and the server-side credential
+# boundary.
 _REQUIRED_ROADMAP_MARKERS = (
     "offline",
     "diagnostics-only",
     "does not route",
     "repository analysis",
-    "not implemented on this branch",
+    "not verified on this branch",
     "server-side only",
+    "bearer",
+    "jwt",
 )
 
 
@@ -440,11 +550,12 @@ def check_roadmap_truthfulness(repo_root: Path) -> list:
     """Semantic contract checker for the deployment roadmap (Phase 8.7-C.3).
 
     Returns a list of violation strings (empty == contract holds).  The
-    contract: the roadmap never claims that configuring/pinging the gateway
-    routes repository analysis to a remote server, and it explicitly states
-    the current offline architecture, the diagnostics-only gateway role,
-    the future (unimplemented) integration boundary, and the server-side
-    Gemini credential boundary.  Used by the contract test and by M7.
+    contract: the roadmap never claims that pinging the gateway alone routes
+    repository analysis to a remote server, and it explicitly states the
+    offline-by-default architecture, the diagnostics-only probe, the
+    implemented authenticated live path (Bearer-JWT, role-gated), the
+    not-yet-production-verified boundary, and the server-side Gemini
+    credential boundary.  Used by the contract test and by M7.
     """
     violations: list = []
     roadmap = Path(repo_root) / "VS_CODE_AND_VERCEL_ROADMAP.md"

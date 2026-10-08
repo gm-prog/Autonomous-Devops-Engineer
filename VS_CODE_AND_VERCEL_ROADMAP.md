@@ -6,18 +6,25 @@ Welcome to the **DevOps.AI Operator Platform** engineering roadmap. This documen
 
 ## 🏗️ Current Branch Architecture (read this first)
 
-> **On the current branch, Android repository analysis is offline and deterministic. The configured gateway URL is diagnostics-only and does not route repository analysis, Gemini requests, deployments, or execution through the remote server.**
+> **On the current branch, Android repository analysis is offline and deterministic BY DEFAULT. When the operator explicitly enables live analysis (gateway URL + gateway JWT + successful reachability probe), analysis is sent as a typed, authenticated request to the gateway's `POST /api/v1/repository/analyze` endpoint (Bearer-JWT, role-gated) and the agent-service calls Gemini with its own server-side key. The gateway does not route deployments or execution; the APK never contains a Gemini provider credential.**
 
 Two separate, independent flows exist today:
 
-**Flow A — Repository analysis (on-device):**
+**Flow A — Repository analysis (offline by default; opt-in authenticated live):**
 
 ```text
 Android repository registration
         ↓
-offline deterministic repository analysis
-        ↓
-local DevOps blueprint generation
+live analysis enabled? (operator toggle + JWT + probe OK)
+        ├─ no  → offline deterministic on-device template engine
+        │          ↓
+        │        local DevOps blueprint generation (source: OFFLINE_SIM)
+        └─ yes → POST /api/v1/repository/analyze  (Authorization: Bearer <JWT>)
+                   ↓  (gateway: JWT + role check → agent-service)
+                 server-side Gemini call (GEMINI_API_KEY in agent-service env)
+                   ↓
+                 validated analysis response (source: LIVE_BACKEND)
+                 failure → truthful LIVE_FAILED, never a fabricated success
 ```
 
 **Flow B — Gateway connectivity (diagnostics only):**
@@ -30,13 +37,14 @@ reachability probe
 diagnostic connectivity status
 ```
 
-Enabling or pinging the gateway (Flow B) **never** switches repository analysis (Flow A)
-to a remote service. The Android app contains no Gemini provider credential
-(no `BuildConfig.GEMINI_API_KEY`, no embedded key), and no
-Android → backend → Gemini repository-analysis path is implemented on this
-branch. Server-side Gemini credentials are **server-side only** and must
-never be placed in the Android APK, `BuildConfig`, Android resources,
-Android preferences, or Android source literals.
+Live analysis is an **explicit operator choice**, not a side effect of
+reachability: the Settings screen keeps the diagnostics-only probe separate
+from the live-analysis toggle (which additionally requires the gateway JWT).
+The Android app contains no Gemini provider credential (no
+`BuildConfig.GEMINI_API_KEY`, no embedded key). Server-side Gemini
+credentials are **server-side only** and must never be placed in the Android
+APK, `BuildConfig`, Android resources, Android preferences, or Android source
+literals.
 
 ---
 
@@ -45,9 +53,11 @@ Android preferences, or Android source literals.
 To run and debug the entire DevOps Multi-Agent Platform locally on your computer inside VS Code, follow these instructions:
 
 > **Scope note:** this section documents how to run the *Python backend
-> infrastructure locally*. Running these services does **not** mean the
-> Android client currently uses them for repository analysis — on this
-> branch Android analysis is offline (see Current Branch Architecture).
+> infrastructure locally*. Android analysis is offline by default; to use the
+> opt-in live path against a locally run backend, the gateway, the
+> agent-service (with `GEMINI_API_KEY` set in its environment), and the
+> Android app must all be configured as described in Step 3 (see Current
+> Branch Architecture).
 
 ### 1. Prerequisites & VS Code Extensions
 Ensure you have **Python 3.11+**, **Docker Desktop**, and **Android Studio / Command Line Tools** installed. Then install the following VS Code extensions:
@@ -113,10 +123,13 @@ You can now open `http://localhost:8000/docs` in your browser to inspect the Swa
 FastAPI apps deploy beautifully to Vercel's serverless edge. Since the database, Redis broker, and Qdrant Vector store are persistent stateful systems, you cannot run them inside Vercel's ephemeral serverless containers directly. You should use **managed serverless database providers** and point your Vercel deployment variables to them!
 
 > **Scope note:** this section documents *deploying backend
-> infrastructure*. Deploying the backend does **not** create a verified
-> Android live-analysis integration: on this branch the Android app does
-> not send repository analysis to the deployed URL, and no future
-> integration exists yet (see the Current vs Future boundary in Step 4).
+> infrastructure*. The authenticated Android live-analysis integration is
+> implemented on this branch; deploying the backend (with `GEMINI_API_KEY`
+> set for the agent-service) and pointing the app's live-analysis
+> configuration at the deployed gateway is what makes the live path
+> available against that deployment. It has **not** been exercised against
+> the real Gemini API in a production deployment on this branch (see the
+> Current vs Future boundary in Step 4).
 
 ### 1. Provision Hosted Services
 *   **Database**: Set up a serverless PostgreSQL database on **Vercel Postgres (Neon)** or **Supabase**.
@@ -185,10 +198,26 @@ backend execution channel.
     *   **Deployed backend**: If you deployed the backend (Step 2), you may input that URL (e.g., `https://devops-ai-platform.vercel.app`) to test reachability.
 5.  Tap **Ping Endpoint**: the status pill shows **CONNECTED** when the
     endpoint responds, or **UNREACHABLE** otherwise.
-6.  **That is the entire effect.** The result only indicates whether the
-    configured endpoint is reachable. **Repository analysis remains
-    offline and deterministic on this branch** — no analysis task, Gemini
-    request, deployment, or execution is routed through the gateway.
+6.  **The probe is diagnostics.** The result only indicates whether the
+    configured endpoint is reachable. Reaching `CONNECTED` alone does not
+    switch analysis: without a gateway JWT the live path stays off and
+    repository analysis remains offline and deterministic (source badge
+    `OFFLINE_SIM`).
+7.  **Opt-in live analysis (authenticated).** Under the same
+    **Live Backend Analysis & Gateway Probe** toggle, also paste the
+    platform-issued **gateway JWT** (never a Gemini key). Live analysis is
+    active only when *all* of these hold: the toggle is on, the gateway URL
+    is set, the JWT is non-blank, and the probe reports `CONNECTED`. While
+    active, "Analyze" sends a typed request with
+    `Authorization: Bearer <JWT>` to
+    `POST /api/v1/repository/analyze`; the gateway verifies the JWT and the
+    caller's role (Developer / operator / DevOpsLead) and forwards it to the
+    agent-service, which calls Gemini with its own server-side key.
+8.  **Truthful results.** A successful live analysis is badged
+    `LIVE_BACKEND`. A failed live attempt is surfaced as `LIVE_FAILED` with
+    the reason — the app never falls back to a fake "successful Gemini"
+    result, and the on-device engine is never presented as a live result.
+    Deployments and execution are never routed through the gateway.
 
 ---
 
@@ -212,42 +241,58 @@ To take this platform to a commercial enterprise-grade product, these are the re
 *   **Behavior**: If the Gemini API experiences throttling or budget issues, visual indicator warnings flash amber and display the Circuit Breaker status (*CLOSED, OPEN, HALF-OPEN*) along with dynamic diagnostic rules, mirroring the resilient patterns implemented in `gemini_caller.py`.
 *   **Phase boundary**: the Android UI currently demonstrates these concepts
     using **local simulation** (the "AI Simulation & Resilience
-    Cockpit"). Real provider telemetry requires the future server-side
-    Gemini integration below — the current cockpit does **not** receive
-    actual Gemini provider telemetry.
+    Cockpit"). The server-side Gemini integration now exists (phase
+    8.7-D), but this branch does not surface provider telemetry to the app
+    — the cockpit still does **not** receive actual Gemini provider
+    telemetry.
 
 ### 🧭 Current vs Future: Backend Integration Boundary
 
-**Current branch**
+**Current branch (implemented in phase 8.7-D)**
 
-*   Android repository analysis is offline/deterministic.
-*   No Gemini provider credential is bundled in the APK.
-*   Gateway configuration is diagnostics-only (reachability probe).
-*   No verified Android → backend → Gemini repository-analysis flow exists.
-
-**Future backend integration — *future / not implemented on this branch***
-
-A future phase may introduce:
+*   Android repository analysis is offline/deterministic by default.
+*   No Gemini provider credential is bundled in the APK (no
+    `BuildConfig.GEMINI_API_KEY`; the Settings field accepts a gateway JWT
+    only).
+*   The authenticated Android → gateway → agent-service → Gemini analysis
+    flow is implemented: a typed `POST /api/v1/repository/analyze`
+    endpoint, JWT + role gating (Developer / operator / DevOpsLead),
+    strict schemas that reject client-supplied key fields, and a
+    server-side Gemini caller with fail-closed secret handling, bounded
+    timeout/retry, a circuit breaker, and a monthly budget ceiling.
+*   The gateway probe stays diagnostics-only; live analysis additionally
+    requires the explicit JWT plus a successful probe.
+*   A failed live attempt is surfaced as `LIVE_FAILED` with the reason —
+    the app never presents a fabricated "successful Gemini" result.
 
 ```text
-Android
+Android (gateway JWT only — no provider key)
   ↓
-authenticated API request
+authenticated API request (Authorization: Bearer <JWT>)
   ↓
-API Gateway / typed analysis endpoint
+API Gateway / typed analysis endpoint (JWT + role check)
   ↓
 analysis/agent service
   ↓
-server-side Gemini credentials
+server-side Gemini credentials (GEMINI_API_KEY in service env)
   ↓
 Gemini
   ↓
-validated analysis response
+validated analysis response (source: LIVE_BACKEND)
   ↓
 Android
 ```
 
-That future flow must be explicitly implemented — a real authenticated API
-contract **and** its implementation on this branch — before any
-documentation, UI, or test may describe it as current behavior. Deploying
+**Future / not verified on this branch**
+
+*   A genuine end-to-end run against the real Gemini API in a production
+    deployment. The flow is covered by automated gateway / agent / Android
+    test suites on this branch; no production-verification claim is made.
+*   Real provider telemetry surfaced in the Android resilience cockpit
+    (the cockpit remains a local simulation — see the phase boundary in
+    the "API Budget and Circuit-Breaker Visualizer" item).
+*   Deploying the backend infrastructure (Steps 1–2) alone does not make
+    the live path available: without `GEMINI_API_KEY` in the agent-service
+    environment, the service fails closed (HTTP 503) instead of
+    fabricating a response.
 the backend infrastructure (Steps 1–2) alone does not create it.

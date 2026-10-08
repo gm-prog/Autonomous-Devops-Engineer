@@ -18,6 +18,7 @@ from fastapi import FastAPI
 
 from .config import GatewayConfigurationError, load_gateway_settings
 from .core.auth import make_bound_verify_token, set_active_config, verify_token
+from .routers.analysis_router import router as analysis_router
 from .routers.gateway_router import router as gateway_router
 
 logger = logging.getLogger("GatewayMain")
@@ -43,6 +44,8 @@ def create_app(env=None) -> FastAPI:
     # Authenticate every request with exactly this app's validated secret.
     app.dependency_overrides[verify_token] = make_bound_verify_token(config)
     app.include_router(gateway_router)
+    # Phase 8.7-D: typed, JWT-authenticated repository-analysis route.
+    app.include_router(analysis_router)
     logger.info(
         "API gateway configured (jwt_secret_origin=%s, app_env=%r).",
         config.jwt_secret_origin,

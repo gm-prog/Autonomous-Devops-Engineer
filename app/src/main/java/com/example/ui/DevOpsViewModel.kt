@@ -91,6 +91,26 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     var isCheckingConnection by mutableStateOf(false)
     var isSettingsSheetOpen by mutableStateOf(false)
 
+    // Phase 8.7-D: gateway access token (platform-issued JWT, operator-
+    // supplied). Never a Gemini key — the Gemini credential stays
+    // server-side. Blank by default: no token means live analysis is off.
+    var gatewayJwtToken by mutableStateOf(prefs.getString("gateway_jwt_token", "") ?: "")
+        private set
+
+    // Last analysis source, surfaced honestly in the header badge:
+    // OFFLINE_SIM (default) | LIVE_BACKEND (server analysis succeeded) |
+    // LIVE_FAILED (server attempt failed — never presented as a success) |
+    // OFFLINE_FAILED (on-device engine failed — never labeled as a live failure).
+    var analysisSource by mutableStateOf("OFFLINE_SIM")
+
+    /** Live analysis is enabled only when the backend is configured AND
+     *  verified reachable (explicit operator choice + working probe). */
+    val isLiveAnalysisEnabled: Boolean
+        get() = isRemoteGatewayEnabled &&
+            apiUrlGateway.isNotBlank() &&
+            gatewayJwtToken.isNotBlank() &&
+            connectionStatus == "ONLINE"
+
     fun setRemoteGateway(enabled: Boolean) {
         isRemoteGatewayEnabled = enabled
         prefs.edit().putBoolean("is_remote_gateway_enabled", enabled).apply()
@@ -100,6 +120,12 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     fun updateApiUrl(newUrl: String) {
         apiUrlGateway = newUrl
         prefs.edit().putString("api_url_gateway", newUrl).apply()
+        connectionStatus = "UNCHECKED"
+    }
+
+    fun updateGatewayJwtToken(newToken: String) {
+        gatewayJwtToken = newToken.trim()
+        prefs.edit().putString("gateway_jwt_token", gatewayJwtToken).apply()
         connectionStatus = "UNCHECKED"
     }
 
@@ -215,10 +241,17 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     fun startAnalysis(repoId: Int) {
         viewModelScope.launch {
             isAnalyzing = true
-            // Phase 8.7-C.1: repository analysis is offline-only on this
-            // branch (no verified live server-side analysis backend exists
-            // here), so no remote selection is passed.
-            repository.analyzeRepoAsync(repoId = repoId)
+            // Phase 8.7-D: when the live backend is configured AND verified
+            // (reachable probe + gateway JWT), analysis runs through the
+            // gateway's typed, authenticated endpoint (server-side Gemini).
+            // Otherwise the deterministic offline engine runs on-device.
+            // A failed live attempt is surfaced as a failure — it never
+            // silently becomes a fake "successful Gemini" result.
+            analysisSource = repository.analyzeRepoAsync(
+                repoId = repoId,
+                backendUrl = if (isLiveAnalysisEnabled) apiUrlGateway else "",
+                jwtToken = if (isLiveAnalysisEnabled) gatewayJwtToken else ""
+            )
             isAnalyzing = false
         }
     }

@@ -64,15 +64,32 @@ the essentials:
 * `GEMINI_API_KEY` is no longer injected into the app
   (`BuildConfig.GEMINI_API_KEY` does not exist and is prohibited). Provider
   credentials belong server-side only.
-* **This branch has no verified live Gemini backend integration for the
-  app.** Repository analysis therefore always runs the non-secret offline
-  template engine — no provider credential, no network round-trip.
-  Server-side Gemini integration belongs to a later backend integration
-  phase; it is not claimed, stubbed, or faked here.
+* **Repository analysis has two explicit, truthfully labeled paths**
+  (Phase 8.7-D).
+  The default is the non-secret offline template engine (deterministic
+  local assets, no provider credential, no network round-trip). When the
+  user has configured a gateway, a live analysis is sent as a typed request
+  to `POST /api/v1/repository/analyze` with an
+  `Authorization: Bearer <JWT>` header only; the gateway verifies the JWT
+  and role (Developer / operator / DevOpsLead) and forwards it to the
+  agent-service, which calls Gemini using `GEMINI_API_KEY` from its own
+  server environment. The app never holds or transmits a provider key, and
+  the request schema rejects any client-supplied key field.
+* **Failures are typed, never fabricated.** If the backend is unavailable
+  or reports failure, the app shows an explicit `LIVE_FAILED` state with the
+  reason — it never falls back to a fake "successful Gemini" result. The
+  analysis screen displays a source badge distinguishing `OFFLINE_SIM`
+  (local simulation) from `LIVE_BACKEND` (server-side provider result).
 * CI runs static guards that fail the build if a Gemini secret reappears in
   the app's code, resources, manifest, assets, gradle config, or env files,
-  and if a fictitious remote analysis path or fake client-side
-  authentication is reintroduced.
+  and if the analysis transport contract is violated (unauthenticated
+  analyze call, `queryRemoteAnalysis` reintroduction, or missing
+  live/offline/failed state handling).
+* **Verification status (honest).** The live path is implemented and
+  covered by the automated gateway / agent / Android test suites on this
+  branch. It has not been exercised against the real Gemini API in a
+  production deployment on this branch, and no production-verification
+  claim is made.
 
 ### Gateway JWT
 * **Production requires an explicit `JWT_SECRET` and fails closed when it is
@@ -92,7 +109,7 @@ DevOps.AI is engineered under rigorous industry standards:
 
 * **Language:** Kotlin 100%
 * **UI toolkit:** Jetpack Compose (Material Design 3, dynamic gradients, responsive viewports)
-* **API Layer:** Gateway reachability diagnostics (non-secret URL probe); repository analysis runs on-device via the offline template engine on this branch
+* **API Layer:** Gateway reachability diagnostics (non-secret URL probe); repository analysis runs on-device via the offline template engine by default, or via the authenticated, role-gated server-side Gemini analysis endpoint when a gateway is configured
 * **Local Persistence:** Secure Room Database persistent state cache (RepoEntity, IncidentEntity, DeploymentLogEntity)
 * **Thread Safety:** Structured Kotlin Coroutines & Flow streams for background calculations
 * **Signings & Builds:** Gradle Kotlin DSL (`build.gradle.kts`) structured via standard custom plugins
@@ -103,16 +120,19 @@ DevOps.AI is engineered under rigorous industry standards:
 
 To build and experience DevOps.AI as a fully functional platform:
 
-1. **No API key is required — none is bundled.**
-   * Repository analysis runs the app's **offline template engine**
-     (deterministic, non-secret, on-device). No Gemini credential is needed
-     in the app, the workspace, or any `.env`.
-   * Live server-side Gemini analysis is **not implemented on this branch**
-     and is not claimed by the app; it belongs to a later backend
-     integration phase.
+1. **No API key is required in the app — none is bundled.**
+   * Repository analysis runs the app's **offline template engine** by
+     default (deterministic, non-secret, on-device). No Gemini credential is
+     needed in the app, the workspace, or any client `.env`.
+   * Live server-side Gemini analysis is available on this branch through
+     the authenticated, role-gated gateway endpoint
+     (`POST /api/v1/repository/analyze` with `Authorization: Bearer <JWT>`).
+     It only works when the platform's `agent-service` is deployed and its
+     server environment provides `GEMINI_API_KEY`; the Android app never
+     holds or sends a provider key, and a live failure is surfaced as an
+     explicit `LIVE_FAILED` state — never as a fabricated success.
    * *The app's Settings screen offers a gateway reachability probe
-     (diagnostics only) for a user-configured URL; it does not perform any
-     analysis.*
+     (diagnostics only) for a user-configured URL.*
 
 2. **Run and Compile:**
    Using Gradle:
@@ -135,8 +155,10 @@ The `devops-ai-platform` services follow the contract in
 * `TELEMETRY_HMAC_SECRET` — trusted telemetry producer secret; ingestion is
   disabled (fail closed) when unset.
 * `GEMINI_API_KEY` — server-side only (read by the `agent-service`'s
-  Gemini caller); not consumed by the Android app, which performs no
-  remote analysis on this branch.
+  Gemini caller for the authenticated analysis path); never consumed by
+  the Android app, which authenticates with JWTs only. The agent-service
+  fails closed when the key is absent and applies timeout/retry,
+  circuit-breaker, and monthly budget limits to provider calls.
 
 ### Security checks
 

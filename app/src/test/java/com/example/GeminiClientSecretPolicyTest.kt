@@ -7,13 +7,21 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Phase 8.7-C.1: the Android client is offline-only and must function
- * without any Gemini provider secret or any remote AI backend.  These tests
- * run under `gradle test` (JDK + Android SDK required).
+ * Phase 8.7-D: the Android client must function without any Gemini provider
+ * secret, in BOTH modes:
  *
- * The build-time structural guarantees (no BuildConfig.GEMINI_API_KEY, no
- * `?key=` request path, no fictitious remote analysis path) are enforced by
- * the CI job `android-secret-guards` over the repository source.
+ *  * OFFLINE: the deterministic, non-secret template engine works with no
+ *    network and no credential.
+ *  * LIVE: analysis runs through the gateway's typed, JWT-authenticated
+ *    endpoint (BackendGatewayClient.requestRepositoryAnalysis). The client
+ *    carries only a platform-issued gateway JWT — never a Gemini key — and a
+ *    failed live attempt is a typed failure, never a fabricated success.
+ *
+ * These tests run under `gradle test` (JDK + Android SDK required). The
+ * build-time structural guarantees (no BuildConfig.GEMINI_API_KEY, no
+ * `?key=` request path, authenticated-and-typed remote path, offline default)
+ * are enforced by the CI job `android-secret-guards` over the repository
+ * source.
  */
 class GeminiClientSecretPolicyTest {
 

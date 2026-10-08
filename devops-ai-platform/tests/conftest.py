@@ -56,6 +56,7 @@ for _dir, _name in [
     ("api-gateway", "platform_pkg.api_gateway"),
     ("monitoring-service", "platform_pkg.monitoring"),
     ("incident-service", "platform_pkg.incident"),
+    ("agent-service", "platform_pkg.agent"),
     ("shared-kernel", "platform_pkg.shared_kernel"),
 ]:
     _register_service_package(PLATFORM_ROOT / _dir, _name)

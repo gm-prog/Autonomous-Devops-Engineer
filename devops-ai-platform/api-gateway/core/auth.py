@@ -52,6 +52,12 @@ OPERATOR_ROLES = frozenset({"operator", "DevOpsLead", "ClusterAdmin"})
 # Roles that are explicitly NOT operator roles (ordinary end users).
 ORDINARY_ROLES = frozenset({"Developer", "Viewer", "user"})
 
+# Role gate for repository analysis (Phase 8.7-D): anyone who operates the
+# platform can request analysis; read-only roles (Viewer/user) cannot.
+# Analysis is NOT a privileged control-plane operation, so it does not use
+# ``require_operator`` — it uses this narrower, explicit gate.
+ANALYSIS_ROLES = frozenset({"operator", "DevOpsLead", "ClusterAdmin", "Developer"})
+
 _DEFAULT_TOKEN_TTL_SECONDS = 3600
 
 # Config bound by the app factory (create_app) for dependency overrides;
@@ -158,6 +164,17 @@ def require_operator(user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, 
         raise HTTPException(
             status_code=403,
             detail="Forbidden: operator role required for this control-plane operation.",
+        )
+    return user
+
+
+def require_analysis_role(user: Dict[str, Any] = Depends(verify_token)) -> Dict[str, Any]:
+    """Authorization gate for repository analysis (Phase 8.7-D): analysis
+    roles only — authenticated viewers cannot trigger provider calls."""
+    if not (set(user.get("roles", [])) & ANALYSIS_ROLES):
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: insufficient role for repository analysis.",
         )
     return user
 

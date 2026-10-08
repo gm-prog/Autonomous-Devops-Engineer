@@ -27,6 +27,19 @@ M7. Docs:      reintroduce the stale roadmap architecture claim (pinging/
                configuring the gateway makes the repository generator route
                analysis to the remote server instead of simulation) — the
                false "remote analysis transport" documentation regression.
+
+Phase 8.7-D mutations:
+
+M8. Gateway:   disable the analysis role gate (a Viewer JWT can trigger
+               provider-backed analysis).
+M9. Gateway:   accept a client-supplied Gemini key field on the analysis
+               schema and forward it to the backend.
+M10. Caller:   missing server Gemini key fails OPEN (fabricated "simulated"
+               response instead of a typed failure).
+M11. Caller:   provider 401/403 is swallowed and answered with a fabricated
+               "simulated" success.
+M12. Caller:   the budget ceiling is bypassed (exhausted budget still
+               places provider calls).
 """
 
 from __future__ import annotations
@@ -36,6 +49,8 @@ import shutil
 import sys
 import types
 from pathlib import Path
+
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -73,6 +88,7 @@ def _register_mutated_tree(repo_root: Path, top_name: str) -> str:
     for sub, rel in (
         ("api_gateway", "api-gateway"),
         ("monitoring", "monitoring-service"),
+        ("agent", "agent-service"),
         ("shared_kernel", "shared-kernel"),
     ):
         subpkg = types.ModuleType(f"{top_name}.{sub}")
@@ -386,20 +402,18 @@ def _apply_fictitious_remote_mutation(repo: Path) -> None:
 
 
 def test_mutation_m5_fictitious_remote_path_detected(mutated_repo):
-    from test_android_secret_guards import check_offline_only_contract
+    from test_android_secret_guards import check_analysis_transport_contract
 
     _apply_fictitious_remote_mutation(mutated_repo)
 
-    violations = check_offline_only_contract(mutated_repo)
+    violations = check_analysis_transport_contract(mutated_repo)
     assert violations, (
         "contract test stayed green after the fictitious unauthenticated "
         "remote analysis path was reintroduced"
     )
     joined = "\n".join(violations)
+    # The unauthenticated client method itself is the regression:
     assert "queryRemoteAnalysis" in joined
-    assert "backendBaseUrl" in joined
-    assert "/api/v1/repository/analyze" in joined
-    assert "BackendGatewayClient" in joined
     for v in violations:
         print("  violation:", v)
 
@@ -459,23 +473,25 @@ def _apply_stale_roadmap_mutation(repo: Path) -> None:
     roadmap = repo / "VS_CODE_AND_VERCEL_ROADMAP.md"
     src = roadmap.read_text(encoding="utf-8")
 
-    targets = (
-        "3.  Open the **Gateway Reachability Probe** section (toggle it on).",
-        "6.  **That is the entire effect.** The result only indicates whether the",
-        "    configured endpoint is reachable. **Repository analysis remains",
+    honest = (
+        "6.  **The probe is diagnostics.** The result only indicates whether the"
+        "\n    configured endpoint is reachable. Reaching `CONNECTED` alone does not"
+        "\n    switch analysis: without a gateway JWT the live path stays off and"
+        "\n    repository analysis remains offline and deterministic (source badge"
+        "\n    `OFFLINE_SIM`)."
     )
-    assert all(t in src for t in targets), "mutation targets not found in roadmap"
+    assert honest in src, "mutation target not found in roadmap"
 
-    replacements = (
-        ("3.  Open the **Gateway Reachability Probe** section (toggle it on).",
-         "3.  Toggle **Connect to Remote Backend** -> **On**."),
-        ("6.  **That is the entire effect.** The result only indicates whether the",
-         "6.  Tap **Ping Endpoint**: The status pill will glow green (**CONNECTED**) as soon as it receives a successful handshake, and the repository generator will"),
-        ("    configured endpoint is reachable. **Repository analysis remains",
-         "    route analyze tasks directly to your remote edge server instead of using simulation!"),
+    # Reintroduce the pre-correction claim: the probe alone makes the
+    # repository generator route analyze tasks to the remote server
+    # instead of the on-device engine.
+    stale = (
+        "6.  **Connect to Remote Backend**: as soon as the probe receives a"
+        "\n    successful handshake, the repository generator will route analyze"
+        "\n    tasks directly to your remote edge server instead of using"
+        "\n    simulation!"
     )
-    for old, new in replacements:
-        src = src.replace(old, new, 1)
+    src = src.replace(honest, stale, 1)
     roadmap.write_text(src, encoding="utf-8")
 
 
@@ -495,3 +511,328 @@ def test_mutation_m7_stale_roadmap_claim_detected(mutated_repo):
     assert "connect to remote backend" in joined
     for v in violations:
         print("  violation:", v)
+
+
+# ---------------------------------------------------------------------------
+# M8 — disable the analysis role gate (insufficient role triggers analysis)
+# ---------------------------------------------------------------------------
+
+
+def _apply_role_gate_bypass(repo: Path) -> None:
+    auth_path = repo / "devops-ai-platform/api-gateway/core/auth.py"
+    src = auth_path.read_text(encoding="utf-8")
+    target = "    if not (set(user.get(\"roles\", [])) & ANALYSIS_ROLES):"
+    assert target in src, "M8 target not found in require_analysis_role"
+    src = src.replace(target, "    if False:  # MUTATION: analysis role gate disabled", 1)
+    auth_path.write_text(src, encoding="utf-8")
+
+
+def _assert_analysis_role_gate_intact(repo: Path) -> None:
+    """Structural guard: the analysis route must keep its role gate, and the
+    gate must actually check ANALYSIS_ROLES."""
+    router_src = (repo / "devops-ai-platform/api-gateway/routers/analysis_router.py").read_text(encoding="utf-8")
+    assert "Depends(require_analysis_role)" in router_src, (
+        "analysis route lost its role-authorization gate"
+    )
+    auth_src = (repo / "devops-ai-platform/api-gateway/core/auth.py").read_text(encoding="utf-8")
+    gate = auth_src.split("def require_analysis_role", 1)[1]
+    assert "ANALYSIS_ROLES" in gate and "raise HTTPException" in gate, (
+        "require_analysis_role no longer enforces ANALYSIS_ROLES"
+    )
+
+
+def test_mutation_m8_analysis_role_gate_bypass_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_analysis_role_gate_intact(REPO_ROOT)
+    _apply_role_gate_bypass(mutated_repo)
+    # The mutated gate is structurally broken:
+    auth_src = (mutated_repo / "devops-ai-platform/api-gateway/core/auth.py").read_text(encoding="utf-8")
+    gate = auth_src.split("def require_analysis_role", 1)[1]
+    assert "ANALYSIS_ROLES" not in gate.split("if False", 1)[1].split("def ", 1)[0], (
+        "guard stayed green after the role gate was disabled"
+    )
+
+    # (2) Behavioral: a read-only Viewer JWT can now trigger provider-backed
+    #     analysis against the weakened control.
+    top = _register_mutated_tree(mutated_repo, "mut_m8")
+    main = importlib.import_module(f"{top}.api_gateway.main")
+    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+
+    class _FakeTransport:
+        def call(self, method, url, json_body, identity):
+            return {"status": "ANALYSIS_COMPLETE", "source": "server_gemini",
+                    "analysis": {"dockerfile": "D", "k8s_yaml": "K", "terraform_tf": "T",
+                                  "pipeline_yaml": "P", "report": "R"}}
+
+    analysis_router = importlib.import_module(f"{top}.api_gateway.routers.analysis_router")
+    app.dependency_overrides[analysis_router.get_downstream_transport] = _FakeTransport
+
+    viewer_token = make_token("viewer-attacker", ["Viewer"])
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/repository/analyze",
+            json={"repo_name": "x", "repo_url": "https://github.com/o/r.git",
+                  "framework": "FastAPI", "technology": "Python 3.12"},
+            headers={"Authorization": f"Bearer {viewer_token}"},
+        )
+    # The attack SUCCEEDS against the weakened control:
+    assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# M9 — accept a client-supplied Gemini key on the analysis schema
+# ---------------------------------------------------------------------------
+
+
+def _apply_client_key_field(repo: Path) -> None:
+    router_path = repo / "devops-ai-platform/api-gateway/routers/analysis_router.py"
+    src = router_path.read_text(encoding="utf-8")
+    target = "    technology: str = Field(min_length=1, max_length=200)"
+    assert target in src, "M9 target not found in gateway analysis schema"
+    src = src.replace(
+        target,
+        target + "\n    gemini_api_key: str = \"\"  # MUTATION: client-supplied provider key",
+        1,
+    )
+    # extra="forbid" would reject the field: the mutation weakens the contract.
+    src = src.replace('model_config = ConfigDict(extra="forbid")',
+                      'model_config = ConfigDict(extra="ignore")', 1)
+    router_path.write_text(src, encoding="utf-8")
+
+
+def _assert_analysis_schema_rejects_key_fields(repo: Path) -> None:
+    """Structural guard: neither analysis schema may accept a provider key
+    field, and both must forbid extra fields."""
+    for rel in ("devops-ai-platform/api-gateway/routers/analysis_router.py",
+                "devops-ai-platform/agent-service/presentation/rest/analysis_router.py"):
+        src = (repo / rel).read_text(encoding="utf-8")
+        assert not re.search(r"^\s*gemini_?api_?key\s*:", src, re.M), (
+            f"{rel}: analysis schema accepts a provider key field"
+        )
+        assert 'extra="forbid"' in src, f"{rel}: schema must forbid extra fields"
+
+
+def test_mutation_m9_client_supplied_gemini_key_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_analysis_schema_rejects_key_fields(REPO_ROOT)
+    _apply_client_key_field(mutated_repo)
+    # The mutated schema is structurally broken:
+    src = (mutated_repo / "devops-ai-platform/api-gateway/routers/analysis_router.py").read_text(encoding="utf-8")
+    assert "gemini_api_key" in src
+    assert 'model_config = ConfigDict(extra="forbid")' not in src, (
+        "guard stayed green after the extra-forbid contract was weakened"
+    )
+
+    # (2) Behavioral: the client can now smuggle a provider key to the
+    #     backend through the weakened contract.
+    top = _register_mutated_tree(mutated_repo, "mut_m9")
+    main = importlib.import_module(f"{top}.api_gateway.main")
+    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+
+    forwarded: list = []
+
+    class _FakeTransport:
+        def call(self, method, url, json_body, identity):
+            forwarded.append(json_body)
+            return {"status": "ANALYSIS_COMPLETE", "source": "server_gemini",
+                    "analysis": {"dockerfile": "D", "k8s_yaml": "K", "terraform_tf": "T",
+                                  "pipeline_yaml": "P", "report": "R"}}
+
+    analysis_router = importlib.import_module(f"{top}.api_gateway.routers.analysis_router")
+    app.dependency_overrides[analysis_router.get_downstream_transport] = _FakeTransport
+
+    dev_token = make_token("dev-attacker", ["Developer"])
+    payload = {"repo_name": "x", "repo_url": "https://github.com/o/r.git",
+               "framework": "FastAPI", "technology": "Python 3.12",
+               "gemini_api_key": "AIzaCLIENT-SMUGGLED-KEY"}
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/v1/repository/analyze", json=payload,
+            headers={"Authorization": f"Bearer {dev_token}"},
+        )
+    # The attack SUCCEEDS: the client-supplied key is accepted and forwarded.
+    assert resp.status_code == 200
+    assert forwarded and forwarded[0].get("gemini_api_key") == "AIzaCLIENT-SMUGGLED-KEY"
+
+
+# ---------------------------------------------------------------------------
+# M10 — missing server Gemini key fails OPEN (fabricated success)
+# ---------------------------------------------------------------------------
+
+
+def _apply_missing_key_fail_open(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    # Weaken: _generate_text fabricates a response when the key is missing
+    # (the first _precall_gates() call site is inside _generate_text).
+    old_check = "        self._precall_gates()"
+    assert old_check in src, "M10 target not found in gemini_caller"
+    src = src.replace(
+        old_check,
+        "        if not self.api_key:  # MUTATION: fail open\n"
+        '            return "SIMULATED GEMINI RESPONSE (offline bypass)"\n'
+        + old_check,
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_missing_key_fails_closed(repo: Path) -> None:
+    """Structural guard: the no-key branch must raise, never return."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = src.split("def _assert_provider_configured", 1)[1].split("def ", 1)[0]
+    assert "if not self.api_key" in fn, "no-key check missing from the caller"
+    branch = fn.split("if not self.api_key", 1)[1]
+    assert "raise GeminiServiceUnavailableException" in branch, (
+        "the no-key branch must raise (fail closed), not fabricate a response"
+    )
+    assert "SIMULATED GEMINI RESPONSE" not in src, (
+        "fabricated-response fallback present in the Gemini caller"
+    )
+
+
+def test_mutation_m10_missing_secret_fail_open_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_missing_key_fails_closed(REPO_ROOT)
+    _apply_missing_key_fail_open(mutated_repo)
+    # The mutated caller is structurally broken (fabricated fallback present):
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    assert "SIMULATED GEMINI RESPONSE" in mut_src, (
+        "guard stayed green after the fail-open fallback was introduced"
+    )
+
+    # (2) Behavioral: without the server key the weakened caller fabricates a
+    #     fake "Gemini answered" success instead of failing closed.
+    top = _register_mutated_tree(mutated_repo, "mut_m10")
+    gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    caller = gc.GeminiCallerAdapter(api_key="")
+    result = caller.generate_remediation("prompt", "system")
+    assert isinstance(result, str) and "SIMULATED" in result, (
+        "expected the weakened control to fabricate a fake success"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M11 — swallow provider auth failure, answer with fabricated success
+# ---------------------------------------------------------------------------
+
+
+def _apply_swallow_auth_failure(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    old = "            if status in _AUTH_STATUS_CODES:\n                self._register_failure()\n                raise GeminiAuthException("
+    assert old in src, "M11 target not found in gemini_caller"
+    src = src.replace(
+        old,
+        "            if status in _AUTH_STATUS_CODES:\n"
+        "                self._register_failure()\n"
+        '                return "SIMULATED GEMINI RESPONSE (provider error swallowed)"  # MUTATION\n'
+        "                raise GeminiAuthException(",
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_auth_failure_raises(repo: Path) -> None:
+    """Structural guard: the provider-auth branch must raise, with no early
+    return before it."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    branch = src.split("if status in _AUTH_STATUS_CODES:", 1)[1].split(
+        "if status in _TRANSIENT_STATUS_CODES:", 1
+    )[0]
+    assert "raise GeminiAuthException" in branch, "auth branch must raise GeminiAuthException"
+    assert "return " not in branch, "auth branch must not return a fabricated result"
+
+
+def test_mutation_m11_fake_gemini_success_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_auth_failure_raises(REPO_ROOT)
+    _apply_swallow_auth_failure(mutated_repo)
+    # The mutated branch is structurally broken:
+    src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    branch = src.split("if status in _AUTH_STATUS_CODES:", 1)[1].split(
+        "if status in _TRANSIENT_STATUS_CODES:", 1
+    )[0]
+    assert "return " in branch, "guard stayed green after the auth swallow was added"
+
+    # (2) Behavioral: a provider 401 now yields a fabricated success.
+    top = _register_mutated_tree(mutated_repo, "mut_m11")
+    gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+
+    class _Resp401:
+        status_code = 401
+        text = ""
+
+        def json(self):
+            raise ValueError("no body")
+
+    def _t401(_payload):
+        return _Resp401()
+
+    caller = gc.GeminiCallerAdapter(api_key="server-key", transport=_t401,
+                                    max_retries=3, backoff_base_seconds=0.01)
+    result = caller.generate_remediation("p", "s")
+    assert isinstance(result, str) and "SIMULATED" in result, (
+        "expected the weakened control to fake a Gemini success on 401"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M12 — bypass the budget ceiling
+# ---------------------------------------------------------------------------
+
+
+def _apply_budget_bypass(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    old = "        return self.accumulated_spend < self.monthly_budget"
+    assert old in src, "M12 target not found in GeminiBudgetService.check_budget"
+    src = src.replace(old, "        return True  # MUTATION: budget ceiling bypassed", 1)
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_budget_enforced(repo: Path) -> None:
+    """Structural guard: check_budget must compare spend against the ceiling."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = src.split("def check_budget", 1)[1].split("def ", 1)[0]
+    assert "self.accumulated_spend < self.monthly_budget" in fn, (
+        "check_budget no longer compares spend against the ceiling"
+    )
+
+
+def test_mutation_m12_budget_bypass_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_budget_enforced(REPO_ROOT)
+    _apply_budget_bypass(mutated_repo)
+    # The mutated budget check is structurally broken:
+    src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = src.split("def check_budget", 1)[1].split("def ", 1)[0]
+    assert "self.accumulated_spend < self.monthly_budget" not in fn, (
+        "guard stayed green after the budget ceiling was bypassed"
+    )
+
+    # (2) Behavioral: an exhausted budget still places a provider call.
+    top = _register_mutated_tree(mutated_repo, "mut_m12")
+    gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+
+    class _Resp200:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}
+
+    calls: list = []
+
+    def _t(payload):
+        calls.append(1)
+        return _Resp200()
+
+    caller = gc.GeminiCallerAdapter(api_key="server-key", transport=_t,
+                                    monthly_budget_usd=0.0, max_retries=1,
+                                    backoff_base_seconds=0.01)
+    result = caller.generate_remediation("p", "s")
+    assert result == "ok" and calls == [1], (
+        "expected the weakened control to call the provider despite the "
+        "exhausted budget"
+    )
