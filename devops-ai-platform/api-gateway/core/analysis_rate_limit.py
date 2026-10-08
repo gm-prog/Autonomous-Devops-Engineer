@@ -16,6 +16,13 @@ Trust model
 * **Fail closed**: if the shared (Redis) store is unreachable the endpoint
   returns a stable 503 — protection is never silently disabled for this
   expensive route.
+* **Production posture** (Phase 8.7-D.1-CORRECTION): `APP_ENV=staging` /
+  `APP_ENV=production` REQUIRE the shared Redis store; startup fails closed
+  when a production-mode gateway would run the in-process limiter (whose
+  limits multiply per replica). A documented single-replica deployment opts
+  in EXPLICITLY via
+  `ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION=true` (exact value; it
+  cannot be enabled by accident).
 
 Semantics
 =========
@@ -233,6 +240,14 @@ class RedisAnalysisRateLimiter:
 DEFAULT_LIMIT_PER_IDENTITY_PER_MINUTE = 30
 DEFAULT_LIMIT_PER_IP_PER_MINUTE = 120
 
+# Environments that MUST run the shared (Redis) limiter: with a per-process
+# limiter, N replicas would each allow their own quota and the effective
+# limit would silently multiply by the replica count.
+_PRODUCTION_ENVS = frozenset({"staging", "production"})
+# Explicit, accidental-usage-proof opt-out for a DOCUMENTED single-replica
+# staging/production deployment: must be exactly "true".
+_SINGLE_INSTANCE_FLAG = "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION"
+
 
 class AnalysisRateLimitConfigurationError(RuntimeError):
     """The rate-limit configuration is invalid (fail closed)."""
@@ -269,6 +284,23 @@ def load_analysis_rate_limit_settings(env: Optional[Mapping[str, str]] = None) -
         # Default: shared (redis) when a redis URL is configured; otherwise
         # the explicit single-instance mode (documented, logged).
         effective = "redis" if redis_url else "local"
+
+    # Phase 8.7-D.1-CORRECTION: staging/production MUST use the shared
+    # store. Failing closed here (at startup) instead of silently running
+    # an in-process limiter whose limits multiply per replica.
+    app_env = (e.get("APP_ENV") or "").strip().lower()
+    if (
+        effective == "local"
+        and app_env in _PRODUCTION_ENVS
+        and (e.get(_SINGLE_INSTANCE_FLAG) or "").strip() != "true"
+    ):
+        raise AnalysisRateLimitConfigurationError(
+            f"APP_ENV={app_env} requires the shared Redis analysis rate-limit "
+            f"store (ANALYSIS_RATE_LIMIT_STORE=redis + REDIS_URL): the "
+            f"in-process limiter is single-instance and its limits multiply "
+            f"across replicas. For a documented single-replica deployment set "
+            f"{_SINGLE_INSTANCE_FLAG}=true explicitly."
+        )
 
     return {
         "store": effective,

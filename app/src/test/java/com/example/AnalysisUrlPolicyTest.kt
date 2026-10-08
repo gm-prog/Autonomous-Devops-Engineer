@@ -2,6 +2,9 @@ package com.example
 
 import com.example.data.BackendGatewayClient
 import kotlinx.coroutines.runBlocking
+import okhttp3.OkHttpClient
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -76,5 +79,52 @@ class AnalysisUrlPolicyTest {
     val failure = outcome as? BackendGatewayClient.AnalysisOutcome.Failure
     assertNotNull("an unsafe URL must yield a typed failure", failure)
     assertTrue(failure!!.reason.contains("HTTPS"))
+  }
+
+  /**
+   * Phase 8.7-D.1-CORRECTION (#9): a transport exception must NOT leak raw
+   * network/exception detail (URL, host, socket, DNS, connection string)
+   * into the user-facing [BackendGatewayClient.AnalysisOutcome.Failure].
+   * The failure reason is a stable message; only a safe technical
+   * identifier (the exception class simple name) is logged, never returned.
+   */
+  @Test
+  fun transport_exception_detail_never_reaches_the_failure_reason() = runBlocking {
+    val previous = BackendGatewayClient.httpClient
+    // A hostile transport whose exception message is FULL of the kind of
+    // detail the audit forbids from reaching the UI layer.
+    val sensitive =
+      "connect timed out to https://gw.internal.corp:8443/api via " +
+          "proxy http://user:pass@10.20.30.40:3128 (socket 10.20.30.40:54321, " +
+          "dns: gw.internal.corp -> 10.20.30.40)"
+    val hostile =
+      OkHttpClient.Builder()
+        .addInterceptor { chain -> throw java.io.IOException(sensitive) }
+        .build()
+    BackendGatewayClient.httpClient = hostile
+    try {
+      val outcome =
+        BackendGatewayClient.requestRepositoryAnalysis(
+          baseUrlStr = "https://gw.internal.corp:8443",
+          jwtToken = "test-jwt",
+          repoName = "x",
+          repoUrl = "https://github.com/o/r.git",
+          framework = "FastAPI",
+          technology = "Python 3.12"
+        )
+      val failure = outcome as? BackendGatewayClient.AnalysisOutcome.Failure
+      assertNotNull("a transport failure must be a typed failure", failure)
+      // Stable, detail-free message:
+      assertEquals("Unable to reach the analysis gateway.", failure!!.reason)
+      // None of the sensitive fragments may appear in the returned reason:
+      for (leak in listOf("gw.internal.corp", "10.20.30.40", "proxy", "socket", "dns", "54321", "8443")) {
+        assertFalse(
+          "sensitive detail '$leak' leaked into Failure.reason: ${failure.reason}",
+          failure.reason.contains(leak)
+        )
+      }
+    } finally {
+      BackendGatewayClient.httpClient = previous
+    }
   }
 }

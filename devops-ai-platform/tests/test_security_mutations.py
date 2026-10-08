@@ -62,6 +62,7 @@ from __future__ import annotations
 import importlib
 import shutil
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -161,7 +162,8 @@ def test_mutation_m1_dispatch_restoration_detected(mutated_repo):
     #     impersonate the telemetry producer through the gateway.
     top = _register_mutated_tree(mutated_repo, "mut_m1")
     main = importlib.import_module(f"{top}.api_gateway.main")
-    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true"})
     dev_token = make_token("dev-attacker", ["Developer"])
     with TestClient(app) as client:
         resp = client.post(
@@ -571,7 +573,8 @@ def test_mutation_m8_analysis_role_gate_bypass_detected(mutated_repo):
     #     analysis against the weakened control.
     top = _register_mutated_tree(mutated_repo, "mut_m8")
     main = importlib.import_module(f"{top}.api_gateway.main")
-    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true"})
 
     class _FakeTransport:
         def call(self, method, url, json_body, identity):
@@ -642,7 +645,8 @@ def test_mutation_m9_client_supplied_gemini_key_detected(mutated_repo):
     #     backend through the weakened contract.
     top = _register_mutated_tree(mutated_repo, "mut_m9")
     main = importlib.import_module(f"{top}.api_gateway.main")
-    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+    app = main.create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true"})
 
     forwarded: list = []
 
@@ -1038,6 +1042,7 @@ def test_mutation_m14_analysis_rate_limit_removal_detected(mutated_repo):
         "APP_ENV": "production",
         "ANALYSIS_RATE_LIMIT_STORE": "local",
         "ANALYSIS_RATE_LIMIT_PER_IDENTITY_PER_MINUTE": "2",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true",
     })
 
     class _FakeTransport:
@@ -1069,6 +1074,7 @@ def test_mutation_m14_analysis_rate_limit_removal_detected(mutated_repo):
         "APP_ENV": "production",
         "ANALYSIS_RATE_LIMIT_STORE": "local",
         "ANALYSIS_RATE_LIMIT_PER_IDENTITY_PER_MINUTE": "2",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true",
     })
     real_app.dependency_overrides[
         real_routers.analysis_router.get_downstream_transport
@@ -1359,3 +1365,266 @@ def test_mutation_m18_deprecated_model_revert_detected(mutated_repo):
     assert intact.model_name == "gemini-3.8-flash"
     intact_cfg = intact._build_payload("prompt", "system").get("generationConfig", {})
     assert "maxOutputTokens" in intact_cfg
+
+
+# ---------------------------------------------------------------------------
+# M19 — make the Redis finalize accounting non-idempotent (duplicate
+#        finalization double-counts)
+# ---------------------------------------------------------------------------
+
+
+def _apply_finalize_idempotency_removal(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    target = (
+        "if redis.call('EXISTS', claim_key) == 1 then\n"
+        "  return 0\n"
+        "end\n"
+        "redis.call('SET', claim_key, '1', 'EX', ttl)\n"
+    )
+    assert target in src, "M19 target not found in the Redis finalize script"
+    src = src.replace(
+        target,
+        "-- MUTATION: exactly-once claim removed; duplicate finalizations "
+        "re-apply the accounting\n",
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_finalize_is_idempotent(repo: Path) -> None:
+    """Structural guard: the Redis finalize script must keep its atomic
+    exactly-once claim (period-scoped claim key, checked-and-set inside
+    the atomic script)."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    script = src.split("_FINALIZE_LUA = ", 1)[1].split('"""', 1)[1].split('"""', 1)[0]
+    assert "EXISTS', claim_key" in script, (
+        "the Redis finalize script lost its duplicate check"
+    )
+    assert "SET', claim_key, '1'" in script, (
+        "the Redis finalize script lost its atomic claim"
+    )
+    # The release must use the supported floating-point primitive
+    # (INCRBYFLOAT with a negative delta) — Redis has no DECRBYFLOAT.
+    assert "DECRBYFLOAT" not in script, (
+        "the finalize script references a nonexistent Redis command"
+    )
+    assert "INCRBYFLOAT', reserved_key, -reserved_amount" in script, (
+        "the reservation release must use INCRBYFLOAT with a negative delta"
+    )
+
+
+def test_mutation_m19_finalize_idempotency_removal_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_finalize_is_idempotent(REPO_ROOT)
+    _apply_finalize_idempotency_removal(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    script = mut_src.split("_FINALIZE_LUA = ", 1)[1].split('"""', 1)[1].split('"""', 1)[0]
+    assert "EXISTS', claim_key" not in script, (
+        "guard stayed green after the exactly-once claim was removed"
+    )
+    # Behavioral proof of the WEAKENED script against a REAL Redis, when
+    # one is available (CI redis-integration environment).  Locally the
+    # structural detection above is the CI-enforced red.
+    import os
+
+    if os.environ.get("REDIS_URL", "").strip():
+        top = _register_mutated_tree(mutated_repo, "mut_m19")
+        m_gc = importlib.import_module(
+            f"{top}.agent.infrastructure.llm.gemini_caller"
+        )
+        ledger = m_gc.RedisBudgetLedger(
+            monthly_budget_usd=10.0, redis_url=os.environ["REDIS_URL"]
+        )
+        ledger._client.flushdb()
+        res = ledger.reserve(4.0)
+        ledger.finalize(res, 2.0)
+        ledger.finalize(res, 2.0)  # duplicate
+        spend = ledger.accumulated_spend
+        ledger._client.flushdb()
+        ledger.close()
+        assert spend == pytest.approx(4.0), (
+            "expected the weakened control to double-count a duplicate "
+            f"finalization (got committed {spend})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# M20 — bypass the production shared-Redis requirement
+# ---------------------------------------------------------------------------
+
+
+def _apply_production_requirement_bypass(repo: Path) -> None:
+    limiter_path = repo / "devops-ai-platform/api-gateway/core/analysis_rate_limit.py"
+    src = limiter_path.read_text(encoding="utf-8")
+    target = "        and app_env in _PRODUCTION_ENVS\n"
+    assert target in src, "M20 target not found in load_analysis_rate_limit_settings"
+    src = src.replace(
+        target,
+        "        and app_env in frozenset()  # MUTATION: production shared-state requirement bypassed\n",
+        1,
+    )
+    limiter_path.write_text(src, encoding="utf-8")
+
+
+def _assert_production_requires_shared_store(repo: Path) -> None:
+    """Structural guard: staging/production must be forced onto the shared
+    store (with the explicit single-replica opt-out)."""
+    src = (repo / "devops-ai-platform/api-gateway/core/analysis_rate_limit.py").read_text(encoding="utf-8")
+    assert "app_env in _PRODUCTION_ENVS" in src, (
+        "the production shared-store requirement is missing"
+    )
+    assert "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION" in src, (
+        "the documented single-replica opt-out flag is missing"
+    )
+
+
+def test_mutation_m20_production_requirement_bypass_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_production_requires_shared_store(REPO_ROOT)
+    _apply_production_requirement_bypass(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/api-gateway/core/analysis_rate_limit.py").read_text(encoding="utf-8")
+    assert "app_env in _PRODUCTION_ENVS" not in mut_src, (
+        "guard stayed green after the production requirement was bypassed"
+    )
+
+    # (2) Behavioral: the INTACT loader refuses a production gateway with
+    #     no shared store; the WEAKENED loader silently downgrades it to
+    #     the single-instance limiter (limits multiply per replica).
+    from platform_pkg.api_gateway.core.analysis_rate_limit import (
+        AnalysisRateLimitConfigurationError,
+        load_analysis_rate_limit_settings as intact_load,
+    )
+
+    with pytest.raises(AnalysisRateLimitConfigurationError):
+        intact_load({"APP_ENV": "production"})
+
+    top = _register_mutated_tree(mutated_repo, "mut_m20")
+    m_arl = importlib.import_module(
+        f"{top}.api_gateway.core.analysis_rate_limit"
+    )
+    settings = m_arl.load_analysis_rate_limit_settings({"APP_ENV": "production"})
+    assert settings["store"] == "local", (
+        "expected the weakened control to silently run the in-process "
+        "limiter in production mode"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M21 — half-open circuit permits multiple concurrent probes
+# ---------------------------------------------------------------------------
+
+
+def _apply_multiple_half_open_probes(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    target = '            if self.cb_state == "HALF-OPEN":\n'
+    assert target in src, "M21 target not found in _check_circuit"
+    src = src.replace(
+        target,
+        '            if self.cb_state == "NEVER":  # MUTATION: half-open allows unlimited concurrent probes\n',
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_single_half_open_probe(repo: Path) -> None:
+    """Structural guard: while a half-open probe is in flight, concurrent
+    callers must be rejected fast (no second probe)."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = src.split("def _check_circuit", 1)[1].split("\n    def ", 1)[0]
+    assert 'if self.cb_state == "HALF-OPEN":' in fn, (
+        "_check_circuit lost the HALF-OPEN fast-fail branch"
+    )
+    branch = fn.split('if self.cb_state == "HALF-OPEN":', 1)[1]
+    assert "raise GeminiServiceUnavailableException" in branch, (
+        "the HALF-OPEN branch must reject concurrent callers"
+    )
+
+
+class _M21CountingTransport:
+    """Failing transport that holds the provider window open long enough
+    for every racer to observe the half-open state."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, payload):
+        self.calls += 1
+        time.sleep(0.05)
+
+        class _Resp500:
+            status_code = 500
+            text = "transient"
+
+            def json(self):
+                raise ValueError("no body")
+
+        return _Resp500()
+
+
+def _m21_open_circuit_then_race(adapter, n_racers: int):
+    import threading
+
+    clock = {"now": 5_000_000.0}
+    adapter._time_fn = lambda: clock["now"]
+    for _ in range(5):
+        try:
+            adapter.generate_remediation("p", "s")  # five failing attempts
+        except Exception:
+            pass
+    assert adapter.cb_state == "OPEN"
+    clock["now"] += 61  # cooldown elapses
+
+    barrier = threading.Barrier(n_racers)
+
+    def worker():
+        barrier.wait()
+        try:
+            adapter.generate_remediation("p", "s")
+        except Exception:
+            pass
+
+    threads = [threading.Thread(target=worker) for _ in range(n_racers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return adapter.cb_state
+
+
+def test_mutation_m21_multiple_half_open_probes_detected(mutated_repo, monkeypatch):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_single_half_open_probe(REPO_ROOT)
+    _apply_multiple_half_open_probes(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = mut_src.split("def _check_circuit", 1)[1].split("\n    def ", 1)[0]
+    assert 'if self.cb_state == "HALF-OPEN":' not in fn, (
+        "guard stayed green after the half-open fast-fail was removed"
+    )
+
+    # (2) Behavioral: after the cooldown, 8 concurrent callers must permit
+    #     exactly ONE provider probe (5 opening failures + 1 probe = 6).
+    monkeypatch.setenv("GEMINI_API_KEY", "m21-test-key-not-a-real-credential")
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    intact_cfg = gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001)
+    intact_t = _M21CountingTransport()
+    intact = gc.GeminiCallerAdapter(config=intact_cfg, transport=intact_t)
+    _m21_open_circuit_then_race(intact, 8)
+    assert intact_t.calls == 6, (
+        "intact breaker: 5 opening failures + exactly ONE half-open probe"
+    )
+
+    top = _register_mutated_tree(mutated_repo, "mut_m21")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    mutated_t = _M21CountingTransport()
+    mutated = m_gc.GeminiCallerAdapter(
+        config=m_gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001),
+        transport=mutated_t,
+    )
+    _m21_open_circuit_then_race(mutated, 8)
+    assert mutated_t.calls >= 7, (
+        "expected the weakened control to let MULTIPLE concurrent callers "
+        f"become provider probes (got {mutated_t.calls - 5} probes)"
+    )

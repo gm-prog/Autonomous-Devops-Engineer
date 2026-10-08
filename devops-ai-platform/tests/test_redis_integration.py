@@ -202,3 +202,91 @@ def test_redis_budget_calendar_rollover(live_redis_url, monkeypatch):
     assert res_next.period_key != current_period
     ledger.finalize(res_next, actual_cost_usd=None)
     ledger.close()
+
+
+def test_redis_budget_duplicate_finalize_counts_once(live_redis_url):
+    """Exactly-once finalization: a duplicate (retried) finalize of the
+    same reservation must NOT release twice or commit twice."""
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        RedisBudgetLedger,
+    )
+
+    ledger = RedisBudgetLedger(monthly_budget_usd=10.0, redis_url=live_redis_url)
+    res = ledger.reserve(4.0)
+    assert ledger.finalize(res, 2.0) is True, "first finalize applies accounting"
+    assert ledger.finalize(res, 2.0) is False, "duplicate finalize is ignored"
+    # A duplicate with DIFFERENT actual is equally ignored — the FIRST
+    # reconciliation is the only one that counts:
+    assert ledger.finalize(res, 9.9) is False
+    assert ledger.accumulated_spend == pytest.approx(2.0), (
+        "committed spend must be the actual cost counted exactly once"
+    )
+    # The reservation was released exactly once: the full remaining budget
+    # is available again.
+    res2 = ledger.reserve(8.0)  # 2.0 committed + 8.0 reserved = 10.0 <= ceiling
+    ledger.finalize(res2, None)
+    assert ledger.accumulated_spend == pytest.approx(10.0)
+    ledger.close()
+
+
+def test_redis_budget_concurrent_duplicate_finalizes_count_once(live_redis_url):
+    """Eight replicas finalizing the SAME reservation concurrently:
+    exactly one applies the accounting (atomic claim in Redis)."""
+    import threading
+
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        RedisBudgetLedger,
+    )
+
+    ledger = RedisBudgetLedger(monthly_budget_usd=20.0, redis_url=live_redis_url)
+    res = ledger.reserve(6.0)
+    results: list = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        applied = ledger.finalize(res, 1.5)
+        with lock:
+            results.append(applied)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count(True) == 1, (
+        f"exactly one concurrent finalize may apply the accounting; "
+        f"got {results.count(True)}"
+    )
+    assert ledger.accumulated_spend == pytest.approx(1.5), (
+        "actual cost must be committed exactly once"
+    )
+    ledger.close()
+
+
+def test_redis_budget_shared_across_ledger_instances(live_redis_url):
+    """Two ledger instances (two replicas) see ONE budget: committed
+    spend, reservations, and the ceiling are global on the store."""
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        BudgetExceededException,
+        RedisBudgetLedger,
+    )
+
+    replica_a = RedisBudgetLedger(monthly_budget_usd=10.0, redis_url=live_redis_url)
+    replica_b = RedisBudgetLedger(monthly_budget_usd=10.0, redis_url=live_redis_url)
+    # Replica A spends: finalize with the actual (cheaper) usage.
+    res_a = replica_a.reserve(6.0)
+    replica_a.finalize(res_a, 2.0)
+    # Replica B sees the same committed spend:
+    assert replica_b.accumulated_spend == pytest.approx(2.0)
+    # Replica B reserves against the SHARED remaining budget:
+    res_b = replica_b.reserve(6.0)  # 2.0 + 6.0 = 8.0 <= 10.0
+    # And replica A now sees replica B's shared reservation too:
+    with pytest.raises(BudgetExceededException):
+        replica_a.reserve(3.0)  # 2.0 committed + 6.0 reserved + 3.0 > 10.0
+    replica_b.finalize(res_b, None)  # missing usage -> full reservation counts
+    assert replica_a.accumulated_spend == pytest.approx(8.0)
+    replica_a.close()
+    replica_b.close()

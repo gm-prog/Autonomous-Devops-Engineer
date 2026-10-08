@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 import pytest
 import requests
@@ -147,7 +148,8 @@ def _agent_app(llm=None):
 def _gateway_app():
     from platform_pkg.api_gateway.main import create_app
 
-    return create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+    return create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true"})
 
 
 # ---------------------------------------------------------------------------
@@ -734,3 +736,135 @@ class TestSharedAnalysisHandlerLifecycle:
             # And the recovered state persists: a normal request succeeds.
             again = client.post(INTERNAL_PATH, json=GOOD_BODY, headers=hdrs)
             assert again.status_code == 200
+
+
+class _SuccessProviderTransport:
+    """Provider transport that always answers a valid 200.
+
+    ``delay`` (seconds) keeps the probe in flight long enough that the
+    concurrent racers deterministically observe the HALF-OPEN state.
+    """
+
+    def __init__(self, delay: float = 0.0):
+        self.calls = 0
+        self.delay = delay
+
+    def __call__(self, payload):
+        self.calls += 1
+        if self.delay:
+            time.sleep(self.delay)
+        return _gemini_http(200, {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(GOOD_ASSETS)}]}}],
+        })
+
+
+class TestHalfOpenSingleProbe:
+    """Phase 8.7-D.1-CORRECTION: at most ONE provider probe in half-open.
+
+    After the cooldown expires, concurrent callers must NOT all become
+    provider probes: the first acquires the single-probe lease; the rest
+    fail fast until the probe settles.
+    """
+
+    def _open_circuit(self, adapter, transport, clock, n_failures: int = 5):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiUpstreamException,
+        )
+
+        adapter._transport = transport
+        for _ in range(n_failures):
+            with pytest.raises(GeminiUpstreamException):
+                adapter.generate_remediation("p", "s")
+        assert adapter.cb_state == "OPEN"
+
+    def _fire_concurrent(self, adapter, n: int = 20):
+        import threading
+
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiServiceUnavailableException,
+            GeminiUpstreamException,
+        )
+
+        barrier = threading.Barrier(n)
+        outcomes: list = []
+        lock = threading.Lock()
+
+        def worker():
+            barrier.wait()
+            try:
+                adapter.generate_remediation("p", "s")
+                with lock:
+                    outcomes.append("success")
+            except GeminiServiceUnavailableException:
+                with lock:
+                    outcomes.append("fast-reject")
+            except GeminiUpstreamException:
+                with lock:
+                    outcomes.append("probe-failed")
+
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return outcomes
+
+    def test_exactly_one_probe_when_probe_fails(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "halfopen-test-key-not-a-real-credential")
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiServiceUnavailableException,
+        )
+
+        app = _production_agent_app()
+        adapter = app.state.analysis_handler.llm
+        clock = {"now": 1_000_000.0}
+        adapter._time_fn = lambda: clock["now"]
+        failing = _FailingProviderTransport()
+        self._open_circuit(adapter, failing, clock)
+        assert failing.calls == 5
+
+        # Cooldown elapses; 20 concurrent requests race for recovery.
+        clock["now"] += 61
+        outcomes = self._fire_concurrent(adapter)
+
+        assert failing.calls == 6, (
+            "exactly ONE half-open probe may contact the provider; "
+            f"got {failing.calls - 5} probe calls"
+        )
+        assert outcomes.count("fast-reject") == 19
+        assert outcomes.count("probe-failed") == 1
+        assert outcomes.count("success") == 0
+        # The failed probe re-opens the circuit: the next call fails fast
+        # WITHOUT any provider contact.
+        assert adapter.cb_state == "OPEN"
+        with pytest.raises(GeminiServiceUnavailableException):
+            adapter.generate_remediation("p", "s")
+        assert failing.calls == 6
+
+    def test_exactly_one_probe_when_probe_recovers(self, monkeypatch):
+        monkeypatch.setenv("GEMINI_API_KEY", "halfopen-test-key-not-a-real-credential")
+
+        app = _production_agent_app()
+        adapter = app.state.analysis_handler.llm
+        clock = {"now": 2_000_000.0}
+        adapter._time_fn = lambda: clock["now"]
+        self._open_circuit(adapter, _FailingProviderTransport(), clock)
+
+        # Cooldown elapses and the provider is healthy again: the single
+        # probe succeeds, the circuit CLOSES, and the other 19 concurrent
+        # calls fail fast — they never become extra probes.  The probe
+        # transport is deliberately delayed so all racers observe
+        # HALF-OPEN before it settles.
+        clock["now"] += 61
+        ok = _SuccessProviderTransport(delay=0.05)
+        adapter._transport = ok
+        outcomes = self._fire_concurrent(adapter)
+
+        assert ok.calls == 1, "recovery is a single probe"
+        assert outcomes.count("success") == 1
+        assert outcomes.count("fast-reject") == 19
+        assert adapter.cb_state == "CLOSED"
+        # Recovered state: a normal call succeeds with no extra probing.
+        text = adapter.generate_remediation("p", "s")
+        assert json.loads(text) == GOOD_ASSETS
+        assert ok.calls == 2

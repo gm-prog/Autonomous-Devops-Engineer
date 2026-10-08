@@ -239,7 +239,10 @@ fun WebOpsHeader(analysisMode: String, onOpenSettings: () -> Unit) {
             val badgeColor = when (analysisMode) {
                 "LIVE_BACKEND" -> ColorNeonGreen
                 "LIVE_FAILED", "OFFLINE_FAILED" -> ColorNeonPink
-                "OFFLINE_SIM", else -> ColorNeonBlue
+                "OFFLINE_SIM" -> ColorNeonBlue
+                // Unknown/absent state: safe non-success fallback — never
+                // rendered as a live/success color.
+                else -> ColorNeonBlue
             }
             Card(
                 colors = CardDefaults.cardColors(

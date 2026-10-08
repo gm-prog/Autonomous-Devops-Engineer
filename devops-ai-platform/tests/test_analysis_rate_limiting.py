@@ -54,7 +54,8 @@ def _gateway_app(env_extra: dict):
     from platform_pkg.api_gateway.main import create_app
     from platform_pkg.api_gateway import routers
 
-    env = {"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"}
+    env = {"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production",
+            "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true"}
     env.update(env_extra)
     app = create_app(env=env)
     analysis_router = routers.analysis_router
@@ -302,3 +303,142 @@ def test_forwarded_headers_are_never_trusted():
     limiter = app.state.analysis_rate_limiter
     assert isinstance(limiter, LocalAnalysisRateLimiter)
     assert list(limiter._ip_counts.keys()) == ["testclient"]
+
+
+# ---------------------------------------------------------------------------
+# Production posture: shared Redis state is REQUIRED (D1-CORRECTION §10)
+# ---------------------------------------------------------------------------
+
+
+class TestProductionSharedStateRequirement:
+    """staging/production must fail closed when the shared (Redis) state
+    that preserves the security limits is missing — for BOTH the gateway
+    rate limiter and the agent budget ledger. Development/test may use the
+    explicit in-process mode. A documented single-replica staging/production
+    deployment opts in via the exact-value flag."""
+
+    def test_development_without_redis_uses_local(self):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            load_analysis_rate_limit_settings,
+        )
+
+        for app_env in ("development", "test", ""):
+            settings = load_analysis_rate_limit_settings({"APP_ENV": app_env})
+            assert settings["store"] == "local"
+
+    def test_staging_and_production_without_redis_fail_closed(self):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            AnalysisRateLimitConfigurationError,
+            load_analysis_rate_limit_settings,
+        )
+
+        for app_env in ("staging", "production"):
+            with pytest.raises(AnalysisRateLimitConfigurationError):
+                load_analysis_rate_limit_settings({"APP_ENV": app_env})
+            # Even an explicitly local store is refused without the flag:
+            with pytest.raises(AnalysisRateLimitConfigurationError):
+                load_analysis_rate_limit_settings(
+                    {"APP_ENV": app_env, "ANALYSIS_RATE_LIMIT_STORE": "local"}
+                )
+
+    def test_production_explicit_single_instance_flag_is_allowed(self):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            load_analysis_rate_limit_settings,
+        )
+
+        settings = load_analysis_rate_limit_settings(
+            {
+                "APP_ENV": "production",
+                "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true",
+            }
+        )
+        assert settings["store"] == "local"
+
+    def test_single_instance_flag_requires_the_exact_value(self):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            AnalysisRateLimitConfigurationError,
+            load_analysis_rate_limit_settings,
+        )
+
+        for bad in ("True", "yes", "1", "TRUE"):  # (surrounding whitespace is tolerated)
+            with pytest.raises(AnalysisRateLimitConfigurationError):
+                load_analysis_rate_limit_settings(
+                    {
+                        "APP_ENV": "production",
+                        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": bad,
+                    }
+                )
+
+    def test_production_with_redis_uses_the_shared_store(self):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            load_analysis_rate_limit_settings,
+        )
+
+        settings = load_analysis_rate_limit_settings(
+            {"APP_ENV": "production", "REDIS_URL": "redis://gw:6379/0"}
+        )
+        assert settings["store"] == "redis"
+
+    # -- agent-side budget ledger -----------------------------------------
+
+    def test_agent_development_without_redis_uses_local(self):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiRuntimeConfig,
+        )
+
+        for app_env in ("development", "test", ""):
+            cfg = GeminiRuntimeConfig.from_env({"APP_ENV": app_env})
+            assert cfg.budget_store == "local"
+
+    def test_agent_staging_and_production_without_redis_fail_closed(self):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiRuntimeConfig,
+        )
+
+        for app_env in ("staging", "production"):
+            with pytest.raises(ValueError):
+                GeminiRuntimeConfig.from_env({"APP_ENV": app_env})
+            with pytest.raises(ValueError):
+                GeminiRuntimeConfig.from_env(
+                    {"APP_ENV": app_env, "GEMINI_BUDGET_STORE": "local"}
+                )
+
+    def test_agent_production_explicit_single_instance_flag_is_allowed(self):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiRuntimeConfig,
+        )
+
+        cfg = GeminiRuntimeConfig.from_env(
+            {
+                "APP_ENV": "production",
+                "GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION": "true",
+            }
+        )
+        assert cfg.budget_store == "local"
+
+    def test_agent_production_with_redis_uses_the_shared_store(self):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiRuntimeConfig,
+        )
+
+        cfg = GeminiRuntimeConfig.from_env(
+            {
+                "APP_ENV": "production",
+                "GEMINI_BUDGET_STORE": "redis",
+                "REDIS_URL": "redis://agent:6379/0",
+            }
+        )
+        assert cfg.budget_store == "redis"
+        assert cfg.redis_url == "redis://agent:6379/0"
+
+    def test_production_gateway_app_refuses_local_limiter_at_startup(self):
+        # The startup path itself must fail closed (not just the loader):
+        # a production gateway without Redis cannot boot.
+        from platform_pkg.api_gateway.main import create_app
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            AnalysisRateLimitConfigurationError,
+        )
+
+        with pytest.raises(AnalysisRateLimitConfigurationError) as excinfo:
+            create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
+        assert "Redis" in str(excinfo.value)

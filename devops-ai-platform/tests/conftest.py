@@ -177,8 +177,18 @@ def recording_incident_repo():
 
 @pytest.fixture
 def gateway_env():
-    """A valid production-mode gateway environment for app factories."""
-    return {"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"}
+    """A valid production-mode gateway environment for app factories.
+
+    These tests exercise a SINGLE-REPLICA production-mode gateway (in-memory
+    app, no Redis), so they opt in EXPLICITLY to the documented
+    single-instance rate-limit mode — the exact-value flag that cannot be
+    enabled by accident. A multi-replica gateway must use the shared store.
+    """
+    return {
+        "JWT_SECRET": TEST_GW_SECRET,
+        "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true",
+    }
 
 
 @pytest.fixture

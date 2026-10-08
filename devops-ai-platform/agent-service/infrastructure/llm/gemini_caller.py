@@ -221,6 +221,26 @@ class GeminiRuntimeConfig:
             raise ValueError(
                 "GEMINI_BUDGET_STORE=redis requires REDIS_URL to be set."
             )
+        # Phase 8.7-D.1-CORRECTION: staging/production MUST run the shared
+        # budget ledger. An in-process ledger is single-process: with N
+        # agent replicas the effective budget silently multiplies by N.
+        # Startup therefore fails closed unless a documented single-replica
+        # deployment opts in EXPLICITLY (exact value, not accidental).
+        app_env = (e.get("APP_ENV") or "").strip().lower()
+        if (
+            store == "local"
+            and app_env in ("staging", "production")
+            and (e.get("GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION") or "").strip()
+            != "true"
+        ):
+            raise ValueError(
+                f"APP_ENV={app_env} requires the shared Redis budget ledger "
+                f"(GEMINI_BUDGET_STORE=redis + REDIS_URL): the in-process "
+                f"ledger is single-process and the effective budget "
+                f"multiplies across replicas. For a documented single-replica "
+                f"deployment set GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION=true "
+                f"explicitly."
+            )
 
         return cls(
             model_name=(e.get("GEMINI_MODEL") or "").strip() or DEFAULT_GEMINI_MODEL,
@@ -268,13 +288,20 @@ class BudgetLedger(Protocol):
     ``reserve`` atomically commits a worst-case amount BEFORE provider
     contact and raises ``BudgetExceededException`` when the ceiling would
     be exceeded; ``finalize`` reconciles the actual cost afterwards.
+
+    Finalization is IDEMPOTENT: each reservation is accounted for exactly
+    once. ``finalize`` returns ``True`` when this call applied the
+    accounting and ``False`` when the reservation was already finalized
+    (duplicate / retried call — the accounting is unchanged).  The
+    exactly-once claim is shared-store-backed (Redis claim key) so it
+    holds across replicas.
     """
 
     def reserve(self, max_cost_usd: float) -> BudgetReservation: ...
 
     def finalize(
         self, reservation: BudgetReservation, actual_cost_usd: Optional[float]
-    ) -> None: ...
+    ) -> bool: ...
 
     @property
     def accumulated_spend(self) -> float: ...
@@ -307,6 +334,11 @@ class InProcessBudgetLedger:
         self._period_key = utc_period_key(self._now_fn())
         self._committed = 0.0
         self._reserved = 0.0
+        # Exactly-once finalization claim.  For the SINGLE-process ledger a
+        # process-local claim set is the correct mechanism (there is only
+        # one process); the shared Redis ledger uses a Redis claim key
+        # instead (see RedisBudgetLedger).
+        self._finalized_ids: set[str] = set()
 
     # -- period handling ---------------------------------------------------
 
@@ -359,8 +391,8 @@ class InProcessBudgetLedger:
 
     def finalize(
         self, reservation: BudgetReservation, actual_cost_usd: Optional[float]
-    ) -> None:
-        """Reconcile a reservation with the actual cost.
+    ) -> bool:
+        """Reconcile a reservation with the actual cost (exactly once).
 
         * actual present  -> committed += actual (the reservation is
           released; the actual — never an estimate — is what counts);
@@ -368,9 +400,20 @@ class InProcessBudgetLedger:
           never undercount);
         * period rolled while in flight -> the reservation is void against
           the new period; the actual (if any) is counted against the
-          current period so spend is never lost.
+          current period so spend is never lost;
+        * duplicate finalize -> ignored (returns False, accounting
+          unchanged) — the claim is held in this process's memory, which
+          is the correct mechanism for a single-process ledger.
         """
         with self._lock:
+            if reservation.reservation_id in self._finalized_ids:
+                logger.info(
+                    "[COST_MONITORING] Duplicate finalization of reservation "
+                    "%s ignored (exactly-once claim); accounting unchanged.",
+                    reservation.reservation_id,
+                )
+                return False
+            self._finalized_ids.add(reservation.reservation_id)
             self._roll_period_if_needed()
             if reservation.period_key == self._period_key:
                 self._reserved = max(0.0, self._reserved - reservation.reserved_usd)
@@ -389,6 +432,7 @@ class InProcessBudgetLedger:
                 self._committed if reservation.period_key == self._period_key else 0.0,
                 self._committed, self.monthly_budget, self._period_key,
             )
+            return True
 
     @property
     def accumulated_spend(self) -> float:
@@ -406,6 +450,15 @@ class RedisBudgetLedger:
     reserve and finalize operations are single atomic Redis script
     invocations, so concurrent replicas cannot double-spend the same
     remaining budget.
+
+    Finalization is EXACTLY ONCE (Phase 8.7-D.1-CORRECTION): each
+    reservation has a period-scoped, TTL-bounded claim key
+    (``…:{period}:finalized:{reservation_id}``) and the atomic finalize
+    script checks-and-sets it, so a duplicate or concurrent finalize of
+    the same reservation is ignored instead of double-releasing the
+    reservation or double-committing the cost.  The reservation is
+    released with a negative ``INCRBYFLOAT`` (Redis has no DECRBYFLOAT
+    command).
     """
 
     _RESERVE_LUA = """
@@ -424,15 +477,35 @@ redis.call('EXPIRE', reserved_key, ttl)
 return 1
 """
 
+    # Exactly-once finalization (Phase 8.7-D.1-CORRECTION).
+    #
+    # * The reservation is released with a NEGATIVE INCRBYFLOAT — Redis has
+    #   no DECRBYFLOAT command; INCRBYFLOAT with a negative delta is the
+    #   supported floating-point decrement primitive.
+    # * KEYS[3] is a per-reservation claim key (period-scoped, TTL-bounded).
+    #   Redis executes the WHOLE script atomically, so the EXISTS-check +
+    #   SET claim is an atomic claim: of N duplicate or concurrent
+    #   finalizations of the same reservation_id, exactly ONE acquires the
+    #   claim and mutates the accounting; the rest return 0 and change
+    #   nothing. This is safe across replicas (the claim lives in Redis,
+    #   never in process memory).
     _FINALIZE_LUA = """
 local committed_key = KEYS[1]
 local reserved_key = KEYS[2]
+local claim_key = KEYS[3]
 local reserved_amount = tonumber(ARGV[1])
 local actual = ARGV[2]
 local ttl = tonumber(ARGV[3])
-redis.call('DECRBYFLOAT', reserved_key, reserved_amount)
-if tonumber(redis.call('GET', reserved_key) or '0') < 0 then
+if redis.call('EXISTS', claim_key) == 1 then
+  return 0
+end
+redis.call('SET', claim_key, '1', 'EX', ttl)
+redis.call('INCRBYFLOAT', reserved_key, -reserved_amount)
+local remaining = tonumber(redis.call('GET', reserved_key) or '0')
+if remaining < 0 then
   redis.call('SET', reserved_key, '0')
+else
+  redis.call('EXPIRE', reserved_key, ttl)
 end
 if actual == '' then
   actual = tostring(reserved_amount)
@@ -503,13 +576,28 @@ return 1
 
     def finalize(
         self, reservation: BudgetReservation, actual_cost_usd: Optional[float]
-    ) -> None:
+    ) -> bool:
+        """Idempotently release the reservation and commit the actual cost.
+
+        Returns ``True`` when this call applied the accounting and
+        ``False`` when the reservation was ALREADY finalized (duplicate /
+        retried finalize — no double release, no double commit).
+        """
         actual = "" if actual_cost_usd is None else repr(float(actual_cost_usd))
-        self._call(
+        committed_key, reserved_key = self._keys(reservation.period_key)
+        claim_key = f"{self._KEY_PREFIX}:{reservation.period_key}:finalized:{reservation.reservation_id}"
+        applied = self._call(
             self._finalize_script,
-            self._keys(reservation.period_key),
+            [committed_key, reserved_key, claim_key],
             [repr(reservation.reserved_usd), actual, str(self._KEY_TTL_SECONDS)],
         )
+        if not applied:
+            logger.info(
+                "[COST_MONITORING] Duplicate finalization of reservation %s "
+                "ignored (exactly-once claim); accounting unchanged.",
+                reservation.reservation_id,
+            )
+        return bool(applied)
 
     @property
     def accumulated_spend(self) -> float:
@@ -522,6 +610,12 @@ return 1
             return float(raw) if raw else 0.0
         except (TypeError, ValueError):
             return 0.0
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:  # pragma: no cover - best effort
+            pass
 
 
 def build_budget_ledger(config: GeminiRuntimeConfig) -> BudgetLedger:
@@ -602,6 +696,13 @@ class GeminiCallerAdapter(RemoteLLMInterface):
         self._now_fn = now_fn
 
         # Circuit breaker states: CLOSED, OPEN, HALF-OPEN.
+        #
+        # HALF-OPEN is a single-probe lease (Phase 8.7-D.1-CORRECTION):
+        # when the cooldown expires, the FIRST caller atomically acquires
+        # the probe lease and becomes the only provider probe; every other
+        # concurrent caller sees HALF-OPEN and fails fast instead of
+        # becoming an additional probe.  The probe's outcome settles the
+        # circuit (success -> CLOSED, failure -> OPEN).
         self.cb_state = "CLOSED"
         self.cb_failures = 0
         self.cb_max_failures = 5
@@ -615,19 +716,46 @@ class GeminiCallerAdapter(RemoteLLMInterface):
         with self._state_lock:
             if self.cb_state == "OPEN":
                 if self._time_fn() - self.cb_last_failure_time > self.cb_cooldown_seconds:
-                    logger.info("[CIRCUIT_BREAKER] Cooldown elapsed. Half-open probe armed.")
+                    # Cooldown elapsed: this caller acquires the SINGLE
+                    # half-open probe lease and proceeds as the probe.
                     self.cb_state = "HALF-OPEN"
-                else:
-                    logger.warning("[CIRCUIT_BREAKER] Circuit OPEN; rejecting call fast.")
-                    raise GeminiServiceUnavailableException(
-                        "Gemini circuit breaker is OPEN; calls are rejected until cooldown."
+                    logger.info(
+                        "[CIRCUIT_BREAKER] Cooldown elapsed; single half-open "
+                        "probe armed."
                     )
+                    return
+                logger.warning("[CIRCUIT_BREAKER] Circuit OPEN; rejecting call fast.")
+                raise GeminiServiceUnavailableException(
+                    "Gemini circuit breaker is OPEN; calls are rejected until cooldown."
+                )
+            if self.cb_state == "HALF-OPEN":
+                # A probe is already in flight: no second probe is
+                # permitted, so concurrent callers fail fast.
+                logger.warning(
+                    "[CIRCUIT_BREAKER] HALF-OPEN probe in flight; rejecting "
+                    "call fast."
+                )
+                raise GeminiServiceUnavailableException(
+                    "Gemini circuit breaker is recovering (a single probe is "
+                    "in flight); calls are rejected until it settles."
+                )
+            # CLOSED: proceed.
 
     def _register_failure(self) -> None:
         with self._state_lock:
             self.cb_failures += 1
             self.cb_last_failure_time = self._time_fn()
-            if self.cb_failures >= self.cb_max_failures:
+            if self.cb_state == "HALF-OPEN":
+                # The single probe failed: re-open the circuit
+                # immediately so the cooldown runs again before the next
+                # probe is permitted.
+                logger.critical(
+                    "[CIRCUIT_BREAKER] Half-open probe FAILED; re-opening "
+                    "circuit."
+                )
+                self.cb_state = "OPEN"
+                self.cb_failures = 1
+            elif self.cb_failures >= self.cb_max_failures:
                 logger.critical(
                     "[CIRCUIT_BREAKER] %d consecutive failures; tripping circuit OPEN.",
                     self.cb_failures,

@@ -215,7 +215,8 @@ def test_app_verifies_with_its_own_startup_secret():
     from platform_pkg.api_gateway.main import create_app
 
     app_secret = "another-startup-secret-0123456789"
-    app = create_app(env={"JWT_SECRET": app_secret, "APP_ENV": "production"})
+    app = create_app(env={"JWT_SECRET": app_secret, "APP_ENV": "production",
+                            "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true"})
     foreign = make_token("ops-1", ["operator"])  # signed with conftest secret
     with TestClient(app) as client:
         resp = client.get("/v1/gateway/metrics",

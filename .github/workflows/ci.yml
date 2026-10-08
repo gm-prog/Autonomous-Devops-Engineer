@@ -152,7 +152,7 @@ jobs:
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install security test dependencies
-        run: pip install -r requirements-test.txt pyyaml
+        run: pip install -r requirements-test.txt
 
       - name: All structural guards over the actual repository source
         # Exits non-zero on any violation: a failed security invariant fails CI.
@@ -170,8 +170,8 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
-      - name: Install test dependencies (incl. redis client)
-        run: pip install -r devops-ai-platform/requirements-test.txt redis
+      - name: Install test dependencies (authoritative contract incl. redis client)
+        run: pip install -r devops-ai-platform/requirements-test.txt
       - name: Start a real Redis (digest-pinned)
         run: |
           set -euo pipefail
@@ -189,12 +189,21 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest tests/test_redis_integration.py -v 2>&1 | tee redis-integration.txt
+      - name: Mutation suite against the live store (M19 behavioral proof — weakened finalize script double-counts on real Redis)
+        working-directory: devops-ai-platform
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_security_mutations.py -v 2>&1 | tee redis-mutations.txt
       - name: Publish Redis integration evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: redis-integration-evidence
-          path: devops-ai-platform/redis-integration.txt
+          path: |
+            devops-ai-platform/redis-integration.txt
+            devops-ai-platform/redis-mutations.txt
           if-no-files-found: warn
       - name: Tear down Redis
         if: always()
@@ -215,8 +224,8 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
-      - name: Install test dependencies (compose YAML validation)
-        run: pip install -r devops-ai-platform/requirements-test.txt pyyaml
+      - name: Install test dependencies (authoritative contract incl. pyyaml)
+        run: pip install -r devops-ai-platform/requirements-test.txt
 
       - name: Canonical compose config (structure + required variables)
         working-directory: devops-ai-platform
@@ -263,8 +272,13 @@ jobs:
           # 4) Truthful fail-closed: an authenticated analysis request with
           #    NO provider credentials must be a typed 503 — never a fake
           #    success and never a crash.
+          # A VALID analysis role (the authorization matrix is operator /
+          # DevOpsLead / ClusterAdmin / Developer) so the request reaches
+          # the agent and exercises the intended fail-closed path:
+          #   valid JWT -> valid role -> rate limiter -> gateway->agent ->
+          #   Gemini key absent -> 503 (never a fabricated 200).
           TOKEN=$(docker compose exec -T api-gateway python -c \
-            "import os; from api_gateway.core.auth import create_access_token; print(create_access_token('ci-smoke-user', ['Administrator'], os.environ['JWT_SECRET']))")
+            "import os; from api_gateway.core.auth import create_access_token; print(create_access_token('ci-smoke-user', ['Developer'], os.environ['JWT_SECRET']))")
           CODE=$(curl -s -o /tmp/analysis.json -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
             -d '{"repo_name":"smoke","repo_url":"https://github.com/o/r.git","framework":"FastAPI","technology":"Python 3.12"}' \

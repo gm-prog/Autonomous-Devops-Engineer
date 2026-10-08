@@ -55,7 +55,15 @@ android {
     compose = true
     buildConfig = true
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      // The gateway client logs via android.util.Log on failure paths; unit
+      // tests exercise those paths offline, so unmocked Log calls are
+      // no-ops instead of "not mocked" crashes.
+      isReturnDefaultValues = true
+    }
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files

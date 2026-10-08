@@ -43,11 +43,21 @@ import java.util.concurrent.TimeUnit
  */
 object BackendGatewayClient {
     private const val TAG = "BackendGatewayClient"
-    private val client = OkHttpClient.Builder()
+
+    private val defaultClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
+
+    /**
+     * The HTTP client used for gateway calls. Production code always uses
+     * the default instance; the setter is a documented TEST seam
+     * (@VisibleForTesting) so the transport-failure contract (stable,
+     * detail-free failure messages) can be verified offline.
+     */
+    @androidx.annotation.VisibleForTesting
+    var httpClient: OkHttpClient = defaultClient
 
     /**
      * Analysis URL policy (Phase 8.7-D.1).
@@ -83,7 +93,10 @@ object BackendGatewayClient {
         val url: HttpUrl = try {
             HttpUrl.parse(clean) ?: return "Gateway URL is malformed."
         } catch (e: Exception) {
-            return "Gateway URL is malformed: ${e.message}"
+            // Defensive only: log a safe technical identifier, never the raw
+            // message (it may embed the raw URL/host) in the returned reason.
+            Log.w(TAG, "Gateway URL parse failure: ${e.javaClass.simpleName}")
+            return "Gateway URL is malformed."
         }
         return when (url.scheme) {
             "https" -> null
@@ -123,7 +136,7 @@ object BackendGatewayClient {
             .build()
 
         try {
-            client.newCall(request).execute().use { response ->
+            httpClient.newCall(request).execute().use { response ->
                 Log.d(TAG, "Connection check: code ${response.code}")
                 return@withContext response.isSuccessful || response.code == 404
             }
@@ -134,7 +147,7 @@ object BackendGatewayClient {
                     .url("$cleanUrl/api/v1/health")
                     .get()
                     .build()
-                client.newCall(healthRequest).execute().use { res ->
+                httpClient.newCall(healthRequest).execute().use { res ->
                     return@withContext res.isSuccessful
                 }
             } catch (ex: Exception) {
@@ -194,7 +207,7 @@ object BackendGatewayClient {
             .build()
 
         try {
-            client.newCall(request).execute().use { response ->
+            httpClient.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     Log.w(TAG, "Live analysis failed: HTTP ${response.code}")
@@ -214,8 +227,12 @@ object BackendGatewayClient {
                 return@withContext parseAnalysisResponse(body)
             }
         } catch (e: Exception) {
+            // Stable, detail-free user-facing message. Raw exception text can
+            // embed the URL, host, proxy, socket or DNS details — none of
+            // that may reach the UI layer or a crash log. Only a safe
+            // technical identifier is logged.
             Log.w(TAG, "Live analysis network failure: ${e.javaClass.simpleName}")
-            return@withContext AnalysisOutcome.Failure("Gateway unreachable: ${e.message}")
+            return@withContext AnalysisOutcome.Failure("Unable to reach the analysis gateway.")
         }
     }
 

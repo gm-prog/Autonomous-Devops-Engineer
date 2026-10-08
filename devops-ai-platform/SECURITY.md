@@ -1,9 +1,12 @@
-# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1)
+# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION)
 
 This document describes the **current** trust model of the platform after the
-Phase 8.7-C security integrity corrections and the Phase 8.7-D.1 production
-security & runtime hardening. It is normative for the gateway, monitoring,
-agent-service, and Android client. Historical phase reports may describe
+Phase 8.7-C security integrity corrections, the Phase 8.7-D.1 production
+security & runtime hardening, and the Phase 8.7-D.1-CORRECTION fixes
+(idempotent Redis budget finalize, production shared-state requirements,
+single-probe half-open circuit recovery, and the verified real-Redis test
+suite). It is normative for the gateway, monitoring, agent-service, and
+Android client. Historical phase reports may describe
 earlier states; where they disagree, this document and the code are
 authoritative.
 
@@ -136,6 +139,16 @@ What this branch does and does not do (truthful contract for this branch):
   never falls back to a fake "successful Gemini" result, and the analysis
   screen displays an explicit source badge distinguishing `OFFLINE_SIM`
   (local simulation) from `LIVE_BACKEND` (server-side provider result).
+* **No backend-detail leakage in user-facing errors (Phase
+  8.7-D.1-CORRECTION).** Failure reasons shown to the user are stable,
+  pre-authored strings ("Unable to reach the analysis gateway." for
+  transport failures; "Gateway URL is malformed." for URL-policy
+  rejections). The raw exception message — which can embed the gateway
+  URL, host, port, socket, or DNS details — is never surfaced in the UI or
+  logs; at most the exception's class name is logged. A regression test in
+  `AnalysisUrlPolicyTest` asserts that no exception-derived text reaches
+  the user-facing failure string, and the UI renders unknown states as the
+  safe offline/non-success color, never as live/success.
 * **Honest verification status.** The path above is implemented and verified
   by the automated gateway/agent/Android test suites on this branch. It has
   **not** been exercised against the real Gemini API in a production
@@ -276,9 +289,25 @@ actual cost is committed when present, and the **full reservation is kept
 when usage metadata is missing** (never undercount). Any failure path keeps
 the full reservation.
 
+**Finalize is exactly-once per reservation.** The ledger's finalize step
+returns a boolean: the accounting is applied at most once per
+`reservation_id`. On the shared store this is enforced atomically *inside
+the Redis script* — a period-scoped claim key
+(`devops:gemini:budget:{period}:finalized:{reservation_id}`, TTL-bound with
+the period key) is checked and set in the same atomic operation as the
+reservation release, so duplicate finalization calls (client retries,
+crash/restart redelivery, concurrent duplicate handling) **cannot
+double-subtract the reserved pool or double-count committed spend**, and
+the guarantee holds across replicas. The release itself uses
+`INCRBYFLOAT reserved -amount` (Redis has no `DECRBYFLOAT`; the script was
+verified against a real Redis 7.2.5 server). The in-process ledger enforces
+the same once-per-reservation contract with a lock-protected set.
+
 * `GEMINI_BUDGET_STORE=local` (default): lock-protected in-process ledger —
   an **explicit single-process deployment contract**; the ceiling is per
-  process and N replicas multiply it by N.
+  process and N replicas multiply it by N. **Refused at startup when
+  `APP_ENV` is `staging` or `production`** (see the shared-state contract
+  below); allowed for `dev`/local development.
 * `GEMINI_BUDGET_STORE=redis` (+ `REDIS_URL`): shared ledger (atomic Lua
   scripts, period-scoped keys, 45-day TTL) — one ceiling across replicas.
   An unreachable store **fails closed** (503) — the call is blocked rather
@@ -290,6 +319,20 @@ ceiling; it does not limit what Google bills for the underlying API key.
 Google-side spend controls (billing budget alerts, key-level restrictions,
 IAM) are a separate operator responsibility on the provider account and are
 not enforced by this platform.
+
+**Production shared-state contract (Phase 8.7-D.1-CORRECTION).** When
+`APP_ENV` is `staging` or `production`, the process **refuses to start**
+(fail-closed configuration error) unless the shared Redis store backs
+**both** the budget ledger (`GEMINI_BUDGET_STORE=redis` + `REDIS_URL`) and
+the analysis rate limiter (see 6.4). The only documented exception is an
+explicit single-replica mode, enabled only by setting the exact value
+`true` (case-sensitive; surrounding whitespace is stripped) of
+`GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION` and/or
+`ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION` — the flag cannot be
+tripped accidentally (`True`, `TRUE`, `yes`, `1`, … are all rejected).
+`dev`/local development keeps the in-process stores. The canonical compose
+stack runs the agent with `APP_ENV=production` and both stores on shared
+Redis, satisfying the contract by construction.
 
 ### 6.3 Current, bounded provider contract (P0-6)
 
@@ -334,8 +377,12 @@ call**:
 (never host-exposed; shared rate-limit and budget state). Base/third-party
 images are pinned to immutable digests (recorded in the compose header,
 resolved 2026-10-08). `JWT_SECRET` and `AGENT_INTERNAL_TOKEN` are required
-(fail closed via `${VAR:?}`); `GEMINI_API_KEY` is optional and its absence
-makes the agent fail closed (503) — the CI boot smoke verifies exactly that.
+(fail closed via `${VAR:?}`); the agent runs with `APP_ENV=production`, so
+the production shared-state contract (6.2) is active in the canonical stack
+and satisfied by the shared Redis service. `GEMINI_API_KEY` is optional and
+its absence makes the agent fail closed (503) — the CI boot smoke verifies
+exactly that (with a correctly role-authorized token, so the 503 is proven
+to come from the missing key, not from authorization).
 The older broad stack is **quarantined** in `docker-compose.legacy.yml`
 (do not use for the D1 path) with its hardcoded database password removed.
 CI builds both service images, boots the stack, and checks readiness,
@@ -371,7 +418,28 @@ construction (shared circuit/budget state lost), **M14** analysis rate
 limiting removed, **M15** cleartext bearer transport re-enabled, **M16**
 non-atomic budget check-then-act (concurrent double-spend), **M17** agent
 build removed from the canonical runtime, **M18** deprecated model / removed
-output bound.
+output bound, **M19** exactly-once finalize claim removed from the Redis
+finalize script (structural guard in the security job; behavioral proof —
+the weakened script double-counts a duplicate finalization — runs in the
+real-Redis integration job), **M20** production shared-state requirement
+bypassed (production + in-process stores silently allowed), **M21**
+half-open single-probe lease removed (multiple concurrent probes).
+
+### 6.8 Single half-open probe lease (circuit recovery, Phase 8.7-D.1-CORRECTION)
+
+The provider circuit breaker uses three states — `CLOSED`, `OPEN`,
+`HALF-OPEN` — under a single state lock, so the recovery transition is
+atomic. When `OPEN` and the cooldown has elapsed, **exactly one** in-flight
+caller performs the `OPEN → HALF-OPEN` transition and is the sole probe;
+the `HALF-OPEN` state itself *is* the probe lease — any other concurrent
+caller that observes it is rejected immediately (503, no provider contact)
+instead of becoming a second probe. If the probe fails, the circuit re-opens
+to `OPEN` immediately (failure counter reset to 1, full cooldown runs
+again); if it succeeds, the breaker returns to `CLOSED` (failure counter
+reset). The barrier test proves the property: N concurrent callers released
+after the cooldown produce exactly **one** provider call and N−1 fast
+failures, and a recovering probe closes the circuit. Removal is proven
+adversarial by M21 (the weakened breaker lets all N racers probe).
 
 ---
 
@@ -392,10 +460,14 @@ output bound.
   envelope is the current machine-authentication mechanism and assumes
   network-level segregation of `/api/internal` endpoints.
 * The in-process budget ledger and in-process rate limiter are explicitly
-  single-process: a multi-replica deployment MUST set
+  single-process. For `APP_ENV` of `staging`/`production`, a configuration
+  that resolves either one of them to the in-process store is **refused at
+  startup** (fail-closed); a multi-replica deployment MUST set
   `GEMINI_BUDGET_STORE=redis` / `ANALYSIS_RATE_LIMIT_STORE=redis` (shared
-  Redis). The application budget is a safety budget for THIS application and
-  is not a Google billing cap (see 6.2).
+  Redis), and the only exception is the explicit, exact-value
+  single-instance flags documented in 6.2. The application budget is a
+  safety budget for THIS application and is not a Google billing cap (see
+  6.2).
 * Nothing on this branch has been exercised against the real Gemini API in a
   production deployment: no production-verification or "production-ready"
   claim is made for the provider path. The compose boot smoke runs WITHOUT

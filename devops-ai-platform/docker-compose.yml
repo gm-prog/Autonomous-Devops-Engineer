@@ -85,6 +85,10 @@ services:
     expose:
       - "8020"
     environment:
+      # Production posture: the budget ledger is backed by the shared
+      # Redis below, satisfying the staging/production shared-state
+      # contract (an in-process ledger would be refused at startup).
+      - APP_ENV=production
       # OPTIONAL: empty => the analysis endpoint fails closed (503) rather
       # than fabricating a provider response (verified by the smoke test).
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}

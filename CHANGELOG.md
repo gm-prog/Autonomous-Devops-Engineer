@@ -2,6 +2,102 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-D.1-CORRECTION] — Verified CI-Failure Remediation (2026-10-08)
+
+Correction pass for the verified CI failures of the 8.7-D.1 release commit
+(`64ce8e5`). Scope: restore the D.1 contract; no new features, no
+architectural rewrites. All fixes were reproduced and verified locally
+(including against a real Redis 7.2.5 server built from source) before
+commit; the GitHub Actions evidence for this commit is the authority for
+the Docker/Android/CI claims.
+
+### Fixed
+
+* **Redis budget finalize (broken command + duplicate accounting).** The
+  finalize script referenced the nonexistent `DECRBYFLOAT` command (real
+  Redis: "Unknown Redis command called from script"), which made every
+  finalize fail with `BudgetStoreUnavailableException`. The reservation
+  release now uses `INCRBYFLOAT <reserved_key> -<amount>`. Finalize is also
+  **exactly-once per reservation**: an atomic, period-scoped claim key
+  (`devops:gemini:budget:{period}:finalized:{reservation_id}`) is
+  check-and-set inside the finalize script itself, so duplicate
+  finalizations (retries, concurrent duplicate handling, cross-replica)
+  cannot double-subtract the reserved pool or double-count committed
+  spend. `finalize()` now returns whether the accounting was applied. The
+  in-process ledger enforces the same contract. The finalize script was
+  verified against a real Redis 7.2.5 server.
+* **Android compile failure.** `MainActivity.kt:242` used an invalid
+  `when` arm (`"OFFLINE_SIM", else -> …`); the offline-simulation state
+  now has its own branch and the `else` maps unknown states to the safe
+  offline/non-success color — never the live/success color.
+* **Android error-detail leakage.** Transport failures now surface the
+  stable user-facing string "Unable to reach the analysis gateway." and
+  malformed-URL rejections "Gateway URL is malformed."; the raw exception
+  message (which can embed URL/host/socket/DNS details) is never surfaced
+  or logged (at most the exception class name). Regression test added to
+  `AnalysisUrlPolicyTest.kt`. `app/build.gradle.kts` enables
+  `isReturnDefaultValues` so the unit tests can exercise `Log`.
+* **Test dependency contract.** `devops-ai-platform/requirements-test.txt`
+  is the single authoritative dependency contract for `tests/` and
+  `security_guards/` (adds `redis`, `pyyaml`, FastAPI test client, JWT,
+  requests, pytest). Every Python CI job installs only that file — the
+  per-job `pip install … pyyaml` / `… redis` extras that masked
+  `ModuleNotFoundError` failures are removed.
+* **Compose smoke tested the wrong role.** The boot smoke minted an
+  `Administrator` token (a 403 role), so the missing-`GEMINI_API_KEY` →
+  503 property was never exercised. The smoke now mints a
+  `Developer`-role token (an authorized role) and proves the exact
+  sequence: valid JWT → valid role → rate limiter → gateway → agent → key
+  absent → exactly 503 (never 200 / fabricated).
+
+### Added
+
+* **Production shared-state requirement (fail closed).** When `APP_ENV` is
+  `staging` or `production`, the agent and gateway refuse to start unless
+  the shared Redis store backs both the budget ledger and the analysis
+  rate limiter. The only exception is the explicit single-replica mode via
+  the exact-value (case-sensitive) flags
+  `GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION=true` /
+  `ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION=true`. `dev` keeps the
+  in-process stores. Tests cover both sides (production+shared passes,
+  production+in-process fails, flag variants rejected, dev+local passes,
+  `create_app` startup fails closed).
+* **Single half-open probe lease.** After the cooldown, exactly one
+  concurrent caller performs the atomic `OPEN → HALF-OPEN` transition and
+  probes the provider; all other concurrent callers fast-fail (503, no
+  provider contact). A failed probe re-opens the circuit immediately; a
+  successful probe closes it. Barrier test: N concurrent racers after the
+  cooldown produce exactly one provider call.
+* **Real-Redis integration suite (8 properties).** Shared rate limiter,
+  shared budget, concurrent reservations respecting the ceiling, finalize
+  semantics, missing-usage full-reservation retention, calendar-month
+  rollover, duplicate-finalize once-only (sequential and 8-thread
+  concurrent), and store-outage fail-closed — all run against a
+  digest-pinned real Redis (no fakeredis); skipped locally, hard-required
+  in the CI `redis-integration` job.
+* **Adversarial mutations M19–M21.** M19: exactly-once finalize claim
+  removed from the Redis script (structural guard; the behavioral proof —
+  the weakened script double-counts on a real Redis — runs in the
+  real-Redis CI job). M20: production shared-state requirement bypassed.
+  M21: half-open single-probe lease removed (20-call race). M1–M18 are
+  unchanged.
+* **Canonical compose production posture.** The agent service in
+  `devops-ai-platform/docker-compose.yml` now runs with
+  `APP_ENV=production` (both stores on shared Redis), satisfying the new
+  contract by construction.
+
+### Verified
+
+* Real Redis 7.2.5 (built from source locally; digest-pinned image in
+  CI): all 8 integration properties green, including concurrent
+  duplicate-finalize once-only and the M19 behavioral proof.
+* All Python suites, structural guards, and the 21-test mutation suite
+  green locally; Android verified with the real Gradle toolchain and the
+  compose stack verified by the CI runtime job (build, boot, health,
+  host-port non-exposure, exact-503 smoke) — per-run evidence is the
+  GitHub Actions artifacts for this commit. No production-verification
+  claim is made for the provider path.
+
 ## [8.7-D.1] — Production Security & Runtime Hardening (2026-10-08)
 
 Audit-driven release blockers corrected on the server-side analysis path,
