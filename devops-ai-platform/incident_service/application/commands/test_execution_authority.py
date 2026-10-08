@@ -715,6 +715,22 @@ class RepositoryExecutionBoundaryAuditTests(unittest.TestCase):
             # untouched and the application still cannot change traffic.
             "incident_service/infrastructure/traffic/"
             "kubernetes_read_client.py",
+            # Phase 8.7-B.2 added the trusted traffic mutation provider. It
+            # launches kubectl through subprocess.run with a host-built argv
+            # only: there is one mutating verb (the module constant `patch`),
+            # one resource (the module constant `httproute`), the JSON patch
+            # is built from typed values (a resourceVersion compare-and-set
+            # plus exactly two backendRef weight replacements) and no
+            # public function accepts an argv, a verb, a resource, a patch
+            # document or a path expression. Every variable element is
+            # validated with the read client's validators, there is no
+            # shell, and the write package's tests assert that this module
+            # is the only process spawner in it. The mutation is refused
+            # unless a fresh observation proves the target identity,
+            # the controller's acceptance and the exact starting
+            # percentage; the B.1 read path remains read-only.
+            "incident_service/infrastructure/traffic_mutation/"
+            "kubernetes_mutation_client.py",
         },
     }
 
