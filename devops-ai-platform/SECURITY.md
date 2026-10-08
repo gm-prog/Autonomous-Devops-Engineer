@@ -103,7 +103,10 @@ What this branch does and does not do (truthful contract for this branch):
   typed internal call to the agent-service, which invokes Gemini using
   `GEMINI_API_KEY` read **from the agent-service server environment**.
   Provider credentials belong **server-side** — that is valid server-side
-  code and is not reachable from the APK. The gateway URL in Settings is a
+  code and is not reachable from the APK. The gateway-to-agent hop is a
+  separate trust boundary authenticated by `AGENT_INTERNAL_TOKEN`; the agent
+  rejects internal analysis requests without that credential before invoking
+  Gemini. The gateway URL in Settings is a
   configuration the user provides; the reachability check stays diagnostics-only.
 * **Authenticated and role-gated, fail-closed end to end.** The analyze
   endpoint rejects unauthenticated requests (401), insufficient roles (403),
@@ -225,3 +228,8 @@ guards, and adversarial mutations.
 * mTLS between producer and monitoring service is not yet deployed; the HMAC
   envelope is the current machine-authentication mechanism and assumes
   network-level segregation of `/api/internal` endpoints.
+
+
+### 2.1 Server-to-server analysis boundary
+
+The public gateway JWT authenticates the end user; it is not reused as the agent-service network credential. The gateway sends the authenticated identity for audit purposes plus `X-Agent-Internal-Token` to the fixed agent-service analysis endpoint. The agent compares that shared secret constant-time and rejects missing/invalid credentials before any LLM call.
