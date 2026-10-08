@@ -430,15 +430,16 @@ def test_documentation_states_the_offline_truth():
 
 MAIN_ACTIVITY = REPO_ROOT / "app" / "src" / "main" / "java" / "com" / "example" / "MainActivity.kt"
 
-# Phrases that would claim a live/current Gemini capability that does not
-# exist on this branch.  Matched case-insensitively against whitespace-
+# Phrases that would falsely present local simulation as live provider
+# telemetry or claim an unverified capability. The authenticated live
+# analysis path is implemented in Phase 8.7-D, so generic "live Gemini"
+# wording is not forbidden unless it mislabels the local cockpit/UI.  Matched case-insensitively against whitespace-
 # normalized production source (comments included: a phrase like "Gemini
 # Live analysis" describing current functionality is a regression anywhere
 # in production source).
 _FORBIDDEN_LIVE_GEMINI_PHRASES = (
     "compile live blueprints",
     "live blueprints via gemini",
-    "gemini live analysis",
     "gemini resilient api cockpit",
     "realtime safety constraints",
 )
