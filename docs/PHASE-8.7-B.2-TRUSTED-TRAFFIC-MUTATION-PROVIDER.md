@@ -498,10 +498,21 @@ PYTHONPATH=. python -m pytest -q tests/test_phase_8_7_b_2_trusted_traffic_mutati
 
 ## 18. Run record
 
-The live run for this phase is the GitHub Actions run of the commit that
-introduced this document: job `kubernetes-traffic-mutation-e2e`, artifact
+The live proof for this phase is the run of this branch whose head is the
+commit under test: job `kubernetes-traffic-mutation-e2e`, artifact
 `traffic-mutation-e2e-evidence` (`traffic-mutation-e2e.json` and its
 `.sha256`). The phase report quotes that run's identifiers, the observed
 percentages, the data-plane cross-check, the refusal classifications and the
-artifact digest directly from the run; nothing in the report is derived from a
-local test run, and the run's evidence file is the authoritative record.
+artifact digest directly from the run. Nothing in the report is derived from a
+local test run, the run's evidence file is the authoritative record, and the
+identifiers are deliberately not hard-coded here — a document cannot contain
+the hash of the run that publishes it.
+
+Two facts about this phase's CI history are worth stating plainly, because a
+reader comparing runs will see them: the first push of this phase failed the
+job before any cluster work, because `pytest` is not in `requirements.txt` and
+the job's own safety-control step could not start; the next commit installs it
+the way the existing `platform-tests` job does, changed nothing else, and the
+job has run the full live sequence since. A skipped live step is never treated
+as proof of anything.
+
