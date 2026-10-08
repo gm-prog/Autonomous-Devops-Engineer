@@ -80,6 +80,11 @@ def get_agent_analysis_transport() -> _AgentAnalysisTransport:
     return _AgentAnalysisTransport()
 
 
+# Compatibility name for the existing gateway test/dependency-override seam.
+# This remains analysis-specific; it is not the removed generic dispatcher.
+get_downstream_transport = get_agent_analysis_transport
+
+
 class RepositoryAnalysisRequest(BaseModel):
     """Strict public analysis contract.
 
@@ -121,7 +126,7 @@ def _map_downstream_error(exc: Exception) -> HTTPException:
 def analyze_repository(
     body: RepositoryAnalysisRequest,
     user: dict = Depends(require_analysis_role),
-    transport: _AgentAnalysisTransport = Depends(get_agent_analysis_transport),
+    transport: _AgentAnalysisTransport = Depends(get_downstream_transport),
 ):
     """Typed, authenticated repository analysis.
 
