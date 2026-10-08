@@ -24,7 +24,7 @@ import logging
 import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from ...application.commands.analyze_repository import (
@@ -38,13 +38,13 @@ from ...application.commands.analyze_repository import (
 )
 from ...infrastructure.llm.gemini_caller import (
     BudgetExceededException,
+    BudgetStoreUnavailableException,
     GeminiAuthException,
     GeminiMalformedResponseException,
     GeminiRateLimitException,
     GeminiServiceUnavailableException,
     GeminiTimeoutException,
     GeminiUpstreamException,
-    GeminiCallerAdapter,
 )
 
 logger = logging.getLogger("AgentAnalysisRouter")
@@ -105,12 +105,22 @@ class RepositoryAnalysisResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def get_analysis_handler() -> AnalyzeRepositoryCommandHandler:
-    """Production wiring: the hardened Gemini adapter (server env key).
+def get_analysis_handler(request: Request) -> AnalyzeRepositoryCommandHandler:
+    """Production wiring: the SHARED, application-lifetime analysis handler.
 
-    Overridable in tests via ``app.dependency_overrides``.
+    The handler (and therefore the single ``GeminiCallerAdapter`` with its
+    circuit-breaker and budget state) is created ONCE per agent application
+    instance in ``create_app`` and stored on ``request.app.state`` — it is
+    shared across requests, never rebuilt per request (D1 P0-1).  Overridable
+    in tests via ``app.dependency_overrides``.
     """
-    return AnalyzeRepositoryCommandHandler(GeminiCallerAdapter())
+    handler = getattr(request.app.state, "analysis_handler", None)
+    if handler is None:  # defensive: mis-assembled app -> fail closed, never build ad hoc
+        raise HTTPException(
+            status_code=503,
+            detail="Agent analysis handler is not initialized (application lifecycle not run).",
+        )
+    return handler
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +139,10 @@ def _handle_failure(exc: Exception) -> HTTPException:
         return HTTPException(status_code=502, detail="Server-side Gemini returned an unusable result.")
     if isinstance(exc, BudgetExceededException):
         return HTTPException(status_code=503, detail="Server-side AI budget ceiling reached; analysis is blocked.")
+    if isinstance(exc, BudgetStoreUnavailableException):
+        # Fail closed: without a reachable budget store the call cannot be
+        # spend-bounded, so it is blocked (never run unlimited).
+        return HTTPException(status_code=503, detail="Server-side AI budget store is unavailable; analysis is blocked.")
     if isinstance(exc, GeminiServiceUnavailableException):
         return HTTPException(status_code=503, detail="Server-side Gemini is not available or not configured; the client should use its offline mode.")
     logger.exception("Unhandled analysis failure (%s).", type(exc).__name__)

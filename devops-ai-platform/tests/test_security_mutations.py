@@ -40,6 +40,21 @@ M11. Caller:   provider 401/403 is swallowed and answered with a fabricated
                "simulated" success.
 M12. Caller:   the budget ceiling is bypassed (exhausted budget still
                places provider calls).
+
+Phase 8.7-D.1 mutations:
+
+M13. Agent:    restore PER-REQUEST Gemini adapter construction (circuit-
+               breaker and budget state reset on every request).
+M14. Gateway:  remove the analysis route's rate-limiting dependency
+               (unlimited provider-bound analysis).
+M15. Android:  re-enable bearer-JWT transport to arbitrary cleartext
+               endpoints (disable the URL transport policy).
+M16. Caller:   reintroduce the NON-ATOMIC budget check-then-act (TOCTOU
+               race) — concurrent reservations race past the ceiling.
+M17. Runtime:  remove the canonical agent-service build from the D1
+               compose stack (runtime verification must turn red).
+M18. Caller:   revert the model to the deprecated gemini-3.5-flash and
+               drop the maxOutputTokens bound from the provider payload.
 """
 
 from __future__ import annotations
@@ -663,15 +678,17 @@ def test_mutation_m9_client_supplied_gemini_key_detected(mutated_repo):
 def _apply_missing_key_fail_open(repo: Path) -> None:
     caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
     src = caller_path.read_text(encoding="utf-8")
-    # Weaken: _generate_text fabricates a response when the key is missing
-    # (the first _precall_gates() call site is inside _generate_text).
-    old_check = "        self._precall_gates()"
-    assert old_check in src, "M10 target not found in gemini_caller"
+    # Weaken: _generate_text fabricates a response when the key is missing —
+    # the guard line is injected right before the fail-closed assertion call
+    # (inside _generate_text, the only place both calls are adjacent).
+    target = "        self._check_circuit()\n        self._assert_provider_configured()"
+    assert target in src, "M10 target not found in gemini_caller"
     src = src.replace(
-        old_check,
+        target,
+        "        self._check_circuit()\n"
         "        if not self.api_key:  # MUTATION: fail open\n"
         '            return "SIMULATED GEMINI RESPONSE (offline bypass)"\n'
-        + old_check,
+        "        self._assert_provider_configured()",
         1,
     )
     caller_path.write_text(src, encoding="utf-8")
@@ -785,18 +802,29 @@ def test_mutation_m11_fake_gemini_success_detected(mutated_repo):
 def _apply_budget_bypass(repo: Path) -> None:
     caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
     src = caller_path.read_text(encoding="utf-8")
-    old = "        return self.accumulated_spend < self.monthly_budget"
-    assert old in src, "M12 target not found in GeminiBudgetService.check_budget"
-    src = src.replace(old, "        return True  # MUTATION: budget ceiling bypassed", 1)
+    old = "            if self._committed + self._reserved + max_cost_usd > self.monthly_budget + _FLOAT_EPS:"
+    assert old in src, "M12 target not found in InProcessBudgetLedger.reserve"
+    src = src.replace(
+        old,
+        "            if False:  # MUTATION: budget ceiling bypassed",
+        1,
+    )
     caller_path.write_text(src, encoding="utf-8")
 
 
 def _assert_budget_enforced(repo: Path) -> None:
-    """Structural guard: check_budget must compare spend against the ceiling."""
+    """Structural guard: the atomic reservation must compare the combined
+    committed + reserved + new amount against the ceiling before allowing
+    the reservation (no bypass, no GET-then-SET race)."""
     src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
-    fn = src.split("def check_budget", 1)[1].split("def ", 1)[0]
-    assert "self.accumulated_spend < self.monthly_budget" in fn, (
-        "check_budget no longer compares spend against the ceiling"
+    fn = src.split("class InProcessBudgetLedger", 1)[1].split("class RedisBudgetLedger", 1)[0]
+    reserve = fn.split("def reserve", 1)[1].split("def finalize", 1)[0]
+    assert "self._committed + self._reserved + max_cost_usd > self.monthly_budget" in reserve, (
+        "reserve() no longer compares committed + reserved + amount "
+        "against the ceiling atomically"
+    )
+    assert "self._reserved += max_cost_usd" in reserve, (
+        "reserve() no longer commits the reserved amount"
     )
 
 
@@ -806,8 +834,9 @@ def test_mutation_m12_budget_bypass_detected(mutated_repo):
     _apply_budget_bypass(mutated_repo)
     # The mutated budget check is structurally broken:
     src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
-    fn = src.split("def check_budget", 1)[1].split("def ", 1)[0]
-    assert "self.accumulated_spend < self.monthly_budget" not in fn, (
+    fn = src.split("class InProcessBudgetLedger", 1)[1].split("class RedisBudgetLedger", 1)[0]
+    reserve = fn.split("def reserve", 1)[1].split("def finalize", 1)[0]
+    assert "self._committed + self._reserved + max_cost_usd > self.monthly_budget" not in reserve, (
         "guard stayed green after the budget ceiling was bypassed"
     )
 
@@ -836,3 +865,497 @@ def test_mutation_m12_budget_bypass_detected(mutated_repo):
         "expected the weakened control to call the provider despite the "
         "exhausted budget"
     )
+
+
+# ---------------------------------------------------------------------------
+# M13 — restore PER-REQUEST Gemini adapter construction (state reset)
+# ---------------------------------------------------------------------------
+
+
+def _apply_per_request_adapter(repo: Path) -> None:
+    router_path = repo / "devops-ai-platform/agent-service/presentation/rest/analysis_router.py"
+    src = router_path.read_text(encoding="utf-8")
+    # Weaken: rebuild the handler (and its GeminiCallerAdapter) on EVERY
+    # request instead of resolving the application-lifetime shared handler.
+    target = (
+        "    handler = getattr(request.app.state, \"analysis_handler\", None)\n"
+        "    if handler is None:  # defensive: mis-assembled app -> fail closed, never build ad hoc\n"
+        "        raise HTTPException(\n"
+        "            status_code=503,\n"
+        "            detail=\"Agent analysis handler is not initialized (application lifecycle not run).\",\n"
+        "        )\n"
+        "    return handler"
+    )
+    assert target in src, "M13 target not found in agent analysis router"
+    src = src.replace(
+        target,
+        "    # MUTATION: per-request adapter construction (state resets every call)\n"
+        "    return AnalyzeRepositoryCommandHandler(GeminiCallerAdapter())",
+        1,
+    )
+    # The router no longer imports the adapter; the mutation re-adds it.
+    src = src.replace(
+        "    GeminiUpstreamException,\n)",
+        "    GeminiUpstreamException,\n    GeminiCallerAdapter,\n)",
+        1,
+    )
+    router_path.write_text(src, encoding="utf-8")
+
+
+def _assert_shared_analysis_handler_intact(repo: Path) -> None:
+    """Structural guard: the route must resolve the SHARED app-lifetime
+    handler and must never construct an adapter per request."""
+    src = (repo / "devops-ai-platform/agent-service/presentation/rest/analysis_router.py").read_text(encoding="utf-8")
+    fn = src.split("def get_analysis_handler", 1)[1].split("\ndef ", 1)[0]
+    assert "app.state" in fn and "analysis_handler" in fn, (
+        "get_analysis_handler no longer resolves the shared app.state handler"
+    )
+    assert "GeminiCallerAdapter(" not in fn, (
+        "get_analysis_handler constructs an adapter per request"
+    )
+
+
+def test_mutation_m13_per_request_adapter_state_reset_detected(mutated_repo, monkeypatch):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_shared_analysis_handler_intact(REPO_ROOT)
+    _apply_per_request_adapter(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/presentation/rest/analysis_router.py").read_text(encoding="utf-8")
+    fn = mut_src.split("def get_analysis_handler", 1)[1].split("\ndef ", 1)[0]
+    assert "GeminiCallerAdapter(" in fn, (
+        "guard stayed green after per-request adapter construction was introduced"
+    )
+
+    # (2) Behavioral: circuit-breaker state must persist ACROSS separate
+    #     requests through the shared handler.  Five failing requests open
+    #     the shared circuit; the sixth request then fails fast WITHOUT any
+    #     provider contact.  With per-request adapters the state resets and
+    #     the sixth request still reaches the provider.
+    import importlib
+
+    monkeypatch.setenv("AGENT_INTERNAL_TOKEN", "test-agent-internal-token-0123456789abcdef0123456789abcdef")
+    monkeypatch.setenv("GEMINI_API_KEY", "m13-test-key-not-a-real-credential")
+    monkeypatch.setenv("GEMINI_MAX_RETRIES", "1")
+    monkeypatch.setenv("GEMINI_BACKOFF_BASE_SECONDS", "0.001")
+
+    hdrs = {
+        "X-Gateway-Identity": "m13-shared-state",
+        "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef",
+    }
+    body = {"repo_name": "m13", "repo_url": "https://github.com/o/r.git",
+            "framework": "FastAPI", "technology": "Python 3.12"}
+
+    class _Resp500:
+        status_code = 500
+        text = "transient upstream error"
+
+        def json(self):
+            raise ValueError("no body")
+
+    # --- unmutated: failures accumulate on the SHARED adapter.
+    from platform_pkg.agent.main import create_app
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    app = create_app(config=gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001))
+    app.state.analysis_handler.llm._transport = lambda payload: _Resp500()
+    with TestClient(app) as client:
+        codes = [client.post("/api/internal/repository/analyze", json=body, headers=hdrs).status_code
+                 for _ in range(5)]
+        sixth = client.post("/api/internal/repository/analyze", json=body, headers=hdrs)
+    assert codes == [502] * 5
+    assert sixth.status_code == 503, (
+        "shared circuit-breaker state was NOT persisted across requests: "
+        "expected fail-fast 503 after 5 failures"
+    )
+
+    # --- mutated: each request rebuilds the adapter; the circuit never
+    #     opens, so the sixth request still contacts the provider (502).
+    top = _register_mutated_tree(mutated_repo, "mut_m13")
+    m_main = importlib.import_module(f"{top}.agent.main")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    calls: list = []
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        calls.append(1)
+        return _Resp500()
+
+    monkeypatch.setattr(m_gc.requests, "post", _fake_post)
+    mapp = m_main.create_app(config=m_gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001))
+    with TestClient(mapp) as client:
+        codes = [client.post("/api/internal/repository/analyze", json=body, headers=hdrs).status_code
+                 for _ in range(5)]
+        sixth = client.post("/api/internal/repository/analyze", json=body, headers=hdrs)
+    assert codes == [502] * 5
+    assert sixth.status_code == 502, (
+        "expected the weakened control to keep contacting the provider per "
+        "request (circuit state resets)"
+    )
+    assert len(calls) >= 6, (
+        "expected the weakened control to make provider calls on every request"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M14 — remove the analysis route's rate limiting
+# ---------------------------------------------------------------------------
+
+
+def _apply_rate_limit_removal(repo: Path) -> None:
+    router_path = repo / "devops-ai-platform/api-gateway/routers/analysis_router.py"
+    src = router_path.read_text(encoding="utf-8")
+    target = "    _rate_limited: None = Depends(require_analysis_rate_limit),"
+    assert target in src, "M14 target not found in gateway analysis route"
+    src = src.replace(target, "    # MUTATION: analysis rate limiting removed", 1)
+    router_path.write_text(src, encoding="utf-8")
+
+
+def _assert_analysis_rate_limit_intact(repo: Path) -> None:
+    """Structural guard: the analysis route keeps its limiter dependency."""
+    src = (repo / "devops-ai-platform/api-gateway/routers/analysis_router.py").read_text(encoding="utf-8")
+    route = src.split('@router.post("/api/v1/repository/analyze")', 1)[1].split("):", 1)[1]
+    sig = src.split("def analyze_repository", 1)[1].split("):", 1)[0]
+    assert "Depends(require_analysis_rate_limit)" in sig, (
+        "the analysis route lost its rate-limiting dependency"
+    )
+
+
+def test_mutation_m14_analysis_rate_limit_removal_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_analysis_rate_limit_intact(REPO_ROOT)
+    _apply_rate_limit_removal(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/api-gateway/routers/analysis_router.py").read_text(encoding="utf-8")
+    sig = mut_src.split("def analyze_repository", 1)[1].split("):", 1)[0]
+    assert "Depends(require_analysis_rate_limit)" not in sig, (
+        "guard stayed green after the rate limiting was removed"
+    )
+
+    # (2) Behavioral: the same burst that the intact control limits with
+    #     429 is now allowed UNLIMITED against the weakened control.
+    top = _register_mutated_tree(mutated_repo, "mut_m14")
+    main = importlib.import_module(f"{top}.api_gateway.main")
+    analysis_router = importlib.import_module(f"{top}.api_gateway.routers.analysis_router")
+    app = main.create_app(env={
+        "JWT_SECRET": TEST_GW_SECRET,
+        "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_STORE": "local",
+        "ANALYSIS_RATE_LIMIT_PER_IDENTITY_PER_MINUTE": "2",
+    })
+
+    class _FakeTransport:
+        def call(self, method, url, json_body, identity):
+            return {"status": "ANALYSIS_COMPLETE", "source": "server_gemini",
+                    "analysis": {"dockerfile": "D", "k8s_yaml": "K", "terraform_tf": "T",
+                                  "pipeline_yaml": "P", "report": "R"}}
+
+    app.dependency_overrides[analysis_router.get_downstream_transport] = _FakeTransport
+    token = make_token("m14-burst", ["Developer"])
+    with TestClient(app) as client:
+        codes = [
+            client.post("/api/v1/repository/analyze", json={
+                "repo_name": "x", "repo_url": "https://github.com/o/r.git",
+                "framework": "FastAPI", "technology": "Python 3.12",
+            }, headers={"Authorization": f"Bearer {token}"}).status_code
+            for _ in range(5)
+        ]
+    # The attack SUCCEEDS: 5 requests, no 429 anywhere.
+    assert codes == [200] * 5, (
+        "expected the weakened control to allow an unlimited burst"
+    )
+
+    # Baseline: the INTACT control limits the same burst.
+    from platform_pkg.api_gateway.main import create_app as real_create_app
+    from platform_pkg.api_gateway import routers as real_routers
+    real_app = real_create_app(env={
+        "JWT_SECRET": TEST_GW_SECRET,
+        "APP_ENV": "production",
+        "ANALYSIS_RATE_LIMIT_STORE": "local",
+        "ANALYSIS_RATE_LIMIT_PER_IDENTITY_PER_MINUTE": "2",
+    })
+    real_app.dependency_overrides[
+        real_routers.analysis_router.get_downstream_transport
+    ] = _FakeTransport
+    with TestClient(real_app) as client:
+        codes = [
+            client.post("/api/v1/repository/analyze", json={
+                "repo_name": "x", "repo_url": "https://github.com/o/r.git",
+                "framework": "FastAPI", "technology": "Python 3.12",
+            }, headers={"Authorization": f"Bearer {token}"}).status_code
+            for _ in range(5)
+        ]
+    assert codes[:2] == [200, 200] and 429 in codes[2:], (
+        "intact control must limit the burst with 429"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M15 — re-enable bearer-JWT transport to arbitrary cleartext endpoints
+# ---------------------------------------------------------------------------
+
+
+def _apply_android_transport_bypass(repo: Path) -> None:
+    client_path = repo / "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+    src = client_path.read_text(encoding="utf-8")
+    target = "        val urlPolicyError = validateAnalysisUrl(cleanUrl)\n"
+    assert target in src, "M15 target not found in BackendGatewayClient.kt"
+    src = src.replace(
+        target,
+        "        val urlPolicyError: String? = null  // MUTATION: transport policy disabled\n",
+        1,
+    )
+    client_path.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m15_cleartext_bearer_transport_detected(mutated_repo):
+    # (1) Structural guard (A8) holds on the unmutated repo.
+    assert android_guard.check_analysis_transport_policy(REPO_ROOT) == [], (
+        "baseline: the unmutated Android transport policy must be intact"
+    )
+    _apply_android_transport_bypass(mutated_repo)
+    # The A8 guard must turn red on the weakened source:
+    violations = android_guard.check_analysis_transport_policy(mutated_repo)
+    assert violations, (
+        "guard stayed green after the URL transport policy was disabled "
+        "(bearer JWTs could be sent to arbitrary cleartext endpoints)"
+    )
+    # And the weakened client no longer calls the policy at all:
+    mut_src = (mutated_repo / "app/src/main/java/com/example/data/BackendGatewayClient.kt").read_text(encoding="utf-8")
+    assert "validateAnalysisUrl(cleanUrl)" not in mut_src, (
+        "expected the policy call to be gone in the mutated client"
+    )
+    # The Kotlin unit tests (app/src/test/.../AnalysisUrlPolicyTest.kt) run
+    # in the CI Gradle job and fail there: the mutation breaks the
+    # https-only / debug-local contract that those tests assert.
+
+
+# ---------------------------------------------------------------------------
+# M16 — reintroduce the NON-ATOMIC budget check-then-act (TOCTOU race)
+# ---------------------------------------------------------------------------
+
+
+def _apply_budget_toctou(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    target = (
+        "        with self._lock:\n"
+        "            self._roll_period_if_needed()\n"
+        "            if self._committed + self._reserved + max_cost_usd > self.monthly_budget + _FLOAT_EPS:\n"
+        "                logger.warning(\n"
+        "                    \"[COST_MONITORING] Budget reservation of $%.6f rejected: \"\n"
+        "                    \"ceiling $%.2f (committed $%.6f, reserved $%.6f).\",\n"
+        "                    max_cost_usd, self.monthly_budget, self._committed, self._reserved,\n"
+        "                )\n"
+        "                raise BudgetExceededException(\n"
+        "                    \"Application AI budget ceiling reached; the call was \"\n"
+        "                    \"blocked before contacting the provider.\"\n"
+        "                )\n"
+        "            self._reserved += max_cost_usd"
+    )
+    assert target in src, "M16 target not found in InProcessBudgetLedger.reserve"
+    src = src.replace(
+        target,
+        "        # MUTATION: NON-ATOMIC check-then-act (TOCTOU race): the\n"
+        "        # ceiling check runs OUTSIDE the lock, then the commit\n"
+        "        # happens under it.\n"
+        "        self._roll_period_if_needed()\n"
+        "        if self._committed + self._reserved + max_cost_usd > self.monthly_budget + _FLOAT_EPS:\n"
+        "            raise BudgetExceededException(\n"
+        "                \"Application AI budget ceiling reached; the call was \"\n"
+        "                \"blocked before contacting the provider.\"\n"
+        "            )\n"
+        "        time.sleep(0.005)  # widen the race window (mutation hook)\n"
+        "        with self._lock:\n"
+        "            self._reserved += max_cost_usd",
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_budget_reserve_atomic(repo: Path) -> None:
+    """Structural guard: the ceiling check must run INSIDE the lock."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    ledger = src.split("class InProcessBudgetLedger", 1)[1].split("class RedisBudgetLedger", 1)[0]
+    reserve = ledger.split("def reserve", 1)[1].split("def finalize", 1)[0]
+    check_idx = reserve.index("self._committed + self._reserved + max_cost_usd")
+    lock_idx = reserve.index("with self._lock")
+    assert lock_idx < check_idx, (
+        "the budget ceiling check no longer runs inside the lock (TOCTOU race)"
+    )
+
+
+def _race_reserve(ledger, n_threads: int, amount: float):
+    """Fire n concurrent reservations; return (allowed, rejected)."""
+    import threading
+
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        BudgetExceededException,
+    )
+
+    barrier = threading.Barrier(n_threads)
+    allowed, rejected = [], []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait()
+        try:
+            res = ledger.reserve(amount)
+            with lock:
+                allowed.append(res)
+        except BudgetExceededException:
+            with lock:
+                rejected.append(1)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return allowed, rejected
+
+
+def test_mutation_m16_non_atomic_budget_race_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_budget_reserve_atomic(REPO_ROOT)
+    _apply_budget_toctou(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    reserve = mut_src.split("class InProcessBudgetLedger", 1)[1].split("class RedisBudgetLedger", 1)[0]
+    reserve = reserve.split("def reserve", 1)[1].split("def finalize", 1)[0]
+    check_idx = reserve.index("self._committed + self._reserved + max_cost_usd")
+    lock_idx = reserve.index("with self._lock")
+    assert check_idx < lock_idx, (
+        "guard stayed green after the ceiling check was moved outside the lock"
+    )
+
+    # (2) Behavioral: concurrent reservations must never race past the
+    #     ceiling.  Ceiling 10.0 with 6.0 reservations: the ATOMIC ledger
+    #     admits exactly one.
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        InProcessBudgetLedger,
+    )
+
+    intact = InProcessBudgetLedger(10.0, 1.5, 7.5)
+    allowed, rejected = _race_reserve(intact, 4, 6.0)
+    assert len(allowed) == 1 and len(rejected) == 3, (
+        "intact atomic ledger must admit exactly one 6.0 reservation "
+        "against a 10.0 ceiling"
+    )
+
+    # The WEAKENED TOCTOU ledger admits all four: the ceiling is blown.
+    top = _register_mutated_tree(mutated_repo, "mut_m16")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    weakened = m_gc.InProcessBudgetLedger(10.0, 1.5, 7.5)
+    allowed, rejected = _race_reserve(weakened, 4, 6.0)
+    assert len(allowed) > 1, (
+        "expected the weakened control to let concurrent reservations race "
+        "past the ceiling"
+    )
+    total = len(allowed) * 6.0
+    assert total > 10.0, (
+        f"weakened ledger double-spent: {total} reserved against a 10.0 ceiling"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M17 — remove the canonical agent build from the D1 runtime
+# ---------------------------------------------------------------------------
+
+
+def _apply_agent_build_removal(repo: Path) -> None:
+    import yaml
+
+    compose_path = repo / "devops-ai-platform/docker-compose.yml"
+    spec = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    assert "agent-service" in spec["services"], "M17 target not found in compose"
+    del spec["services"]["agent-service"]
+    compose_path.write_text(
+        yaml.safe_dump(spec, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+
+
+def _assert_runtime_contract_intact(repo: Path) -> None:
+    from security_guards.runtime_guard import check_runtime_contract
+
+    assert check_runtime_contract(repo) == [], (
+        "baseline: the canonical D1 runtime contract must hold"
+    )
+
+
+def test_mutation_m17_agent_build_removal_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_runtime_contract_intact(REPO_ROOT)
+    _apply_agent_build_removal(mutated_repo)
+    # The runtime guard must turn red: the canonical stack no longer
+    # declares the internal analysis boundary (and CI would no longer
+    # build/boot the full path).
+    from security_guards.runtime_guard import check_runtime_contract
+
+    violations = check_runtime_contract(mutated_repo)
+    assert any("agent-service" in v for v in violations), (
+        "guard stayed green after the agent-service was removed from the "
+        "canonical compose stack"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M18 — revert to the deprecated Gemini model + drop the output bound
+# ---------------------------------------------------------------------------
+
+
+def _apply_deprecated_model_revert(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    target = 'DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"'
+    assert target in src, "M18 target not found in gemini_caller"
+    src = src.replace(target, 'DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"', 1)
+    bound = '                "maxOutputTokens": int(self.config.max_output_tokens),\n'
+    assert bound in src, "M18 maxOutputTokens target not found in gemini_caller"
+    src = src.replace(bound, "                # MUTATION: output bound removed\n", 1)
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_current_model_contract_intact(repo: Path) -> None:
+    """Structural guard: the configured model is the current stable
+    gemini-3.8-flash and the payload keeps the explicit output bound."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    assert 'DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"' in src, (
+        "the default model is not the current stable gemini-3.8-flash"
+    )
+    assert '= "gemini-3.5-flash"' not in src, (
+        "the deprecated gemini-3.5-flash is present as a model default"
+    )
+    payload = src.split("def _build_payload", 1)[1].split("\n    def ", 1)[0]
+    assert '"maxOutputTokens"' in payload, (
+        "the provider payload lost its explicit maxOutputTokens bound"
+    )
+
+
+def test_mutation_m18_deprecated_model_revert_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_current_model_contract_intact(REPO_ROOT)
+    _apply_deprecated_model_revert(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    assert 'DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"' in mut_src and (
+        '"maxOutputTokens"' not in mut_src.split("def _build_payload", 1)[1].split("\n    def ", 1)[0]
+    ), "expected the deprecated model and the missing output bound in the mutation"
+
+    # (2) Behavioral: the weakened default configuration is observably
+    #     different — the adapter resolves the deprecated model and its
+    #     payload no longer carries the output bound.
+    top = _register_mutated_tree(mutated_repo, "mut_m18")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    caller = m_gc.GeminiCallerAdapter(api_key="m18-test-key-not-a-real-credential")
+    assert caller.model_name == "gemini-3.5-flash", (
+        "expected the weakened control to revert to the deprecated model"
+    )
+    payload = caller._build_payload("prompt", "system")
+    gen_cfg = payload.get("generationConfig", {})
+    assert "maxOutputTokens" not in gen_cfg, (
+        "expected the weakened control to drop the output bound"
+    )
+    # And the INTACT default still carries both properties:
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        GeminiCallerAdapter as IntactAdapter,
+    )
+
+    intact = IntactAdapter(api_key="m18-test-key-not-a-real-credential")
+    assert intact.model_name == "gemini-3.8-flash"
+    intact_cfg = intact._build_payload("prompt", "system").get("generationConfig", {})
+    assert "maxOutputTokens" in intact_cfg

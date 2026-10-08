@@ -26,9 +26,10 @@ import logging
 import os
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..core.analysis_rate_limit import RateLimitStoreUnavailable
 from ..core.auth import require_analysis_role
 from .gateway_router import (
     INCIDENT_INTERNAL_BASE,
@@ -122,17 +123,59 @@ def _map_downstream_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail="Downstream service 'agent' unavailable.")
 
 
+def require_analysis_rate_limit(
+    request: Request,
+    user: dict = Depends(require_analysis_role),
+) -> None:
+    """Route-specific limiter BEFORE any provider call (D1 P0-3).
+
+    * Primary key: the authenticated JWT ``sub``.
+    * Second key: the direct TCP peer (``request.client.host``) — spoofable
+      forwarded headers are never read.
+    * Fail closed: a missing limiter or an unreachable shared store blocks
+      the route (503) rather than allowing unlimited expensive calls.
+    * Limited requests get ``429`` + ``Retry-After``.
+    """
+    limiter = getattr(request.app.state, "analysis_rate_limiter", None)
+    if limiter is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis rate limiting is not configured; analysis is blocked.",
+        )
+    identity = (user.get("sub") or "").strip()
+    if not identity:
+        raise HTTPException(
+            status_code=401,
+            detail="A valid authenticated identity is required for analysis.",
+        )
+    source_ip = request.client.host if request.client else "unknown"
+    try:
+        decision = limiter.check(identity, source_ip)
+    except RateLimitStoreUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Analysis rate limiting is temporarily unavailable; analysis is blocked.",
+        )
+    if not decision.allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Analysis rate limit exceeded; retry later.",
+            headers={"Retry-After": str(decision.retry_after_seconds or 60)},
+        )
+
+
 @router.post("/api/v1/repository/analyze")
 def analyze_repository(
     body: RepositoryAnalysisRequest,
     user: dict = Depends(require_analysis_role),
     transport: _AgentAnalysisTransport = Depends(get_downstream_transport),
+    _rate_limited: None = Depends(require_analysis_rate_limit),
 ):
-    """Typed, authenticated repository analysis.
+    """Typed, authenticated, rate-limited repository analysis.
 
-    Forwards a fixed, typed payload to the fixed agent-service internal
-    path.  The downstream host and path are code constants — never taken
-    from request input.
+    Rate limiting runs before any provider contact.  Forwards a fixed, typed
+    payload to the fixed agent-service internal path.  The downstream host
+    and path are code constants — never taken from request input.
     """
     base = SERVICES.get(_ANALYSIS_SERVICE)
     if base is None:  # defensive: the table is code-owned

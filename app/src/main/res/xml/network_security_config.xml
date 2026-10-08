@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Phase 8.7-D.1: the authenticated analysis transport is HTTPS-only.
+  Cleartext traffic is disabled for the whole app at the platform level.
+  The DEBUG build overrides this file (app/src/debug/res/xml) with a narrow,
+  local-emulator-only exception; release builds permit NO cleartext.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

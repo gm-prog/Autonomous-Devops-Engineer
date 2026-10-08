@@ -1,0 +1,90 @@
+# =============================================================================
+# LEGACY / QUARANTINED stack — NOT the Phase 8.7-D.1 production path.
+# =============================================================================
+# Do NOT use this file for the D1 analysis stack. The canonical D1 path is
+# `docker-compose.yml` (gateway + agent + shared Redis). This file preserves
+# the older broad stack (postgres / redis / qdrant / celery worker) for
+# reference only.
+#
+# * The `celery-worker` service references `./deployment-service/Dockerfile`,
+#   which does NOT exist on this branch — the worker is NOT runnable here and
+#   is intentionally left as-is (we do not fabricate a fake deployment
+#   service just to satisfy Compose). `docker compose config` will flag it if
+#   you try to build this legacy file.
+# * The legacy stack exposes data stores to the host and used a hard-coded
+#   database password; the password is now externally supplied (no committed
+#   secret value).
+# =============================================================================
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: devops_postgres
+    environment:
+      POSTGRES_USER: postgres
+      # Externally supplied — no committed secret value (hard-coded password
+      # removed in Phase 8.7-D.1).
+      POSTGRES_PASSWORD: ${LEGACY_POSTGRES_PASSWORD:?LEGACY_POSTGRES_PASSWORD must be set for the legacy stack}
+      POSTGRES_DB: devops_prod
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: devops_redis
+    ports:
+      - "6379:6379"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: devops_qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: ./api-gateway/Dockerfile
+    container_name: devops_api_gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=${APP_ENV:-production}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set — see devops-ai-platform/SECURITY.md}
+      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see devops-ai-platform/SECURITY.md}
+      - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
+    depends_on:
+      - agent-service
+      - postgres
+      - redis
+
+  agent-service:
+    build:
+      context: .
+      dockerfile: ./agent-service/Dockerfile
+    container_name: devops_agent_service
+    expose:
+      - "8020"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY must be set for live analysis}
+      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see devops-ai-platform/SECURITY.md}
+    depends_on:
+      - redis
+
+  celery-worker:
+    build:
+      context: .
+      dockerfile: ./deployment-service/Dockerfile
+    container_name: devops_celery_worker
+    command: celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+
+volumes:
+  postgres_data:

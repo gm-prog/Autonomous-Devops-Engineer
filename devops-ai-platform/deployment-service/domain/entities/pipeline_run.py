@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -8,7 +8,7 @@ class PipelineRun:
     id: str
     status: str # Started, InProgress, Completed, Failed
     triggered_by: str # e.g. "GithubPushEvent", "OperatorTrigger"
-    started_at: datetime = datetime.utcnow()
+    started_at: datetime = field(default_factory=datetime.utcnow)
     finished_at: Optional[datetime] = None
     error_log: Optional[str] = None
 

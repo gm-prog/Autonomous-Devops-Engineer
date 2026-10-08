@@ -8,21 +8,29 @@ on:
 permissions:
   contents: read
 
-# Phase 8.7-C: mandatory security jobs. A failed security invariant fails CI.
-# There is no optional/warning-only security gate: every job below is a hard
-# requirement and none may be silently skipped (no continue-on-error, no
-# condition that can skip the security steps).
+# Phase 8.7-C / 8.7-D.1: mandatory security AND runtime-hardening gates.
+#
+# * A failed security invariant fails CI: no continue-on-error, no optional
+#   security step, no condition that can skip a security check.
+# * Action versions are pinned to the CURRENT (non-deprecated) majors so no
+#   Node deprecation warnings are emitted (verified against the GitHub API on
+#   2026-10-08): checkout@v7, setup-python@v7, setup-java@v6,
+#   upload-artifact@v7, android-actions/setup-android@v4.
+# * NO real provider secret is used in this workflow. Dummy values are used
+#   only to satisfy the compose file's required-variable substitution; they
+#   are not credentials and are never echoed.
+# * Persisted artifacts are reports and runtime logs only — never secrets.
 
 jobs:
   security-integrity:
-    name: Phase 8.7-C focused security suites
+    name: Phase 8.7-C/D.1 focused security suites
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: devops-ai-platform
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -39,10 +47,16 @@ jobs:
       - name: Telemetry trust boundary — HMAC, replay, tamper, no side effects (Defect A)
         run: python -m pytest tests/test_telemetry_ingestion_trust.py -v
 
+      - name: Gemini analysis lifecycle, budget, rate limit, structured contract
+        run: python -m pytest tests/test_gemini_analysis_path.py -v
+
+      - name: Analysis route rate limiting (burst, isolation, malformed identity, fail-closed)
+        run: python -m pytest tests/test_analysis_rate_limiting.py -v
+
       - name: Adversarial mutations — weakening each control must turn the suite red
         run: python -m pytest tests/test_security_mutations.py -v
 
-      - name: Full Phase 8.7-C security suite (evidence)
+      - name: Full Phase 8.7-C/D.1 security suite (evidence)
         run: |
           set -euo pipefail
           python -m pytest tests/ -q --junitxml=security-tests.xml 2>&1 | tee security-tests.txt
@@ -52,28 +66,63 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo '### Phase 8.7-C security suites'
+            echo '### Phase 8.7-C/D.1 security suites'
             echo '```'
             tail -5 security-tests.txt 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: security-tests-evidence
           path: devops-ai-platform/security-tests.xml
           if-no-files-found: warn
 
+  android-unit-tests:
+    name: Android unit tests + debug build (real Gradle toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17" # AGP 9.x documented minimum JDK
+      - uses: android-actions/setup-android@v4
+      - name: Install Gradle 9.3.1 (pinned to the AGP 9.1.1 documented minimum, official page 2026-10-08)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://services.gradle.org/distributions/gradle-9.3.1-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt/gradle
+          echo "/opt/gradle/gradle-9.3.1/bin" >> "$GITHUB_PATH"
+          gradle --version
+      - name: Generate CI-only debug keystore (standard androiddebugkey; gitignored, not a secret)
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v -storepass android -alias androiddebugkey \
+            -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US" -keystore debug.keystore
+      - name: Unit tests (AnalysisUrlPolicyTest, GeminiClientSecretPolicyTest, Robolectric)
+        run: gradle :app:testDebugUnitTest --console=plain
+      - name: Debug APK build (the artifact the URL policy governs)
+        run: gradle :app:assembleDebug --console=plain
+      - name: Publish Android test reports (no secrets)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-unit-test-reports
+          path: app/build/reports
+          if-no-files-found: warn
+
   android-secret-guards:
-    name: Phase 8.7-C Android embedded-secret static guards
+    name: Phase 8.7-C/D.1 Android embedded-secret + transport-policy static guards
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: devops-ai-platform
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -84,29 +133,165 @@ jobs:
       - name: Android secret guards over the actual repository source (Defect B)
         run: python -m pytest tests/test_android_secret_guards.py -v
 
-      - name: Standalone structural guard runner — android surface
+      - name: Standalone structural guard runner — android surface (incl. A8 transport policy)
         run: |
           set -euo pipefail
           PYTHONPATH=. python -c "from pathlib import Path; from security_guards import android_check; v = android_check(Path.cwd().resolve().parents[0]); [print('VIOLATION:', x) for x in v]; assert not v, 'Android secret guard failed'; print('android-gemini-secret guard: PASS')" | tee -a "$GITHUB_STEP_SUMMARY"
 
   structural-guards:
-    name: Phase 8.7-C structural security guards (all surfaces)
+    name: Phase 8.7-C/D.1 structural security + runtime guards (all surfaces)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: devops-ai-platform
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install security test dependencies
-        run: pip install -r requirements-test.txt
+        run: pip install -r requirements-test.txt pyyaml
 
       - name: All structural guards over the actual repository source
         # Exits non-zero on any violation: a failed security invariant fails CI.
         run: |
           set -euo pipefail
           PYTHONPATH=. python -m security_guards | tee -a "$GITHUB_STEP_SUMMARY"
+
+  redis-integration:
+    name: Real-Redis integration tests (shared budget ledger + shared rate limiter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements-test.txt
+      - name: Install test dependencies (incl. redis client)
+        run: pip install -r devops-ai-platform/requirements-test.txt redis
+      - name: Start a real Redis (digest-pinned)
+        run: |
+          set -euo pipefail
+          docker run -d --name d1-redis -p 127.0.0.1:6379:6379 \
+            redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e619aa0ee78de08c6ca0
+          for i in $(seq 1 15); do
+            docker exec d1-redis redis-cli ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          docker exec d1-redis redis-cli ping
+      - name: Integration tests against the live store
+        working-directory: devops-ai-platform
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_redis_integration.py -v 2>&1 | tee redis-integration.txt
+      - name: Publish Redis integration evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: redis-integration-evidence
+          path: devops-ai-platform/redis-integration.txt
+          if-no-files-found: warn
+      - name: Tear down Redis
+        if: always()
+        run: docker rm -f d1-redis || true
+
+  compose-runtime:
+    name: Canonical compose — config, image builds, boot/readiness smoke
+    runs-on: ubuntu-latest
+    env:
+      # DUMMY values only: satisfy the compose file's required-variable
+      # substitution (${VAR:?}). Not real credentials; never echoed.
+      JWT_SECRET: ci-dummy-jwt-secret-not-a-real-secret
+      AGENT_INTERNAL_TOKEN: ci-dummy-internal-token-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: devops-ai-platform/requirements-test.txt
+      - name: Install test dependencies (compose YAML validation)
+        run: pip install -r devops-ai-platform/requirements-test.txt pyyaml
+
+      - name: Canonical compose config (structure + required variables)
+        working-directory: devops-ai-platform
+        run: docker compose config --quiet
+
+      - name: Build gateway + agent images (digest-pinned bases)
+        working-directory: devops-ai-platform
+        run: docker compose build api-gateway agent-service
+
+      - name: Boot the canonical stack (NO real provider credentials)
+        working-directory: devops-ai-platform
+        env:
+          GEMINI_API_KEY: "" # deliberately absent: the agent must fail closed
+        run: |
+          set -euo pipefail
+          docker compose up -d
+          docker compose ps
+
+      - name: Readiness + gateway->agent connectivity + truthful fail-closed
+        working-directory: devops-ai-platform
+        run: |
+          set -euo pipefail
+          # 1) Gateway readiness (proves the gateway depends on healthy redis
+          #    and serves /api/v1/health).
+          for i in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/api/v1/health >/dev/null && break
+            if [ "$i" -eq 30 ]; then docker compose ps; docker compose logs; exit 1; fi
+            sleep 2
+          done
+          echo "gateway /api/v1/health:"
+          curl -fsS http://127.0.0.1:8000/api/v1/health; echo
+
+          # 2) Agent reachable through the COMPOSE NETWORK (never via host).
+          docker compose exec -T api-gateway python -c \
+            "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://agent-service:8020/health', timeout=5).status == 200 else 1)"
+          echo "agent /health reachable via compose network: OK"
+
+          # 3) The agent port must NOT be published on the host.
+          if curl -fsS --max-time 3 http://127.0.0.1:8020/health >/dev/null 2>&1; then
+            echo "FAIL: agent-service port 8020 is reachable on the host"; exit 1
+          fi
+          echo "agent port 8020 not host-exposed: OK"
+
+          # 4) Truthful fail-closed: an authenticated analysis request with
+          #    NO provider credentials must be a typed 503 — never a fake
+          #    success and never a crash.
+          TOKEN=$(docker compose exec -T api-gateway python -c \
+            "import os; from api_gateway.core.auth import create_access_token; print(create_access_token('ci-smoke-user', ['Administrator'], os.environ['JWT_SECRET']))")
+          CODE=$(curl -s -o /tmp/analysis.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d '{"repo_name":"smoke","repo_url":"https://github.com/o/r.git","framework":"FastAPI","technology":"Python 3.12"}' \
+            http://127.0.0.1:8000/api/v1/repository/analyze)
+          echo "analysis HTTP status without GEMINI_API_KEY: $CODE"
+          cat /tmp/analysis.json; echo
+          [ "$CODE" = "503" ] || { echo "FAIL: expected truthful 503 fail-closed, got $CODE"; exit 1; }
+
+      - name: Collect runtime logs (stack ran without provider credentials; nothing secret is logged)
+        if: always()
+        working-directory: devops-ai-platform
+        run: |
+          set -euo pipefail
+          docker compose ps > d1-compose-ps.txt 2>&1 || true
+          docker compose logs --no-color > d1-boot-logs.txt 2>&1 || true
+
+      - name: Publish compose boot evidence (reports/logs only, no secrets)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: d1-compose-boot-evidence
+          path: |
+            devops-ai-platform/d1-compose-ps.txt
+            devops-ai-platform/d1-boot-logs.txt
+          if-no-files-found: warn
+
+      - name: Tear down
+        if: always()
+        working-directory: devops-ai-platform
+        run: docker compose down --remove-orphans || true

@@ -636,3 +636,101 @@ class TestEndToEndFakeProvider:
         assert body["source"] == "server_gemini"
         assert body["analysis"] == GOOD_ASSETS
         assert "server-side-test-key" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# Positive lifecycle: ONE shared handler/adapter per process (D1 P0-1)
+# ---------------------------------------------------------------------------
+
+
+class _FailingProviderTransport:
+    """Provider transport that always answers a transient 500."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, payload):
+        self.calls += 1
+        return _gemini_http(500, None)
+
+
+def _production_agent_app(**config_kwargs):
+    from platform_pkg.agent.main import create_app
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    return create_app(config=gc.GeminiRuntimeConfig(max_retries=1, **config_kwargs))
+
+
+class TestSharedAnalysisHandlerLifecycle:
+    def test_two_requests_resolve_the_same_handler_instance(self):
+        from starlette.requests import Request
+
+        from platform_pkg.agent.presentation.rest import analysis_router
+
+        app = _production_agent_app()
+        scope = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/",
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "app": app,
+        }
+        handler_1 = analysis_router.get_analysis_handler(Request(scope))
+        handler_2 = analysis_router.get_analysis_handler(Request(scope))
+        assert handler_1 is handler_2 is app.state.analysis_handler, (
+            "the analysis handler must be the single application-lifetime "
+            "instance shared across requests"
+        )
+
+    def test_provider_state_persists_across_separate_requests(self, monkeypatch):
+        """Five failing SEPARATE requests open the shared circuit; the next
+        request fails fast (503) WITHOUT any provider contact until the
+        cooldown elapses, then a half-open probe can recover the circuit."""
+        monkeypatch.setenv("GEMINI_API_KEY", "lifecycle-test-key-not-a-real-credential")
+        app = _production_agent_app()
+        adapter = app.state.analysis_handler.llm
+        transport = _FailingProviderTransport()
+        adapter._transport = transport
+
+        clock = {"now": 1_000_000.0}
+        adapter._time_fn = lambda: clock["now"]
+
+        hdrs = {
+            "X-Gateway-Identity": "lifecycle",
+            "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef",
+        }
+        with TestClient(app) as client:
+            # Five independent HTTP requests, each through the router.
+            for _ in range(5):
+                resp = client.post(INTERNAL_PATH, json=GOOD_BODY, headers=hdrs)
+                assert resp.status_code == 502
+            assert transport.calls == 5
+
+            # Circuit OPEN: the sixth request fails fast with NO provider call.
+            blocked = client.post(INTERNAL_PATH, json=GOOD_BODY, headers=hdrs)
+            assert blocked.status_code == 503
+            assert transport.calls == 5, "circuit-open request must not contact the provider"
+
+            # Still inside the cooldown: no provider contact.
+            clock["now"] += 10
+            still_blocked = client.post(INTERNAL_PATH, json=GOOD_BODY, headers=hdrs)
+            assert still_blocked.status_code == 503
+            assert transport.calls == 5
+
+            # Cooldown elapsed: half-open probe is allowed; a SUCCESS recovers
+            # the circuit (state lived across all of these requests).
+            clock["now"] += 55
+            adapter._transport = lambda payload: _gemini_http(200, {
+                "candidates": [{"content": {"parts": [{"text": json.dumps(GOOD_ASSETS)}]}}],
+            })
+            recovered = client.post(INTERNAL_PATH, json=GOOD_BODY, headers=hdrs)
+            assert recovered.status_code == 200
+            assert recovered.json()["analysis"] == GOOD_ASSETS
+
+            # And the recovered state persists: a normal request succeeds.
+            again = client.post(INTERNAL_PATH, json=GOOD_BODY, headers=hdrs)
+            assert again.status_code == 200

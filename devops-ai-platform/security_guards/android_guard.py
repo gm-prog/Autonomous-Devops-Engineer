@@ -19,6 +19,11 @@ A5. No ``GEMINI_API_KEY`` token or ``key=`` Gemini URL in AndroidManifest,
 A6. No real Google/Gemini API key literal (``AIza...``) anywhere in app
     production sources or resources.
 A7. No ``buildConfigField`` generating a Gemini key into BuildConfig.
+A8. (Phase 8.7-D.1) The bearer-JWT analysis transport is HTTPS-only: a
+    URL policy must reject unsafe URLs before the Authorization header is
+    attached, the cleartext exception must be debug-build-gated to the
+    local emulator endpoint, and the Network Security Configuration must
+    not permit cleartext in production builds.
 
 The checker operates on source text, so mutation tests can feed weakened
 variants and must observe violations.
@@ -232,6 +237,89 @@ def check_android_source(source: str, label: str = "kotlin source") -> List[str]
     return violations
 
 
+def check_analysis_transport_policy(repo_root: Path) -> List[str]:
+    """A8 (Phase 8.7-D.1): the bearer-JWT analysis transport must be
+    HTTPS-only, with the local-emulator HTTP exception gated to debug
+    builds, and the Network Security Configuration must not permit
+    cleartext in production builds."""
+    violations: List[str] = []
+    client_path = repo_root / "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+    rel = "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+    if not client_path.is_file():
+        violations.append(
+            "android guard: BackendGatewayClient.kt not found — the "
+            "analysis transport policy cannot be verified"
+        )
+    else:
+        code = _strip_kotlin_comments(client_path.read_text(encoding="utf-8"))
+        if "fun validateAnalysisUrl" not in code:
+            violations.append(
+                f"{rel}: URL policy function validateAnalysisUrl missing — "
+                "the bearer JWT may be sent to arbitrary cleartext HTTP"
+            )
+        else:
+            def_idx = code.find("fun validateAnalysisUrl")
+            call_idx = code.find("validateAnalysisUrl(", def_idx + 10)
+            header_idx = code.find('addHeader("Authorization"')
+            if call_idx < 0 or (0 <= header_idx < call_idx):
+                violations.append(
+                    f"{rel}: the analysis URL policy is not enforced before "
+                    "the Authorization header is attached to the request"
+                )
+            body = code[def_idx:]
+            nxt_fun = body.find("\n    fun ", 10)
+            policy_body = body[:nxt_fun] if nxt_fun > 0 else body
+            if '"https"' not in policy_body:
+                violations.append(
+                    f"{rel}: the URL policy does not enforce the HTTPS "
+                    "scheme for live analysis"
+                )
+            if "BuildConfig.DEBUG" not in policy_body:
+                violations.append(
+                    f"{rel}: the cleartext-HTTP exception is not gated to "
+                    "debug builds (BuildConfig.DEBUG) — production builds "
+                    "would accept cleartext analysis destinations"
+                )
+
+    nsc_main = repo_root / "app/src/main/res/xml/network_security_config.xml"
+    if not nsc_main.is_file():
+        violations.append(
+            "android guard: main network_security_config.xml missing — "
+            "cleartext traffic cannot be ruled out at the platform level"
+        )
+    else:
+        nsc = nsc_main.read_text(encoding="utf-8", errors="ignore")
+        if 'cleartextTrafficPermitted="false"' not in nsc:
+            violations.append(
+                "android guard: main network_security_config.xml must set "
+                "base-config cleartextTrafficPermitted=false"
+            )
+        if 'cleartextTrafficPermitted="true"' in nsc:
+            violations.append(
+                "android guard: main network_security_config.xml permits "
+                "cleartext for a domain — production builds must not"
+            )
+
+    manifest = repo_root / "app/src/main/AndroidManifest.xml"
+    if manifest.is_file() and "networkSecurityConfig" not in manifest.read_text(encoding="utf-8", errors="ignore"):
+        violations.append(
+            "android guard: AndroidManifest.xml does not reference a "
+            "networkSecurityConfig — platform defaults would apply"
+        )
+
+    dbg_dir = repo_root / "app/src/debug/res/xml"
+    if dbg_dir.is_dir():
+        for dbg in dbg_dir.glob("network_security_config*.xml"):
+            text = dbg.read_text(encoding="utf-8", errors="ignore")
+            for domain in re.findall(r"<domain[^>]*>([^<]+)</domain>", text):
+                if domain.strip() not in ("10.0.2.2", "localhost", "127.0.0.1"):
+                    violations.append(
+                        f"android guard: debug NSC {dbg.name} permits "
+                        f"cleartext for a non-local host: {domain.strip()!r}"
+                    )
+    return violations
+
+
 def check_android(repo_root: Union[str, Path]) -> List[str]:
     """Run the Android secret guard over the actual repository."""
     repo_root = Path(repo_root)
@@ -240,6 +328,9 @@ def check_android(repo_root: Union[str, Path]) -> List[str]:
     if not app_dir.is_dir():
         violations.append(f"android guard: app directory not found: {app_dir}")
         return violations
+
+    # A8 — authenticated analysis transport is HTTPS-only (Phase 8.7-D.1).
+    violations.extend(check_analysis_transport_policy(repo_root))
 
     # A1/A2/A3/A6 — production Kotlin sources.
     for py in _iter_app_kotlin_files(app_dir):

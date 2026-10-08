@@ -1,9 +1,11 @@
-# Security Model — Autonomous DevOps AI Platform (Phase 8.7-C)
+# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1)
 
 This document describes the **current** trust model of the platform after the
-Phase 8.7-C security integrity corrections. It is normative for the gateway,
-monitoring, and Android client. Historical phase reports may describe earlier
-states; where they disagree, this document and the code are authoritative.
+Phase 8.7-C security integrity corrections and the Phase 8.7-D.1 production
+security & runtime hardening. It is normative for the gateway, monitoring,
+agent-service, and Android client. Historical phase reports may describe
+earlier states; where they disagree, this document and the code are
+authoritative.
 
 ---
 
@@ -116,6 +118,18 @@ What this branch does and does not do (truthful contract for this branch):
   `GEMINI_API_KEY` is absent (503, no fabricated response), applies bounded
   timeout/retry, a circuit breaker, and a monthly budget ceiling, and never
   echoes the credential in responses or logs.
+* **The bearer JWT never travels over cleartext (Phase 8.7-D.1).** Before a
+  request is constructed, `validateAnalysisUrl` enforces the transport policy:
+  `https://` is the only permitted scheme for live URLs; `http://` is allowed
+  ONLY for the local-emulator loopback hosts (`10.0.2.2`, `localhost`,
+  `127.0.0.1`) AND only in debug builds (explicit `BuildConfig.DEBUG` gating,
+  injectable for tests — a production build rejects the local exception).
+  Unsafe or malformed URLs are rejected **before** the request is built, with
+  a typed `AnalysisOutcome.Failure`; the policy runs before the
+  `Authorization: Bearer` header is attached, so a rejected URL sends
+  nothing. The Network Security Configuration is updated to match: the main
+  config permits **no** cleartext, and the debug overlay permits cleartext
+  only for those local hosts. `testConnection` remains diagnostics-only.
 * **No silent fabrication on the client.** If the backend is unavailable,
   the live path is not configured, or the server reports failure, the app
   records a **typed, truthful failure** (`LIVE_FAILED` with the reason) — it
@@ -179,10 +193,20 @@ source** (AST where meaningful) so these weaknesses cannot silently return:
   telemetry boundary machine-authenticated (no user-JWT dependency).
 * `android-gemini-secret` — no `BuildConfig.GEMINI*`, no Gemini URL with a
   runtime key parameter, no relocated secret (resources/manifest/assets/
-  gradle/env/SharedPreferences defaults), no `AIza…` key literals.
+  gradle/env/SharedPreferences defaults), no `AIza…` key literals, and (A8,
+  Phase 8.7-D.1) the analysis transport policy is intact: the URL policy is
+  invoked before the Authorization header is attached, the policy keeps
+  https-only with the debug-local exception, the main Network Security
+  Configuration permits no cleartext, the manifest wires the NSC, and the
+  debug overlay is restricted to local hosts.
 * `jwt-fail-closed` — no bundled `JWT_SECRET` fallback, no hard-coded signing
   secret, legacy secret quarantined, development fallback gated behind the
   explicit switch.
+* `d1-runtime-contract` (Phase 8.7-D.1) — the canonical compose stack
+  declares gateway + agent + redis with existing Dockerfiles, digest-pinned
+  third-party images, no host-exposed ports except gateway 8000, CI builds
+  both service images, and the quarantined legacy stack carries no hardcoded
+  database password.
 
 Run locally:
 
@@ -210,24 +234,172 @@ Covers: JWT fail-closed contract, gateway control-plane authorization matrix,
 telemetry HMAC trust boundary (valid/altered/replayed/unsigned),
 no-side-effect-on-rejection with spies on validator/publisher/incident
 ingestion, trusted producer end-to-end pipeline, Android static secret
-guards, and adversarial mutations.
+guards, the Gemini analysis lifecycle (shared handler across requests,
+circuit persistence with fail-fast until cooldown, budget reservation and
+reconciliation, structured-output contract, fail-closed missing key), the
+analysis rate limiter (burst, cross-identity isolation, IP backstop,
+spoofed-header immunity, window expiry, concurrency, fail-closed store
+failure), and adversarial mutations M1–M18.
+
+CI additionally runs the Android unit tests and debug build with a real
+Gradle toolchain (`android-unit-tests` job), the real-Redis integration
+tests for the shared budget ledger and rate limiter (`redis-integration`
+job), and the canonical compose config/build/boot smoke (`compose-runtime`
+job).
 
 ---
 
-## 6. Known limitations (honest)
+## 6. Analysis runtime hardening (Phase 8.7-D.1)
+
+### 6.1 Single shared analysis handler per process (P0-1)
+
+The agent-service builds **exactly one** `AnalyzeRepositoryCommandHandler`
+per application instance, in `create_app`, and stores it on
+`app.state.analysis_handler`. The internal route resolves that shared
+instance (never a per-request construction), so the single
+`GeminiCallerAdapter` — its circuit breaker, budget ledger, and retry state —
+persists for the life of the process. `GeminiRuntimeConfig` is the **single
+configuration source**: every tunable (model, budget, costs, retries,
+timeout, budget store) has exactly one env var and exactly one default, so
+two places can no longer disagree (the 150 vs 100 budget defect).
+
+### 6.2 Atomic budget reservation (P0-2)
+
+Before any provider contact, the adapter **atomically reserves the
+conservative worst-case cost** of the call (retries × (estimated prompt
+tokens × input price + `maxOutputTokens` × output price)) against the
+**application-level monthly (UTC calendar-month) ceiling**. If the
+reservation would exceed the ceiling, the call is rejected with a typed
+`BudgetExceededException` **before** the provider is contacted. After the
+call, the reservation is reconciled from the provider's `usageMetadata`: the
+actual cost is committed when present, and the **full reservation is kept
+when usage metadata is missing** (never undercount). Any failure path keeps
+the full reservation.
+
+* `GEMINI_BUDGET_STORE=local` (default): lock-protected in-process ledger —
+  an **explicit single-process deployment contract**; the ceiling is per
+  process and N replicas multiply it by N.
+* `GEMINI_BUDGET_STORE=redis` (+ `REDIS_URL`): shared ledger (atomic Lua
+  scripts, period-scoped keys, 45-day TTL) — one ceiling across replicas.
+  An unreachable store **fails closed** (503) — the call is blocked rather
+  than run unlimited.
+
+**This budget is an application safety budget, NOT a Google billing cap.**
+It bounds how much *this application* may spend per month against its
+ceiling; it does not limit what Google bills for the underlying API key.
+Google-side spend controls (billing budget alerts, key-level restrictions,
+IAM) are a separate operator responsibility on the provider account and are
+not enforced by this platform.
+
+### 6.3 Current, bounded provider contract (P0-6)
+
+The default model is **`gemini-3.8-flash`** (stable; verified 2026-10-08
+against the official Gemini API deprecations, model, and pricing pages —
+`gemini-3.5-flash` is no longer the configured model). The provider request
+is a bounded structured-output call: `application/json` response MIME type,
+the five-field response schema, and an explicit `maxOutputTokens` ceiling.
+Cost defaults use the **post-promotion** pricing from the official pricing
+page fetched 2026-10-08 (input $1.50 / 1M, output $7.50 / 1M — conservative
+relative to the 2026 promotional rates); the source and date are recorded in
+`gemini_caller.py` and are operator-configurable. All LLM paths parse and
+validate the five-field contract strictly; there is no lenient alternate
+parse. Bounded timeout/retry with typed error mapping is preserved.
+
+### 6.4 Route-specific rate limiting on the analysis route (P0-3)
+
+`POST /api/v1/repository/analyze` is rate limited **before any provider
+call**:
+
+| Setting | Env var | Default |
+| ------- | ------- | ------- |
+| Per-JWT-sub limit | `ANALYSIS_RATE_LIMIT_PER_IDENTITY_PER_MINUTE` | 30/min |
+| Per-source-IP backstop | `ANALYSIS_RATE_LIMIT_PER_IP_PER_MINUTE` | 120/min |
+| Window (fixed) | `ANALYSIS_RATE_LIMIT_WINDOW_SECONDS` | 60 s |
+| Store | `ANALYSIS_RATE_LIMIT_STORE` | `redis` when `REDIS_URL` set, else explicit `local` |
+
+* Primary key: the authenticated JWT `sub`; second dimension: the **direct
+  TCP peer** (`request.client.host`) — forwarded headers are never read.
+* Counters are atomic (Redis Lua script; in-process lock otherwise).
+* Limited requests get **429 + `Retry-After`** (window's remaining seconds).
+* Authentication precedes limiting: unauthenticated bursts consume no quota.
+* Fail closed: a missing limiter or an unreachable/misconfigured shared
+  store blocks the route with **503** — protection is never silently
+  disabled for this expensive route.
+
+### 6.5 Canonical D1 compose stack (P0-5)
+
+`devops-ai-platform/docker-compose.yml` is the **canonical** D1 runtime:
+`api-gateway` (host 8000, JWT-authenticated control plane) + `agent-service`
+(8020, **never host-exposed**, reached only through the gateway) + `redis`
+(never host-exposed; shared rate-limit and budget state). Base/third-party
+images are pinned to immutable digests (recorded in the compose header,
+resolved 2026-10-08). `JWT_SECRET` and `AGENT_INTERNAL_TOKEN` are required
+(fail closed via `${VAR:?}`); `GEMINI_API_KEY` is optional and its absence
+makes the agent fail closed (503) — the CI boot smoke verifies exactly that.
+The older broad stack is **quarantined** in `docker-compose.legacy.yml`
+(do not use for the D1 path) with its hardcoded database password removed.
+CI builds both service images, boots the stack, and checks readiness,
+gateway→agent connectivity over the compose network, and the agent port's
+non-exposure on the host.
+
+### 6.6 Truthfulness corrections (P1)
+
+* `github_pr_client.create_pull_request` **raises** when credentials are
+  missing (no fabricated PR URL) and when the API omits `html_url`.
+* `mark_pr_ready_for_review` performs the correct GitHub operation
+  (`PUT /repos/{slug}/pulls/{number}` with `draft: false`) and **raises** on
+  missing credentials or non-success — it never reports success for a no-op.
+* The hotfix `apply_verification_pass` placeholder was renamed
+  `record_claimed_verification`: it records that a verification pass was
+  *claimed* without running any check, and **leaves the proposal
+  unverified**; the apply-automated-fix flow no longer attaches it as a
+  verified patch (real verification requires actually executing the checks).
+* The git SSH client no longer ships `StrictHostKeyChecking=no` +
+  `UserKnownHostsFile=/dev/null`: clones verify host keys against an
+  operator-managed `known_hosts` file (`DEVOPS_SSH_KNOWN_HOSTS_PATH`) and are
+  **refused** when it is not configured (no trust-on-first-use).
+* Dataclass timestamp defaults use `default_factory` (no import-time
+  frozen timestamps).
+
+### 6.7 Guard + mutation coverage for the D.1 controls
+
+The `d1-runtime-contract` structural guard enforces 6.5 (canonical services
+declared, existing Dockerfiles, digest-pinned redis, no unneeded host ports,
+CI builds both images, legacy password removed). Adversarial mutations prove
+each D.1 control turns red when weakened: **M13** per-request adapter
+construction (shared circuit/budget state lost), **M14** analysis rate
+limiting removed, **M15** cleartext bearer transport re-enabled, **M16**
+non-atomic budget check-then-act (concurrent double-spend), **M17** agent
+build removed from the canonical runtime, **M18** deprecated model / removed
+output bound.
+
+---
+
+## 7. Known limitations (honest)
 
 * The gateway's typed control-plane forwards are synchronous HTTP; in this
   codebase state they relay typed payloads to the incident service's internal
   API and surface downstream availability errors (502).
 * Telemetry nonce state is process-local; a horizontally scaled deployment
   must share the nonce store (e.g. Redis) to keep replay protection global.
-* The Android Gradle unit tests for the client path
-  (`app/src/test/java/com/example/GeminiClientSecretPolicyTest.kt`) run under
-  `gradle test` on machines with a JDK/Android SDK; CI enforces the Android
-  secret property through the static guards, which do not require a JDK.
+* The Android unit tests (including `GeminiClientSecretPolicyTest.kt` and
+  the Phase 8.7-D.1 `AnalysisUrlPolicyTest.kt`) run under a real Gradle
+  toolchain in the `android-unit-tests` CI job (JDK 17, AGP 9.1.1,
+  Gradle 9.3.1) and locally via `gradle :app:testDebugUnitTest` on machines
+  with a JDK/Android SDK; the Python static guards additionally hold on any
+  machine without a JDK.
 * mTLS between producer and monitoring service is not yet deployed; the HMAC
   envelope is the current machine-authentication mechanism and assumes
   network-level segregation of `/api/internal` endpoints.
+* The in-process budget ledger and in-process rate limiter are explicitly
+  single-process: a multi-replica deployment MUST set
+  `GEMINI_BUDGET_STORE=redis` / `ANALYSIS_RATE_LIMIT_STORE=redis` (shared
+  Redis). The application budget is a safety budget for THIS application and
+  is not a Google billing cap (see 6.2).
+* Nothing on this branch has been exercised against the real Gemini API in a
+  production deployment: no production-verification or "production-ready"
+  claim is made for the provider path. The compose boot smoke runs WITHOUT
+  provider credentials and verifies the truthful fail-closed behavior.
 
 
 ### 2.1 Server-to-server analysis boundary

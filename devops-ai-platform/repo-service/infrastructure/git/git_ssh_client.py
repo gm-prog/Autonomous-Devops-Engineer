@@ -1,28 +1,61 @@
 import os
+import re
 import subprocess
 import logging
 from typing import Optional, List
-from pathlib import Path
 from ...domain.exceptions import InvalidGitRepositoryException
 
 logger = logging.getLogger("GitSSHClient")
 
+# Path-safe characters for the known_hosts file path (no shell metachars,
+# since the value is composed into GIT_SSH_COMMAND).
+_KNOWN_HOSTS_PATH_RE = re.compile(r"^[A-Za-z0-9._/~-]+$")
+
+
 class GitSSHClient:
-    """Provides secure, credential-based clones of private enterprise code hosting sites."""
-    def __init__(self, private_key_path: Optional[str] = None):
+    """Provides secure, credential-based clones of private enterprise code hosting sites.
+
+    Host-key trust model (Phase 8.7-D.1): ``StrictHostKeyChecking=no`` and
+    ``UserKnownHostsFile=/dev/null`` are NO LONGER shipped.  Every clone
+    verifies the remote host key against an operator-managed ``known_hosts``
+    file (``DEVOPS_SSH_KNOWN_HOSTS_PATH``); when that file is not
+    configured, the clone is REFUSED rather than falling back to
+    trust-on-first-use (a MITM would otherwise be able to intercept the
+    enterprise repository transfer).
+    """
+    def __init__(self, private_key_path: Optional[str] = None, known_hosts_path: Optional[str] = None):
         self.pkey = private_key_path or os.getenv("DEVOPS_SSH_KEY_PATH", "")
+        self.known_hosts = known_hosts_path or os.getenv("DEVOPS_SSH_KNOWN_HOSTS_PATH", "")
+
+    def _build_git_ssh_command(self) -> str:
+        if not self.known_hosts:
+            raise InvalidGitRepositoryException(
+                "DEVOPS_SSH_KNOWN_HOSTS_PATH is not configured: cloning "
+                "without verifiable host-key trust is refused."
+            )
+        if not _KNOWN_HOSTS_PATH_RE.match(self.known_hosts):
+            raise InvalidGitRepositoryException(
+                "DEVOPS_SSH_KNOWN_HOSTS_PATH contains unsafe characters."
+            )
+        host_opts = (
+            "-o StrictHostKeyChecking=yes "
+            f"-o UserKnownHostsFile={self.known_hosts}"
+        )
+        if self.pkey:
+            if not os.path.exists(self.pkey):
+                raise InvalidGitRepositoryException(
+                    f"Configured SSH key path {self.pkey} does not exist."
+                )
+            return f"ssh -i {self.pkey} {host_opts}"
+        return f"ssh {host_opts}"
 
     def clone_repository(self, repo_url: str, dest_dir: str) -> bool:
         logger.info(f"Cloning codebase from private host: {repo_url} into local cache namespace {dest_dir}")
-        
-        # Check environment and setup SSH command override
+
+        # Check environment and setup SSH command override (verifiable
+        # host-key trust only).
         env = os.environ.copy()
-        if self.pkey:
-            if not os.path.exists(self.pkey):
-                logger.warning(f"Configured SSH key path {self.pkey} does not exist. Proceeding with fallback keys.")
-            env["GIT_SSH_COMMAND"] = f"ssh -i {self.pkey} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-        else:
-            env["GIT_SSH_COMMAND"] = "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        env["GIT_SSH_COMMAND"] = self._build_git_ssh_command()
 
         try:
             # Execute actual git subprocess with a defensive 120-second timeout
@@ -60,4 +93,3 @@ class GitSSHClient:
         except Exception as e:
             logger.warning(f"Could not fetch git logs in {repo_path}: {e}")
             return []
-

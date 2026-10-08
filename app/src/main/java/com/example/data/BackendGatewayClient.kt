@@ -1,8 +1,10 @@
 package com.example.data
 
 import android.util.Log
+import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,6 +32,11 @@ import java.util.concurrent.TimeUnit
  *    the JWT, enforces role authorization, and calls Gemini with its own
  *    SERVER-SIDE GEMINI_API_KEY.
  *
+ * TRANSPORT POLICY (Phase 8.7-D.1): the JWT is only ever sent to HTTPS
+ * destinations; cleartext HTTP is permitted exclusively for the local
+ * emulator endpoint and only in debug builds. Unsafe URLs are rejected
+ * before the request is constructed (see [validateAnalysisUrl]).
+ *
  * HONEST FAILURE: every non-success outcome is surfaced as a typed
  * [AnalysisFailure] with a truthful reason. This client NEVER fabricates an
  * analysis result — there is no silent fallback to simulated content.
@@ -41,6 +48,60 @@ object BackendGatewayClient {
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .build()
+
+    /**
+     * Analysis URL policy (Phase 8.7-D.1).
+     *
+     * The authenticated analysis transport must NEVER carry a bearer JWT
+     * over arbitrary cleartext HTTP:
+     *  * live backend URLs must be HTTPS;
+     *  * `http://` is permitted ONLY for the local emulator/loopback
+     *    endpoints (10.0.2.2, localhost, 127.0.0.1) and ONLY in debug
+     *    builds (BuildConfig.DEBUG — production builds reject even the
+     *    local exception);
+     *  * anything else is rejected BEFORE the request is constructed, so
+     *    a user-entered `http://host` can never become an authenticated
+     *    analysis destination.
+     *
+     * The diagnostics probe ([testConnection]) is a separate,
+     * credential-free path and stays governed by the Network Security
+     * Configuration (no cleartext in production builds at the platform
+     * level either).
+     */
+    private val LOCAL_EMULATOR_HOSTS = setOf("10.0.2.2", "localhost", "127.0.0.1")
+
+    /**
+     * @param debugBuild the build-type gate for the local cleartext
+     *   exception — defaults to the real [BuildConfig.DEBUG] of the
+     *   compiled variant (production builds therefore reject even the
+     *   local exception).
+     * @return a truthful rejection reason, or null when the URL is permitted.
+     */
+    fun validateAnalysisUrl(rawUrl: String, debugBuild: Boolean = BuildConfig.DEBUG): String? {
+        val clean = rawUrl.trim().removeSuffix("/")
+        if (clean.isEmpty()) return "Gateway URL is not configured."
+        val url: HttpUrl = try {
+            HttpUrl.parse(clean) ?: return "Gateway URL is malformed."
+        } catch (e: Exception) {
+            return "Gateway URL is malformed: ${e.message}"
+        }
+        return when (url.scheme) {
+            "https" -> null
+            "http" -> when {
+                !debugBuild ->
+                    "Cleartext HTTP is not permitted for authenticated analysis in " +
+                        "production builds. Configure an HTTPS gateway URL."
+                url.host.lowercase() in LOCAL_EMULATOR_HOSTS -> null
+                else ->
+                    "Cleartext HTTP is permitted only for the local emulator endpoint " +
+                        "($LOCAL_EMULATOR_HOSTS) in debug builds. Configure an HTTPS " +
+                        "gateway URL."
+            }
+            else ->
+                "Only HTTPS is permitted for authenticated analysis (the local " +
+                    "emulator endpoint is allowed over HTTP in debug builds only)."
+        }
+    }
 
     /** Outcome of a typed, authenticated remote analysis request. */
     sealed class AnalysisOutcome {
@@ -108,6 +169,14 @@ object BackendGatewayClient {
         if (jwtToken.isBlank()) {
             // Fail closed on the client side too: no token, no live call.
             return@withContext AnalysisOutcome.Failure("No gateway access token (JWT) configured — live analysis requires one.")
+        }
+
+        // Phase 8.7-D.1: reject unsafe URLs BEFORE constructing/sending the
+        // authenticated request (HTTPS-only, with a debug-local exception).
+        val urlPolicyError = validateAnalysisUrl(cleanUrl)
+        if (urlPolicyError != null) {
+            Log.w(TAG, "Analysis URL rejected by policy")
+            return@withContext AnalysisOutcome.Failure(urlPolicyError)
         }
 
         val endpoint = "$cleanUrl/api/v1/repository/analyze"

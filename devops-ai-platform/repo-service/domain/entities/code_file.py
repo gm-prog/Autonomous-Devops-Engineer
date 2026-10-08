@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 @dataclass
@@ -12,7 +12,7 @@ class CodeFile:
     language: str
     size_bytes: int
     content: str
-    last_modified: datetime = datetime.utcnow()
+    last_modified: datetime = field(default_factory=datetime.utcnow)
 
     def is_yaml_config(self) -> bool:
         return self.filepath.endswith(".yaml") or self.filepath.endswith(".yml")

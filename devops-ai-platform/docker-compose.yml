@@ -1,71 +1,110 @@
-version: "3.8"
+# =============================================================================
+# CANONICAL Phase 8.7-D.1 stack — gateway + agent + shared Redis
+# =============================================================================
+# This is the D1 production path for the authenticated repository-analysis
+# stack. It declares ONLY the services this phase requires:
+#
+#   * api-gateway  — typed, JWT-authenticated control plane (user-facing;
+#                    exposes 8000 so operators can reach the API).
+#   * agent-service — internal analysis boundary (NOT exposed to the host;
+#                    reached only through the gateway).
+#   * redis        — shared state for the gateway's analysis rate limiter
+#                    and the agent's AI budget ledger (NOT exposed to the
+#                    host).
+#
+# The older broad stack (postgres/qdrant/celery) is quarantined in
+# docker-compose.legacy.yml — do not use it for the D1 path.
+#
+# Secrets are EXTERNALLY SUPPLIED; nothing secret is committed or baked into
+# the images:
+#   * JWT_SECRET            — REQUIRED (fail closed; see SECURITY.md).
+#   * AGENT_INTERNAL_TOKEN  — REQUIRED (gateway->agent hop credential).
+#   * GEMINI_API_KEY        — OPTIONAL. When empty the agent-service fails
+#     CLOSED (503) on analysis instead of fabricating a response; the boot
+#     smoke test verifies exactly that behavior.
+#
+# Image references are pinned to immutable digests (resolved 2026-10-08):
+#   * redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e619aa0ee78de08c6ca0
+#   * python base for both services:
+#     python:3.11-slim@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90def6709ab0c5ce
+#
+# Usage:
+#   export JWT_SECRET="<32+ random chars>" AGENT_INTERNAL_TOKEN="<32+ random chars>"
+#   docker compose up --build
+# =============================================================================
 
 services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: devops_postgres
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: devops_prod
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
   redis:
-    image: redis:7-alpine
-    container_name: devops_redis
-    ports:
-      - "6379:6379"
-
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: devops_qdrant
-    ports:
-      - "6333:6333"
-      - "6334:6334"
+    image: redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e619aa0ee78de08c6ca0
+    container_name: devops_d1_redis
+    # No host ports: the shared store is internal to the D1 network.
+    expose:
+      - "6379"
+    networks:
+      - d1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
   api-gateway:
     build:
       context: .
       dockerfile: ./api-gateway/Dockerfile
-    container_name: devops_api_gateway
+    container_name: devops_d1_api_gateway
     ports:
       - "8000:8000"
     environment:
       - APP_ENV=${APP_ENV:-production}
-      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set — see devops-ai-platform/SECURITY.md}
-      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see devops-ai-platform/SECURITY.md}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set — see SECURITY.md}
+      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see SECURITY.md}
+      # Shared rate-limit state for the expensive analysis route.
+      - REDIS_URL=redis://redis:6379/0
+      - ANALYSIS_RATE_LIMIT_STORE=redis
       - RATE_LIMIT_MAX_REQUESTS=${RATE_LIMIT_MAX_REQUESTS:-100}
     depends_on:
-      - agent-service
-      - postgres
-      - redis
+      redis:
+        condition: service_healthy
+    networks:
+      - d1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   agent-service:
     build:
       context: .
       dockerfile: ./agent-service/Dockerfile
-    container_name: devops_agent_service
+    container_name: devops_d1_agent_service
+    # NOT exposed to the host: the analysis boundary is internal and is
+    # reached only through the gateway's authenticated route.
     expose:
       - "8020"
     environment:
-      - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY must be set for live analysis}
-      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see devops-ai-platform/SECURITY.md}
+      # OPTIONAL: empty => the analysis endpoint fails closed (503) rather
+      # than fabricating a provider response (verified by the smoke test).
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see SECURITY.md}
+      # Shared AI budget ledger across replicas.
+      - REDIS_URL=redis://redis:6379/0
+      - GEMINI_BUDGET_STORE=redis
+      - GEMINI_MONTHLY_BUDGET_USD=${GEMINI_MONTHLY_BUDGET_USD:-150}
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    networks:
+      - d1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8020/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
-  celery-worker:
-    build:
-      context: .
-      dockerfile: ./deployment-service/Dockerfile
-    container_name: devops_celery_worker
-    command: celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info
-    environment:
-      - REDIS_HOST=redis
-    depends_on:
-      - redis
-
-volumes:
-  postgres_data:
+networks:
+  d1:
+    internal: false

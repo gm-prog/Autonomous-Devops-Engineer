@@ -2,6 +2,112 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-D.1] — Production Security & Runtime Hardening (2026-10-08)
+
+Audit-driven release blockers corrected on the server-side analysis path,
+the Android transport, and the canonical runtime. No behavior is claimed
+production-verified: the provider path has not been exercised against the
+real Gemini API, and the compose boot smoke runs without provider
+credentials to verify the truthful fail-closed behavior.
+
+### Added
+
+* **Single shared analysis handler per process (P0-1).** The agent-service
+  now constructs exactly one analysis handler in `create_app` and shares it
+  via `app.state.analysis_handler`; the internal route resolves the shared
+  instance (no per-request adapter construction). `GeminiRuntimeConfig` is
+  the single configuration source for all Gemini tunables (one env var, one
+  default each — the 150 vs 100 budget default conflict is eliminated).
+* **Atomic pre-invocation budget reservation (P0-2).** Worst-case cost
+  (retries × bounded tokens × documented prices) is reserved atomically
+  against the UTC calendar-month ceiling before any provider contact;
+  rejected reservations block the call before the provider is contacted.
+  Reconciliation uses provider `usageMetadata` when present and keeps the
+  FULL reservation when it is missing (never undercount). `local` store =
+  explicit single-process contract; `GEMINI_BUDGET_STORE=redis` = shared
+  atomic ledger (Lua) across replicas; an unreachable store fails closed
+  (503). The budget is an application safety budget, NOT a Google billing
+  cap (documented in SECURITY.md 6.2).
+* **Route-specific rate limiting on the analysis route (P0-3).** Fixed
+  60-second window: 30/min per JWT `sub` and 120/min per direct-TCP-peer IP
+  (forwarded headers are never read), env-configurable, atomic counters
+  (Redis Lua or explicit in-process single-instance mode), 429 +
+  `Retry-After`, authentication before limiting, and fail-closed 503 when
+  the limiter/store is missing or unreachable.
+* **Android cleartext transport policy (P0-4).**
+  `validateAnalysisUrl(rawUrl, debugBuild = BuildConfig.DEBUG)` rejects any
+  URL that is not `https://`; `http://` is permitted only for the
+  local-emulator hosts (`10.0.2.2`, `localhost`, `127.0.0.1`) and only in
+  debug builds. Unsafe/malformed URLs are rejected before the request is
+  constructed (typed failure, nothing sent); the policy runs before the
+  `Authorization: Bearer` header is attached. The Network Security
+  Configuration now permits no cleartext in the main config and local hosts
+  only in the debug overlay; the manifest wires the NSC.
+  `AnalysisUrlPolicyTest.kt` (6 offline JUnit tests) covers HTTPS
+  success, arbitrary-HTTP rejection, debug-local allowance,
+  production-build local rejection, malformed URLs, and the request-level
+  pre-send failure.
+* **Canonical D1 compose stack (P0-5).** New
+  `devops-ai-platform/docker-compose.yml`: `api-gateway` (host 8000) +
+  `agent-service` (8020, never host-exposed) + `redis` (never host-exposed),
+  digest-pinned images (`redis:7.2-alpine@sha256:29e8589c…`,
+  `python:3.11-slim@sha256:0dd364ba…`, resolved 2026-10-08), healthchecks,
+  required `${JWT_SECRET:?}` / `${AGENT_INTERNAL_TOKEN:?}`, optional
+  `GEMINI_API_KEY` (empty → agent fails closed 503). The previous stack is
+  quarantined in `docker-compose.legacy.yml` with its hardcoded
+  `POSTGRES_PASSWORD` removed. Both service Dockerfiles pin the digest
+  base image.
+* **CI: real Android Gradle job, compose runtime job, real-Redis job.**
+  `android-unit-tests` (JDK 17 + Android SDK + Gradle 9.3.1, pinned to the
+  AGP 9.1.1 documented minimum): unit tests incl. the new policy tests +
+  `assembleDebug`. `compose-runtime`: `docker compose config`, image
+  builds for both services, boot smoke (readiness, gateway→agent over the
+  compose network, agent port not host-exposed, authenticated analysis
+  without provider credentials → truthful 503), log artifacts.
+  `redis-integration`: real-Redis tests for the shared budget ledger and
+  shared rate limiter (hard-fails in CI without `REDIS_URL`). All action
+  pins upgraded to current non-deprecated majors (checkout@v7,
+  setup-python@v7, setup-java@v6, upload-artifact@v7,
+  android-actions/setup-android@v4) — no Node deprecation warnings.
+* **Structural runtime guard + mutations M13–M18.** New
+  `d1-runtime-contract` guard (canonical services, existing Dockerfiles,
+  digest pins, host-port policy, CI builds both images, legacy password
+  removed). New adversarial mutations: M13 per-request adapter
+  construction, M14 analysis rate limiting removed, M15 cleartext bearer
+  transport re-enabled, M16 non-atomic budget check-then-act, M17 agent
+  build removed from the canonical runtime, M18 deprecated model / removed
+  output bound — each proven to turn the suite red.
+* **Current, bounded provider contract (P0-6).** Default model
+  **`gemini-3.8-flash`** (verified 2026-10-08 against the official Gemini
+  API deprecations, model, and pricing pages; `GEMINI_MODEL` override
+  remains). Cost defaults use the post-promotion rates from the official
+  pricing page fetched 2026-10-08 (input $1.50 / 1M, output $7.50 / 1M),
+  documented in `gemini_caller.py`. The provider request is bounded and
+  structured: `application/json` + five-field schema + explicit
+  `maxOutputTokens`; all LLM paths keep the same strict validation and the
+  bounded timeout/retry + typed error mapping.
+
+### Changed
+
+* **Truthfulness corrections (P1).** `github_pr_client.create_pull_request`
+  raises when credentials are missing or the API omits `html_url` (no
+  fabricated PR URL); `mark_pr_ready_for_review` performs the correct
+  GitHub operation (`PUT …/pulls/{n}` with `draft: false`) and raises on
+  missing credentials or non-success (never success for a no-op); the
+  `apply_verification_pass` placeholder is renamed
+  `record_claimed_verification` (records a claim, runs no checks, leaves
+  the proposal unverified — the apply-automated-fix flow no longer treats
+  it as verified); the git SSH client verifies host keys against an
+  operator-managed `known_hosts` (`DEVOPS_SSH_KNOWN_HOSTS_PATH`) and is
+  refused without it (`StrictHostKeyChecking=no` /
+  `UserKnownHostsFile=/dev/null` removed); dataclass timestamp defaults use
+  `default_factory`.
+* `SECURITY.md` updated normatively for the D.1 controls (single shared
+  handler, budget reservation/reconciliation and the explicit
+  "not a Google billing cap" distinction, rate-limit semantics and
+  defaults, model/pricing citation, transport policy, canonical compose
+  stack, truthfulness corrections, new guard and mutations).
+
 ## [8.7-D] — Verified Server-Side Gemini Integration (2026-10-08)
 
 ### Added
