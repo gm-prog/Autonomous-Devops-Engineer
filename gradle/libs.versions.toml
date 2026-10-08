@@ -10,7 +10,12 @@ lifecycleRuntimeCompose = "2.8.7"
 activityCompose = "1.10.1"
 kotlin = "2.2.10"
 composeBom = "2024.09.00"
-googleDevtoolsKsp = "2.3.5"
+# KSP versions are strictly pinned to the Kotlin compiler version.
+# Kotlin 2.2.10 (this project's documented pin) requires KSP 2.2.10-2.0.2;
+# the previous value 2.3.5 targets the Kotlin 2.3.x line and fails the
+# build (Phase 8.7-D.1-CORRECTION, CI evidence runs 37825860227 /
+# 37827128519).
+googleDevtoolsKsp = "2.2.10-2.0.2"
 navigationCompose = "2.8.9"
 roomRuntime = "2.7.0"
 roomKtx = "2.7.0"
