@@ -146,10 +146,18 @@ jobs:
             echo "$DIGEST"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" || true
-          # Run annotation (API-readable; newlines escaped per workflow
-          # command encoding, payload kept under the 1000-char limit).
-          EXCERPT=$(printf '%s' "$DIGEST" | tr '\n' ' ' | head -c 900)
+          # Run annotation (API-readable; workflow-command payload limit is
+          # 65535 chars — keep it compact but complete for the error block).
+          EXCERPT=$(printf '%s' "$DIGEST" | tr '\n' ' ' | head -c 4000)
           echo "::error title=Gradle failure digest (Android job)::$EXCERPT" || true
+          for f in "$GITHUB_WORKSPACE/android-unit-tests.txt" "$GITHUB_WORKSPACE/android-assemble-debug.txt"; do
+            if [ -f "$f" ]; then
+              EXTRA=$(grep -n -A4 -E "kotlin.sourceSets DSL|What went wrong|Caused by" "$f" | head -30 | tr '\n' ' ' | head -c 3000)
+              if [ -n "$EXTRA" ]; then
+                echo "::error title=Gradle error block (Android job)::$EXTRA" || true
+              fi
+            fi
+          done
       - name: Publish Android test reports (no secrets)
         if: always()
         uses: actions/upload-artifact@v7

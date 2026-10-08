@@ -65,6 +65,25 @@ val ColorNeonPink = Color(0xFFFF007A)
 val ColorMutedGray = Color(0xFF7E849A)
 val ColorLightGray = Color(0xFFE2E4E9)
 
+/**
+ * Maps an analysis-source state to the header badge color.
+ *
+ * Phase 8.7-D.1-CORRECTION: this is the single source of truth for the
+ * badge color so the safety property can be tested directly. The invariant
+ * is: **only `LIVE_BACKEND` (a real, authenticated server-side success)
+ * renders the live/success color (`ColorNeonGreen`); every other state —
+ * including any unknown or absent value — renders a safe, non-success
+ * color and is never shown as live/success.**
+ */
+fun analysisBadgeColor(analysisMode: String): Color = when (analysisMode) {
+    "LIVE_BACKEND" -> ColorNeonGreen
+    "LIVE_FAILED", "OFFLINE_FAILED" -> ColorNeonPink
+    "OFFLINE_SIM" -> ColorNeonBlue
+    // Unknown/absent state: safe non-success fallback — never
+    // rendered as a live/success color.
+    else -> ColorNeonBlue
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -236,14 +255,7 @@ fun WebOpsHeader(analysisMode: String, onOpenSettings: () -> Unit) {
             // LIVE_FAILED = a live attempt failed (never shown as a success);
             // OFFLINE_FAILED = the on-device engine itself failed (never
             // labeled as a live failure).
-            val badgeColor = when (analysisMode) {
-                "LIVE_BACKEND" -> ColorNeonGreen
-                "LIVE_FAILED", "OFFLINE_FAILED" -> ColorNeonPink
-                "OFFLINE_SIM" -> ColorNeonBlue
-                // Unknown/absent state: safe non-success fallback — never
-                // rendered as a live/success color.
-                else -> ColorNeonBlue
-            }
+            val badgeColor = analysisBadgeColor(analysisMode)
             Card(
                 colors = CardDefaults.cardColors(
                     containerColor = badgeColor.copy(alpha = 0.15f)

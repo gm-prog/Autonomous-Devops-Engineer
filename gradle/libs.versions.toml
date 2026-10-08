@@ -10,12 +10,14 @@ lifecycleRuntimeCompose = "2.8.7"
 activityCompose = "1.10.1"
 kotlin = "2.2.10"
 composeBom = "2024.09.00"
-# KSP versions are strictly pinned to the Kotlin compiler version.
-# Kotlin 2.2.10 (this project's documented pin) requires KSP 2.2.10-2.0.2;
-# the previous value 2.3.5 targets the Kotlin 2.3.x line and fails the
-# build (Phase 8.7-D.1-CORRECTION, CI evidence runs 37825860227 /
-# 37827128519).
-googleDevtoolsKsp = "2.2.10-2.0.2"
+# KSP for AGP 9's BUILT-IN Kotlin: this project does not apply the
+# standalone kotlin-android plugin; AGP 9.1.1 provides Kotlin
+# compilation itself. With built-in Kotlin, KSP 2.2.x fails at
+# configuration ("Using kotlin.sourceSets DSL to add Kotlin sources is
+# not allowed with built-in Kotlin" — google/ksp#2729), so the KSP 2.3.x
+# line (>= 2.3.4) is required. 2.3.5 verified to configure cleanly on
+# this AGP (CI run 37817281031 reached real compilation with it).
+googleDevtoolsKsp = "2.3.5"
 navigationCompose = "2.8.9"
 roomRuntime = "2.7.0"
 roomKtx = "2.7.0"
