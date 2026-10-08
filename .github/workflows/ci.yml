@@ -87,16 +87,7 @@ jobs:
       - name: Standalone structural guard runner — android surface
         run: |
           set -euo pipefail
-          PYTHONPATH=. python -c "
-          from pathlib import Path
-          from security_guards import android_check
-          root = Path('.').resolve().parents[1]
-          violations = android_check(root)
-          for v in violations:
-              print('VIOLATION:', v)
-          assert not violations, 'Android secret guard failed'
-          print('android-gemini-secret guard: PASS')
-          " | tee -a "$GITHUB_STEP_SUMMARY"
+          PYTHONPATH=. python -c "from pathlib import Path; from security_guards import android_check; v = android_check(Path.cwd().resolve().parents[0]); [print('VIOLATION:', x) for x in v]; assert not v, 'Android secret guard failed'; print('android-gemini-secret guard: PASS')" | tee -a "$GITHUB_STEP_SUMMARY"
 
   structural-guards:
     name: Phase 8.7-C structural security guards (all surfaces)
