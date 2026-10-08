@@ -109,29 +109,37 @@ jobs:
       - name: Unit tests (AnalysisUrlPolicyTest, GeminiClientSecretPolicyTest, Robolectric)
         run: |
           set -o pipefail
-          gradle :app:testDebugUnitTest --console=plain 2>&1 | tee android-unit-tests.txt
+          gradle :app:testDebugUnitTest --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/android-unit-tests.txt"
       - name: Debug APK build (the artifact the URL policy governs)
         run: |
           set -o pipefail
-          gradle :app:assembleDebug --console=plain 2>&1 | tee android-assemble-debug.txt
+          gradle :app:assembleDebug --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/android-assemble-debug.txt"
       # Evidence surfacing ONLY: on failure, the error digest is written to
       # the step summary (readable via the GitHub API / run UI). The job
       # still fails on the Gradle exit code — nothing is masked.
       - name: Surface Gradle failure digest (step summary)
         if: failure()
         run: |
-          for f in android-unit-tests.txt android-assemble-debug.txt; do
-            if [ -f "$f" ]; then
-              {
-                echo "## Gradle failure digest ($f)"
-                echo '```text'
-                grep -n -E "^e: |error: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED" "$f" | head -40
-                echo '--- tail ---'
+          {
+            echo "## Gradle failure digest"
+            echo '```text'
+            echo "--- environment ---"
+            pwd
+            ls -la "$GITHUB_WORKSPACE" | grep -E "\.txt|gradle" || true
+            free -m || true
+            echo "--- error matches + tails ---"
+            for f in "$GITHUB_WORKSPACE/android-unit-tests.txt" "$GITHUB_WORKSPACE/android-assemble-debug.txt"; do
+              if [ -f "$f" ]; then
+                echo "### $f ($(wc -l < "$f") lines)"
+                grep -n -E "^e: |error: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED|Out of memory|Killed" "$f" | head -40
+                echo "--- tail ---"
                 tail -n 60 "$f"
-                echo '```'
-              } >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
+              else
+                echo "### $f MISSING"
+              fi
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Publish Android test reports (no secrets)
         if: always()
         uses: actions/upload-artifact@v7
