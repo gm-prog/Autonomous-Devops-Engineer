@@ -107,9 +107,31 @@ jobs:
             -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US" -keystore debug.keystore
       - name: Unit tests (AnalysisUrlPolicyTest, GeminiClientSecretPolicyTest, Robolectric)
-        run: gradle :app:testDebugUnitTest --console=plain
+        run: |
+          set -o pipefail
+          gradle :app:testDebugUnitTest --console=plain 2>&1 | tee android-unit-tests.txt
       - name: Debug APK build (the artifact the URL policy governs)
-        run: gradle :app:assembleDebug --console=plain
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --console=plain 2>&1 | tee android-assemble-debug.txt
+      # Evidence surfacing ONLY: on failure, the error digest is written to
+      # the step summary (readable via the GitHub API / run UI). The job
+      # still fails on the Gradle exit code — nothing is masked.
+      - name: Surface Gradle failure digest (step summary)
+        if: failure()
+        run: |
+          for f in android-unit-tests.txt android-assemble-debug.txt; do
+            if [ -f "$f" ]; then
+              {
+                echo "## Gradle failure digest ($f)"
+                echo '```text'
+                grep -n -E "^e: |error: |FAILURE:|What went wrong|Caused by:|> Task .* FAILED" "$f" | head -40
+                echo '--- tail ---'
+                tail -n 60 "$f"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
       - name: Publish Android test reports (no secrets)
         if: always()
         uses: actions/upload-artifact@v7
