@@ -23,6 +23,7 @@ Trust model
 from __future__ import annotations
 
 import logging
+import os
 
 import requests
 from fastapi import APIRouter, Depends, HTTPException
@@ -33,7 +34,6 @@ from .gateway_router import (
     INCIDENT_INTERNAL_BASE,
     SERVICES,
     _DownstreamTransport,
-    get_downstream_transport,
 )
 
 logger = logging.getLogger("GatewayAnalysisRouter")
@@ -43,6 +43,41 @@ router = APIRouter(tags=["Repository Analysis"])
 # Fixed downstream target: service constant + constant internal path.
 _ANALYSIS_SERVICE = "agent"
 ANALYSIS_INTERNAL_PATH = "/repository/analyze"
+
+
+class AgentInternalConfigurationError(RuntimeError):
+    """Gateway-to-agent transport is not configured safely."""
+
+
+class _AgentAnalysisTransport:
+    """Dedicated authenticated gateway-to-agent HTTP transport."""
+
+    def call(self, method: str, url: str, json_body: dict, authorizing_identity: str) -> dict:
+        token = os.getenv("AGENT_INTERNAL_TOKEN", "").strip()
+        if len(token) < 32:
+            raise AgentInternalConfigurationError("AGENT_INTERNAL_TOKEN is missing or too short.")
+        response = requests.request(
+            method,
+            url,
+            json=json_body,
+            headers={
+                "X-Gateway-Identity": authorizing_identity,
+                "X-Agent-Internal-Token": token,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise requests.RequestException("Agent-service returned a non-JSON response.") from exc
+        if not isinstance(payload, dict):
+            raise requests.RequestException("Agent-service returned a non-object response.")
+        return payload
+
+
+def get_agent_analysis_transport() -> _AgentAnalysisTransport:
+    return _AgentAnalysisTransport()
 
 
 class RepositoryAnalysisRequest(BaseModel):
@@ -62,7 +97,7 @@ class RepositoryAnalysisRequest(BaseModel):
     technology: str = Field(min_length=1, max_length=200)
 
 
-def _map_downstream_error(exc: Exception, body: "RepositoryAnalysisRequest") -> HTTPException:
+def _map_downstream_error(exc: Exception) -> HTTPException:
     """Map agent-service failures to stable public semantics.
 
     The downstream detail may be relayed (it is provider-neutral by
@@ -86,7 +121,7 @@ def _map_downstream_error(exc: Exception, body: "RepositoryAnalysisRequest") -> 
 def analyze_repository(
     body: RepositoryAnalysisRequest,
     user: dict = Depends(require_analysis_role),
-    transport: _DownstreamTransport = Depends(get_downstream_transport),
+    transport: _AgentAnalysisTransport = Depends(get_agent_analysis_transport),
 ):
     """Typed, authenticated repository analysis.
 
@@ -100,8 +135,10 @@ def analyze_repository(
     url = f"{base}{INCIDENT_INTERNAL_BASE}{ANALYSIS_INTERNAL_PATH}"
     try:
         result = transport.call("POST", url, body.model_dump(), user["sub"])
+    except AgentInternalConfigurationError as exc:
+        raise HTTPException(status_code=503, detail="Internal analysis transport is not configured.") from exc
     except requests.HTTPError as exc:
-        raise _map_downstream_error(exc, body) from exc
+        raise _map_downstream_error(exc) from exc
     except requests.RequestException as exc:
         raise HTTPException(
             status_code=502, detail="Downstream service 'agent' unavailable."
