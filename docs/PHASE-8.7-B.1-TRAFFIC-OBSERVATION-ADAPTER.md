@@ -118,7 +118,9 @@ share, never the raw weight: weights `25/75` are a 75% canary share, and
   both weights are zero (no share exists);
 * the share is not an exact integer percentage;
 * an endpoint carries no Pod `targetRef`, or a ready endpoint is not
-  visible in the pod listing (its workload identity cannot be proved).
+  visible in the pod listing (its workload identity cannot be proved);
+* the Gateway controller has not reported `Accepted=True` for the route
+  (missing acceptance status or explicit `Accepted=False`).
 
 `CONFLICT` — the cluster contradicts itself or the request:
 
@@ -292,6 +294,16 @@ tests now assert the registration and that nothing else in the observation
 package spawns a process. The lesson is the one this repository keeps
 re-learning: a green local suite over the directories you remembered is
 not a green build.
+
+## 13.1 Controller-acceptance hardening corrective
+
+The observation adapter now fails closed unless the Gateway controller explicitly
+reports `Accepted=True` for the observed route. A missing `Accepted`
+condition or `Accepted=False` is `UNKNOWN`, never `KNOWN`. This prevents
+a structurally healthy-looking route from being treated as mutation authority
+when the controller itself has not accepted it. The corrective adds explicit
+adversarial tests for both cases; it does not change the trusted mutation
+boundary or introduce any write capability.
 
 ## 13. Next step
 

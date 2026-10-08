@@ -459,6 +459,32 @@ class HealthyObservationTests(unittest.TestCase):
         self.assertIn("not a sampled request percentage",
                       payload["configured"]["note"])
 
+    def test_controller_explicit_rejection_is_never_known(self):
+        world = live_documents()
+        world["route"]["status"]["parents"][0]["conditions"][0]["status"] = "False"
+        record = observe(world)
+        self.assertEqual(record.observation.observed_status, OBSERVED_UNKNOWN)
+        self.assertIsNone(record.observation.observed_percentage)
+        self.assertTrue(
+            any("Accepted=False" in text for _severity, text in record.findings),
+            record.findings,
+        )
+
+    def test_missing_controller_acceptance_status_is_never_known(self):
+        world = live_documents()
+        world["route"]["status"]["parents"][0]["conditions"] = [
+            condition for condition in
+            world["route"]["status"]["parents"][0]["conditions"]
+            if condition["type"] != "Accepted"
+        ]
+        record = observe(world)
+        self.assertEqual(record.observation.observed_status, OBSERVED_UNKNOWN)
+        self.assertIsNone(record.observation.observed_percentage)
+        self.assertTrue(
+            any("Accepted=True" in text for _severity, text in record.findings),
+            record.findings,
+        )
+
     def test_a_route_still_reconciling_is_recorded_not_hidden(self):
         world = live_documents()
         world["route"]["metadata"]["generation"] = 5

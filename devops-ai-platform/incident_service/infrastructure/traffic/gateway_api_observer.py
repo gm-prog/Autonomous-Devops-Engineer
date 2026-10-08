@@ -611,6 +611,18 @@ class KubernetesTrafficObserver:
             return None, targets, None, (), findings
 
         route_facts = self._route_facts(route)
+        if route_facts.accepted is None:
+            findings.append((
+                _UNAVAILABLE,
+                "the Gateway controller has not reported Accepted=True for "
+                "the observed route, so controller authority is unavailable",
+            ))
+        elif route_facts.accepted is False:
+            findings.append((
+                _UNAVAILABLE,
+                "the Gateway controller reports Accepted=False for the observed "
+                "route, so controller authority is unavailable",
+            ))
         refs, ref_findings = self._backend_refs(route)
         findings.extend(ref_findings)
         if refs is None:
