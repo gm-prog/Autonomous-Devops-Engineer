@@ -5,6 +5,7 @@ import com.example.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -91,7 +92,9 @@ object BackendGatewayClient {
         val clean = rawUrl.trim().removeSuffix("/")
         if (clean.isEmpty()) return "Gateway URL is not configured."
         val url: HttpUrl = try {
-            HttpUrl.parse(clean) ?: return "Gateway URL is malformed."
+            // OkHttp 4.x: HttpUrl.parse() is an error-level deprecation;
+            // the supported form is the String.toHttpUrl() extension.
+            clean.toHttpUrl() ?: return "Gateway URL is malformed."
         } catch (e: Exception) {
             // Defensive only: log a safe technical identifier, never the raw
             // message (it may embed the raw URL/host) in the returned reason.
