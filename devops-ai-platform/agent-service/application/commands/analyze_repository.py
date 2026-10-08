@@ -134,6 +134,9 @@ class AnalyzeRepositoryCommandHandler:
             ) from exc
         if not isinstance(data, dict):
             raise MalformedAnalysisResponseError("Provider payload was not a JSON object.")
+        unexpected = set(data) - set(ASSET_FIELDS)
+        if unexpected:
+            raise MalformedAnalysisResponseError("Provider payload contained unexpected fields.")
         for field in ASSET_FIELDS:
             value = data.get(field)
             if not isinstance(value, str) or not value.strip():
