@@ -805,9 +805,8 @@ fun RepositoryScreen(
 
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // Actions Panel: Trigger the offline analysis simulation
-                        // (Phase 8.7-C.2: this branch has no live Gemini path; analysis is
-                        // always the deterministic on-device template engine).
+                        // Actions Panel: repository analysis can run offline by default or through
+                        // the explicitly enabled authenticated server-side Gemini path.
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             // Run analysis
                             Button(
@@ -869,7 +868,7 @@ fun RepositoryScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "AI Discovery Report (Offline)",
+                                    text = "AI Discovery Report",
                                     color = Color.White,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 13.sp
@@ -1756,7 +1755,7 @@ fun ImportRepositoryDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    "Register repository parameters to generate offline DevOps blueprints (on-device simulation — no live Gemini calls on this branch).",
+                    "Register repository parameters to generate DevOps blueprints offline by default; authenticated live backend analysis can be enabled in Settings.",
                     color = ColorMutedGray,
                     fontSize = 11.sp
                 )
@@ -1880,7 +1879,7 @@ fun ConnectivitySettingsDialog(
                             fontWeight = FontWeight.Bold
                         )
                         Text(
-                            "Configure the gateway URL and the platform-issued gateway JWT. When the probe is CONNECTED, analysis runs server-side (server-side Gemini, authenticated). Otherwise the on-device offline engine is used. The Gemini key never enters this app.",
+                            "Configure the gateway URL and platform-issued gateway JWT. The JWT is held only in memory. When the probe is CONNECTED, analysis may run server-side (authenticated); otherwise the on-device offline engine is used. The Gemini key never enters this app.",
                             color = ColorMutedGray,
                             fontSize = 10.sp
                         )
