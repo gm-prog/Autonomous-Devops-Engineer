@@ -291,3 +291,90 @@ def test_documentation_states_the_offline_truth():
     # The retired BuildConfig-based instructions must not remain in the
     # current README.
     assert "BuildConfig.GEMINI_API_KEY" not in readme
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-C.2 — UI truthfulness: the UI must not misrepresent the
+# offline/simulated AI path as live Gemini functionality
+# ---------------------------------------------------------------------------
+
+MAIN_ACTIVITY = REPO_ROOT / "app" / "src" / "main" / "java" / "com" / "example" / "MainActivity.kt"
+
+# Phrases that would claim a live/current Gemini capability that does not
+# exist on this branch.  Matched case-insensitively against whitespace-
+# normalized production source (comments included: a phrase like "Gemini
+# Live analysis" describing current functionality is a regression anywhere
+# in production source).
+_FORBIDDEN_LIVE_GEMINI_PHRASES = (
+    "compile live blueprints",
+    "live blueprints via gemini",
+    "gemini live analysis",
+    "gemini resilient api cockpit",
+    "realtime safety constraints",
+)
+
+# Honest language the UI must carry instead (semantic markers, whitespace-
+# insensitive).
+_REQUIRED_TRUTHFUL_MARKERS = (
+    "offline devops blueprints",
+    "ai simulation & resilience cockpit",
+    "not live gemini telemetry",
+    "simulated api rate load",
+    "simulated token cost",
+    "simulated circuit state",
+    "analyze (offline ai)",
+)
+
+
+def _normalized_main_activity() -> str:
+    return re.sub(r"\s+", " ", MAIN_ACTIVITY.read_text(encoding="utf-8")).lower()
+
+
+def check_ui_truthfulness(repo_root: Path) -> list:
+    """Semantic contract checker for Android UI truthfulness (Phase 8.7-C.2).
+
+    Returns a list of violation strings (empty == contract holds).  The
+    contract: no production Android source claims live/current Gemini
+    analysis, live blueprints, or a live Gemini API cockpit; the offline
+    analysis path and the AI resilience cockpit are explicitly labeled as
+    offline/simulated.  Used by the contract tests and by mutation M6.
+    """
+    violations: list = []
+    main_activity = Path(repo_root) / "app" / "src" / "main" / "java" / "com" / "example" / "MainActivity.kt"
+    if not main_activity.is_file():
+        return ["MainActivity.kt: missing — UI truthfulness contract cannot be verified"]
+    norm = re.sub(r"\s+", " ", main_activity.read_text(encoding="utf-8")).lower()
+
+    for phrase in _FORBIDDEN_LIVE_GEMINI_PHRASES:
+        if phrase in norm:
+            violations.append(
+                f"MainActivity.kt: stale live-Gemini claim present: {phrase!r} — "
+                "this branch has no verified live Gemini integration"
+            )
+    for marker in _REQUIRED_TRUTHFUL_MARKERS:
+        if marker not in norm:
+            violations.append(
+                f"MainActivity.kt: required truthful language missing: {marker!r} — "
+                "the UI must label the offline/simulated behavior explicitly"
+            )
+    # Metric labels must be simulation-qualified, never bare provider labels.
+    for bare_label in ("\"api rate load\"", "\"token cost\""):
+        if re.search(r"text\(\s*" + re.escape(bare_label), norm):
+            violations.append(
+                f"MainActivity.kt: unqualified metric label {bare_label} — "
+                "simulated metrics must be labeled as simulated"
+            )
+    return violations
+
+
+def test_no_stale_live_gemini_ui_claims():
+    norm = _normalized_main_activity()
+    for phrase in _FORBIDDEN_LIVE_GEMINI_PHRASES:
+        assert phrase not in norm, (
+            f"stale live-Gemini UI claim still present: {phrase!r}"
+        )
+
+
+def test_ai_cockpit_and_analysis_labeled_as_simulation():
+    violations = check_ui_truthfulness(REPO_ROOT)
+    assert violations == [], "\n".join(violations)

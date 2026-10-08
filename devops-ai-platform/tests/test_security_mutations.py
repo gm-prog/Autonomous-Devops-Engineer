@@ -19,6 +19,10 @@ M5. Android:   reintroduce the fictitious remote Gemini execution path
                (unauthenticated backend request to an endpoint that does not
                exist in this branch) — the false "authenticated backend
                exists" regression.
+M6. Android:   reintroduce stale live-Gemini UI claims (the UI again says it
+               compiles live blueprints via Gemini AI and presents the
+               simulator as a "Gemini Resilient API Cockpit") — the false
+               "live Gemini telemetry" regression.
 """
 
 from __future__ import annotations
@@ -392,5 +396,48 @@ def test_mutation_m5_fictitious_remote_path_detected(mutated_repo):
     assert "backendBaseUrl" in joined
     assert "/api/v1/repository/analyze" in joined
     assert "BackendGatewayClient" in joined
+    for v in violations:
+        print("  violation:", v)
+
+
+# ---------------------------------------------------------------------------
+# M6 — reintroduce stale live-Gemini UI claims
+# ---------------------------------------------------------------------------
+
+
+def _apply_stale_ui_mutation(repo: Path) -> None:
+    """Reintroduce the pre-correction UI wording: live-Gemini blueprint
+    claims and the unqualified "Gemini Resilient API Cockpit" title that
+    presents local simulation as live provider telemetry."""
+    main_activity = repo / "app/src/main/java/com/example/MainActivity.kt"
+    src = main_activity.read_text(encoding="utf-8")
+
+    old_copy = "Register repository parameters to generate offline DevOps blueprints (on-device simulation — no live Gemini calls on this branch)."
+    old_title = '"AI Simulation & Resilience Cockpit"'
+    assert old_copy in src, "mutation target (blueprint copy) not found"
+    assert old_title in src, "mutation target (cockpit title) not found"
+
+    src = src.replace(
+        old_copy,
+        "Register code parameters to compile live blueprints via Gemini AI.",
+        1,
+    )
+    src = src.replace(old_title, '"Gemini Resilient API Cockpit"', 1)
+    main_activity.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m6_stale_live_gemini_ui_detected(mutated_repo):
+    from test_android_secret_guards import check_ui_truthfulness
+
+    _apply_stale_ui_mutation(mutated_repo)
+
+    violations = check_ui_truthfulness(mutated_repo)
+    assert violations, (
+        "UI truthfulness contract stayed green after stale live-Gemini "
+        "claims were reintroduced"
+    )
+    joined = "\n".join(violations)
+    assert "live blueprints via gemini" in joined
+    assert "gemini resilient api cockpit" in joined
     for v in violations:
         print("  violation:", v)

@@ -488,13 +488,13 @@ fun DashboardScreen(
             }
         }
 
-        // Available Agents Showcase & Gemini Cockpit Integration
+        // Available Agents Showcase & AI Simulation Cockpit
         item {
             SwarmStateMachineMonitor(viewModel = viewModel)
         }
 
         item {
-            GeminiApiCockpit(viewModel = viewModel)
+            AiSimulationCockpit(viewModel = viewModel)
         }
     }
 }
@@ -796,7 +796,9 @@ fun RepositoryScreen(
 
                         Spacer(modifier = Modifier.height(16.dp))
 
-                        // Actions Panel: Trigger Gemini Live analysis or Simulation
+                        // Actions Panel: Trigger the offline analysis simulation
+                        // (Phase 8.7-C.2: this branch has no live Gemini path; analysis is
+                        // always the deterministic on-device template engine).
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             // Run analysis
                             Button(
@@ -809,9 +811,9 @@ fun RepositoryScreen(
                                 if (viewModel.isAnalyzing) {
                                     CircularProgressIndicator(color = Color.White, modifier = Modifier.size(16.dp))
                                 } else {
-                                    Icon(Icons.Default.Refresh, contentDescription = "AI", tint = Color.White, modifier = Modifier.size(16.dp))
+                                    Icon(Icons.Default.Refresh, contentDescription = "Offline AI", tint = Color.White, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Analyze (AI)")
+                                    Text("Analyze (Offline AI)")
                                 }
                             }
 
@@ -837,7 +839,7 @@ fun RepositoryScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // Gemini Discovery & Analysis Report Box
+                // AI Discovery & Analysis Report Box (offline engine output)
                 if (selectedRepo.lastAnalysisReport.isNotEmpty()) {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = ColorNeonPurple.copy(alpha = 0.05f)),
@@ -855,7 +857,7 @@ fun RepositoryScreen(
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    text = "Gemini Agent Discovery Report",
+                                    text = "AI Discovery Report (Offline)",
                                     color = Color.White,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 13.sp
@@ -1742,7 +1744,7 @@ fun ImportRepositoryDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    "Register code parameters to compile live blueprints via Gemini AI.",
+                    "Register repository parameters to generate offline DevOps blueprints (on-device simulation — no live Gemini calls on this branch).",
                     color = ColorMutedGray,
                     fontSize = 11.sp
                 )
@@ -1844,7 +1846,7 @@ fun ConnectivitySettingsDialog(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 Text(
-                    text = "Configure the active execution bridge to route multi-agent deployments, alerts, and code reviews directly to your remote server architecture.",
+                    text = "Gateway diagnostics: configure a gateway URL and probe its reachability. Repository analysis and deployments run locally on this branch — the gateway is not an analysis or execution path.",
                     color = ColorMutedGray,
                     fontSize = 11.sp,
                     lineHeight = 16.sp
@@ -2269,7 +2271,10 @@ fun SwarmStateMachineMonitor(
 }
 
 @Composable
-fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
+fun AiSimulationCockpit(viewModel: DevOpsViewModel) {
+    // Phase 8.7-C.2: every metric below is a locally simulated value
+    // (see DevOpsViewModel.simulateLoadSpike). This branch has no live
+    // Gemini provider telemetry; the labels must say so.
     val breakerText = when (viewModel.circuitBreakerState) {
         "CLOSED" -> "CLOSED"
         "OPEN" -> "TRIPPED"
@@ -2297,13 +2302,13 @@ fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
             ) {
                 Column {
                     Text(
-                        text = "Gemini Resilient API Cockpit",
+                        text = "AI Simulation & Resilience Cockpit",
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
                         fontSize = 14.sp
                     )
                     Text(
-                        text = "Realtime safety constraints & hardware budgets",
+                        text = "Locally simulated load, cost & circuit behavior — not live Gemini telemetry",
                         color = ColorMutedGray,
                         fontSize = 11.sp
                     )
@@ -2317,7 +2322,7 @@ fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
                     shape = RoundedCornerShape(4.dp)
                 ) {
                     Text(
-                        text = "BREAKER: $breakerText",
+                        text = "SIM BREAKER: $breakerText",
                         color = breakerCol,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold,
@@ -2372,7 +2377,7 @@ fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
                         }
                     }
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text("API Rate Load", color = ColorMutedGray, fontSize = 10.sp)
+                    Text("Simulated API Rate Load", color = ColorMutedGray, fontSize = 10.sp)
                 }
 
                 // Dial 2: Cost metrics (USD Charges accumulated)
@@ -2412,7 +2417,7 @@ fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
                         }
                     }
                     Spacer(modifier = Modifier.height(6.dp))
-                    Text("Token Cost", color = ColorMutedGray, fontSize = 10.sp)
+                    Text("Simulated Token Cost", color = ColorMutedGray, fontSize = 10.sp)
                 }
 
                 // Dial 3: Circuit breaker visual gauge indicator
@@ -2454,7 +2459,7 @@ fun GeminiApiCockpit(viewModel: DevOpsViewModel) {
                     }
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = "BREAKER",
+                        text = "Simulated Circuit State",
                         color = breakerCol,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Bold

@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-C.2] — Android UI Truthfulness & Offline Gemini Contract (2026-10-08)
+
+### Corrected
+
+* **Root cause:** residual UI language still implied live Gemini
+  functionality even though the analysis path is offline/simulated on this
+  branch.
+* **Fix (labeling only — no architecture change):**
+  * Repository registration copy: "compile live blueprints via Gemini AI"
+    → "generate offline DevOps blueprints (on-device simulation — no live
+    Gemini calls on this branch)".
+  * Analysis button relabeled `Analyze (Offline AI)`; analysis action
+    comment updated; report box renamed to "AI Discovery Report (Offline)".
+  * "Gemini Resilient API Cockpit" (locally simulated metrics) renamed to
+    "AI Simulation & Resilience Cockpit" (`GeminiApiCockpit` →
+    `AiSimulationCockpit`); subtitle and metric labels now explicitly
+    state "Simulated API Rate Load", "Simulated Token Cost", "Simulated
+    Circuit State" / "not live Gemini telemetry". Simulation functionality
+    retained, honestly labeled.
+  * Gateway settings copy no longer claims the app routes deployments,
+    alerts, or code reviews to a remote server; the probe is labeled
+    diagnostics-only.
+* **Tests:** new UI truthfulness contract tests (stale live-Gemini phrases
+  forbidden; explicit offline/simulation language required; simulated
+  metric labels required) plus mutation M6, which reintroduces the stale
+  claims and proves the guard detects them. No security control changed.
+
 ## [8.7-C.1] — Android Remote-Analysis Contract Correction (2026-10-08)
 
 ### Corrected
