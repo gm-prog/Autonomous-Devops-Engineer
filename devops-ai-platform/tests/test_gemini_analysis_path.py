@@ -327,7 +327,14 @@ class TestAgentAnalysisBoundary:
     def test_malformed_provider_response_never_fabricated(self, bad):
         fake = FakeLLM(response=bad)
         with TestClient(_agent_app(llm=fake)) as client:
-            resp = client.post(INTERNAL_PATH, json=GOOD_BODY)
+            resp = client.post(
+                INTERNAL_PATH,
+                json=GOOD_BODY,
+                headers={
+                    "X-Gateway-Identity": "agent-test",
+                    "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef",
+                },
+            )
         assert resp.status_code == 502
         assert "analysis" not in resp.json()
 
