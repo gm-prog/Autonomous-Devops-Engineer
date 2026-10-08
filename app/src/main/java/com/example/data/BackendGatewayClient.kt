@@ -67,7 +67,7 @@ object BackendGatewayClient {
                 return@withContext response.isSuccessful || response.code == 404
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Failed connection test to $cleanUrl: ${e.message}")
+            Log.w(TAG, "Gateway connection probe failed: ${e.javaClass.simpleName}")
             try {
                 val healthRequest = Request.Builder()
                     .url("$cleanUrl/api/v1/health")
@@ -145,7 +145,7 @@ object BackendGatewayClient {
                 return@withContext parseAnalysisResponse(body)
             }
         } catch (e: Exception) {
-            Log.w(TAG, "Live analysis network failure: ${e.message}")
+            Log.w(TAG, "Live analysis network failure: ${e.javaClass.simpleName}")
             return@withContext AnalysisOutcome.Failure("Gateway unreachable: ${e.message}")
         }
     }
