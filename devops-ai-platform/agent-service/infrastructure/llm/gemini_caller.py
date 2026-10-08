@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
@@ -91,20 +92,38 @@ class BudgetExceededException(Exception):
 
 
 class GeminiBudgetService:
-    """Manages platform AI spend against a hard monthly ceiling (USD)."""
+    """Per-process calendar-month AI spend ceiling (USD).
 
-    # Pricing mappings matching gemini-3.5-flash (per 1M tokens).
-    INPUT_COST_PER_MILLION = 0.075
-    OUTPUT_COST_PER_MILLION = 0.30
+    This is a local safety guard, not a provider-account/global billing limit.
+    Horizontally scaled replicas require a shared budget store for a global
+    ceiling.
+    """
+
+    # Gemini 3.5 Flash Standard pricing (per 1M tokens).
+    INPUT_COST_PER_MILLION = 1.50
+    OUTPUT_COST_PER_MILLION = 9.00
 
     def __init__(self, monthly_budget_usd: float = 100.0):
         self.monthly_budget = float(monthly_budget_usd)
         self.accumulated_spend = 0.0
+        self._period_key = self._current_period_key()
+
+    @staticmethod
+    def _current_period_key() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m")
+
+    def _roll_period_if_needed(self) -> None:
+        current = self._current_period_key()
+        if current != self._period_key:
+            self._period_key = current
+            self.accumulated_spend = 0.0
 
     def check_budget(self) -> bool:
+        self._roll_period_if_needed()
         return self.accumulated_spend < self.monthly_budget
 
     def warn_if_low(self) -> None:
+        self._roll_period_if_needed()
         remaining = self.monthly_budget - self.accumulated_spend
         if remaining < 10.0:
             logger.warning(
@@ -113,6 +132,7 @@ class GeminiBudgetService:
             )
 
     def record_cost(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self._roll_period_if_needed()
         cost = (
             prompt_tokens * self.INPUT_COST_PER_MILLION / 1_000_000
         ) + (completion_tokens * self.OUTPUT_COST_PER_MILLION / 1_000_000)
