@@ -14,20 +14,16 @@ package com.example.data
  *
  * TRUTHFUL BEHAVIOR ON THIS BRANCH:
  *
- * This branch does NOT expose a verified live server-side Gemini backend
- * integration for the Android app. Repository analysis therefore ALWAYS runs
- * the deterministic, non-secret offline template engine below — the app
- * works completely without any provider credential and without a network
- * round-trip.
+ * This class is the deterministic offline engine. The Android app also has a
+ * separate authenticated server-side analysis path in BackendGatewayClient;
+ * that path carries only a platform JWT and keeps GEMINI_API_KEY server-side.
  *
- * Live server-side AI (Android -> authenticated platform backend -> Gemini,
- * with the key kept server-side) belongs to a later backend integration
- * phase. Until that phase lands in this branch:
+ * The live path must remain in the dedicated authenticated gateway client:
  *
  *  * do not add a `?key=` request path or any BuildConfig provider secret;
  *  * do not add fake/placeholder authentication headers presented as real
  *    security;
- *  * do not claim the app performs server-side Gemini analysis.
+ *  * keep this class network-free and non-secret.
  *
  * The CI job `android-secret-guards` fails the build if a Gemini secret or a
  * fictitious remote analysis path reappears.
