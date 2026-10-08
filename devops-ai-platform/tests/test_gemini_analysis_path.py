@@ -307,7 +307,7 @@ class TestAgentAnalysisBoundary:
     def test_successful_response_parsed_typed(self):
         fake = FakeLLM(response=GOOD_ASSETS)
         with TestClient(_agent_app(llm=fake)) as client:
-            resp = client.post(INTERNAL_PATH, json=GOOD_BODY)
+            resp = client.post(INTERNAL_PATH, json=GOOD_BODY, headers={"X-Gateway-Identity": "agent-test", "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef"})
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "ANALYSIS_COMPLETE"
@@ -370,7 +370,7 @@ class TestAgentAnalysisBoundary:
         payload = dict(GOOD_BODY)
         payload["repo_url"] = "no-scheme"
         with TestClient(_agent_app(llm=fake)) as client:
-            resp = client.post(INTERNAL_PATH, json=payload)
+            resp = client.post(INTERNAL_PATH, json=payload, headers={"X-Gateway-Identity": "agent-test", "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef"})
         assert resp.status_code == 422
         assert fake.calls == 0
 
@@ -606,7 +606,10 @@ class TestEndToEndFakeProvider:
             def call(self, method, url, json_body, identity):
                 resp = agent_client.post(
                     url, json=json_body,
-                    headers={"X-Gateway-Identity": identity},
+                    headers={
+                        "X-Gateway-Identity": identity,
+                        "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef",
+                    },
                 )
                 if resp.status_code != 200:
                     raise _downstream_http_error(resp.status_code)
