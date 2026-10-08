@@ -876,6 +876,256 @@ jobs:
             "${{ github.run_id }}" "${{ github.run_attempt }}" "${{ github.job }}" \
             "${ARTIFACT_ID}" "${DIGEST}"
 
+  kubernetes-traffic-mutation-e2e:
+    name: Phase 8.7-B.2 trusted traffic mutation E2E
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: devops-ai-platform } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip, cache-dependency-path: devops-ai-platform/requirements.txt }
+      - run: pip install -r requirements.txt
+      - name: Prove the phase's own safety controls before touching a cluster
+        run: |
+          set -euo pipefail
+          # These two modules are the phase's falsifiable specification: the
+          # provider's safety probes with their executed source-mutation
+          # controls, and the control-flow tests that run the real E2E driver
+          # against a stub cluster. Running them here means a red control
+          # fails THIS job too, instead of only being visible in another
+          # job's log.
+          PYTHONPATH=. python -m pytest -q \
+            tests/test_phase_8_7_b_2_trusted_traffic_mutation_provider.py \
+            tests/test_phase_8_7_b_2_driver_control_flow.py
+      - name: Record runtime prerequisites
+        run: |
+          set -euo pipefail
+          docker --version
+          kind --version
+          docker info --format 'daemon: {{.ServerVersion}}'
+      - name: Fetch kubectl against the committed checksum
+        run: |
+          set -euo pipefail
+          read -r KVER KSHA < <(grep -v '^#' e2e/pinned-kubectl.txt | grep -v '^$' | head -1)
+          curl -fsSL -o /tmp/kubectl \
+            "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+          echo "${KSHA}  /tmp/kubectl" | sha256sum -c -
+          chmod 0755 /tmp/kubectl
+          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      - name: Start a real Kind cluster
+        run: |
+          set -euo pipefail
+          PINS=e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          kind create cluster --name ares-mutation-e2e \
+            --image "$NODE_IMAGE" --config e2e/kind-config.yaml --wait 180s
+          kubectl --context kind-ares-mutation-e2e get nodes -o wide
+      # Every external byte this phase depends on is committed as a digest
+      # in e2e/pinned-traffic-topology.txt (its own parser, fail closed).
+      # Nothing resolves a tag or a floating reference here, and kubectl
+          # only
+      # ever sees a file whose sha256 was verified against the pin.
+      - name: Install the pinned Gateway API CRDs and Envoy Gateway
+        run: |
+          set -euo pipefail
+          CTX=kind-ares-mutation-e2e
+          while read -r KEY URL PIN; do
+            [ -n "${KEY:-}" ] || continue
+            curl -fsSL -o "/tmp/${KEY}.yaml" "$URL"
+            echo "${PIN#sha256:}  /tmp/${KEY}.yaml" | sha256sum -c -
+          done < <(PYTHONPATH=. python3 -m e2e.traffic_topology_pins \
+                     e2e/pinned-traffic-topology.txt --refs)
+          for KEY in GATEWAY_API_CRDS_URL ENVOY_GATEWAY_CRDS_URL ENVOY_GATEWAY_INSTALL_URL; do
+            printf '::notice title=8.7-B.2 pinned artifact::%s sha256=%s\n' \
+              "$KEY" "$(sha256sum "/tmp/${KEY}.yaml" | cut -d' ' -f1)"
+          done
+          # Server-side apply: the Gateway API CRD schemas exceed the
+          # client-side last-applied annotation limit, and it is idempotent.
+          kubectl --context "$CTX" apply --server-side -f /tmp/GATEWAY_API_CRDS_URL.yaml
+          kubectl --context "$CTX" wait --for=condition=Established --timeout=180s \
+            crd/gatewayclasses.gateway.networking.k8s.io \
+            crd/gateways.gateway.networking.k8s.io \
+            crd/httproutes.gateway.networking.k8s.io
+          kubectl --context "$CTX" apply --server-side -f /tmp/ENVOY_GATEWAY_CRDS_URL.yaml
+          kubectl --context "$CTX" apply --server-side -f /tmp/ENVOY_GATEWAY_INSTALL_URL.yaml
+          # Re-apply the pinned Gateway API CRDs so what is on the cluster
+          # is the pinned release even if the controller bundle shipped a
+          # different copy (the driver re-checks the installed version).
+          kubectl --context "$CTX" apply --server-side -f /tmp/GATEWAY_API_CRDS_URL.yaml
+          kubectl --context "$CTX" -n envoy-gateway-system \
+            wait --for=condition=Available --timeout=300s deployment/envoy-gateway
+          kubectl --context "$CTX" -n envoy-gateway-system get deployments,pods -o wide
+          kubectl --context "$CTX" get crd httproutes.gateway.networking.k8s.io \
+            -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}{"\n"}'
+      # The mutation step below is the only place in this workflow where an
+      # application module (not a test, not the harness) writes to a live
+      # cluster: the driver constructs the shipped provider, the provider
+      # observes through the Phase 8.7-B.1 observer, patches the HTTPRoute's
+      # backendRef weights through the shipped client, and re-observes. The
+      # driver's own state changes (proof states, the injected competing
+      # write) go through the topology driver and are recorded separately in
+      # the evidence as harness control.
+      - name: Apply, verify, roll back and refuse over the live routing
+        run: |
+          set -euo pipefail
+          PINS=e2e/pinned-images.txt
+          while read -r KEY REF; do
+            [ -n "${KEY:-}" ] || continue
+            export "$KEY=$REF"
+          done < <(PYTHONPATH=. python3 -m e2e.image_pins "$PINS" --refs)
+          # The loop above reads from a process substitution, which cannot
+          # fail the step by itself: the one build input this step depends
+          # on is therefore checked explicitly instead of failing later as
+          # an unset variable.
+          if [ -z "${E2E_PYTHON_BASE_IMAGE:-}" ]; then
+            printf '::error title=8.7-B.2 build input::%s\n' \
+              'e2e/pinned-images.txt did not export E2E_PYTHON_BASE_IMAGE'
+            exit 1
+          fi
+          # Artifact and raw-log retrieval is unreliable for this
+          # repository, so EVERY failure below is mirrored into the step
+          # summary and into ::error annotations: a build or a load that
+          # fails silently would otherwise be undiagnosable from the run
+          # page alone.
+          build_image() {
+            local tag="$1"; shift
+            local logfile="/tmp/build-${tag%%:*}.log"
+            local code=0
+            docker build --progress=plain "$@" -t "$tag" >"$logfile" 2>&1 || code=$?
+            tail -n 25 "$logfile"
+            if [ "$code" != "0" ]; then
+              printf '::error title=8.7-B.2 image build failed (%s)::exit %s: %s\n' \
+                "$tag" "$code" "$(tail -n 1 "$logfile")"
+              {
+                echo "### Phase 8.7-B.2 image build failed: ${tag} (exit ${code})"
+                echo '```'
+                tail -c 6000 "$logfile"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit "$code"
+            fi
+            printf '::notice title=8.7-B.2 image built::%s id=%s\n' \
+              "$tag" "$(docker image inspect --format '{{.Id}}' "$tag")"
+          }
+          load_image() {
+            local image="$1"
+            local logfile="/tmp/load-${image%%:*}.log"
+            local code=0
+            kind load docker-image "$image" --name ares-mutation-e2e \
+              >"$logfile" 2>&1 || code=$?
+            tail -n 10 "$logfile"
+            if [ "$code" != "0" ]; then
+              printf '::error title=8.7-B.2 image load failed (%s)::exit %s: %s\n' \
+                "$image" "$code" "$(tail -n 1 "$logfile")"
+              {
+                echo "### Phase 8.7-B.2 image load failed: ${image} (exit ${code})"
+                echo '```'
+                tail -c 4000 "$logfile"
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit "$code"
+            fi
+          }
+          # Two builds of ONE workload fixture with different tracks: the
+          # stable and canary backends differ in image identity as well as
+          # in Deployment, so "two real workloads" is observable.
+          build_image ares-mutation-stable:local \
+            -f e2e/traffic-topology/workload/Dockerfile \
+            --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" --build-arg TRACK=stable \
+            e2e/traffic-topology/workload
+          build_image ares-mutation-canary:local \
+            -f e2e/traffic-topology/workload/Dockerfile \
+            --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" --build-arg TRACK=canary \
+            e2e/traffic-topology/workload
+          build_image ares-mutation-sampler:local \
+            -f e2e/traffic-topology/sampler/Dockerfile \
+            --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" \
+            e2e/traffic-topology/sampler
+          for IMAGE in ares-mutation-stable:local ares-mutation-canary:local \
+                       ares-mutation-sampler:local; do
+            load_image "$IMAGE"
+          done
+          # Artifact and raw-log retrieval is unreliable for this
+          # repository, so the driver's output is mirrored into the step
+          # summary and annotations here. Without this, a crash before the
+          # driver can seal evidence would be invisible.
+          #
+          # The driver's pass/fail is derived from its own reads: the route's
+          # backendRef weights, the B.1 observation, and a statistical
+          # data-plane cross-check. It never trusts a returned result object.
+          set +e
+          PYTHONPATH=. python e2e/traffic_mutation_kind_e2e.py \
+            --cluster ares-mutation-e2e \
+            --stable-image ares-mutation-stable:local \
+            --canary-image ares-mutation-canary:local \
+            --sampler-image ares-mutation-sampler:local \
+            --deployment-run-id "$GITHUB_RUN_ID" \
+            --expected-commit "$GITHUB_SHA" \
+            --gateway-api-version v1.4.1 \
+            --envoy-gateway-version v1.6.7 \
+            --destroy-cluster \
+            --evidence traffic-mutation-e2e.json 2>&1 | tee /tmp/8.7-b2.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE" != "0" ]; then
+            {
+              echo '### Phase 8.7-B.2 traffic mutation output (tail)'
+              echo '```'
+              tail -c 14000 /tmp/8.7-b2.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ ! -f traffic-mutation-e2e.json ]; then
+              tail -n 8 /tmp/8.7-b2.log | while IFS= read -r LINE; do
+                printf '::error title=8.7-B.2 crash::%s\n' "${LINE//$'\r'/}"
+              done
+            fi
+          fi
+          exit "$CODE"
+      - name: Publish live evidence
+        if: always()
+        run: |
+          set +e
+          if [ -f traffic-mutation-e2e.json ]; then
+            {
+              echo '### Phase 8.7-B.2 trusted traffic mutation evidence'
+              echo '```json'
+              cat traffic-mutation-e2e.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Tear down the cluster
+        if: always()
+        run: kind delete cluster --name ares-mutation-e2e || true
+      - uses: actions/upload-artifact@v4
+        id: upload-traffic-mutation-evidence
+        if: always()
+        with:
+          name: traffic-mutation-e2e-evidence
+          path: |
+            devops-ai-platform/traffic-mutation-e2e.json
+            devops-ai-platform/traffic-mutation-e2e.json.sha256
+          if-no-files-found: warn
+      - name: Publish evidence provenance
+        if: always()
+        run: |
+          set +e
+          DIGEST=$(cat traffic-mutation-e2e.json.sha256 2>/dev/null)
+          ARTIFACT_ID="${{ steps.upload-traffic-mutation-evidence.outputs.artifact-id }}"
+          {
+            echo '### Phase 8.7-B.2 trusted traffic mutation provenance'
+            echo "- python_run_id: ${{ github.run_id }} (attempt ${{ github.run_attempt }})"
+            echo "- job_key: ${{ github.job }}"
+            echo "- artifact_id: ${ARTIFACT_ID}"
+            echo "- evidence_digest: ${DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf '::notice title=8.7-B.2 evidence provenance::run_id=%s attempt=%s job=%s artifact_id=%s digest=%s\n' \
+            "${{ github.run_id }}" "${{ github.run_attempt }}" "${{ github.job }}" \
+            "${ARTIFACT_ID}" "${DIGEST}"
+
+
   api-gateway:
     name: API gateway checks
     runs-on: ubuntu-latest
