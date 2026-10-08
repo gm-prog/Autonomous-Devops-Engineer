@@ -19,7 +19,9 @@ Trust model
 
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -50,6 +52,26 @@ logger = logging.getLogger("AgentAnalysisRouter")
 router = APIRouter(prefix="/api/internal", tags=["Agent Internal"])
 
 
+INTERNAL_TOKEN_HEADER = "X-Agent-Internal-Token"
+IDENTITY_HEADER = "X-Gateway-Identity"
+
+
+def require_gateway_internal_auth(
+    internal_token: Optional[str] = Header(default=None, alias=INTERNAL_TOKEN_HEADER),
+    gateway_identity: Optional[str] = Header(default=None, alias=IDENTITY_HEADER),
+) -> str:
+    """Authenticate the gateway-to-agent hop before any provider call."""
+    expected = os.getenv("AGENT_INTERNAL_TOKEN", "").strip()
+    if len(expected) < 32:
+        logger.error("AGENT_INTERNAL_TOKEN is missing or too short; refusing internal analysis.")
+        raise HTTPException(status_code=503, detail="Agent internal authentication is not configured.")
+    if not gateway_identity or not gateway_identity.strip():
+        raise HTTPException(status_code=401, detail="Gateway identity header is required.")
+    if not internal_token or not hmac.compare_digest(internal_token, expected):
+        raise HTTPException(status_code=401, detail="Invalid internal gateway credential.")
+    return gateway_identity.strip()
+
+
 # ---------------------------------------------------------------------------
 # Strict, typed contract (no provider credential field is accepted)
 # ---------------------------------------------------------------------------
@@ -65,7 +87,6 @@ class RepositoryAnalysisRequest(BaseModel):
     repo_url: str = Field(min_length=1, max_length=MAX_REPO_URL, pattern=r"^[a-zA-Z][a-zA-Z0-9+.\-]*://\S+$")
     framework: str = Field(min_length=1, max_length=MAX_FIELD)
     technology: str = Field(min_length=1, max_length=MAX_FIELD)
-    authorizing_identity: Optional[str] = Field(default=None, max_length=200)
 
 
 class RepositoryAnalysisResponse(BaseModel):
@@ -76,7 +97,7 @@ class RepositoryAnalysisResponse(BaseModel):
 
     status: str = "ANALYSIS_COMPLETE"
     source: str = "server_gemini"
-    analysis: dict
+    analysis: dict[str, str]
 
 
 # ---------------------------------------------------------------------------
@@ -118,13 +139,10 @@ def _handle_failure(exc: Exception) -> HTTPException:
 def analyze_repository(
     body: RepositoryAnalysisRequest,
     handler: AnalyzeRepositoryCommandHandler = Depends(get_analysis_handler),
-    x_gateway_identity: Optional[str] = Header(default=None, alias="X-Gateway-Identity"),
+    identity: str = Depends(require_gateway_internal_auth),
 ):
     """Run validated repository analysis via the server-side Gemini path."""
-    identity = body.authorizing_identity or x_gateway_identity
-    if identity:
-        # Identity propagation for audit only; never combined with secrets.
-        logger.info("Internal analysis request by identity=%s.", identity)
+    logger.info("Internal analysis request by identity=%s.", identity)
     try:
         assets = handler.handle(
             AnalyzeRepositoryCommand(
