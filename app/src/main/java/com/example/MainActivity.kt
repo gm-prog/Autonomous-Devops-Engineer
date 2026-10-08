@@ -1755,7 +1755,7 @@ fun ImportRepositoryDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 Text(
-                    "Register repository parameters to generate DevOps blueprints offline by default; authenticated live backend analysis can be enabled in Settings.",
+                    "Register repository parameters to generate offline DevOps blueprints by default; authenticated live backend analysis can be enabled in Settings.",
                     color = ColorMutedGray,
                     fontSize = 11.sp
                 )
