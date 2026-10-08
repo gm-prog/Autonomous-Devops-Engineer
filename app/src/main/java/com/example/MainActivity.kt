@@ -15,6 +15,8 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
@@ -313,7 +315,7 @@ fun DevOpsNavigationBar(activeTab: Int, onTabSelected: (Int) -> Unit) {
             NavigationItemData("Hub", Icons.Default.Home, 0),
             NavigationItemData("Repos", Icons.Default.Build, 1),
             NavigationItemData("Topology", Icons.Default.Share, 2),
-            NavigationItemData("Monitor", Icons.Default.List, 3),
+            NavigationItemData("Monitor", Icons.AutoMirrored.Filled.List, 3),
             NavigationItemData("Incidents", Icons.Default.Warning, 4)
         )
 
@@ -2791,7 +2793,7 @@ fun HumanInTheLoopAuthorizationView(
                         )
                     } else {
                         Icon(
-                            imageVector = Icons.Default.ArrowForward,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                             contentDescription = "Swipe Arrow",
                             tint = ColorDarkBg,
                             modifier = Modifier.size(20.dp)

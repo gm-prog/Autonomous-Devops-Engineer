@@ -33,6 +33,15 @@ PLATFORM_ROOT = REPO_ROOT / "devops-ai-platform"
 # test collection.  Individual tests build apps with explicit env mappings.
 os.environ.setdefault("JWT_SECRET", "unit-test-process-jwt-secret-0123456789ab")
 
+# The test PROCESS is a single-instance test deployment.  Phase 8.7-D.1-
+# CORRECTION-2 (P1-B) treats an EMPTY/MISSING APP_ENV as non-development
+# (fail closed: shared store required), so the process environment must
+# EXPLICITLY declare the recognized test environment — development mode is
+# enabled by an exact value, never inferred.  Tests that assert the
+# fail-closed classification pass explicit env mappings and are unaffected
+# by this process-level declaration.
+os.environ.setdefault("APP_ENV", "test")
+
 # Make the guard package importable in-process.
 if str(PLATFORM_ROOT) not in sys.path:
     sys.path.insert(0, str(PLATFORM_ROOT))

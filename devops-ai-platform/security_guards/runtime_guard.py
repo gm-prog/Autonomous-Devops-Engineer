@@ -46,6 +46,51 @@ def _dockerfile_exists(repo_root: Path, build) -> bool:
     return (repo_root / PLATFORM / context / dockerfile).is_file()
 
 
+def _check_redis_integration_contract(repo_root: Path, violations: List[str]) -> None:
+    """Fail-closed contract for the real-Redis CI gate (P1-C / M24)."""
+    ci_path = repo_root / CI_WORKFLOW
+    if not ci_path.is_file():
+        violations.append("CI workflow file is missing (cannot verify the Redis gate contract)")
+        return
+    try:
+        wf = yaml.safe_load(ci_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        violations.append(f"CI workflow is not valid YAML: {exc}")
+        return
+    jobs = (wf or {}).get("jobs") or {}
+    redis_job = jobs.get("redis-integration")
+    if not isinstance(redis_job, dict):
+        violations.append("CI workflow is missing the redis-integration job")
+        return
+    live_store_steps = []
+    for step in redis_job.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        run = str(step.get("run") or "")
+        if "tests/test_redis_integration.py" in run or "tests/test_security_mutations.py" in run:
+            live_store_steps.append(step)
+    if not live_store_steps:
+        violations.append(
+            "redis-integration job does not run the real-Redis test suite"
+        )
+        return
+    for step in live_store_steps:
+        name = str(step.get("name") or "<unnamed>")
+        env = step.get("env") or {}
+        if not str(env.get("REDIS_URL", "")).startswith("redis://"):
+            violations.append(
+                f"redis-integration step '{name}' must set REDIS_URL "
+                "(live store required)"
+            )
+        if str(env.get("REDIS_INTEGRATION_REQUIRED", "")) != "true":
+            violations.append(
+                f"redis-integration step '{name}' must set "
+                "REDIS_INTEGRATION_REQUIRED=true: without it a missing or "
+                "unreachable store turns the mandatory gate into silent "
+                "skips instead of a hard failure"
+            )
+
+
 def check_runtime_contract(repo_root: Path) -> List[str]:
     """Structural contract for the canonical D1 runtime (violations list)."""
     violations: List[str] = []
@@ -105,6 +150,15 @@ def check_runtime_contract(repo_root: Path) -> List[str]:
     ci_src = ci_path.read_text(encoding="utf-8") if ci_path.is_file() else ""
     if "docker compose config" not in ci_src:
         violations.append("CI does not run 'docker compose config' on the canonical stack")
+
+    # Phase 8.7-D.1-CORRECTION-2 (P1-C, mutation M24): the redis-
+    # integration job's live-store steps must run FAIL-CLOSED — every step
+    # that executes the real-Redis suite must set REDIS_URL AND
+    # REDIS_INTEGRATION_REQUIRED=true.  Without the flag, a missing or
+    # unreachable store degrades the mandatory gate into a silent skip
+    # (green CI, zero Redis tests executed), so the contract is checked
+    # here, structurally, on every structural-guards run.
+    _check_redis_integration_contract(repo_root, violations)
     for svc in _BUILT_SERVICES:
         if f"dockerfile: ./{svc}/Dockerfile" not in compose_path.read_text(encoding="utf-8"):
             violations.append(

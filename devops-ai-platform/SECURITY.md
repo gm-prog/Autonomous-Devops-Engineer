@@ -1,4 +1,4 @@
-# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION)
+# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION / 8.7-D.1-CORRECTION-2)
 
 This document describes the **current** trust model of the platform after the
 Phase 8.7-C security integrity corrections, the Phase 8.7-D.1 production
@@ -215,11 +215,16 @@ source** (AST where meaningful) so these weaknesses cannot silently return:
 * `jwt-fail-closed` — no bundled `JWT_SECRET` fallback, no hard-coded signing
   secret, legacy secret quarantined, development fallback gated behind the
   explicit switch.
-* `d1-runtime-contract` (Phase 8.7-D.1) — the canonical compose stack
-  declares gateway + agent + redis with existing Dockerfiles, digest-pinned
-  third-party images, no host-exposed ports except gateway 8000, CI builds
-  both service images, and the quarantined legacy stack carries no hardcoded
-  database password.
+* `d1-runtime-contract` (Phase 8.7-D.1; extended by 8.7-D.1-CORRECTION-2) —
+  the canonical compose stack declares gateway + agent + redis with
+  existing Dockerfiles, digest-pinned third-party images, no host-exposed
+  ports except gateway 8000, CI builds both service images, the
+  quarantined legacy stack carries no hardcoded database password, and
+  (P1-C) the `redis-integration` CI job's live-store steps are FAIL-CLOSED:
+  every step that executes the real-Redis suite must set both `REDIS_URL`
+  and `REDIS_INTEGRATION_REQUIRED=true`, so a missing store is a hard test
+  failure, never a silent skip that turns the mandatory gate green with
+  zero Redis tests executed (removal is detected by mutation M24).
 
 Run locally:
 
@@ -289,19 +294,29 @@ actual cost is committed when present, and the **full reservation is kept
 when usage metadata is missing** (never undercount). Any failure path keeps
 the full reservation.
 
-**Finalize is exactly-once per reservation.** The ledger's finalize step
-returns a boolean: the accounting is applied at most once per
-`reservation_id`. On the shared store this is enforced atomically *inside
-the Redis script* — a period-scoped claim key
-(`devops:gemini:budget:{period}:finalized:{reservation_id}`, TTL-bound with
-the period key) is checked and set in the same atomic operation as the
-reservation release, so duplicate finalization calls (client retries,
-crash/restart redelivery, concurrent duplicate handling) **cannot
-double-subtract the reserved pool or double-count committed spend**, and
-the guarantee holds across replicas. The release itself uses
+**Finalize is exactly-once per reservation while the finalization claim is
+retained.** The ledger's finalize step returns a boolean: the accounting
+is applied at most once per `reservation_id` for as long as its claim is
+retained. On the shared store this is enforced atomically *inside the
+Redis script* — a period-scoped claim key
+(`devops:gemini:budget:{period}:finalized:{reservation_id}`) is checked
+and set in the same atomic operation as the reservation release, so
+duplicate finalization calls (client retries, crash/restart redelivery,
+concurrent duplicate handling) **cannot double-subtract the reserved pool
+or double-count committed spend**, and the guarantee holds across
+replicas. **Retention window (Phase 8.7-D.1-CORRECTION-2, stated
+explicitly):** the claim key carries a **45-day TTL** — longer than one
+UTC calendar billing period — so the claim outlives every period it can
+belong to, and any duplicate finalization within the billing window is
+guaranteed to be rejected. After the claim expires (≥ 45 days after
+finalization), a redelivered finalize can at most re-create counters of
+the ALREADY-EXPIRED period (whose keys are also gone or irrelevant) — it
+can never affect the current period's budget, because the claim key is
+scoped to the reservation's original period. The release itself uses
 `INCRBYFLOAT reserved -amount` (Redis has no `DECRBYFLOAT`; the script was
-verified against a real Redis 7.2.5 server). The in-process ledger enforces
-the same once-per-reservation contract with a lock-protected set.
+verified against a real Redis 7.2.5 server). The in-process ledger
+enforces the same once-per-reservation contract with a lock-protected set
+retained for the process lifetime.
 
 * `GEMINI_BUDGET_STORE=local` (default): lock-protected in-process ledger —
   an **explicit single-process deployment contract**; the ceiling is per
@@ -320,19 +335,32 @@ Google-side spend controls (billing budget alerts, key-level restrictions,
 IAM) are a separate operator responsibility on the provider account and are
 not enforced by this platform.
 
-**Production shared-state contract (Phase 8.7-D.1-CORRECTION).** When
-`APP_ENV` is `staging` or `production`, the process **refuses to start**
-(fail-closed configuration error) unless the shared Redis store backs
-**both** the budget ledger (`GEMINI_BUDGET_STORE=redis` + `REDIS_URL`) and
-the analysis rate limiter (see 6.4). The only documented exception is an
+**Production shared-state contract (Phase 8.7-D.1-CORRECTION; environment
+classification extended by Phase 8.7-D.1-CORRECTION-2, P1-B).** The
+in-process (single-instance) stores may only be used in the **explicitly
+recognized development environments `development` and `test`**. Every
+other `APP_ENV` value — `staging`, `production`, an **empty** string, a
+**missing** variable, or any **unexpected** value — is treated as
+**NON-DEVELOPMENT**, and the process **refuses to start** (fail-closed
+configuration error) unless the shared Redis store backs **both** the
+budget ledger (`GEMINI_BUDGET_STORE=redis` + `REDIS_URL`) and the
+analysis rate limiter (see 6.4). An environment that cannot be positively
+identified as a development environment must never silently fall back to
+single-instance state — an unset `APP_ENV` is therefore NOT a safe local
+default; it is a configuration error. The only documented exception is an
 explicit single-replica mode, enabled only by setting the exact value
 `true` (case-sensitive; surrounding whitespace is stripped) of
 `GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION` and/or
 `ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION` — the flag cannot be
 tripped accidentally (`True`, `TRUE`, `yes`, `1`, … are all rejected).
-`dev`/local development keeps the in-process stores. The canonical compose
-stack runs the agent with `APP_ENV=production` and both stores on shared
-Redis, satisfying the contract by construction.
+`development`/`test` deployments keep the in-process stores. The canonical
+compose stack runs the agent with `APP_ENV=production` and both stores on
+shared Redis, satisfying the contract by construction. The classification
+is enforced in BOTH `GeminiRuntimeConfig.from_env` (agent budget ledger)
+and `load_analysis_rate_limit_settings` (gateway rate limiter), with the
+full environment matrix (development / test / staging / production /
+empty / missing / unexpected, each ± Redis) covered by
+`TestAppEnvClassificationMatrix` in `tests/test_analysis_rate_limiting.py`.
 
 ### 6.3 Current, bounded provider contract (P0-6)
 
@@ -421,11 +449,19 @@ build removed from the canonical runtime, **M18** deprecated model / removed
 output bound, **M19** exactly-once finalize claim removed from the Redis
 finalize script (structural guard in the security job; behavioral proof —
 the weakened script double-counts a duplicate finalization — runs in the
-real-Redis integration job), **M20** production shared-state requirement
-bypassed (production + in-process stores silently allowed), **M21**
-half-open single-probe lease removed (multiple concurrent probes).
+real-Redis integration job), **M20** non-development shared-state
+requirement bypassed (staging/production/empty/missing/unexpected
+`APP_ENV` + in-process stores silently allowed), **M21** half-open
+single-probe lease removed (multiple concurrent probes), **M22** pre-
+provider probe-lease settlement bypassed (circuit wedges `HALF-OPEN`
+forever), **M23** empty/missing `APP_ENV` admitted to single-instance
+local state in either the gateway or the agent classification, **M24**
+`REDIS_INTEGRATION_REQUIRED=true` removed from the CI redis-integration
+job (the mandatory real-Redis gate degrades into silent skips — detected
+structurally by the `d1-runtime-contract` guard AND behaviorally by the
+fixture's fail-closed resolution).
 
-### 6.8 Single half-open probe lease (circuit recovery, Phase 8.7-D.1-CORRECTION)
+### 6.8 Single half-open probe lease (circuit recovery, Phase 8.7-D.1-CORRECTION; lease settlement hardened in Phase 8.7-D.1-CORRECTION-2)
 
 The provider circuit breaker uses three states — `CLOSED`, `OPEN`,
 `HALF-OPEN` — under a single state lock, so the recovery transition is
@@ -441,6 +477,36 @@ after the cooldown produce exactly **one** provider call and N−1 fast
 failures, and a recovering probe closes the circuit. Removal is proven
 adversarial by M21 (the weakened breaker lets all N racers probe).
 
+**Probe-lease settlement contract (Phase 8.7-D.1-CORRECTION-2, P1-A).**
+The lease is settled through exactly **one exception-safe finalization
+path** in `_generate_text`: the entire post-admission section (precondition
+checks, budget reservation, provider contact) is wrapped in a single
+`try/except` that settles the lease on ANY failure — there is no
+per-branch remember-to-settle discipline that an exception could bypass.
+The outcomes:
+
+* provider **success** → `CLOSED` (`_register_success`);
+* provider **failure** → `OPEN` with a fresh cooldown (`_register_failure`);
+* **pre-provider** failure — missing `GEMINI_API_KEY`, budget store
+  unavailable, budget ceiling exceeded → `OPEN` with a **fresh cooldown**
+  (`_settle_failed_probe`). Deliberately **not** `CLOSED`: an
+  unconfigured or budget-exhausted deployment must not stream unlimited
+  doomed probes; and never an unsettled `HALF-OPEN`, which would wedge
+  every future call into a permanent fast-fail with no probe ever
+  permitted again.
+
+Settlement is idempotent: `_settle_failed_probe` is a no-op when the probe
+was already settled by `_register_success`/`_register_failure` (both
+transitions run under the same state lock), so the lease settles exactly
+once. Coverage: A1 (missing key), A2 (budget store down), A3 (budget
+ceiling), A4 (provider failure → OPEN), A5 (recovery → CLOSED), A6
+(20-concurrent pre-provider failure leaves no permanent `HALF-OPEN`) — in
+`tests/test_gemini_analysis_path.py`. The bypass is proven adversarial by
+**M22** (with the settlement call removed, a pre-provider failure wedges
+the circuit `HALF-OPEN`: ten fresh cooldowns pass, the credential is
+restored and the provider is healthy, and the circuit still never probes
+again).
+
 ---
 
 ## 7. Known limitations (honest)
@@ -452,10 +518,13 @@ adversarial by M21 (the weakened breaker lets all N racers probe).
   must share the nonce store (e.g. Redis) to keep replay protection global.
 * The Android unit tests (including `GeminiClientSecretPolicyTest.kt` and
   the Phase 8.7-D.1 `AnalysisUrlPolicyTest.kt`) run under a real Gradle
-  toolchain in the `android-unit-tests` CI job (JDK 17, AGP 9.1.1,
-  Gradle 9.3.1) and locally via `gradle :app:testDebugUnitTest` on machines
-  with a JDK/Android SDK; the Python static guards additionally hold on any
-  machine without a JDK.
+  toolchain in the `android-unit-tests` CI job (JDK 21, AGP 9.1.1,
+  Gradle 9.3.1 — the job verifies the pinned executable by absolute path,
+  `/opt/gradle/gradle-9.3.1/bin/gradle`, for the version check, the test
+  run, and the `assembleDebug` build, so the log proves the exact
+  toolchain that executed) and locally via
+  `gradle :app:testDebugUnitTest` on machines with a JDK/Android SDK; the
+  Python static guards additionally hold on any machine without a JDK.
 * mTLS between producer and monitoring service is not yet deployed; the HMAC
   envelope is the current machine-authentication mechanism and assumes
   network-level segregation of `/api/internal` endpoints.

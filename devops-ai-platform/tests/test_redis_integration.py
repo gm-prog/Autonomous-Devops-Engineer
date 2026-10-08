@@ -21,20 +21,32 @@ import os
 import pytest
 
 
-@pytest.fixture()
-def live_redis_url():
-    """Live store URL; the disposable store is flushed before and after
-    each test so the shared-key tests are deterministic."""
+def resolve_live_redis_url():
+    """Resolve the live store URL with the FAIL-CLOSED contract (P1-C).
+
+    A missing/empty ``REDIS_URL`` is a HARD failure when
+    ``REDIS_INTEGRATION_REQUIRED=true`` (the CI contract — never a silent
+    skip that would turn the mandatory gate green with zero Redis tests
+    executed); otherwise it is an explicit local skip.  Returns the URL on
+    success.  This is a plain function (not a fixture) so the fail-closed
+    decision itself is directly unit-testable (mutation M24).
+    """
     url = os.environ.get("REDIS_URL", "").strip()
     if not url:
-        # The redis-integration CI job sets REDIS_INTEGRATION_REQUIRED=true:
-        # there a missing store is a hard failure (never a silent skip).
         if os.environ.get("REDIS_INTEGRATION_REQUIRED") == "true":
             pytest.fail(
                 "CI must provide REDIS_URL for the real-Redis integration "
                 "tests (redis-integration job)."
             )
         pytest.skip("REDIS_URL not set locally; runs in CI (redis-integration job)")
+    return url
+
+
+@pytest.fixture()
+def live_redis_url():
+    """Live store URL; the disposable store is flushed before and after
+    each test so the shared-key tests are deterministic."""
+    url = resolve_live_redis_url()
     import redis
 
     client = redis.Redis.from_url(url, socket_connect_timeout=3, socket_timeout=3)

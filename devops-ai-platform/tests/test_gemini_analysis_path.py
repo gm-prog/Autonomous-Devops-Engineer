@@ -139,10 +139,24 @@ def agent_internal_token(monkeypatch):
     monkeypatch.setenv("AGENT_INTERNAL_TOKEN", "test-agent-internal-token-0123456789abcdef0123456789abcdef")
 
 
-def _agent_app(llm=None):
+def _agent_app(llm=None, config=None):
     from platform_pkg.agent.main import create_app
 
-    return create_app(llm_engine=llm)
+    return create_app(llm_engine=llm, config=config)
+
+
+def _single_replica_test_config():
+    """Explicit single-replica test deployment config.
+
+    Phase 8.7-D.1-CORRECTION-2 (P1-B): an EMPTY/MISSING APP_ENV is no
+    longer a recognized development environment, so the default
+    (local-store) adapter must not be resolved from the test process
+    environment implicitly.  These tests are single-replica deployments
+    and therefore opt in with an EXPLICIT config — the same documented
+    single-instance mechanism the production code requires."""
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    return gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001)
 
 
 def _gateway_app():
@@ -301,7 +315,7 @@ class TestAgentAnalysisBoundary:
     def test_missing_server_gemini_secret_fails_closed(self, monkeypatch):
         """No server key => 503, and NEVER a fabricated analysis."""
         monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-        with TestClient(_agent_app()) as client:
+        with TestClient(_agent_app(config=_single_replica_test_config())) as client:
             resp = client.post(INTERNAL_PATH, json=GOOD_BODY, headers={"X-Gateway-Identity": "agent-test", "X-Agent-Internal-Token": "test-agent-internal-token-0123456789abcdef0123456789abcdef"})
         assert resp.status_code == 503
         assert "analysis" not in resp.json()
@@ -392,8 +406,11 @@ class TestAgentAnalysisBoundary:
 def _caller(transport=None, **kw):
     from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
 
+    # Explicit single-replica config: never resolves the store from the
+    # test process environment (P1-B fail-closed classification).
     defaults = dict(
         api_key="test-server-key",
+        config=gc.GeminiRuntimeConfig(),
         max_retries=3,
         backoff_base_seconds=0.01,
         timeout_seconds=5.0,
@@ -596,10 +613,11 @@ class TestEndToEndFakeProvider:
             "usageMetadata": {"promptTokenCount": 300, "candidatesTokenCount": 900},
         }
 
-        agent_app = agent_create_app()
+        agent_app = agent_create_app(config=_single_replica_test_config())
         # Wire the production caller with a fake provider transport:
         caller = gc.GeminiCallerAdapter(
             api_key="server-side-test-key",
+            config=_single_replica_test_config(),
             transport=lambda _p: _gemini_http(200, provider_payload),
             backoff_base_seconds=0.01,
         )
@@ -868,3 +886,219 @@ class TestHalfOpenSingleProbe:
         text = adapter.generate_remediation("p", "s")
         assert json.loads(text) == GOOD_ASSETS
         assert ok.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-2 (P1-A): probe-lease settlement for PRE-provider
+# failures — A1 (missing key), A2 (budget store down), A3 (budget ceiling),
+# A6 (20-concurrent pre-provider failure must not wedge HALF-OPEN).
+# A4 (provider failure -> OPEN) and A5 (recovery -> CLOSED) are the two
+# tests above them in TestHalfOpenSingleProbe.
+# ---------------------------------------------------------------------------
+
+
+class _FailingBudgetLedger:
+    """Budget ledger double whose reserve() fails BEFORE provider contact
+    (budget store unavailable / budget ceiling)."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+
+    def reserve(self, max_cost_usd: float):
+        raise self._exc
+
+    def finalize(self, reservation, actual_cost_usd):  # pragma: no cover
+        raise AssertionError("finalize must not run when reserve() failed")
+
+    @property
+    def accumulated_spend(self):
+        return 0.0
+
+
+def _direct_probe_adapter(**kwargs):
+    """A GeminiCallerAdapter built with an EXPLICIT single-replica config
+    (no from_env) so the probe-lifecycle tests are independent of the
+    process environment; transport/clock are injected like everywhere else."""
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    return gc.GeminiCallerAdapter(
+        config=gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001),
+        **kwargs,
+    )
+
+
+class _HalfOpenProbeBase:
+    """Shared driver for the pre-provider settlement tests (A1–A3)."""
+
+    def _open_circuit(self, adapter, transport, clock, n_failures: int = 5):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiUpstreamException,
+        )
+
+        adapter._transport = transport
+        for _ in range(n_failures):
+            with pytest.raises(GeminiUpstreamException):
+                adapter.generate_remediation("p", "s")
+        assert adapter.cb_state == "OPEN"
+
+    def _assert_settled_open_with_fresh_cooldown(self, adapter, clock, recover=None):
+        """The probe lease must have settled to OPEN (never a permanent
+        HALF-OPEN) with a fresh cooldown: an immediate call fails fast with
+        no provider contact, and the circuit can still recover afterwards.
+        ``recover`` (optional) may repair whatever the test broke for the
+        recovery probe (e.g. restore the credential)."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        assert adapter.cb_state == "OPEN", (
+            "pre-provider failure must settle the probe lease to OPEN with "
+            f"a fresh cooldown — the circuit must never remain {adapter.cb_state}"
+        )
+        transport_calls_before = adapter._transport.calls
+        with pytest.raises(gc.GeminiServiceUnavailableException):
+            adapter.generate_remediation("p", "s")
+        assert adapter._transport.calls == transport_calls_before, (
+            "a settled OPEN circuit must fail fast without provider contact"
+        )
+        # The settled state must not be a dead end: after the fresh
+        # cooldown the single probe can recover the circuit.  (A healthy
+        # budget service is restored first — the A2/A3 pre-provider fault
+        # is what is under test, not the ledger itself.)
+        clock["now"] += 61
+        adapter.budget_service = gc.build_budget_ledger(adapter.config)
+        adapter._transport = _SuccessProviderTransport()
+        if recover is not None:
+            recover(adapter)
+        assert json.loads(adapter.generate_remediation("p", "s")) == GOOD_ASSETS
+        assert adapter.cb_state == "CLOSED"
+
+
+class TestProbeLeaseSettlesOnPreProviderFailure(_HalfOpenProbeBase):
+    """A pre-provider exception after acquiring the half-open lease must
+    settle the lease (OPEN + fresh cooldown) — the audit defect P1-A left
+    the circuit HALF-OPEN forever on exactly these paths."""
+
+    def test_a1_probe_lease_settles_when_api_key_missing(self, monkeypatch):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        # Circuit opens while configured; the key is lost afterwards
+        # (mid-flight credential loss), so the next admitted call fails
+        # pre-provider while holding the half-open lease.
+        adapter = _direct_probe_adapter(
+            api_key="a1-test-key-not-a-real-credential"
+        )
+        clock = {"now": 3_000_000.0}
+        adapter._time_fn = lambda: clock["now"]
+        self._open_circuit(adapter, _FailingProviderTransport(), clock)
+        adapter.api_key = ""
+
+        clock["now"] += 61  # cooldown elapsed -> this call takes the lease
+        with pytest.raises(gc.GeminiServiceUnavailableException):
+            adapter.generate_remediation("p", "s")
+        self._assert_settled_open_with_fresh_cooldown(
+            adapter, clock,
+            recover=lambda a: setattr(a, "api_key", "a1-restored-key-not-a-real-credential"),
+        )
+
+    def test_a2_probe_lease_settles_when_budget_store_unavailable(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter = _direct_probe_adapter(
+            api_key="a2-test-key-not-a-real-credential"
+        )
+        clock = {"now": 4_000_000.0}
+        adapter._time_fn = lambda: clock["now"]
+        self._open_circuit(adapter, _FailingProviderTransport(), clock)
+
+        clock["now"] += 61
+        adapter.budget_service = _FailingBudgetLedger(
+            gc.BudgetStoreUnavailableException("budget store connection refused")
+        )
+        with pytest.raises(gc.BudgetStoreUnavailableException):
+            adapter.generate_remediation("p", "s")
+        self._assert_settled_open_with_fresh_cooldown(adapter, clock)
+
+    def test_a3_probe_lease_settles_when_budget_ceiling_exceeded(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter = _direct_probe_adapter(
+            api_key="a3-test-key-not-a-real-credential"
+        )
+        clock = {"now": 4_500_000.0}
+        adapter._time_fn = lambda: clock["now"]
+        self._open_circuit(adapter, _FailingProviderTransport(), clock)
+
+        clock["now"] += 61
+        adapter.budget_service = _FailingBudgetLedger(
+            gc.BudgetExceededException("monthly budget ceiling exceeded")
+        )
+        with pytest.raises(gc.BudgetExceededException):
+            adapter.generate_remediation("p", "s")
+        self._assert_settled_open_with_fresh_cooldown(adapter, clock)
+
+    def test_a6_twenty_concurrent_pre_provider_failure_no_permanent_half_open(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        import threading
+
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiServiceUnavailableException,
+        )
+
+        # Circuit opens while configured; the key is lost afterwards so
+        # that EVERY admitted call in the race fails pre-provider.
+        adapter = _direct_probe_adapter(
+            api_key="a6-test-key-not-a-real-credential"
+        )
+        clock = {"now": 5_000_000.0}
+        adapter._time_fn = lambda: clock["now"]
+        self._open_circuit(adapter, _FailingProviderTransport(), clock)
+        adapter.api_key = ""
+
+        clock["now"] += 61  # all 20 racers race right after the cooldown
+        barrier = threading.Barrier(20)
+        outcomes: list = []
+        lock = threading.Lock()
+
+        def worker():
+            barrier.wait()
+            try:
+                adapter.generate_remediation("p", "s")
+                with lock:
+                    outcomes.append("success")
+            except GeminiServiceUnavailableException:
+                with lock:
+                    outcomes.append("fast-reject")
+            except Exception:
+                with lock:
+                    outcomes.append("other")
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # The lease holder fails pre-provider; the 19 racers fail fast on
+        # the in-flight lease.  THE DEFECT: without settlement this leaves
+        # the breaker HALF-OPEN forever and every future call fails fast
+        # indefinitely — the circuit can never probe again.
+        assert len(outcomes) == 20
+        assert outcomes.count("success") == 0
+        assert adapter.cb_state == "OPEN", (
+            "a concurrent pre-provider failure must not leave the circuit "
+            f"permanently HALF-OPEN (got {adapter.cb_state})"
+        )
+        # Fresh cooldown: immediate call fails fast, no provider contact...
+        with pytest.raises(GeminiServiceUnavailableException):
+            adapter.generate_remediation("p", "s")
+        # ...and recovery is still possible once configured (no dead
+        # state): the budget service was never touched (the key check runs
+        # before reserve), so only the credential changes.
+        clock["now"] += 61
+        adapter.api_key = "a6-recovery-key-not-a-real-credential"
+        adapter._transport = _SuccessProviderTransport()
+        assert json.loads(adapter.generate_remediation("p", "s")) == GOOD_ASSETS
+        assert adapter.cb_state == "CLOSED"

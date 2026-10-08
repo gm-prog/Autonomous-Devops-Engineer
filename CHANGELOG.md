@@ -2,6 +2,117 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-D.1-CORRECTION-2] — Final Hardening After Independent Adversarial Audit (2026-10-08)
+
+Final hardening pass for Phase 8.7-D.1, driven by an independent
+adversarial audit of the green-CI state (`eb90a88`). No feature
+expansion, no architectural rewrite; the green CI was treated as
+evidence, not approval. All new controls carry a structural guard plus a
+behavioral failure test, and removal is proven adversarial by the new
+mutations M22–M24 (isolated repository copies).
+
+### P1-A — circuit breaker can wedge permanently HALF-OPEN (fixed)
+
+A pre-provider exception raised after acquiring the half-open probe lease
+(missing `GEMINI_API_KEY`, budget store unavailable, budget ceiling
+exceeded) left the circuit `HALF-OPEN` forever: every subsequent call
+failed fast and no probe was ever permitted again. The lease now settles
+through **one exception-safe finalization path** in
+`GeminiCallerAdapter._generate_text` (single `try/except` around the
+entire post-admission section — no per-branch remember-to-settle
+discipline): success → `CLOSED`; provider failure → `OPEN`; pre-provider
+failure → `OPEN` with a **fresh cooldown** via the new idempotent
+`_settle_failed_probe()` (deliberately not `CLOSED`, so an unconfigured
+or exhausted deployment cannot stream unlimited doomed probes). Coverage:
+A1–A6 in `tests/test_gemini_analysis_path.py` (including a 20-concurrent
+pre-provider failure that must not leave a permanent `HALF-OPEN`);
+adversarial proof **M22** (settlement bypass wedges the circuit: ten
+fresh cooldowns + restored credential + healthy provider, and the
+weakened circuit still never probes again).
+
+### P1-B — empty/missing/unknown `APP_ENV` must not resolve to local state (fixed)
+
+The in-process (single-instance) rate limiter and budget ledger were
+reachable with an EMPTY, MISSING, or UNEXPECTED `APP_ENV` — an
+unidentified environment silently got single-replica state. The
+classification is now fail-closed in **both**
+`load_analysis_rate_limit_settings` (gateway) and
+`GeminiRuntimeConfig.from_env` (agent): only the explicitly recognized
+`development` and `test` values may use local state; everything else
+(staging, production, empty, missing, unexpected) is treated as
+NON-DEVELOPMENT and requires the shared Redis stores, with the documented
+exact-value single-instance flags as the only explicit opt-out. The full
+environment matrix (development / test / staging / production / empty /
+missing / unexpected, each ± Redis) is covered by
+`TestAppEnvClassificationMatrix`; tests asserting unset-env = safe local
+were updated, not weakened. Adversarial proof **M23** (admitting `""` to
+the local-state set in either service makes the empty/missing `APP_ENV`
+silently resolve to local state — guard turns red). The test process
+itself now declares `APP_ENV=test` explicitly in `tests/conftest.py`
+(development mode enabled by exact value, never inferred).
+
+### P1-C — real-Redis CI gate was not fail-closed (fixed)
+
+The `redis-integration` job set `REDIS_URL` but never
+`REDIS_INTEGRATION_REQUIRED=true`, so a missing/unreachable store would
+degrade the mandatory gate into **silent skips** (green CI, zero Redis
+tests executed). Both live-store steps now set the flag, and the
+`d1-runtime-contract` structural guard checks the contract on every run:
+every step executing the real-Redis suite must set `REDIS_URL` **and**
+`REDIS_INTEGRATION_REQUIRED=true`. Adversarial proof **M24** (removing the
+flag from an isolated CI copy turns the guard red, and the fixture's
+fail-closed resolution is behaviorally demonstrated: no flag → silent
+skip; flag → hard failure).
+
+### P2 — exactly-once wording (corrected)
+
+The finalization guarantee is now stated truthfully: **exactly-once per
+reservation while the finalization claim is retained**. The retention
+window is documented explicitly (SECURITY.md §6.2 and
+`gemini_caller.py`): the claim key carries a 45-day TTL — longer than one
+UTC calendar billing period — so the claim outlives every period it can
+belong to; after expiry, a redelivered finalize can at most touch the
+already-expired period's counters, never the current period's budget.
+
+### P2 — truthful Gradle verification (fixed)
+
+The in-step `gradle --version` showed the runner's preinstalled Gradle
+(`$GITHUB_PATH` takes effect only in later steps), misrepresenting the
+toolchain. The `android-unit-tests` job now runs the **pinned executable
+by absolute path** — `/opt/gradle/gradle-9.3.1/bin/gradle` — for the
+version check, `:app:testDebugUnitTest`, and `:app:assembleDebug`, and
+prints the resolved executable path in the test step, so the log proves
+the exact toolchain that executed.
+
+### P2 — deprecation warnings (fixed, no global suppression)
+
+* `MainActivity.kt`: `Icons.Filled.List` and `Icons.Filled.ArrowForward`
+  (both deprecated) replaced with the auto-mirrored equivalents
+  (`Icons.AutoMirrored.Filled.List` / `Icons.AutoMirrored.Filled.ArrowForward`),
+  which mirror correctly in RTL layouts.
+* The `StarletteDeprecationWarning` ("Using `httpx` with
+  `starlette.testclient` is deprecated; install `httpx2`") is resolved by
+  EXACTLY pinning the last pre-starlette-1.0 generation in
+  `requirements-test.txt`: `fastapi==0.128.8`, `starlette==0.52.1`,
+  `anyio==4.12.1` (anyio 4.15+ would reintroduce a different TestClient
+  deprecation via the `anyio.abc.BlockingPortal` alias — 4.13/4.14
+  verified clean, 4.15 emits the warning), `httpx==0.28.1`.
+  The full suite now runs with zero deprecation warnings from the test
+  client stack; nothing is globally suppressed.
+
+### Retained (verified, not modified in behavior)
+
+JWT fail-closed environment contract, role-based authorization, telemetry
+machine-auth (HMAC envelope), no generic dispatch, server-side-only
+Gemini credential (no Android secret), typed analysis route,
+gateway→agent internal auth, HTTPS bearer-JWT transport, Redis rate
+limiting + budget ledger, `maxOutputTokens` output bound, strict
+five-field validation, circuit breaker with single half-open probe
+(M21), truthful failure mapping, canonical digest-pinned compose stack,
+and mutations M1–M21 (M10's injection point was re-targeted to the
+restructured `_generate_text`; M20's target re-targeted to the
+fail-closed classification — intent unchanged, both still turn CI red).
+
 ## [8.7-D.1-CORRECTION] — Verified CI-Failure Remediation (2026-10-08)
 
 Correction pass for the verified CI failures of the 8.7-D.1 release commit

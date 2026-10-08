@@ -165,6 +165,13 @@ DEFAULT_ESTIMATED_PROMPT_TOKENS = 220
 # Tolerance for float accounting comparisons (USD).
 _FLOAT_EPS = 1e-9
 
+# Phase 8.7-D.1-CORRECTION-2 (P1-B): the ONLY APP_ENV values that may use
+# the in-process (single-process) budget ledger.  Every other value —
+# staging, production, empty, missing, or unexpected — is treated as
+# NON-DEVELOPMENT and requires the shared Redis ledger (fail closed),
+# mirroring the gateway's analysis-rate-limit classification exactly.
+_LOCAL_STATE_ENVS = frozenset({"development", "test"})
+
 
 @dataclass(frozen=True)
 class GeminiRuntimeConfig:
@@ -221,25 +228,32 @@ class GeminiRuntimeConfig:
             raise ValueError(
                 "GEMINI_BUDGET_STORE=redis requires REDIS_URL to be set."
             )
-        # Phase 8.7-D.1-CORRECTION: staging/production MUST run the shared
-        # budget ledger. An in-process ledger is single-process: with N
-        # agent replicas the effective budget silently multiplies by N.
-        # Startup therefore fails closed unless a documented single-replica
-        # deployment opts in EXPLICITLY (exact value, not accidental).
+        # Phase 8.7-D.1-CORRECTION (extended by 8.7-D.1-CORRECTION-2, P1-B):
+        # the in-process budget ledger may only be used in the explicitly
+        # recognized development environments (development/test).  staging,
+        # production, an EMPTY APP_ENV, a MISSING APP_ENV, and any
+        # UNEXPECTED value are all treated as NON-DEVELOPMENT: with N agent
+        # replicas an in-process ledger silently multiplies the effective
+        # budget by N, so startup fails closed unless a documented
+        # single-replica deployment opts in EXPLICITLY (exact value, not
+        # accidental).
         app_env = (e.get("APP_ENV") or "").strip().lower()
         if (
             store == "local"
-            and app_env in ("staging", "production")
+            and app_env not in _LOCAL_STATE_ENVS
             and (e.get("GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION") or "").strip()
             != "true"
         ):
             raise ValueError(
-                f"APP_ENV={app_env} requires the shared Redis budget ledger "
-                f"(GEMINI_BUDGET_STORE=redis + REDIS_URL): the in-process "
-                f"ledger is single-process and the effective budget "
-                f"multiplies across replicas. For a documented single-replica "
-                f"deployment set GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION=true "
-                f"explicitly."
+                f"APP_ENV={app_env!r} is not a recognized development "
+                f"environment ({sorted(_LOCAL_STATE_ENVS)}); it requires the "
+                f"shared Redis budget ledger (GEMINI_BUDGET_STORE=redis + "
+                f"REDIS_URL): the in-process ledger is single-process and "
+                f"the effective budget multiplies across replicas. Empty, "
+                f"missing, or unexpected APP_ENV values are deliberately "
+                f"treated as non-development (fail closed). For a documented "
+                f"single-replica deployment set "
+                f"GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION=true explicitly."
             )
 
         return cls(
@@ -289,12 +303,18 @@ class BudgetLedger(Protocol):
     contact and raises ``BudgetExceededException`` when the ceiling would
     be exceeded; ``finalize`` reconciles the actual cost afterwards.
 
-    Finalization is IDEMPOTENT: each reservation is accounted for exactly
-    once. ``finalize`` returns ``True`` when this call applied the
-    accounting and ``False`` when the reservation was already finalized
-    (duplicate / retried call — the accounting is unchanged).  The
-    exactly-once claim is shared-store-backed (Redis claim key) so it
-    holds across replicas.
+    Finalization is IDEMPOTENT while the finalization claim is retained:
+    each reservation is accounted for at most once for as long as its
+    claim is held.  ``finalize`` returns ``True`` when this call applied
+    the accounting and ``False`` when the reservation was already
+    finalized within the retention window (duplicate / retried call —
+    the accounting is unchanged).  On the shared store the claim is a
+    Redis claim key with a 45-day TTL — longer than one UTC calendar
+    billing period — so it outlives every period the reservation can
+    belong to and holds across replicas; after expiry a redelivered
+    finalize can at most touch the already-expired period's counters,
+    never the current period's budget.  The in-process ledger retains
+    its claims for the process lifetime.
     """
 
     def reserve(self, max_cost_usd: float) -> BudgetReservation: ...
@@ -392,7 +412,8 @@ class InProcessBudgetLedger:
     def finalize(
         self, reservation: BudgetReservation, actual_cost_usd: Optional[float]
     ) -> bool:
-        """Reconcile a reservation with the actual cost (exactly once).
+        """Reconcile a reservation with the actual cost (exactly once for
+        the process lifetime).
 
         * actual present  -> committed += actual (the reservation is
           released; the actual — never an estimate — is what counts);
@@ -402,8 +423,9 @@ class InProcessBudgetLedger:
           the new period; the actual (if any) is counted against the
           current period so spend is never lost;
         * duplicate finalize -> ignored (returns False, accounting
-          unchanged) — the claim is held in this process's memory, which
-          is the correct mechanism for a single-process ledger.
+          unchanged) — the claim is held in this process's memory for the
+          process lifetime, which is the correct mechanism for a
+          single-process ledger.
         """
         with self._lock:
             if reservation.reservation_id in self._finalized_ids:
@@ -451,14 +473,19 @@ class RedisBudgetLedger:
     invocations, so concurrent replicas cannot double-spend the same
     remaining budget.
 
-    Finalization is EXACTLY ONCE (Phase 8.7-D.1-CORRECTION): each
-    reservation has a period-scoped, TTL-bounded claim key
-    (``…:{period}:finalized:{reservation_id}``) and the atomic finalize
-    script checks-and-sets it, so a duplicate or concurrent finalize of
-    the same reservation is ignored instead of double-releasing the
-    reservation or double-committing the cost.  The reservation is
-    released with a negative ``INCRBYFLOAT`` (Redis has no DECRBYFLOAT
-    command).
+    Finalization is EXACTLY ONCE WHILE THE CLAIM IS RETAINED (Phase
+    8.7-D.1-CORRECTION; retention stated explicitly in Phase
+    8.7-D.1-CORRECTION-2): each reservation has a period-scoped claim key
+    (``…:{period}:finalized:{reservation_id}``) with a 45-day TTL — longer
+    than one UTC calendar billing period — and the atomic finalize script
+    checks-and-sets it, so a duplicate or concurrent finalize of the same
+    reservation within the retention window is ignored instead of
+    double-releasing the reservation or double-committing the cost.  The
+    claim outlives every period the reservation can belong to; after
+    expiry a redelivered finalize can at most touch the already-expired
+    period's counters, never the current period's budget.  The
+    reservation is released with a negative ``INCRBYFLOAT`` (Redis has no
+    DECRBYFLOAT command).
     """
 
     _RESERVE_LUA = """
@@ -697,12 +724,26 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
         # Circuit breaker states: CLOSED, OPEN, HALF-OPEN.
         #
-        # HALF-OPEN is a single-probe lease (Phase 8.7-D.1-CORRECTION):
+        # HALF-OPEN is a single-probe lease (Phase 8.7-D.1-CORRECTION,
+        # settlement contract hardening in 8.7-D.1-CORRECTION-2):
         # when the cooldown expires, the FIRST caller atomically acquires
         # the probe lease and becomes the only provider probe; every other
         # concurrent caller sees HALF-OPEN and fails fast instead of
-        # becoming an additional probe.  The probe's outcome settles the
-        # circuit (success -> CLOSED, failure -> OPEN).
+        # becoming an additional probe.
+        #
+        # SETTLEMENT CONTRACT — the lease is always settled through
+        # exactly one exception-safe finalization path in
+        # _generate_text() (a single try/finally-style except handler
+        # wrapping the ENTIRE post-lease section, not a per-branch
+        # remember-to-settle discipline):
+        #   * provider success  -> CLOSED      (_register_success)
+        #   * provider failure  -> OPEN        (_register_failure)
+        #   * PRE-provider failure (missing key, budget store unavailable,
+        #     budget ceiling) -> OPEN with a FRESH cooldown
+        #     (_settle_failed_probe) — never CLOSED, so an unconfigured
+        #     or exhausted deployment cannot stream unlimited doomed
+        #     probes; never an unsettled HALF-OPEN, so the circuit cannot
+        #     wedge with every caller failing fast forever.
         self.cb_state = "CLOSED"
         self.cb_failures = 0
         self.cb_max_failures = 5
@@ -712,18 +753,25 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
     # -- circuit breaker ----------------------------------------------------
 
-    def _check_circuit(self) -> None:
+    def _check_circuit(self) -> bool:
+        """Admission check. Returns True ONLY when this caller acquired the
+        single half-open probe lease (and is therefore responsible for
+        settling it via the finalization path in _generate_text).
+        Raises for every rejected call (OPEN cooldown, probe in flight)."""
         with self._state_lock:
             if self.cb_state == "OPEN":
                 if self._time_fn() - self.cb_last_failure_time > self.cb_cooldown_seconds:
                     # Cooldown elapsed: this caller acquires the SINGLE
                     # half-open probe lease and proceeds as the probe.
+                    # The lease MUST be settled by _generate_text's
+                    # finalization path — see the SETTLEMENT CONTRACT in
+                    # the constructor.
                     self.cb_state = "HALF-OPEN"
                     logger.info(
                         "[CIRCUIT_BREAKER] Cooldown elapsed; single half-open "
                         "probe armed."
                     )
-                    return
+                    return True
                 logger.warning("[CIRCUIT_BREAKER] Circuit OPEN; rejecting call fast.")
                 raise GeminiServiceUnavailableException(
                     "Gemini circuit breaker is OPEN; calls are rejected until cooldown."
@@ -739,7 +787,34 @@ class GeminiCallerAdapter(RemoteLLMInterface):
                     "Gemini circuit breaker is recovering (a single probe is "
                     "in flight); calls are rejected until it settles."
                 )
-            # CLOSED: proceed.
+            # CLOSED: proceed (no lease held).
+            return False
+
+    def _settle_failed_probe(self) -> None:
+        """Idempotent pre-provider failure settlement for the half-open
+        probe lease (Phase 8.7-D.1-CORRECTION-2).
+
+        Called from _generate_text's single finalization path when the
+        probe fails BEFORE provider contact (missing GEMINI_API_KEY,
+        budget store unavailable, budget ceiling).  Re-opens the circuit
+        with a FRESH cooldown — never CLOSED (an unconfigured/exhausted
+        deployment must not stream unlimited doomed probes) and never an
+        unsettled HALF-OPEN (which would wedge every caller failing fast
+        forever).
+
+        No-op when the probe was already settled by _register_success /
+        _register_failure — settlement is exactly-once either way, and
+        both transitions happen under the same state lock."""
+        with self._state_lock:
+            if self.cb_state != "HALF-OPEN":
+                return
+            logger.critical(
+                "[CIRCUIT_BREAKER] Pre-provider failure during half-open "
+                "probe; re-opening circuit with a fresh cooldown."
+            )
+            self.cb_state = "OPEN"
+            self.cb_failures = 1
+            self.cb_last_failure_time = self._time_fn()
 
     def _register_failure(self) -> None:
         with self._state_lock:
@@ -874,17 +949,39 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
     def _generate_text(self, prompt: str, system_instruction: str) -> str:
         """Bounded, retrying, circuit-protected, budget-reserving text
-        generation (real calls only — fail closed when unconfigured)."""
-        self._check_circuit()
-        self._assert_provider_configured()
+        generation (real calls only — fail closed when unconfigured).
 
-        # Atomic worst-case reservation BEFORE any provider contact.
-        reservation = self.budget_service.reserve(self._max_estimated_cost_usd())
+        HALF-OPEN probe-lease lifecycle (Phase 8.7-D.1-CORRECTION-2):
+        when _check_circuit hands us the single probe lease, the ENTIRE
+        post-lease section (precondition checks, budget reservation,
+        provider contact) is wrapped in ONE exception-safe finalization
+        path.  Whatever fails — a pre-provider precondition, the budget
+        store, the budget ceiling, or the provider itself — settles the
+        lease exactly once: success closes the circuit, any failure re-
+        opens it with a fresh cooldown.  No per-branch remember-to-settle
+        discipline exists that an exception could bypass."""
+        probing = self._check_circuit()
         try:
-            return self._generate_text_with_reservation(prompt, system_instruction, reservation)
+            self._assert_provider_configured()
+
+            # Atomic worst-case reservation BEFORE any provider contact.
+            reservation = self.budget_service.reserve(self._max_estimated_cost_usd())
+            try:
+                return self._generate_text_with_reservation(prompt, system_instruction, reservation)
+            except Exception:
+                # Any failure path keeps the FULL reservation (conservative).
+                # The provider-side failure itself is already registered
+                # (and the lease settled) by _generate_text_with_reservation.
+                self.budget_service.finalize(reservation, None)
+                raise
         except Exception:
-            # Any failure path keeps the FULL reservation (conservative).
-            self.budget_service.finalize(reservation, None)
+            # Single finalization path: settle the probe lease exactly once
+            # if we hold it and it is still unsettled.  No-op when the
+            # provider call already settled it (_register_success /
+            # _register_failure) — and a no-op entirely when we were not
+            # the probe (CLOSED admission).
+            if probing:
+                self._settle_failed_probe()
             raise
 
     def _generate_text_with_reservation(

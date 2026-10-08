@@ -99,21 +99,31 @@ jobs:
           curl -fsSL https://services.gradle.org/distributions/gradle-9.3.1-bin.zip -o /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /opt/gradle
           echo "/opt/gradle/gradle-9.3.1/bin" >> "$GITHUB_PATH"
-          gradle --version
+          # Phase 8.7-D.1-CORRECTION-2 (P2): verify the pinned executable
+          # by ABSOLUTE PATH. $GITHUB_PATH only takes effect in LATER
+          # steps, so a bare `gradle --version` here would show the
+          # runner's preinstalled Gradle and misrepresent the toolchain.
+          echo "== pinned Gradle (absolute path, this step) =="
+          /opt/gradle/gradle-9.3.1/bin/gradle --version
       - name: Generate CI-only debug keystore (standard androiddebugkey; gitignored, not a secret)
         run: |
           set -euo pipefail
           keytool -genkeypair -v -storepass android -alias androiddebugkey \
             -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US" -keystore debug.keystore
+      # Phase 8.7-D.1-CORRECTION-2 (P2): test and build invoke the SAME
+      # pinned executable by absolute path — the log therefore proves the
+      # exact toolchain that ran (no reliance on PATH resolution).
       - name: Unit tests (AnalysisUrlPolicyTest, GeminiClientSecretPolicyTest, Robolectric)
         run: |
           set -o pipefail
-          gradle :app:testDebugUnitTest --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/android-unit-tests.txt"
+          echo "== toolchain under test (same executable as the verified install) =="
+          readlink -f /opt/gradle/gradle-9.3.1/bin/gradle
+          /opt/gradle/gradle-9.3.1/bin/gradle :app:testDebugUnitTest --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/android-unit-tests.txt"
       - name: Debug APK build (the artifact the URL policy governs)
         run: |
           set -o pipefail
-          gradle :app:assembleDebug --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/android-assemble-debug.txt"
+          /opt/gradle/gradle-9.3.1/bin/gradle :app:assembleDebug --console=plain 2>&1 | tee "$GITHUB_WORKSPACE/android-assemble-debug.txt"
       # Evidence surfacing ONLY: on failure, a compact error digest is
       # written to (a) the step summary and (b) a run annotation (both
       # readable in the run UI and via the GitHub API — the raw log blob
@@ -234,17 +244,24 @@ jobs:
             sleep 1
           done
           docker exec d1-redis redis-cli ping
+      # Phase 8.7-D.1-CORRECTION-2 (P1-C): the live-store steps are
+      # FAIL-CLOSED. REDIS_INTEGRATION_REQUIRED=true makes a missing or
+      # unreachable Redis a HARD test failure instead of a silent skip —
+      # the structural contract is enforced by the d1-runtime-contract
+      # guard (removing either env var turns CI red; mutation M24).
       - name: Integration tests against the live store
         working-directory: devops-ai-platform
         env:
           REDIS_URL: redis://127.0.0.1:6379/0
+          REDIS_INTEGRATION_REQUIRED: "true"
         run: |
           set -euo pipefail
           python -m pytest tests/test_redis_integration.py -v 2>&1 | tee redis-integration.txt
-      - name: Mutation suite against the live store (M19 behavioral proof — weakened finalize script double-counts on real Redis)
+      - name: Mutation suite against the live store (M19/M22 behavioral proofs — weakened finalize script double-counts; pre-provider probe bypass wedges the breaker, both on the real code paths)
         working-directory: devops-ai-platform
         env:
           REDIS_URL: redis://127.0.0.1:6379/0
+          REDIS_INTEGRATION_REQUIRED: "true"
         run: |
           set -euo pipefail
           python -m pytest tests/test_security_mutations.py -v 2>&1 | tee redis-mutations.txt

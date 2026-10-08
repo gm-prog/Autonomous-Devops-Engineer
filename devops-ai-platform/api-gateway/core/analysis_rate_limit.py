@@ -240,12 +240,18 @@ class RedisAnalysisRateLimiter:
 DEFAULT_LIMIT_PER_IDENTITY_PER_MINUTE = 30
 DEFAULT_LIMIT_PER_IP_PER_MINUTE = 120
 
-# Environments that MUST run the shared (Redis) limiter: with a per-process
-# limiter, N replicas would each allow their own quota and the effective
-# limit would silently multiply by the replica count.
-_PRODUCTION_ENVS = frozenset({"staging", "production"})
+# Phase 8.7-D.1-CORRECTION-2 (P1-B): the in-process (single-instance)
+# limiter may only be used in EXPLICITLY recognized development
+# environments.  Every other value — including staging, production, an
+# EMPTY string, a MISSING variable, or an UNEXPECTED value — is treated
+# as NON-DEVELOPMENT and requires the shared (Redis) limiter: with a
+# per-process limiter, N replicas would each allow their own quota and
+# the effective limit would silently multiply by the replica count.
+# An environment that cannot be positively identified as a development
+# environment must never silently fall back to single-instance state.
+_LOCAL_STATE_ENVS = frozenset({"development", "test"})
 # Explicit, accidental-usage-proof opt-out for a DOCUMENTED single-replica
-# staging/production deployment: must be exactly "true".
+# non-development deployment: must be exactly "true".
 _SINGLE_INSTANCE_FLAG = "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION"
 
 
@@ -285,20 +291,28 @@ def load_analysis_rate_limit_settings(env: Optional[Mapping[str, str]] = None) -
         # the explicit single-instance mode (documented, logged).
         effective = "redis" if redis_url else "local"
 
-    # Phase 8.7-D.1-CORRECTION: staging/production MUST use the shared
-    # store. Failing closed here (at startup) instead of silently running
-    # an in-process limiter whose limits multiply per replica.
+    # Phase 8.7-D.1-CORRECTION (extended by 8.7-D.1-CORRECTION-2, P1-B):
+    # the single-instance (local) store may only be used in the explicitly
+    # recognized development environments (development/test).  staging,
+    # production, an EMPTY APP_ENV, a MISSING APP_ENV, and any UNEXPECTED
+    # value are all treated as NON-DEVELOPMENT and fail closed at startup
+    # instead of silently running an in-process limiter whose limits
+    # multiply per replica.
     app_env = (e.get("APP_ENV") or "").strip().lower()
     if (
         effective == "local"
-        and app_env in _PRODUCTION_ENVS
+        and app_env not in _LOCAL_STATE_ENVS
         and (e.get(_SINGLE_INSTANCE_FLAG) or "").strip() != "true"
     ):
         raise AnalysisRateLimitConfigurationError(
-            f"APP_ENV={app_env} requires the shared Redis analysis rate-limit "
-            f"store (ANALYSIS_RATE_LIMIT_STORE=redis + REDIS_URL): the "
-            f"in-process limiter is single-instance and its limits multiply "
-            f"across replicas. For a documented single-replica deployment set "
+            f"APP_ENV={app_env!r} is not a recognized development "
+            f"environment ({sorted(_LOCAL_STATE_ENVS)}); it requires the "
+            f"shared Redis analysis rate-limit store "
+            f"(ANALYSIS_RATE_LIMIT_STORE=redis + REDIS_URL): the in-process "
+            f"limiter is single-instance and its limits multiply across "
+            f"replicas. Empty, missing, or unexpected APP_ENV values are "
+            f"deliberately treated as non-development (fail closed). For a "
+            f"documented single-replica deployment set "
             f"{_SINGLE_INSTANCE_FLAG}=true explicitly."
         )
 

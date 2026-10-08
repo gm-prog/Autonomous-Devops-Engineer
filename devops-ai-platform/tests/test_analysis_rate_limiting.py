@@ -229,12 +229,19 @@ def test_concurrent_requests_cannot_exceed_limit():
     assert sum(results) == 5, "concurrent checks admitted more than the limit"
 
 
-def test_production_defaults_are_safe():
+def test_development_defaults_are_safe():
+    """The LIMIT defaults are safe; the store default in a recognized
+    development environment (test) is the single-instance local store.
+
+    Phase 8.7-D.1-CORRECTION-2 (P1-B): an EMPTY env mapping is no longer
+    a recognized development environment — it fails closed (covered by
+    TestAppEnvClassificationMatrix), so this test declares the test env
+    explicitly instead of assuming unset env = safe local."""
     from platform_pkg.api_gateway.core.analysis_rate_limit import (
         load_analysis_rate_limit_settings,
     )
 
-    settings = load_analysis_rate_limit_settings({})
+    settings = load_analysis_rate_limit_settings({"APP_ENV": "test"})
     assert settings["limit_per_identity_per_minute"] == 30
     assert settings["limit_per_ip_per_minute"] == 120
     assert settings["window_seconds"] == 60
@@ -317,12 +324,15 @@ class TestProductionSharedStateRequirement:
     explicit in-process mode. A documented single-replica staging/production
     deployment opts in via the exact-value flag."""
 
-    def test_development_without_redis_uses_local(self):
+    def test_development_environments_without_redis_use_local(self):
         from platform_pkg.api_gateway.core.analysis_rate_limit import (
             load_analysis_rate_limit_settings,
         )
 
-        for app_env in ("development", "test", ""):
+        # ONLY the explicitly recognized development environments may use
+        # the single-instance store (Phase 8.7-D.1-CORRECTION-2, P1-B):
+        # an empty/missing/unexpected APP_ENV is NOT development.
+        for app_env in ("development", "test"):
             settings = load_analysis_rate_limit_settings({"APP_ENV": app_env})
             assert settings["store"] == "local"
 
@@ -381,12 +391,14 @@ class TestProductionSharedStateRequirement:
 
     # -- agent-side budget ledger -----------------------------------------
 
-    def test_agent_development_without_redis_uses_local(self):
+    def test_agent_development_environments_without_redis_use_local(self):
         from platform_pkg.agent.infrastructure.llm.gemini_caller import (
             GeminiRuntimeConfig,
         )
 
-        for app_env in ("development", "test", ""):
+        # ONLY development/test may use the single-process ledger
+        # (Phase 8.7-D.1-CORRECTION-2, P1-B).
+        for app_env in ("development", "test"):
             cfg = GeminiRuntimeConfig.from_env({"APP_ENV": app_env})
             assert cfg.budget_store == "local"
 
@@ -442,3 +454,123 @@ class TestProductionSharedStateRequirement:
         with pytest.raises(AnalysisRateLimitConfigurationError) as excinfo:
             create_app(env={"JWT_SECRET": TEST_GW_SECRET, "APP_ENV": "production"})
         assert "Redis" in str(excinfo.value)
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-2 (P1-B): full APP_ENV classification matrix.
+# development/test -> local allowed. EVERYTHING else (staging, production,
+# empty, missing, unexpected) -> non-development -> shared store required
+# (fail closed), for BOTH the gateway rate limiter and the agent budget
+# ledger, each with and without Redis configured.
+# ---------------------------------------------------------------------------
+
+
+class TestAppEnvClassificationMatrix:
+    """Empty/missing/unexpected APP_ENV must NEVER resolve to local state."""
+
+    # (APP_ENV value to inject | None = variable absent, redis url or None)
+    _GATEWAY_CASES = [
+        # recognized development environments: local allowed.
+        pytest.param({"APP_ENV": "development"}, None, "local", id="development-no-redis"),
+        pytest.param({"APP_ENV": "development"}, "redis://gw:6379/0", "redis", id="development-redis"),
+        pytest.param({"APP_ENV": "test"}, None, "local", id="test-no-redis"),
+        pytest.param({"APP_ENV": "test"}, "redis://gw:6379/0", "redis", id="test-redis"),
+        # non-development: shared required (fail closed without Redis).
+        pytest.param({"APP_ENV": "staging"}, None, "fail", id="staging-no-redis"),
+        pytest.param({"APP_ENV": "staging"}, "redis://gw:6379/0", "redis", id="staging-redis"),
+        pytest.param({"APP_ENV": "production"}, None, "fail", id="production-no-redis"),
+        pytest.param({"APP_ENV": "production"}, "redis://gw:6379/0", "redis", id="production-redis"),
+        # THE P1-B DEFECT: empty and missing APP_ENV used to fall through
+        # to the local store.
+        pytest.param({"APP_ENV": ""}, None, "fail", id="empty-no-redis"),
+        pytest.param({"APP_ENV": ""}, "redis://gw:6379/0", "redis", id="empty-redis"),
+        pytest.param({}, None, "fail", id="missing-no-redis"),
+        pytest.param({}, "redis://gw:6379/0", "redis", id="missing-redis"),
+        # unexpected values are non-development too (case-normalized).
+        pytest.param({"APP_ENV": "unknownenv"}, None, "fail", id="unknown-no-redis"),
+        pytest.param({"APP_ENV": "unknownenv"}, "redis://gw:6379/0", "redis", id="unknown-redis"),
+        pytest.param({"APP_ENV": "Staging"}, "redis://gw:6379/0", "redis", id="staging-case-normalized-redis"),
+    ]
+
+    @pytest.mark.parametrize("env_extra,redis_url,expected", _GATEWAY_CASES)
+    def test_gateway_loader_matrix(self, env_extra, redis_url, expected):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            AnalysisRateLimitConfigurationError,
+            load_analysis_rate_limit_settings,
+        )
+
+        env = dict(env_extra)
+        if redis_url is not None:
+            env["REDIS_URL"] = redis_url
+        if expected == "fail":
+            with pytest.raises(AnalysisRateLimitConfigurationError):
+                load_analysis_rate_limit_settings(env)
+        else:
+            assert load_analysis_rate_limit_settings(env)["store"] == expected
+
+    def test_gateway_explicit_local_still_refused_for_non_development(self):
+        # An EXPLICIT local store is no more exempt than the default one.
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            AnalysisRateLimitConfigurationError,
+            load_analysis_rate_limit_settings,
+        )
+
+        for env in (
+            {"APP_ENV": "", "ANALYSIS_RATE_LIMIT_STORE": "local"},
+            {"ANALYSIS_RATE_LIMIT_STORE": "local"},  # APP_ENV missing
+            {"APP_ENV": "weird-env", "ANALYSIS_RATE_LIMIT_STORE": "local"},
+        ):
+            with pytest.raises(AnalysisRateLimitConfigurationError):
+                load_analysis_rate_limit_settings(env)
+
+    def test_gateway_single_instance_flag_rescues_empty_env_explicitly(self):
+        from platform_pkg.api_gateway.core.analysis_rate_limit import (
+            load_analysis_rate_limit_settings,
+        )
+
+        settings = load_analysis_rate_limit_settings(
+            {
+                "APP_ENV": "",
+                "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION": "true",
+            }
+        )
+        assert settings["store"] == "local"
+
+    # -- agent-side budget ledger -------------------------------------------
+
+    _AGENT_CASES = [
+        pytest.param({"APP_ENV": "development", "GEMINI_BUDGET_STORE": "local"}, "local", id="agent-development-local"),
+        pytest.param({"APP_ENV": "test", "GEMINI_BUDGET_STORE": "local"}, "local", id="agent-test-local"),
+        pytest.param({"APP_ENV": "staging", "GEMINI_BUDGET_STORE": "local"}, "fail", id="agent-staging-local"),
+        pytest.param({"APP_ENV": "production", "GEMINI_BUDGET_STORE": "local"}, "fail", id="agent-production-local"),
+        pytest.param({"APP_ENV": "", "GEMINI_BUDGET_STORE": "local"}, "fail", id="agent-empty-local"),
+        pytest.param({"GEMINI_BUDGET_STORE": "local"}, "fail", id="agent-missing-local"),
+        pytest.param({"APP_ENV": "unknownenv", "GEMINI_BUDGET_STORE": "local"}, "fail", id="agent-unknown-local"),
+        pytest.param(
+            {"APP_ENV": "production", "GEMINI_BUDGET_STORE": "redis", "REDIS_URL": "redis://agent:6379/0"},
+            "redis", id="agent-production-redis",
+        ),
+        pytest.param(
+            {"APP_ENV": "", "GEMINI_BUDGET_STORE": "redis", "REDIS_URL": "redis://agent:6379/0"},
+            "redis", id="agent-empty-redis",
+        ),
+        pytest.param(
+            {
+                "APP_ENV": "",
+                "GEMINI_BUDGET_STORE": "local",
+                "GEMINI_BUDGET_SINGLE_INSTANCE_PRODUCTION": "true",
+            },
+            "local", id="agent-empty-local-explicit-flag",
+        ),
+    ]
+
+    @pytest.mark.parametrize("env,expected", _AGENT_CASES)
+    def test_agent_budget_store_matrix(self, env, expected):
+        from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+            GeminiRuntimeConfig,
+        )
+
+        if expected == "fail":
+            with pytest.raises(ValueError):
+                GeminiRuntimeConfig.from_env(env)
+        else:
+            assert GeminiRuntimeConfig.from_env(env).budget_store == expected

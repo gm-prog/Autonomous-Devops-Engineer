@@ -60,6 +60,7 @@ M18. Caller:   revert the model to the deprecated gemini-3.5-flash and
 from __future__ import annotations
 
 import importlib
+import json
 import shutil
 import sys
 import time
@@ -683,16 +684,16 @@ def _apply_missing_key_fail_open(repo: Path) -> None:
     caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
     src = caller_path.read_text(encoding="utf-8")
     # Weaken: _generate_text fabricates a response when the key is missing —
-    # the guard line is injected right before the fail-closed assertion call
-    # (inside _generate_text, the only place both calls are adjacent).
-    target = "        self._check_circuit()\n        self._assert_provider_configured()"
+    # the fail-open branch is injected right after the circuit admission
+    # check (before the fail-closed precondition inside the finalization
+    # path), inside _generate_text.
+    target = "        probing = self._check_circuit()\n"
     assert target in src, "M10 target not found in gemini_caller"
     src = src.replace(
         target,
-        "        self._check_circuit()\n"
+        "        probing = self._check_circuit()\n"
         "        if not self.api_key:  # MUTATION: fail open\n"
-        '            return "SIMULATED GEMINI RESPONSE (offline bypass)"\n'
-        "        self._assert_provider_configured()",
+        '            return "SIMULATED GEMINI RESPONSE (offline bypass)"\n',
         1,
     )
     caller_path.write_text(src, encoding="utf-8")
@@ -726,7 +727,7 @@ def test_mutation_m10_missing_secret_fail_open_detected(mutated_repo):
     #     fake "Gemini answered" success instead of failing closed.
     top = _register_mutated_tree(mutated_repo, "mut_m10")
     gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
-    caller = gc.GeminiCallerAdapter(api_key="")
+    caller = gc.GeminiCallerAdapter(api_key="", config=gc.GeminiRuntimeConfig())
     result = caller.generate_remediation("prompt", "system")
     assert isinstance(result, str) and "SIMULATED" in result, (
         "expected the weakened control to fabricate a fake success"
@@ -791,6 +792,7 @@ def test_mutation_m11_fake_gemini_success_detected(mutated_repo):
         return _Resp401()
 
     caller = gc.GeminiCallerAdapter(api_key="server-key", transport=_t401,
+                                    config=gc.GeminiRuntimeConfig(),
                                     max_retries=3, backoff_base_seconds=0.01)
     result = caller.generate_remediation("p", "s")
     assert isinstance(result, str) and "SIMULATED" in result, (
@@ -862,6 +864,7 @@ def test_mutation_m12_budget_bypass_detected(mutated_repo):
         return _Resp200()
 
     caller = gc.GeminiCallerAdapter(api_key="server-key", transport=_t,
+                                    config=gc.GeminiRuntimeConfig(),
                                     monthly_budget_usd=0.0, max_retries=1,
                                     backoff_base_seconds=0.01)
     result = caller.generate_remediation("p", "s")
@@ -1347,7 +1350,10 @@ def test_mutation_m18_deprecated_model_revert_detected(mutated_repo):
     #     payload no longer carries the output bound.
     top = _register_mutated_tree(mutated_repo, "mut_m18")
     m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
-    caller = m_gc.GeminiCallerAdapter(api_key="m18-test-key-not-a-real-credential")
+    caller = m_gc.GeminiCallerAdapter(
+        api_key="m18-test-key-not-a-real-credential",
+        config=m_gc.GeminiRuntimeConfig(),
+    )
     assert caller.model_name == "gemini-3.5-flash", (
         "expected the weakened control to revert to the deprecated model"
     )
@@ -1450,29 +1456,34 @@ def test_mutation_m19_finalize_idempotency_removal_detected(mutated_repo):
 
 
 # ---------------------------------------------------------------------------
-# M20 — bypass the production shared-Redis requirement
+# M20 — bypass the shared-Redis requirement for non-development APP_ENV
 # ---------------------------------------------------------------------------
 
 
 def _apply_production_requirement_bypass(repo: Path) -> None:
     limiter_path = repo / "devops-ai-platform/api-gateway/core/analysis_rate_limit.py"
     src = limiter_path.read_text(encoding="utf-8")
-    target = "        and app_env in _PRODUCTION_ENVS\n"
+    target = "        and app_env not in _LOCAL_STATE_ENVS\n"
     assert target in src, "M20 target not found in load_analysis_rate_limit_settings"
     src = src.replace(
         target,
-        "        and app_env in frozenset()  # MUTATION: production shared-state requirement bypassed\n",
+        "        and app_env in frozenset()  # MUTATION: non-development shared-state requirement bypassed\n",
         1,
     )
     limiter_path.write_text(src, encoding="utf-8")
 
 
 def _assert_production_requires_shared_store(repo: Path) -> None:
-    """Structural guard: staging/production must be forced onto the shared
-    store (with the explicit single-replica opt-out)."""
+    """Structural guard: every NON-development APP_ENV (staging, production,
+    empty, missing, unexpected) must be forced onto the shared store, with
+    the explicit single-replica opt-out."""
     src = (repo / "devops-ai-platform/api-gateway/core/analysis_rate_limit.py").read_text(encoding="utf-8")
-    assert "app_env in _PRODUCTION_ENVS" in src, (
-        "the production shared-store requirement is missing"
+    assert "app_env not in _LOCAL_STATE_ENVS" in src, (
+        "the non-development shared-store requirement is missing"
+    )
+    assert 'frozenset({"development", "test"})' in src, (
+        "the local-state environment classification must be EXACTLY "
+        "development/test (no empty/production values may be admitted)"
     )
     assert "ANALYSIS_RATE_LIMIT_SINGLE_INSTANCE_PRODUCTION" in src, (
         "the documented single-replica opt-out flag is missing"
@@ -1484,7 +1495,7 @@ def test_mutation_m20_production_requirement_bypass_detected(mutated_repo):
     _assert_production_requires_shared_store(REPO_ROOT)
     _apply_production_requirement_bypass(mutated_repo)
     mut_src = (mutated_repo / "devops-ai-platform/api-gateway/core/analysis_rate_limit.py").read_text(encoding="utf-8")
-    assert "app_env in _PRODUCTION_ENVS" not in mut_src, (
+    assert "app_env not in _LOCAL_STATE_ENVS" not in mut_src, (
         "guard stayed green after the production requirement was bypassed"
     )
 
@@ -1628,3 +1639,311 @@ def test_mutation_m21_multiple_half_open_probes_detected(mutated_repo, monkeypat
         "expected the weakened control to let MULTIPLE concurrent callers "
         f"become provider probes (got {mutated_t.calls - 5} probes)"
     )
+
+
+# ---------------------------------------------------------------------------
+# M22 — pre-provider probe-lease settlement bypass (circuit wedges
+#       HALF-OPEN forever) — Phase 8.7-D.1-CORRECTION-2
+# ---------------------------------------------------------------------------
+
+
+_M22_ASSETS = {"ok": True}
+
+
+def _m22_ok_response():
+    class _Resp200:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"candidates": [{"content": {"parts": [{"text": json.dumps(_M22_ASSETS)}]}}]}
+
+    return _Resp200()
+
+
+def _apply_probe_settlement_bypass(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    target = "                self._settle_failed_probe()\n"
+    assert target in src, "M22 target not found in _generate_text's finalization path"
+    src = src.replace(
+        target,
+        "                pass  # MUTATION: probe lease settlement bypassed\n",
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def _assert_probe_lease_settlement_intact(repo: Path) -> None:
+    """Structural guard: _generate_text must settle the half-open probe
+    lease through its single finalization path, and the settlement must
+    be an idempotent HALF-OPEN -> OPEN transition."""
+    src = (repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = src.split("def _generate_text", 1)[1].split("\n    def ", 1)[0]
+    assert "self._settle_failed_probe()" in fn, (
+        "_generate_text's finalization path lost the probe-lease "
+        "settlement call (a pre-provider failure would wedge the circuit "
+        "HALF-OPEN forever)"
+    )
+    settle = src.split("def _settle_failed_probe", 1)[1].split("\n    def ", 1)[0]
+    assert 'if self.cb_state != "HALF-OPEN":' in settle, (
+        "settlement must be idempotent (no-op when the probe was already "
+        "settled by _register_success/_register_failure)"
+    )
+    assert 'self.cb_state = "OPEN"' in settle, (
+        "pre-provider settlement must re-open the circuit"
+    )
+
+
+class _M22CountingTransport:
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, payload):
+        self.calls += 1
+
+        class _Resp500:
+            status_code = 500
+            text = "transient"
+
+            def json(self):
+                raise ValueError("no body")
+
+        return _Resp500()
+
+
+def _m22_open_circuit(adapter, transport, clock: dict, upstream_exc) -> None:
+    """Five provider failures trip the breaker OPEN.  ``upstream_exc`` must
+    be the adapter's OWN module's exception class (mutated trees are
+    separate module objects)."""
+    adapter._transport = transport
+    for _ in range(5):
+        with pytest.raises(upstream_exc):
+            adapter.generate_remediation("p", "s")
+    assert adapter.cb_state == "OPEN"
+
+
+def test_mutation_m22_pre_provider_settlement_bypass_detected(mutated_repo, monkeypatch):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_probe_lease_settlement_intact(REPO_ROOT)
+    _apply_probe_settlement_bypass(mutated_repo)
+    mut_src = (mutated_repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py").read_text(encoding="utf-8")
+    fn = mut_src.split("def _generate_text", 1)[1].split("\n    def ", 1)[0]
+    assert "self._settle_failed_probe()" not in fn, (
+        "guard stayed green after the settlement call was bypassed"
+    )
+
+    # (2) Behavioral: a pre-provider failure (missing key) during the
+    #     half-open probe must settle the lease to OPEN so the circuit can
+    #     still probe again after a fresh cooldown.
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    # INTACT: lease settles to OPEN; after the fresh cooldown + restored
+    # key the circuit recovers to CLOSED.
+    intact_t = _M22CountingTransport()
+    intact = gc.GeminiCallerAdapter(
+        api_key="m22-intact-key-not-a-real-credential",
+        config=gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001),
+        transport=intact_t,
+    )
+    clock = {"now": 7_000_000.0}
+    intact._time_fn = lambda: clock["now"]
+    _m22_open_circuit(intact, intact_t, clock, gc.GeminiUpstreamException)
+    intact.api_key = ""  # key lost after the circuit tripped
+    clock["now"] += 61
+    with pytest.raises(gc.GeminiServiceUnavailableException):
+        intact.generate_remediation("p", "s")
+    assert intact.cb_state == "OPEN", (
+        "intact breaker: pre-provider failure must settle the lease to OPEN"
+    )
+    clock["now"] += 61
+    intact.api_key = "m22-intact-restore-key-not-a-real-credential"
+    intact._transport = lambda payload: _m22_ok_response()
+    assert json.loads(intact.generate_remediation("p", "s")) == _M22_ASSETS
+    assert intact.cb_state == "CLOSED"
+
+    # MUTATED: the lease is never settled — the circuit wedges HALF-OPEN
+    # and can NEVER probe again, even after many fresh cooldowns.
+    top = _register_mutated_tree(mutated_repo, "mut_m22")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    mut_t = _M22CountingTransport()
+    mutated = m_gc.GeminiCallerAdapter(
+        api_key="m22-mutated-key-not-a-real-credential",
+        config=m_gc.GeminiRuntimeConfig(max_retries=1, backoff_base_seconds=0.001),
+        transport=mut_t,
+    )
+    clock2 = {"now": 8_000_000.0}
+    mutated._time_fn = lambda: clock2["now"]
+    _m22_open_circuit(mutated, mut_t, clock2, m_gc.GeminiUpstreamException)
+    mutated.api_key = ""
+    clock2["now"] += 61
+    with pytest.raises(m_gc.GeminiServiceUnavailableException):
+        mutated.generate_remediation("p", "s")
+    assert mutated.cb_state == "HALF-OPEN", (
+        "expected the weakened control to leave the probe lease unsettled "
+        "(the audit defect: permanent HALF-OPEN)"
+    )
+    # The wedge is behavioral, not cosmetic: ten fresh cooldowns pass, the
+    # key is restored and the provider is healthy — and yet the circuit
+    # still fast-rejects every call WITHOUT a single provider probe.
+    clock2["now"] += 61 * 10
+    mutated.api_key = "m22-mutated-restore-key-not-a-real-credential"
+    mutated._transport = lambda payload: _m22_ok_response()
+    provider_calls_after_restore = mut_t.calls
+    with pytest.raises(m_gc.GeminiServiceUnavailableException):
+        mutated.generate_remediation("p", "s")
+    assert mut_t.calls == provider_calls_after_restore, (
+        "a wedged HALF-OPEN circuit must never probe the provider again"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M23 — APP_ENV missing/empty falls back to local state (fail-closed
+#       classification defeated) — Phase 8.7-D.1-CORRECTION-2
+# ---------------------------------------------------------------------------
+
+
+def _apply_empty_env_local_fallback(repo: Path) -> None:
+    """Weaken BOTH classifications: admit an empty APP_ENV to the
+    single-instance (local) state set."""
+    for rel in (
+        "devops-ai-platform/api-gateway/core/analysis_rate_limit.py",
+        "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py",
+    ):
+        path = repo / rel
+        src = path.read_text(encoding="utf-8")
+        target = '_LOCAL_STATE_ENVS = frozenset({"development", "test"})'
+        assert target in src, f"M23 target not found in {rel}"
+        src = src.replace(
+            target,
+            '_LOCAL_STATE_ENVS = frozenset({"development", "test", ""})  # MUTATION: empty APP_ENV admitted to local state',
+            1,
+        )
+        path.write_text(src, encoding="utf-8")
+
+
+def _assert_env_classification_fail_closed(repo: Path) -> None:
+    """Structural guard: the single-instance state set is EXACTLY
+    development/test in BOTH the gateway rate limiter and the agent budget
+    ledger — no empty string, no production values."""
+    for rel in (
+        "devops-ai-platform/api-gateway/core/analysis_rate_limit.py",
+        "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py",
+    ):
+        src = (repo / rel).read_text(encoding="utf-8")
+        assert '_LOCAL_STATE_ENVS = frozenset({"development", "test"})' in src, (
+            f"{rel}: the local-state environment set must be EXACTLY "
+            "development/test — an empty or production APP_ENV value must "
+            "not be admitted to single-instance state"
+        )
+
+
+def test_mutation_m23_empty_app_env_local_fallback_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _assert_env_classification_fail_closed(REPO_ROOT)
+    _apply_empty_env_local_fallback(mutated_repo)
+    for rel in (
+        "devops-ai-platform/api-gateway/core/analysis_rate_limit.py",
+        "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py",
+    ):
+        mut_src = (mutated_repo / rel).read_text(encoding="utf-8")
+        assert '_LOCAL_STATE_ENVS = frozenset({"development", "test"})' not in mut_src, (
+            "guard stayed green after empty APP_ENV was admitted to local state"
+        )
+
+    # (2) Behavioral: the INTACT loaders fail closed for an empty and a
+    #     MISSING APP_ENV (both services).
+    from platform_pkg.api_gateway.core.analysis_rate_limit import (
+        AnalysisRateLimitConfigurationError,
+        load_analysis_rate_limit_settings as intact_gw_load,
+    )
+    from platform_pkg.agent.infrastructure.llm.gemini_caller import (
+        GeminiRuntimeConfig as intact_agent_cfg,
+    )
+
+    with pytest.raises(AnalysisRateLimitConfigurationError):
+        intact_gw_load({"APP_ENV": ""})
+    with pytest.raises(AnalysisRateLimitConfigurationError):
+        intact_gw_load({})  # APP_ENV missing
+    with pytest.raises(ValueError):
+        intact_agent_cfg.from_env({"APP_ENV": "", "GEMINI_BUDGET_STORE": "local"})
+    with pytest.raises(ValueError):
+        intact_agent_cfg.from_env({"GEMINI_BUDGET_STORE": "local"})  # APP_ENV missing
+
+    # WEAKENED: the same empty/missing APP_ENV silently resolves to the
+    # single-instance state — the audit defect.
+    top = _register_mutated_tree(mutated_repo, "mut_m23")
+    m_arl = importlib.import_module(f"{top}.api_gateway.core.analysis_rate_limit")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    assert m_arl.load_analysis_rate_limit_settings({"APP_ENV": ""})["store"] == "local", (
+        "expected the weakened gateway to silently fall back to the "
+        "single-instance limiter for an empty APP_ENV"
+    )
+    assert m_arl.load_analysis_rate_limit_settings({})["store"] == "local", (
+        "expected the weakened gateway to silently fall back to the "
+        "single-instance limiter for a MISSING APP_ENV"
+    )
+    assert m_gc.GeminiRuntimeConfig.from_env(
+        {"APP_ENV": "", "GEMINI_BUDGET_STORE": "local"}
+    ).budget_store == "local", (
+        "expected the weakened agent to silently use the in-process "
+        "budget ledger for an empty APP_ENV"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M24 — REDIS_INTEGRATION_REQUIRED removed from the CI workflow (the real-
+#       Redis gate degrades into silent skips) — Phase 8.7-D.1-CORRECTION-2
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_m24_redis_ci_flag_removal_detected(mutated_repo, monkeypatch):
+    # (1) Structural guard holds on the unmutated repo: both live-store
+    #     steps of the redis-integration job set REDIS_URL +
+    #     REDIS_INTEGRATION_REQUIRED=true.
+    from security_guards import runtime_guard
+
+    violations: list = []
+    runtime_guard._check_redis_integration_contract(REPO_ROOT, violations)
+    assert violations == [], f"unmutated repo violates the CI Redis contract: {violations}"
+
+    # (2) Mutation: remove the flag from the CI copy.
+    ci = mutated_repo / ".github/workflows/ci.yml"
+    src = ci.read_text(encoding="utf-8")
+    flag_line = '          REDIS_INTEGRATION_REQUIRED: "true"\n'
+    assert src.count(flag_line) == 2, (
+        "expected exactly two live-store steps carrying the fail-closed flag"
+    )
+    ci.write_text(src.replace(flag_line, "", 2), encoding="utf-8")
+
+    violations2: list = []
+    runtime_guard._check_redis_integration_contract(mutated_repo, violations2)
+    assert sum("REDIS_INTEGRATION_REQUIRED" in v for v in violations2) == 2, (
+        "guard stayed green after REDIS_INTEGRATION_REQUIRED=true was "
+        f"removed from the CI workflow (got {violations2})"
+    )
+
+    # (3) Behavioral: with the flag gone, a missing store makes the live-
+    #     store fixture SILENTLY SKIP (green CI, zero Redis tests
+    #     executed) — instead of the intact contract's hard failure.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "live_redis_fixture_under_test",
+        REPO_ROOT / "devops-ai-platform" / "tests" / "test_redis_integration.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_INTEGRATION_REQUIRED", raising=False)
+
+    # Flag absent -> the gate degrades into a silent skip (the defect the
+    # flag prevents: green CI with zero Redis tests executed).
+    with pytest.raises(pytest.skip.Exception):
+        mod.resolve_live_redis_url()
+
+    # Flag present -> the same missing store is a HARD failure.
+    monkeypatch.setenv("REDIS_INTEGRATION_REQUIRED", "true")
+    with pytest.raises(pytest.fail.Exception):
+        mod.resolve_live_redis_url()
