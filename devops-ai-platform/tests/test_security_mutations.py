@@ -430,7 +430,7 @@ def _apply_stale_ui_mutation(repo: Path) -> None:
     main_activity = repo / "app/src/main/java/com/example/MainActivity.kt"
     src = main_activity.read_text(encoding="utf-8")
 
-    old_copy = "Register repository parameters to generate offline DevOps blueprints (on-device simulation — no live Gemini calls on this branch)."
+    old_copy = "Register repository parameters to generate offline DevOps blueprints by default; authenticated live backend analysis can be enabled in Settings."
     old_title = '"AI Simulation & Resilience Cockpit"'
     assert old_copy in src, "mutation target (blueprint copy) not found"
     assert old_title in src, "mutation target (cockpit title) not found"
