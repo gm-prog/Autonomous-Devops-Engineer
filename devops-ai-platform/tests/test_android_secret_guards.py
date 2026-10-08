@@ -123,6 +123,30 @@ def test_no_secret_relocated_into_app_storage():
             continue
         assert not re.match(r"\s*GEMINI_API_KEY\s*=", line), line
 
+    # committed env template: must not carry the stale remote-backend claim
+    # and must state the offline-only truth (Phase 8.7-C.3).  The template
+    # content lives in comment lines, so strip the comment markers before
+    # normalizing (line wraps would otherwise split phrases).
+    env_norm = re.sub(
+        r"\s+", " ", re.sub(r"(?m)^\s*#\s*", " ", ENV_EXAMPLE.read_text(encoding="utf-8"))
+    ).lower()
+    for stale_claim in (
+        "authenticated platform backend",
+        "calls gemini server-side",
+        "sends analysis requests to the",
+    ):
+        assert stale_claim not in env_norm, (
+            f".env.example: stale remote-backend claim still present: "
+            f"{stale_claim!r}"
+        )
+    for truth_marker in ("offline-only", "not implemented on this branch"):
+        assert truth_marker in env_norm, (
+            f".env.example: required truth missing: {truth_marker!r} — the "
+            "template must state that Android analysis is offline-only on "
+            "this branch and the future server-side integration is not "
+            "implemented"
+        )
+
     # gradle: no buildConfigField for a gemini key
     gradle_text = GRADLE.read_text(encoding="utf-8")
     assert not android_guard._RE_GRADLE_GEMINI.search(gradle_text)
