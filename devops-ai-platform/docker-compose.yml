@@ -109,6 +109,46 @@ services:
       retries: 12
       start_period: 10s
 
+  deployment-service:
+    build:
+      context: .
+      dockerfile: ./deployment_service/Dockerfile
+    container_name: devops_d1_deployment_service
+    # NOT exposed to the host: the deployment execution boundary is
+    # internal (Phase 8.8A) and is reached only over the d1 network —
+    # the gateway's deployment route uses deployment-service:8030 and
+    # the gRPC default deployment-service:50053 (no gRPC server is
+    # exposed in this slice; the HTTP boundary is the real service).
+    expose:
+      - "8030"
+    environment:
+      # Celery broker: the shared internal Redis (same store the D1
+      # services already use).
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      # FAIL CLOSED BY DEFAULT: real cluster execution is refused with a
+      # typed error unless an operator explicitly enables it in a
+      # deliberately configured environment. Dry run / approval remain
+      # available; execution of an approved plan additionally requires
+      # a provisioned, policy-bound sandbox environment.
+      - DEPLOYMENT_EXECUTION_ENABLED=${DEPLOYMENT_EXECUTION_ENABLED:-false}
+      # OPTIONAL: server-side source-revision verification. Empty means
+      # the unauthenticated GitHub API is used at a low rate limit; a
+      # revision the service cannot confirm fails the dry run — it is
+      # never faked.
+      - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - d1
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
 networks:
   d1:
     internal: false

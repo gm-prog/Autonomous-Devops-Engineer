@@ -12,10 +12,10 @@ This guard inspects the ACTUAL files and fails CI when:
   ``pip-compile --generate-hashes``, or a pinned package lacks hashes;
 * the two locks DISAGREE on any shared package version (the "one
   compatible set" contract: test == container for every shared package);
-* the runtime lock is missing any of the 13 declared direct runtime
+* the runtime lock is missing any of the 14 declared direct runtime
   dependencies, or the test lock is missing its test-only tools;
-* either service Dockerfile does NOT install the runtime lock with
-  ``pip install --require-hashes``;
+* any service Dockerfile (gateway, agent, deployment production + E2E)
+  does NOT install the runtime lock with ``pip install --require-hashes``;
 * any CI Python job installs without ``--require-hashes`` (the unpinned
   fallback the audit flagged), or the retired broad ``requirements.txt``
   reappears.
@@ -44,6 +44,11 @@ OLD_REQUIREMENTS = f"{PLATFORM}/requirements.txt"
 DOCKERFILES = (
     f"{PLATFORM}/agent-service/Dockerfile",
     f"{PLATFORM}/api-gateway/Dockerfile",
+    # Phase 8.8A: the deployment slice's images carry the same contract —
+    # the production image and the E2E variant both install ONLY the
+    # hash-pinned runtime lock.
+    f"{PLATFORM}/deployment_service/Dockerfile",
+    f"{PLATFORM}/deployment_service/Dockerfile.e2e",
 )
 CI_WORKFLOW = ".github/workflows/ci.yml"
 
@@ -51,6 +56,18 @@ CI_WORKFLOW = ".github/workflows/ci.yml"
 # be IDENTICAL (the "one compatible set" contract).
 SHARED_PACKAGES = frozenset({
     "fastapi", "starlette", "anyio", "pydantic", "redis", "requests", "pyjwt",
+    # Phase 8.8A: the deployment engine imports yaml at runtime, so
+    # PyYAML is now a shared runtime dependency (both locks must agree).
+    "pyyaml",
+    # The deployment task module imports celery at import time and the
+    # test environment exercises it (tests/test_deployment_dispatch_truth.py),
+    # so the two locks must agree on celery too.
+    "celery",
+    # The Phase 6.5.1 release-identity carrier (backend/app/
+    # release_identity.py) imports prometheus_client, and the ported
+    # release-identity test loads that real module — both environments
+    # must agree on the version.
+    "prometheus-client",
 })
 
 # Every direct runtime dependency the containers must carry (the full set
@@ -59,10 +76,14 @@ RUNTIME_DIRECT = frozenset({
     "fastapi", "uvicorn", "requests", "sqlalchemy", "pydantic", "redis",
     "celery", "grpcio", "prometheus-client", "websockets", "structlog",
     "python-dotenv", "pyjwt",
+    # Phase 8.8A: deployment engine / IaC validation import yaml.
+    "pyyaml",
 })
 
 # Test/security-only tools that must be present in the test lock.
-TEST_ONLY = frozenset({"httpx", "pytest", "pyyaml"})
+# (pyyaml moved to SHARED_PACKAGES with Phase 8.8A — it is a runtime
+# dependency now, and the shared-parity check covers its presence.)
+TEST_ONLY = frozenset({"httpx", "pytest"})
 
 _PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\]+)")
 
@@ -176,7 +197,9 @@ def check_dependency_contract(repo_root: Path) -> List[str]:
                      "requirements.txt")
 
     # 5) Every CI Python install path uses --require-hashes on the test
-    #    lock (5 jobs), and no plain install of the lock remains.
+    #    lock (10 jobs: the six Phase 8.7-C/D.1 gates plus the five
+    #    Phase 8.8A deployment gates), and no plain install of the lock
+    #    remains.
     ci = repo_root / CI_WORKFLOW
     if ci.exists():
         csrc = ci.read_text(encoding="utf-8")
@@ -184,8 +207,8 @@ def check_dependency_contract(repo_root: Path) -> List[str]:
             r"pip install --require-hashes -r (?:\S+/)?requirements-test\.txt",
             csrc,
         ))
-        if hashed != 5:
-            v.append(f"ci.yml: expected exactly 5 hash-verified test-lock "
+        if hashed != 10:
+            v.append(f"ci.yml: expected exactly 10 hash-verified test-lock "
                      f"installs (found {hashed})")
         plain = re.findall(
             r"pip install (?!--require-hashes)(?:[^\n]* )?-r "

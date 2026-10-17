@@ -1,0 +1,10 @@
+# Phase 8.6-A — immutable kubectl build input for the sandbox image.
+#
+# format: <version> <sha256-of-linux-amd64-binary>
+#
+# Authority: https://dl.k8s.io/release/<version>/bin/linux/amd64/kubectl.sha256
+# fetched 2026-10-07 and recorded verbatim. dl.k8s.io publishes a BARE
+# digest with no filename, so `sha256sum -c` cannot consume that file
+# directly -- the workflow synthesises the checksum line and binds it to
+# the downloaded path. Never invented, never resolved at dispatch time.
+v1.31.4 298e19e9c6c17199011404278f0ff8168a7eca4217edad9097af577023a5620f

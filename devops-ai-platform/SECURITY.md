@@ -1,4 +1,4 @@
-# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION / 8.7-D.1-CORRECTION-2 / 8.7-D.1-CORRECTION-3)
+# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION / 8.7-D.1-CORRECTION-2 / 8.7-D.1-CORRECTION-3 / 8.8A)
 
 This document describes the **current** trust model of the platform after the
 Phase 8.7-C security integrity corrections, the Phase 8.7-D.1 production
@@ -825,7 +825,204 @@ bypassed) is detected by the guard.
 
 ---
 
-## 7. Known limitations (honest)
+## 7. Deployment execution trust boundary (Phase 8.8A)
+
+Phase 8.8A forward-ported the sandboxed deployment-execution vertical slice
+from the candidate head `029ab4900366cf6c926de39654ffa002bb090f0e`
+(PR #12/#13) onto this branch's security baseline
+(`4f2b1ba370b67a8584eb57cb23ffc1cca89f735c`), file by file — no merge of
+the candidate's history. It replaces the false-success deployment stubs
+(hard-coded plan summaries, `True`-returning apply, `run_grpc_998` /
+`SUCCESS` gRPC responses, sleep-and-log-"healthy" Celery task) with a
+truthful, tested, sandboxed execution/preview path.
+
+### 7.1 Package namespace decision
+
+* The Python package is `devops-ai-platform/deployment_service/`
+  (underscore, importable). The old hyphenated
+  `devops-ai-platform/deployment-service/` stub package (11 files) was
+  deleted after a full cross-reference audit: the only external
+  references are **container DNS hostnames** (`deployment-service:8030`,
+  `deployment-service:50053` in the api-gateway config/router), which are
+  service-name contracts, not Python paths, and remain valid — the
+  Compose service/container DNS name stays `deployment-service`.
+  `docker-compose.legacy.yml` (quarantined) got a one-line Dockerfile
+  path update.
+* Three bounded, demonstrated dependencies were ported with it
+  (documented in the migration manifest):
+  `shared_kernel/domain/provenance.py` (hash-covered provenance records,
+  stdlib-only), the `incident_service` deployment-evidence collector pair
+  (the deployment→incident evidence normalization contract), and
+  `backend/app/release_identity.py` (the Phase 6.5.1 Prometheus identity
+  carrier). Nothing else from the candidate's broad package migration was
+  imported.
+
+### 7.2 Terraform sandbox (fixed-operation, container-isolated)
+
+* **No host Terraform exists or can exist in the control plane.** The
+  control-plane image (production and E2E) is asserted at build time to
+  contain **no terraform binary**; the `TerraformRunnerService` has no
+  `subprocess` import and no host fallback. The only place terraform
+  exists is `Dockerfile.terraform-sandbox` (terraform 1.9.8, official
+  `SHA256SUMS`-verified, non-root uid/gid 65532 identity, no shell
+  entrypoint, `CHECKPOINT_DISABLE=1`).
+* **Every operation is a fixed argv** assembled by policy
+  (`build_terraform_argv`): `fmt`, `init`, `validate`, `plan`, `apply` —
+  with a per-operation timeout and a bounded capture size. Untrusted
+  Terraform content can only influence the configuration being planned;
+  it never chooses the executable, argv, image, user, network, mounts,
+  limits, environment or credentials.
+* **Container runtime profile** (the trusted adapter,
+  `container_terraform_sandbox.py`, is the only module allowed to spawn
+  a process, and only a container runtime):
+  `--network none --read-only --cap-drop ALL
+  --security-opt no-new-privileges --pids-limit --memory --cpus
+  --user <non-root> --rm --pull never`. The sandbox image reference must
+  be `name@sha256:<64hex>` — a tag is refused. No Docker socket is ever
+  passed into the sandbox; it is mounted into the control plane only,
+  because the control plane is the component that launches the sandbox.
+* **Plan artifacts are sensitive.** A saved plan is bounded to a single
+  expected filename directly inside the workspace, rejected if it is a
+  symlink or escapes the workspace, content-hashed
+  (`hash_plan_artifact`) and bound to the exact workspace. Raw plan
+  bytes are never logged or published; only the hash crosses the
+  approval boundary.
+* **Apply is hash-bound.** `apply_plan` refuses to run without an
+  expected hash, re-hashes the saved plan and refuses on mismatch
+  (`PLAN_ARTIFACT_MISMATCH`); there is no "unverified apply" mode.
+
+### 7.3 Kubernetes sandbox (fixed-operation, cluster-scoped)
+
+* The `KubectlRunnerService` is sandboxed through
+  `container_kubectl_sandbox.py` — the only host-spawning module for
+  Kubernetes. There is no host kubectl path in an application service.
+* The boundary enforces: kubeconfig parsing/sanitization,
+  cluster/server identity checks (API server + CA fingerprint),
+  namespace policy, manifest policy, workload identity/RBAC profile,
+  release-identity injection (the manifest is bound to the run id +
+  source SHA **before** the approval boundary — one artifact
+  representation crosses the boundary, no post-approval mutation), and
+  an approved sandbox-network identity distinct from Terraform's
+  network-none mode.
+* The dry run is a **server-side** dry run against the target cluster
+  (it contacts the API server and carries the same authorization
+  weight as the corresponding write — it is NOT equivalent to
+  client-side validation; a payload without a Kubernetes component
+  performs no Kubernetes operation at all and is reported
+  `SKIPPED`/`not applicable`, never "allowed through").
+* CI proves the boundary with a **disposable Kind cluster only**
+  (pinned node image from `e2e/pinned-images.txt`; kubectl v1.31.4
+  fetched against the committed sha256 in `e2e/pinned-kubectl.txt`);
+  the cluster is deleted in the job. No live user cluster, no cloud
+  account, no production credentials are used anywhere in CI.
+
+### 7.4 Approval binding (what an approval actually binds)
+
+A dry run produces a persisted run with an `artifact_hash` (the
+canonical effective payload, including the declared component
+selection) and a `plan_hash` over: the artifact hash, the repository
+identity, the source revision, the Terraform plan status/output, the
+**saved plan file hash**, the sandbox **policy identity**, the
+credential profile id (names only, never values), the Kubernetes
+dry-run output and the **Kubernetes execution identity** (namespace,
+API server, CA fingerprint, credential profile, manifest policy,
+sandbox policy, network). Approval requires the caller to echo both
+hashes exactly; execution re-checks them against the approval record
+and re-derives the same effective payload, so a changed artifact, a
+moved cluster, a changed sandbox policy or a re-planned Terraform plan
+all invalidate the approval instead of silently executing. The
+approved plan itself is kept in a persistent, `0o2770`-owned workspace
+(never world-readable) and is destroyed when the run reaches any
+terminal state.
+
+### 7.5 State persistence and dispatch semantics (truthful)
+
+* Run state persists in **Redis** (`RedisPipelineStore`) — every state
+  transition is stored; the execution lock makes a concurrent duplicate
+  dispatch refuse (`Deployment is already executing`) rather than
+  double-execute.
+* **Execution is off by default.** `DEPLOYMENT_EXECUTION_ENABLED` must
+  be explicitly `true`; otherwise execution is refused with a typed
+  error and nothing runs.
+* **Celery** (`tasks.execute_iac_deployment`) invokes the real
+  `DeploymentEngine` and returns a **typed result**
+  (SUCCEEDED / ROLLED_BACK / FAILED / BLOCKED + final state + error).
+  A refused or failed dispatch never leaves a run in an
+  accepted/completed state. **Exactly-once delivery is NOT claimed**:
+  Celery is at-least-once here; run-state durability comes from the
+  store, and the lock makes duplicates refuse.
+* **gRPC seam** (`deployment_service_impl`): validates the request
+  contract, creates a REAL persisted dry run and returns the real run
+  id + state + hashes, or a typed failure. It returns `DRY_RUN_PERSISTED`
+  on success — a dry run is not a deployment, so no `SUCCESS` status
+  exists. The slice ships no `.proto`/server bootstrap, so this surface
+  is not exposed over the wire; the HTTP boundary
+  (`/api/internal/deployments/*`, port 8030) is the real service.
+* **Legacy paths fail closed instead of faking**: the legacy
+  `ExecuteDeploymentCommand` (pipeline repository has no implementation
+  in this slice) returns typed `PIPELINE_REPOSITORY_NOT_IMPLEMENTED`
+  with no run id and no in-process idempotency cache; the
+  `CompileIaCManifest` command returns typed
+  `MANIFEST_COMPILATION_NOT_IMPLEMENTED` and never emits sample
+  manifests; the pipeline aggregate refuses `Completed` without
+  explicit `verified_operations` evidence and rejects unknown states.
+* **BLOCKED vs the other outcomes**: `BLOCKED` = a requested operation
+  could not be performed safely (sandbox unavailable, policy violation,
+  missing dependency, hash/approval mismatch) — nothing executed.
+  `FAIL` = an operation ran and did not succeed. `NOT_APPLICABLE` /
+  `SKIPPED` = the component was never declared — no operation was
+  requested, attempted, or claimed. None of these is ever silently
+  converted into a success.
+
+### 7.6 Image/tool pins and how CI verifies them
+
+* `e2e/pinned-images.txt` — committed `name@sha256:` digests (python
+  3.11-slim, redis 7-alpine, registry:2, kindest/node v1.31.4, …) with
+  recorded digest authority; the workflow reads them, builds
+  `<repo>@<digest>` references and pulls exactly those — a tag is never
+  resolved at dispatch time, and a malformed pin is a hard error.
+* `e2e/pinned-kubectl.txt` — kubectl v1.31.4 + sha256 of the
+  linux/amd64 binary; CI downloads and verifies before use.
+* The sandbox images are **built by CI from the committed
+  `Dockerfile.terraform-sandbox` / kubectl sandbox Dockerfile** against
+  the pinned base, pushed to a local registry so they carry a real
+  digest, and run with `--pull never`.
+* The deployment service images (production + E2E) install ONLY the
+  hash-pinned `requirements-runtime.txt` via
+  `pip install --require-hashes` — enforced by the dependency-parity
+  guard (which now covers the deployment Dockerfiles) and mutation M29.
+
+### 7.7 Test and CI coverage (Phase 8.8A)
+
+* 12 ported deployment test modules (trust boundary, approval
+  integrity, sandbox network isolation, source verification, release
+  identity, evidence provenance, Kubernetes trust boundary, engine,
+  state, HTTP contract, internal API, component selection) run in the
+  full-suite evidence gate.
+* `tests/test_deployment_dispatch_truth.py` (13 tests): the four former
+  false-success paths (gRPC, Celery, compile, legacy execute) plus the
+  pipeline terminal-state guard, each proven typed-failure and
+  no-fabrication.
+* Mutation **M31** (isolated copy): reintroduced host-side Terraform
+  subprocess fallback → the AST host-execution guard
+  (`scripts/assert_no_host_terraform_execution.py`) must fail.
+  Mutation **M32**: reintroduced the fabricated gRPC run id + SUCCESS
+  → the dispatch-truth control must fail. M29 extended to the
+  deployment Dockerfile. M1–M30 unchanged.
+* Five CI deployment gates: Terraform trust boundary (+ AST guard +
+  mutation probes), containerized Terraform sandbox E2E (real Docker,
+  pinned terraform 1.9.8, harmless fixtures), Kubernetes trust boundary
+  (unit + probes), live disposable Kind E2E (real cluster, workload
+  observed, torn down), and real deployment-service→Kind E2E over HTTP
+  (the real service image is built and exercised).
+* The CI evidence binds to the commit under test
+  (`E2E_BASE_COMMIT` = the run's SHA prefix), not a hard-coded SHA.
+* **Not claimed**: production deployment, production-verified
+  execution, or "fully autonomous" operation. The E2E proof is
+  local/disposable (Kind); production credentials and clusters are
+  deliberately out of scope and absent from CI.
+
+## 8. Known limitations (honest)
 
 * The gateway's typed control-plane forwards are synchronous HTTP; in this
   codebase state they relay typed payloads to the incident service's internal

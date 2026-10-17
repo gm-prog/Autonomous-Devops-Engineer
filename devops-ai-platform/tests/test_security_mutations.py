@@ -2492,6 +2492,29 @@ def test_mutation_m29_dependency_drift_detected(mutated_repo):
         f"Dockerfile (got {violations_b})"
     )
 
+    # (4) Mutation C — Phase 8.8A: the DEPLOYMENT service Dockerfile drops
+    #     --require-hashes (the same unpinned-fallback defect in the new
+    #     image the forward-port adds). The guard must name it.
+    dep_df = mutated_repo / "devops-ai-platform/deployment_service/Dockerfile"
+    dsrc = dep_df.read_text(encoding="utf-8")
+    old_dep_df = "RUN pip install --no-cache-dir --require-hashes -r requirements-runtime.txt"
+    assert old_dep_df in dsrc, "M29 target (deployment Dockerfile hash-verified install) not found"
+    dsrc = dsrc.replace(
+        old_dep_df,
+        "RUN pip install --no-cache-dir -r requirements-runtime.txt",
+        1,
+    )
+    dep_df.write_text(dsrc, encoding="utf-8")
+
+    violations_c = dependency_guard.check_dependency_contract(mutated_repo)
+    assert any(
+        "--require-hashes" in v and "deployment_service/Dockerfile" in v
+        for v in violations_c
+    ), (
+        f"guard stayed green after --require-hashes was dropped from the "
+        f"deployment service Dockerfile (got {violations_c})"
+    )
+
 
 # ---------------------------------------------------------------------------
 # M30 — Android: the JWT-bearing client follows redirects again / the
@@ -2552,4 +2575,170 @@ def test_mutation_m30_android_redirect_trust_detected(mutated_repo):
     violations3 = android_guard.check_redirect_trust_policy(mutated_repo)
     assert any("trust gate" in v for v in violations3), (
         f"guard stayed green after the trust gate was bypassed (got {violations3})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M31 — Deployment: reintroduce a host-side Terraform execution fallback
+# ---------------------------------------------------------------------------
+def test_mutation_m31_host_terraform_fallback_detected(mutated_repo):
+    """The sandboxed-deployment boundary (Phase 8.8A) must bite.
+
+    Mutation: when the Terraform sandbox is unavailable, the runner
+    "helpfully" falls back to executing terraform ON THE HOST via
+    subprocess — exactly the path Phase 8.5-A exists to close. The
+    AST host-execution guard must turn red on the mutated tree.
+    """
+    import subprocess as sp
+
+    platform_root = REPO_ROOT / "devops-ai-platform"
+    guard_rel = Path("scripts") / "assert_no_host_terraform_execution.py"
+
+    # (1) The guard is clean on the unmutated repository.
+    clean = sp.run(
+        [sys.executable, str(platform_root / guard_rel)],
+        cwd=platform_root,
+        capture_output=True,
+        text=True,
+    )
+    assert clean.returncode == 0, (
+        f"unmutated repo violates the host-execution boundary:\n"
+        f"{clean.stdout}\n{clean.stderr}"
+    )
+
+    # (2) Mutation — a host-side fallback inside the fail-closed
+    #     sandbox-error path of the terraform runner.
+    runner_rel = (
+        "devops-ai-platform/deployment_service/application/services/"
+        "terraform_runner.py"
+    )
+    runner = mutated_repo / runner_rel
+    src = runner.read_text(encoding="utf-8")
+    anchor = "        except TerraformSandboxError as exc:\n"
+    assert anchor in src, "M31 target (fail-closed sandbox error path) not found"
+    mutated = (
+        anchor
+        + "            import subprocess  # MUTATION: host-side fallback\n"
+        + '            subprocess.run(["terraform", "plan"], cwd=iac_dir)\n'
+    )
+    src = src.replace(anchor, mutated, 1)
+    runner.write_text(src, encoding="utf-8")
+
+    # (3) The guard, run against the mutated tree (it derives its scan
+    #     root from its own location), must FAIL and name the module.
+    violated = sp.run(
+        [sys.executable, str(mutated_repo / "devops-ai-platform" / guard_rel)],
+        cwd=mutated_repo / "devops-ai-platform",
+        capture_output=True,
+        text=True,
+    )
+    assert violated.returncode != 0, (
+        "host-execution guard stayed GREEN after a host-side terraform "
+        f"fallback was reintroduced:\n{violated.stdout}\n{violated.stderr}"
+    )
+    assert "terraform_runner.py" in violated.stdout, (
+        "guard failure does not name the mutated module:\n" + violated.stdout
+    )
+    assert "subprocess" in violated.stdout, (
+        "guard failure does not name the offending API:\n" + violated.stdout
+    )
+
+
+# ---------------------------------------------------------------------------
+# M32 — Deployment: reintroduce the fabricated gRPC run ID + SUCCESS
+# ---------------------------------------------------------------------------
+def test_mutation_m32_grpc_false_success_detected(mutated_repo):
+    """The dispatch-truth control (tests/test_deployment_dispatch_truth.py)
+    must catch a restored fabrication.
+
+    Mutation: the gRPC boundary again returns a hard-coded placeholder run
+    ID and an unconditional success status without ever creating a run.
+    """
+    grpc_rel = (
+        "devops-ai-platform/deployment_service/presentation/grpc/"
+        "deployment_service_impl.py"
+    )
+    impl_path = mutated_repo / grpc_rel
+    src = impl_path.read_text(encoding="utf-8")
+
+    # (1) The unmutated control holds: no fabricated literal, and the
+    #     dispatch-truth suite passes on the real tree.
+    real_src = (REPO_ROOT / grpc_rel).read_text()
+    assert "run_grpc_998" not in real_src
+    import subprocess as sp
+
+    truth = sp.run(
+        [sys.executable, "-m", "pytest",
+         "tests/test_deployment_dispatch_truth.py", "-q", "--no-header"],
+        cwd=REPO_ROOT / "devops-ai-platform",
+        capture_output=True,
+        text=True,
+    )
+    assert truth.returncode == 0, (
+        "dispatch-truth suite is RED on the unmutated repo:\n"
+        f"{truth.stdout}\n{truth.stderr}"
+    )
+
+    # (2) Mutation — the success path fabricates the run ID and claims
+    #     SUCCESS without creating anything.
+    anchor = (
+        "        state = run.state.value if hasattr(run.state, \"value\") else str(run.state)\n"
+        "        return _response(\n"
+        "            \"DRY_RUN_PERSISTED\",\n"
+        "            run_id=run.id,\n"
+    )
+    assert anchor in src, "M32 target (gRPC success path) not found"
+    mutated = (
+        "        state = run.state.value if hasattr(run.state, \"value\") else str(run.state)\n"
+        "        return _response(\n"
+        "            \"SUCCESS\",  # MUTATION: unconditional success restored\n"
+        "            run_id=\"run_grpc_998\",  # MUTATION: fabricated run ID\n"
+    )
+    impl_path.write_text(src.replace(anchor, mutated, 1), encoding="utf-8")
+
+    # (3) The structural control goes red on the mutated source ...
+    mutated_src = impl_path.read_text(encoding="utf-8")
+    assert "run_grpc_998" in mutated_src
+
+    # ... and the fabrication is behaviorally live: load the mutated
+    # module (absolute imports resolve to the real engine modules) and
+    # show it actually returns the fake ID + SUCCESS.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "m32_mutated_grpc_impl", str(impl_path)
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class _Run:
+        id = "run_real"
+        state = types.SimpleNamespace(value="AWAITING_APPROVAL")
+        artifact_hash = "a" * 64
+        plan_hash = "p" * 64
+
+    class _Engine:
+        def create_dry_run(self, payload):
+            return _Run()
+
+    impl = module.DeploymentServiceGRPCImpl(engine=_Engine())
+    resp = impl.TriggerContinuousDeployment(
+        types.SimpleNamespace(
+            repository_id=7,
+            repository_name="acme/checkout",
+            requested_by="ops",
+            dockerfile="FROM python:3.11-slim\n",
+            k8s_yaml="",
+            terraform_tf="",
+            pipeline_yaml="name: ci\n",
+            head_sha="b" * 40,
+            components=["dockerfile", "pipeline"],
+        ),
+        context=None,
+    )
+    assert resp.pipeline_run_id == "run_grpc_998", (
+        "mutation did not take effect (fabricated ID not returned)"
+    )
+    assert resp.dispatch_status == "SUCCESS", (
+        "mutation did not take effect (unconditional SUCCESS not returned)"
     )

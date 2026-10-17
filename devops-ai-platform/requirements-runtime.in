@@ -44,11 +44,20 @@ pydantic==2.14.1
 redis==8.1.0
 requests==2.34.2
 PyJWT==2.15.1
-uvicorn>=0.22.0
-sqlalchemy>=2.0.19
-celery>=5.3.1
-grpcio>=1.54.2
-prometheus_client>=0.17.1
-websockets>=11.0.3
-structlog>=23.1.0
-python-dotenv>=1.0.0
+# Phase 8.8A: the previously open-ended minimums are pinned to the EXACT
+# versions the compiled lock carries (2026-10-17). This stabilises
+# regeneration: re-running the documented pip-compile workflow cannot
+# silently float these packages to newer, unverified versions. Bumping any
+# of them is a deliberate, reviewed dependency change — pin it here first.
+uvicorn==0.54.0
+sqlalchemy==2.1.5
+celery==5.6.3
+grpcio==1.84.0
+prometheus_client==0.26.0
+websockets==17.2
+structlog==26.1.0
+python-dotenv==1.2.4
+# Phase 8.8A: the deployment engine (IaC validation, manifest parsing)
+# imports yaml at runtime. Version matches the existing test-lock pin so
+# the dependency-parity guard keeps one compatible set.
+PyYAML==6.0.3

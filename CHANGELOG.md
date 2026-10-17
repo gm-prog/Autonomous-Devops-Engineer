@@ -2,6 +2,81 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.8A] — Sandboxed Deployment Execution Forward-Port (2026-10-17)
+
+Selective, file-level forward-port of the sandboxed deployment-execution
+vertical slice from candidate head
+`029ab4900366cf6c926de39654ffa002bb090f0e` (PR #12/#13) onto the
+`4f2b1ba` security baseline — **no merge of the candidate history, no
+third deployment engine, no wholesale import of the 431-file diff.**
+
+### What changed
+
+* **`deployment_service/` (underscore) is now the deployment package.**
+  The 11 hyphenated `deployment-service/` stub files (hard-coded plan
+  summaries, `True`-returning apply/rollback, `run_grpc_998`/`SUCCESS`
+  gRPC response, sleep-and-log-"healthy" Celery task) are deleted after
+  a full cross-reference audit. The Compose service/container DNS name
+  stays `deployment-service` (api-gateway hostname references remain
+  valid); `docker-compose.legacy.yml` got a one-line Dockerfile path
+  update.
+* **Sandboxed execution, no host fallback.** Terraform runs only inside
+  the fixed-operation sandbox container (`--network none --read-only
+  --cap-drop ALL --no-new-privileges`, non-root, `--pull never`,
+  digest-pinned image; the control-plane image is build-asserted to
+  contain no terraform binary). kubectl runs only through its container
+  sandbox with kubeconfig/namespace/manifest/execution-identity
+  policies. Apply is hash-bound to the approved plan artifact; a
+  mismatch refuses (`PLAN_ARTIFACT_MISMATCH`).
+* **Truthful orchestration.** Dry run → hash-bound approval → execution
+  applies the exact approved plan (no re-plan), Kubernetes apply under
+  the approved execution identity, health check, deterministic
+  rollback. Run state persists in Redis; execution is OFF unless
+  `DEPLOYMENT_EXECUTION_ENABLED=true`; Celery returns typed results
+  (at-least-once delivery — exactly-once is NOT claimed); the gRPC seam
+  returns real persisted run ids or typed failures (the slice ships no
+  proto/server, so it is not wire-exposed); the legacy pipeline command
+  and the compile-IaC command fail closed with typed BLOCKED results
+  instead of fabricating runs or sample manifests; the pipeline
+  aggregate requires verified-operation evidence for `Completed`.
+* **Canonical compose** gains `deployment-service` (internal 8030, no
+  host port, fail-closed defaults, healthcheck); a trimmed
+  `docker-compose.e2e.yml` (deployment-service only) supports the E2E
+  topology validation.
+* **CI:** the six existing Phase 8.7-C/D.1 gates are unchanged; five
+  deployment gates were hand-merged (Terraform trust boundary + AST
+  guard + mutation probes; containerized Terraform sandbox E2E with
+  pinned terraform 1.9.8; Kubernetes trust boundary unit + probes; live
+  disposable Kind E2E with checksum-pinned kubectl v1.31.4; real
+  deployment-service→Kind E2E over HTTP). All Python jobs install the
+  hash-pinned test lock. E2E images/tools come only from the committed
+  pin files; evidence is bound to the commit under test.
+* **Locks:** `PyYAML` added to the runtime lock (deployment engine
+  imports yaml at runtime); the previously open-ended runtime pins were
+  stabilized to the exact locked versions; `celery` + `prometheus-client`
+  added to the test lock's shared set (the task module and the release-
+  identity carrier are exercised by tests). Both locks regenerated with
+  the documented `pip-compile --generate-hashes --strip-extras`
+  workflow; fresh-venv installs verified.
+* **Tests/guards:** 12 ported deployment test modules joined the
+  full-suite gate; new `tests/test_deployment_dispatch_truth.py`
+  (13 tests) proves the former false-success paths fail honestly; new
+  mutations **M31** (host-side Terraform fallback → AST guard must
+  fail) and **M32** (fabricated gRPC run id + SUCCESS → dispatch-truth
+  control must fail); M29 extended to the deployment Dockerfile; the
+  dependency-parity guard now covers the deployment Dockerfiles, the
+  new shared packages and the 10 CI test-lock installs. M1–M30
+  unrenumbered, unremoved, unweakened.
+* **Docs:** `SECURITY.md` §7 (deployment execution trust boundary)
+  states the actual behavior and the explicit non-claims.
+
+### Not claimed
+
+No production deployment, no production-verified execution, no
+"fully autonomous" operation. E2E evidence is local/disposable (Kind);
+production credentials and clusters are out of scope and absent from
+CI. The branch is unmerged.
+
 ## [8.7-D.1-CORRECTION-3] — Correction of Six Audit Findings (2026-10-17)
 
 Narrow correction pass for the six findings (A–F) of the independent

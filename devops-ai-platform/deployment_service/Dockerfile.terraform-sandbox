@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+# check=skip=InvalidDefaultArgInFrom;error=true
+
+# Phase 8.5-A corrective — the untrusted Terraform execution sandbox.
+#
+# This is the ONLY place Terraform is allowed to exist and run. The
+# deployment service (the trusted control plane) deliberately has no
+# Terraform binary at all; it launches this image with a fixed,
+# policy-owned argv and a locked-down runtime profile:
+#
+#     --network none --read-only --cap-drop ALL
+#     --security-opt no-new-privileges --pids-limit --memory --cpus
+#     --user <non-root> --rm --pull never
+#
+# Nothing in here is trusted. The image intentionally contains no shell
+# entrypoint wrapper, no package manager at runtime, no cloud CLIs, no
+# credentials and no Docker client: a workload that escapes Terraform
+# itself should find as little as possible to work with.
+#
+# Built and pushed to a registry so it has a real, immutable digest; the
+# control plane refuses any image reference that is not name@sha256:...
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS fetch
+
+ARG TERRAFORM_VERSION=1.9.8
+ARG TARGETARCH=amd64
+
+# Official release + official SHA256SUMS, verified before use.
+# The pinned base (e2e/pinned-images.txt) is Debian-based, so use its
+# package manager directly rather than guessing at the distro: a build
+# that "tries things" is a build whose failures are hard to read.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl unzip; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    base="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}"; \
+    archive="terraform_${TERRAFORM_VERSION}_linux_${TARGETARCH}.zip"; \
+    cd /tmp; \
+    # The checksum file lists the archive by its CANONICAL name, so the
+    # download must keep that name -- saving it as tf.zip makes
+    # `sha256sum -c` look for a file that does not exist and fail with a
+    # misleading "No such file or directory" instead of a checksum error.
+    curl -fsSLo "${archive}" "${base}/${archive}"; \
+    curl -fsSLo terraform_SHA256SUMS "${base}/terraform_${TERRAFORM_VERSION}_SHA256SUMS"; \
+    grep " ${archive}\$" terraform_SHA256SUMS | sha256sum -c -; \
+    unzip -o "${archive}" -d /usr/local/bin terraform; \
+    chmod 0755 /usr/local/bin/terraform; \
+    rm -f "${archive}" terraform_SHA256SUMS; \
+    /usr/local/bin/terraform version
+
+# ---------------------------------------------------------------------
+# Runtime stage: a minimal image carrying the verified binary and a
+# dedicated unprivileged identity. Nothing from the fetch stage's
+# tooling (curl, unzip, package manager) survives into it.
+# ---------------------------------------------------------------------
+FROM ${BASE_IMAGE}
+
+ARG SANDBOX_UID=65532
+ARG SANDBOX_GID=65532
+
+COPY --from=fetch /usr/local/bin/terraform /usr/local/bin/terraform
+
+# A real, fixed, non-root identity. The control plane creates the
+# workspace owned by exactly this uid:gid so Terraform can write its
+# plan without anyone being tempted to widen permissions or run as root.
+RUN set -eux; \
+    groupadd -g "${SANDBOX_GID}" -r sandbox; \
+    useradd -u "${SANDBOX_UID}" -g "${SANDBOX_GID}" -r -M \
+        -s /usr/sbin/nologin sandbox; \
+    mkdir -p /workspace; \
+    chown "${SANDBOX_UID}:${SANDBOX_GID}" /workspace; \
+    /usr/local/bin/terraform version
+
+# Terraform must never phone home or check for upgrades from inside a
+# network-none sandbox; these keep it from wasting the timeout trying.
+ENV CHECKPOINT_DISABLE=1 \
+    TF_IN_AUTOMATION=1 \
+    TF_INPUT=0 \
+    TF_CLI_ARGS=""
+
+USER ${SANDBOX_UID}:${SANDBOX_GID}
+WORKDIR /workspace
+
+# Fixed executable. The control plane supplies only subcommands and
+# flags it assembled itself, so there is no shell and no path by which
+# untrusted content can choose what runs.
+ENTRYPOINT ["/usr/local/bin/terraform"]
+CMD ["version"]

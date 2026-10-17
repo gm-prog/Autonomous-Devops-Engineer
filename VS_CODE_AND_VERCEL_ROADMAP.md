@@ -296,3 +296,35 @@ Android
     environment, the service fails closed (HTTP 503) instead of
     fabricating a response.
 the backend infrastructure (Steps 1–2) alone does not create it.
+
+---
+
+## 🔒 Phase 8.8A — Sandboxed Deployment Execution (forward-ported, unmerged)
+
+The deployment execution path is no longer a set of success-shaped
+stubs. The sandboxed deployment slice from the candidate PR #12/#13
+source (`029ab49003`) was forward-ported **file by file** onto the
+Phase 8.7-D.1-CORRECTION-3 security baseline (`4f2b1ba`) — no merge of
+the candidate history, no third engine.
+
+* **Truthful states, real persistence.** Deployments flow dry-run →
+  hash-bound approval → execution, with every state transition
+  persisted in Redis and execution refused (typed BLOCKED/FAIL) unless
+  the approved artifact, plan hash and sandbox policy identity all
+  match. Execution is off by default
+  (`DEPLOYMENT_EXECUTION_ENABLED=false`).
+* **No host Terraform/kubectl.** Both execute only inside locked-down
+  sandbox containers (network-none / pinned cluster-scoped, non-root,
+  read-only, dropped capabilities, bounded output and timeouts); the
+  control-plane image is build-asserted to contain no terraform binary,
+  and the AST guard + mutation M31/M32 keep it that way.
+* **What is proven where.** Unit/trust-boundary: the ported 12 test
+  modules + dispatch-truth tests in CI. Real sandbox container:
+  Terraform 1.9.8 pinned, disposable local registry. Real cluster:
+  disposable Kind only (checksum-pinned kubectl v1.31.4), torn down in
+  the job. **Production deployment is NOT claimed** — no production
+  credentials or clusters exist in this branch or its CI.
+* See `devops-ai-platform/SECURITY.md` §7 for the full trust boundary
+  and `CHANGELOG.md` [8.8A] for the exact change set. The branch
+  `arena/phase-8-8a-sandboxed-deployment-forward-port` is ready for
+  independent review and is **not merged**.

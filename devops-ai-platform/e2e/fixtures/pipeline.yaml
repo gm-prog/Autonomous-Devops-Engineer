@@ -1,0 +1,7 @@
+name: e2e-fixture-pipeline
+on: [push]
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo fixture

@@ -30,8 +30,16 @@ pydantic==2.14.1
 redis==8.1.0
 requests==2.34.2
 PyJWT==2.15.1
+# Phase 8.8A: the deployment task module (celery) and the deployment
+# engine's yaml usage are now exercised by the test environment
+# (tests/test_deployment_dispatch_truth.py); the versions must match the
+# runtime lock exactly (dependency-parity guard, SHARED_PACKAGES).
+celery==5.6.3
+PyYAML==6.0.3
+prometheus_client==0.26.0
 
 # --- test/security-only dependencies ---
+# (pyyaml moved to the shared block above with Phase 8.8A: the deployment
+# engine imports it at runtime, so it is a shared runtime dependency.)
 httpx==0.28.1
 pytest==9.1.1
-pyyaml==6.0.3

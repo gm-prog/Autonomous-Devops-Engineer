@@ -1,0 +1,55 @@
+# Phase 8.8A — E2E-only override for the deployment-service slice.
+# Never part of the default contract; used only by the deployment E2E
+# CI jobs to validate the topology:
+#
+#   docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml config
+#
+# This override covers ONLY the deployment service (the canonical stack
+# is the Phase 8.7-D.1 gateway + agent + Redis contract). The broad
+# Phase 8 integration-stack overrides from the candidate source (postgres,
+# qdrant, repo/incident/agent E2E Dockerfiles and their env) are NOT
+# ported: they describe services that do not exist in this baseline.
+#
+# Image refs are digest-resolved by the harness before `up` (committed
+# pins in devops-ai-platform/e2e/pinned-images.txt); the placeholders
+# below only exist so `compose config` validation can run in CI.
+services:
+  deployment-service:
+    build:
+      context: ./devops-ai-platform
+      dockerfile: ./deployment_service/Dockerfile.e2e
+      args:
+        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+    environment:
+      - DEPLOYMENT_EXECUTION_ENABLED=true
+      - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
+      - DEPLOYMENT_KUBECONFIG_PATH=/etc/deployment/kubeconfig
+      - DEPLOYMENT_ALLOWED_NAMESPACES=devops-production-namespace
+      # The Terraform sandbox image must be digest-pinned and must
+      # already exist locally — the control plane runs it with
+      # --pull never and refuses a tag.
+      - DEPLOYMENT_TERRAFORM_SANDBOX_IMAGE=${TERRAFORM_SANDBOX_IMAGE:?E2E requires a digest-pinned terraform sandbox image}
+      - DEPLOYMENT_TERRAFORM_SANDBOX_VERSION=${E2E_TERRAFORM_VERSION:-1.9.8}
+      # The identity the sandbox runs as; never 0.
+      - DEPLOYMENT_TERRAFORM_SANDBOX_UID=65532
+      - DEPLOYMENT_TERRAFORM_SANDBOX_GID=65532
+      # Workspace root, mounted at the SAME absolute path on the host
+      # and in this container.
+      - DEPLOYMENT_WORKSPACE_ROOT=/tmp/ares-e2e-tf-workspaces
+      # v1 forwards no credentials into Terraform at all.
+      - DEPLOYMENT_CREDENTIAL_ENV_KEYS=
+    volumes:
+      - ${E2E_KUBECONFIG_HOST_PATH:-/tmp/ares-e2e-kubeconfig}:/etc/deployment/kubeconfig:ro
+      # TRUST BOUNDARY NOTE. The socket is mounted into the deployment
+      # service because that service IS the trusted control plane: it
+      # launches the sandbox. It is NEVER passed into the sandbox
+      # container itself — the Terraform workload gets --network none,
+      # no socket, and only its own workspace. Mounting the socket here
+      # grants this container control-plane authority over the daemon,
+      # which is exactly the privilege it already needs and must be
+      # treated as such when reviewing changes to this service.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Workspace root bind-mounted at an IDENTICAL absolute path on
+      # both sides: the control plane asks the daemon to bind-mount a
+      # workspace path, and the daemon resolves that path on the HOST.
+      - /tmp/ares-e2e-tf-workspaces:/tmp/ares-e2e-tf-workspaces

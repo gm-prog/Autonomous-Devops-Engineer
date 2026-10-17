@@ -6,10 +6,13 @@
 # the older broad stack (postgres / redis / qdrant / celery worker) for
 # reference only.
 #
-# * The `celery-worker` service references `./deployment-service/Dockerfile`,
-#   which does NOT exist on this branch — the worker is NOT runnable here and
-#   is intentionally left as-is (we do not fabricate a fake deployment
-#   service just to satisfy Compose). `docker compose config` will flag it if
+# * The `celery-worker` service references `./deployment_service/Dockerfile`
+#   (Phase 8.8A path update — the package was migrated from the hyphenated
+#   `deployment-service/` namespace). This legacy stack remains QUARANTINED
+#   and is NOT the canonical D1 stack: the deployment service itself is
+#   part of the canonical `docker-compose.yml` now, with its own security
+#   contract (fail-closed execution, no host port exposure). Do not use
+#   this file for the D1 path. `docker compose config` will flag it if
 #   you try to build this legacy file.
 # * The legacy stack exposes data stores to the host and used a hard-coded
 #   database password; the password is now externally supplied (no committed
@@ -78,7 +81,7 @@ services:
   celery-worker:
     build:
       context: .
-      dockerfile: ./deployment-service/Dockerfile
+      dockerfile: ./deployment_service/Dockerfile
     container_name: devops_celery_worker
     command: celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info
     environment:
