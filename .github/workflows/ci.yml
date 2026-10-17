@@ -97,11 +97,16 @@ jobs:
           # not reachable from every review environment, so mirror the
           # FAILED/ERROR node ids into annotations — the durable record
           # of exactly which tests failed. Bounded to the first 25.
+          # A GREEN suite has no FAILED lines: grep would exit 1 under
+          # pipefail, so the no-match case is handled explicitly.
           if [ -f security-tests.txt ]; then
-            grep -E '^(FAILED|ERROR) ' security-tests.txt | head -25 \
-              | while IFS= read -r LINE; do
-                printf '::error file=security-tests.txt,title=security suite::%s\n' "${LINE//$'\r'/}"
-              done
+            FAILED_LINES="$(grep -E '^(FAILED|ERROR) ' security-tests.txt || true)"
+            if [ -n "$FAILED_LINES" ]; then
+              printf '%s\n' "$FAILED_LINES" | head -25 \
+                | while IFS= read -r LINE; do
+                    printf '::error file=security-tests.txt,title=security suite::%s\n' "${LINE//$'\r'/}"
+                  done
+            fi
           fi
 
       - uses: actions/upload-artifact@v7
