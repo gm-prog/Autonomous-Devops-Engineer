@@ -146,7 +146,9 @@ object BackendGatewayClient {
         // are all rejected: they make the "exact URL used" ambiguous and
         // can smuggle credentials or alter the destination the operator
         // approved.  Legitimate base paths are preserved.
-        if (url.username.isNotEmpty() || url.encodedPassword().isNotEmpty()) {
+        // OkHttp 4.10: the *() function forms are ERROR-level
+        // deprecations ("moved to val") — use the property forms.
+        if (url.username.isNotEmpty() || url.encodedPassword.isNotEmpty()) {
             return "Gateway URLs must not contain user info (user:pass@host) — " +
                 "configure scheme://host[:port] with an optional base path only."
         }
