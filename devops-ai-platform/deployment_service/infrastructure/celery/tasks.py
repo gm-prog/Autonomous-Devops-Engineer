@@ -1,24 +1,32 @@
-"""Deployment Celery tasks — REAL orchestration dispatch (Phase 8.8A).
+"""Deployment Celery tasks — worker-owned execution (Phase 8.8A
+Correction-1, F5/F7).
 
-This module is the asynchronous execution seam. It contains NO sleep-based
-fakes and NO fake-healthy logging: the task invokes the real
-``DeploymentEngine``, which verifies the APPROVED state, re-verifies the
-approved artifact/plan hashes, applies the exact approved plan, performs
-the Kubernetes apply under the approved execution identity, runs the
-post-deployment health check and persists every state transition through
-the engine's Redis store.
+This module is the asynchronous execution seam. The API validates,
+persists a durable run in EXECUTION_REQUESTED and enqueues; THIS task
+is the only thing that executes. It:
+
+* short-circuits redelivered tasks for runs already in a terminal
+  state — the persisted outcome is returned, nothing is re-run
+  (at-least-once delivery is honest, not dangerous);
+* acquires the run's fenced execution lease — a duplicate concurrent
+  task finds the lease held and refuses without touching the run, so
+  N duplicate dispatches yield exactly one active executor;
+* invokes the real ``DeploymentEngine`` under the lease: every side
+  effect is fenced, losing the lease cancels the running sandbox and
+  marks the run LEASE_LOST (the stale worker commits nothing further).
 
 Delivery semantics (honest, documented):
+  * Celery provides AT-LEAST-ONCE delivery here. Exactly-once is NOT
+    claimed; idempotency comes from the durable run state + the
+    fenced lease, not from the broker.
   * a successful call returns a typed result reflecting the run's REAL
-    final state (SUCCEEDED / ROLLED_BACK / FAILED);
-  * a refused execution (not approved, execution disabled, hash mismatch,
-    sandbox BLOCKED, ...) returns a typed BLOCKED result — the run is
-    NEVER left in an "accepted/completed" state by a failed dispatch;
-  * any unexpected worker exception is mapped to a typed FAILED result;
-  * exactly-once delivery is NOT claimed: Celery provides at-least-once
-    semantics here; durability of the RUN STATE comes from the engine's
-    store, and the engine's execution lock makes a concurrent duplicate
-    dispatch refuse rather than double-execute.
+    final state (SUCCEEDED / ROLLED_BACK / FAILED / LEASE_LOST /
+    BLOCKED / ALREADY_EXECUTING);
+  * a refused execution (not approved, execution disabled, hash
+    mismatch, sandbox BLOCKED, ...) returns a typed BLOCKED result —
+    the run is NEVER left in an "accepted/completed" state by a failed
+    dispatch;
+  * any unexpected worker exception is mapped to a typed FAILED result.
 """
 
 import logging
@@ -33,8 +41,8 @@ celery_app = Celery("deployment_tasks", broker=f"redis://{REDIS_HOST}:{REDIS_POR
 
 logger = logging.getLogger("DeploymentCeleryTasks")
 
-#: The engine's terminal deployment states and the task-level status each
-#: maps to. Anything not DEPLOYED is reported as a non-success.
+#: The engine's terminal deployment states and the task-level status
+#: each maps to. Anything not DEPLOYED is reported as a non-success.
 _STATUS_BY_STATE = {
     "DEPLOYED": "SUCCEEDED",
     "ROLLED_BACK": "ROLLED_BACK",
@@ -42,7 +50,15 @@ _STATUS_BY_STATE = {
     "DEPLOYMENT_FAILED": "FAILED",
     "DRY_RUN_FAILED": "FAILED",
     "VALIDATION_FAILED": "FAILED",
+    "LEASE_LOST": "LEASE_LOST",
 }
+
+#: Every terminal state: a task redelivered for one of these must NOT
+#: start another execution.
+_TERMINAL_STATES = frozenset({
+    "DEPLOYED", "DEPLOYMENT_FAILED", "ROLLED_BACK", "ROLLBACK_FAILED",
+    "DRY_RUN_FAILED", "VALIDATION_FAILED", "LEASE_LOST",
+})
 
 
 def _result(status: str, run_id: Optional[str], *, dispatched: bool, **extra) -> Dict[str, Any]:
@@ -72,13 +88,20 @@ def execute_iac_deployment(
 ) -> Dict[str, Any]:
     """Execute an APPROVED deployment run through the real engine.
 
-    The payload here is the SAME artifact bundle the dry run was created
-    from: the engine re-derives the canonical effective payload and
-    re-checks its hash against the approval before touching anything.
+    The payload here is the SAME artifact bundle the dry run was
+    created from: the engine re-derives the canonical effective payload
+    and re-checks its hash against the approval before touching
+    anything. Idempotent under at-least-once delivery (see module
+    docstring).
     """
     from deployment_service.application.services.deployment_engine import (
         DeploymentActionError,
         DeploymentEngine,
+        DeploymentExecutionLeaseHeld,
+        LeaseLostDuringExecutionError,
+    )
+    from deployment_service.domain.value_objects.deployment_state import (
+        DeploymentState,
     )
 
     payload = {
@@ -92,6 +115,19 @@ def execute_iac_deployment(
 
     try:
         engine = DeploymentEngine()
+        # Idempotency (E.7/F7.3): a redelivered task for a finished run
+        # returns the persisted outcome and starts NOTHING.
+        stored = engine.store.get(run_id)
+        if stored:
+            stored_state = stored.get("state", "")
+            if stored_state in _TERMINAL_STATES:
+                return _result(
+                    _STATUS_BY_STATE.get(stored_state, "FAILED"),
+                    run_id,
+                    dispatched=False,
+                    idempotent_replay=True,
+                    final_state=stored_state,
+                )
         run = engine.execute(
             run_id,
             payload,
@@ -100,6 +136,25 @@ def execute_iac_deployment(
             namespace,
             healthcheck_url,
             previous_good_terraform_tf,
+        )
+    except DeploymentExecutionLeaseHeld:
+        # A concurrent duplicate: the run is executing under another
+        # owner's lease. Nothing was started here — report the truth.
+        return _result(
+            "ALREADY_EXECUTING",
+            run_id,
+            dispatched=False,
+            error_code="LEASE_HELD_BY_OTHER_OWNER",
+        )
+    except LeaseLostDuringExecutionError as exc:
+        # The engine already marked the run LEASE_LOST (fenced).
+        return _result(
+            "LEASE_LOST",
+            run_id,
+            dispatched=True,
+            error_code="LEASE_LOST",
+            error=str(exc),
+            final_state="LEASE_LOST",
         )
     except DeploymentActionError as exc:
         # Typed refusal: the run's state is whatever it already

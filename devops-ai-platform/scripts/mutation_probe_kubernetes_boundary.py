@@ -43,6 +43,7 @@ ADAPTER = "deployment_service/infrastructure/sandbox/container_kubectl_sandbox.p
 
 BOUNDARY_TESTS = "deployment_service/tests/test_kubernetes_trust_boundary.py"
 NETWORK_TESTS = "deployment_service/tests/test_sandbox_network_isolation.py"
+STAGING_TESTS = "deployment_service/tests/test_kubeconfig_staging_permissions.py"
 
 
 class MutationNotApplied(RuntimeError):
@@ -479,8 +480,9 @@ PROBES: list[Probe] = [
     ),
     Probe(
         "sandbox-skip-network-verification",
-        "launch the sandbox without re-validating its network",
-        replace(ADAPTER, "self._validate_network()", "pass"),
+        "launch the sandbox without validating its network (both the "
+        "pre-staging and pre-launch checks are stripped)",
+        replace(ADAPTER, "self._validate_network()", "pass", count=2),
         tests=[BOUNDARY_TESTS, NETWORK_TESTS],
     ),
     Probe(
@@ -512,6 +514,63 @@ PROBES: list[Probe] = [
                 '            f"namespace={self.namespace}",',
                 'f"sa_tokens=",\n            f"namespace={self.namespace}",'),
         tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    # -----------------------------------------------------------------
+    # Phase 8.8A Correction-1 (F3/F4): exact network membership and
+    # private credential staging.
+    # -----------------------------------------------------------------
+    Probe(
+        "network-prefix-authorization-bypass",
+        "accept any member NAMED LIKE the sandbox (the original flaw): "
+        "a malicious ares-kubectl-* co-tenant must stay refused",
+        replace(NETWORK,
+                "    unexpected = [m for m in members if m not in permitted]",
+                "    unexpected = [m for m in members if m not in permitted"
+                " and not m.startswith('ares-kubectl-')]"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-empty-peer-set-passes",
+        "an empty/missing peer set must be a hard failure, not a "
+        "validation of nothing",
+        replace(NETWORK,
+                "    if not approved_peers:\n        raise KubernetesSandboxNetworkError(",
+                "    if False:\n        raise KubernetesSandboxNetworkError("),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "network-malformed-peer-name-accepted",
+        "a traversal/malformed peer identity must be refused",
+        replace(NETWORK,
+                "    _require_peer_names(approved_peers, source=\"approved peers\")",
+                "    pass  # F3 mutation: peer names unchecked"),
+        tests=[BOUNDARY_TESTS, NETWORK_TESTS],
+    ),
+    Probe(
+        "staging-world-readable-fallback",
+        "the original flaw: stage the kubeconfig world-readable (0444) "
+        "instead of 0600",
+        replace(ADAPTER,
+                "_CREDENTIAL_MODE = 0o600",
+                "_CREDENTIAL_MODE = 0o444"),
+        tests=[STAGING_TESTS],
+    ),
+    Probe(
+        "staging-adopt-permissive-root",
+        "a world-readable staging root must be refused, not adopted",
+        replace(ADAPTER,
+                "            if stat.S_IMODE(st.st_mode) & 0o077:\n                raise KubectlSandboxConfigurationError(",
+                "            if False:\n                raise KubectlSandboxConfigurationError("),
+        tests=[STAGING_TESTS],
+    ),
+    Probe(
+        "staging-follow-symlink-cleanup",
+        "cleanup must unlink a planted symlink, never follow it (this "
+        "mutation deletes the LINK TARGET through the symlink)",
+        replace(ADAPTER,
+                "            if os.path.islink(child):\n                os.unlink(child)",
+                "            if os.path.islink(child):\n                os.remove(os.readlink(child))"),
+        tests=[STAGING_TESTS],
     ),
 ]
 

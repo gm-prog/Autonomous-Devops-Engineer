@@ -25,6 +25,7 @@ from deployment_service.infrastructure.sandbox.kubernetes_sandbox_network import
     ALLOWED_DRIVERS,
     KubernetesSandboxNetworkError,
     SandboxNetworkIdentity,
+    approved_peers_from_environment,
     identity_from_inspection,
     observed_members,
     validate_network,
@@ -68,8 +69,28 @@ def test_an_isolated_network_with_only_approved_peers_validates():
 
 
 def test_transient_sandbox_containers_are_permitted():
+    # F3: the short-lived sandbox container is permitted only by its
+    # EXACT current name (allow_transient_members) — never by name
+    # prefix.
     with _patch(_inspection(members=(PEER, "ares-kubectl-0123456789ab"))):
-        validate_network(SANDBOX_NET, approved_identity=None, approved_peers=[PEER])
+        validate_network(
+            SANDBOX_NET,
+            approved_identity=None,
+            approved_peers=[PEER],
+            allow_transient_members=("ares-kubectl-0123456789ab",),
+        )
+
+
+def test_same_prefix_co_tenant_is_REFUSED():
+    """F3: a container merely NAMED like the sandbox is a co-tenant.
+
+    The pre-correction code accepted every ares-kubectl-* member, which
+    let a co-tenant pose as the sandbox. Exact identity only.
+    """
+    with _patch(_inspection(members=(PEER, "ares-kubectl-0123456789ab"))):
+        with pytest.raises(KubernetesSandboxNetworkError, match="co-tenant"):
+            validate_network(SANDBOX_NET, approved_identity=None,
+                             approved_peers=[PEER])
 
 
 # ------------------------------------------------------- isolation failures
@@ -94,6 +115,24 @@ def test_an_unexpected_driver_is_refused():
         with pytest.raises(KubernetesSandboxNetworkError, match="driver"):
             validate_network(SANDBOX_NET, approved_identity=None,
                              approved_peers=[PEER])
+
+
+def test_an_empty_peer_set_is_a_hard_policy_failure():
+    """F3: an empty/missing peer set proves nothing about reachability;
+    it must refuse, not "validate nothing"."""
+    with pytest.raises(KubernetesSandboxNetworkError, match="no approved peers"):
+        validate_network(SANDBOX_NET, approved_identity=None,
+                         approved_peers=())
+    with pytest.raises(KubernetesSandboxNetworkError, match="no approved peers"):
+        validate_network(SANDBOX_NET, approved_identity=None,
+                         approved_peers=[])
+
+
+def test_a_malformed_peer_identity_is_refused():
+    with _patch(_inspection(members=(PEER,))):
+        with pytest.raises(KubernetesSandboxNetworkError, match="container name"):
+            validate_network(SANDBOX_NET, approved_identity=None,
+                             approved_peers=["../../etc/passwd"])
 
 
 def test_a_missing_approved_destination_is_refused():
@@ -264,8 +303,8 @@ def test_approved_digest_match_is_accepted():
 def test_sandbox_refuses_to_execute_on_an_unverifiable_network(monkeypatch, tmp_path):
     """Workstream A, production path: inspection failure blocks execution."""
     from deployment_service.application.services.kubectl_sandbox import (
-        KubectlOperation, KubectlSandboxPolicyViolation, KubectlSandboxSpec,
-        KubectlSandboxStep,
+        KubectlOperation, KubectlSandboxConfigurationError,
+        KubectlSandboxPolicyViolation, KubectlSandboxSpec, KubectlSandboxStep,
     )
     from deployment_service.infrastructure.sandbox.container_kubectl_sandbox import (
         ContainerKubectlSandbox,
@@ -278,7 +317,9 @@ def test_sandbox_refuses_to_execute_on_an_unverifiable_network(monkeypatch, tmp_
     launched = []
     with mock.patch("subprocess.run", side_effect=lambda *a, **k: launched.append(a)):
         with _patch(None, returncode=1):
-            with pytest.raises(KubectlSandboxPolicyViolation, match="could not be verified"):
+            with pytest.raises((KubectlSandboxPolicyViolation,
+                                KubectlSandboxConfigurationError),
+                               match="could not be verified"):
                 sandbox.execute(
                     KubectlSandboxStep(
                         operation=KubectlOperation.APPLY,
@@ -453,3 +494,63 @@ def test_an_identity_missing_a_required_field_refuses_to_rebuild():
         execution = {"kubernetes_execution_identity": {"namespace": "n"}}
 
     assert DeploymentEngine._approved_kubernetes_identity(_Run()) is None
+
+
+# ---------------------------------------------------------------------
+# Phase 8.8A Correction-1 (F3) — host-owned peer configuration is
+# fail-closed: missing, empty, whitespace, duplicate or malformed
+# configuration is a hard policy error. The pre-correction code returned
+# an empty tuple for a missing value, which the caller treated as
+# "nothing to validate" — a fail-open path.
+# ---------------------------------------------------------------------
+
+def test_missing_peer_env_is_a_hard_policy_failure(monkeypatch):
+    monkeypatch.delenv("DEPLOYMENT_K8S_SANDBOX_PEERS", raising=False)
+    with pytest.raises(KubernetesSandboxNetworkError,
+                       match="missing or empty"):
+        approved_peers_from_environment()
+
+
+def test_empty_peer_env_is_a_hard_policy_failure(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "")
+    with pytest.raises(KubernetesSandboxNetworkError,
+                       match="missing or empty"):
+        approved_peers_from_environment()
+
+
+def test_whitespace_peer_env_is_a_hard_policy_failure(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "   ")
+    with pytest.raises(KubernetesSandboxNetworkError,
+                       match="missing or empty"):
+        approved_peers_from_environment()
+
+
+def test_trailing_comma_in_peer_env_is_a_hard_policy_failure(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "ares-e2e-control-plane,")
+    with pytest.raises(KubernetesSandboxNetworkError,
+                       match="empty entry"):
+        approved_peers_from_environment()
+
+
+def test_duplicate_peer_env_entries_are_refused(monkeypatch):
+    monkeypatch.setenv(
+        "DEPLOYMENT_K8S_SANDBOX_PEERS",
+        "ares-e2e-control-plane,ares-e2e-control-plane")
+    with pytest.raises(KubernetesSandboxNetworkError,
+                       match="duplicate"):
+        approved_peers_from_environment()
+
+
+@pytest.mark.parametrize("bad", ["../../etc/passwd", "a/b", "has space",
+                                 "-leading-dash", "a" * 65])
+def test_malformed_peer_env_entry_is_refused(monkeypatch, bad):
+    monkeypatch.setenv("DEPLOYMENT_K8S_SANDBOX_PEERS", bad)
+    with pytest.raises(KubernetesSandboxNetworkError,
+                       match="not a valid container name"):
+        approved_peers_from_environment()
+
+
+def test_well_formed_peer_env_is_accepted(monkeypatch):
+    monkeypatch.setenv(
+        "DEPLOYMENT_K8S_SANDBOX_PEERS", "ares-e2e-control-plane")
+    assert approved_peers_from_environment() == ("ares-e2e-control-plane",)

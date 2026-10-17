@@ -43,9 +43,24 @@ ALLOWED_DRIVERS = ("bridge",)
 
 _NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
 
+#: A peer is a named container on the host network; anything that is
+#: not a well-formed container name is a malformed configuration, not
+#: a peer (F3: configuration errors are policy failures, never a
+#: narrower allow-list).
+_CONTAINER_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
+
 
 class KubernetesSandboxNetworkError(Exception):
     """Raised when the sandbox network is not provably isolated."""
+
+
+def _require_peer_names(peers: Sequence[str], *, source: str) -> None:
+    for peer in peers:
+        if not isinstance(peer, str) or not _CONTAINER_NAME.match(peer or ""):
+            raise KubernetesSandboxNetworkError(
+                f"{source}: peer identity {peer!r} is not a valid container "
+                "name; refusing to reason about malformed identities"
+            )
 
 
 def _run(argv: Sequence[str], timeout: int = 60) -> subprocess.CompletedProcess:
@@ -160,12 +175,32 @@ def validate_network(
     """Prove the network is the approved, isolated one. Fail closed.
 
     ``approved_peers`` are the destinations the sandbox is permitted to
-    reach. Any other member is an unapproved co-tenant and is refused:
-    with ``--internal`` alone such a peer would be fully reachable.
+    reach. Membership is an EXACT allow-list (F3): any member that is
+    not in ``approved_peers`` or explicitly listed in
+    ``allow_transient_members`` is an unapproved co-tenant and is
+    refused — with ``--internal`` alone such a peer would be fully
+    reachable. A name is NOT an identity and no name prefix
+    (including ``ares-kubectl-``) is ever accepted as membership
+    proof: a container a co-tenant names to look like the sandbox is
+    still a co-tenant.
+
+    An empty peer set is a hard policy failure: it would prove nothing
+    about what the sandbox may reach, so execution is refused rather
+    than "validated" against an empty destination set.
 
     ``allow_transient_members`` covers the short-lived sandbox
-    containers themselves, which legitimately appear and disappear.
+    containers themselves (their EXACT current names), which
+    legitimately appear and disappear.
     """
+    if not approved_peers:
+        raise KubernetesSandboxNetworkError(
+            f"network {name!r}: no approved peers supplied; an empty peer "
+            "set proves nothing about reachability, so the sandbox must "
+            "not run"
+        )
+    _require_peer_names(approved_peers, source="approved peers")
+    _require_peer_names(allow_transient_members, source="transient members")
+
     raw = inspect_network(name, runtime=runtime)
     observed = identity_from_inspection(raw, approved_peers)
 
@@ -181,8 +216,7 @@ def validate_network(
 
     members = observed_members(raw)
     permitted = set(approved_peers) | set(allow_transient_members)
-    unexpected = [m for m in members
-                  if m not in permitted and not m.startswith("ares-kubectl-")]
+    unexpected = [m for m in members if m not in permitted]
     if unexpected:
         raise KubernetesSandboxNetworkError(
             f"network {name!r} carries unapproved co-tenant(s) {unexpected}; "
@@ -227,6 +261,13 @@ class PerExecutionNetwork:
     _connected: List[str] = field(default_factory=list)
 
     def create(self) -> SandboxNetworkIdentity:
+        if not self.approved_peers:
+            raise KubernetesSandboxNetworkError(
+                "a per-execution sandbox network requires at least one "
+                "approved peer; an empty destination set is not a valid "
+                "isolation proof"
+            )
+        _require_peer_names(self.approved_peers, source="approved peers")
         self.name = f"ares-k8s-x-{uuid.uuid4().hex[:12]}"
         created = _run([self.runtime, "network", "create", "--internal",
                         "--driver", "bridge", self.name])
@@ -264,6 +305,32 @@ class PerExecutionNetwork:
 
 
 def approved_peers_from_environment() -> Tuple[str, ...]:
-    """Host-owned list of destinations the sandbox may reach."""
-    raw = os.getenv("DEPLOYMENT_K8S_SANDBOX_PEERS", "").strip()
-    return tuple(sorted(p.strip() for p in raw.split(",") if p.strip()))
+    """Host-owned list of destinations the sandbox may reach.
+
+    Fail closed (F3): missing, empty or malformed configuration is a
+    hard policy error. Previously an absent/empty value returned an
+    empty tuple, which the caller treated as "nothing to validate" —
+    the exact fail-open path this correction closes.
+    """
+    raw = os.getenv("DEPLOYMENT_K8S_SANDBOX_PEERS")
+    if raw is None or not raw.strip():
+        raise KubernetesSandboxNetworkError(
+            "DEPLOYMENT_K8S_SANDBOX_PEERS is missing or empty; the kubectl "
+            "sandbox has no approved destination and must not run"
+        )
+    peers: List[str] = []
+    for part in raw.split(","):
+        name = part.strip()
+        if not name:
+            raise KubernetesSandboxNetworkError(
+                "DEPLOYMENT_K8S_SANDBOX_PEERS contains an empty entry; "
+                "refusing ambiguous peer configuration"
+            )
+        peers.append(name)
+    if len(set(peers)) != len(peers):
+        raise KubernetesSandboxNetworkError(
+            "DEPLOYMENT_K8S_SANDBOX_PEERS contains duplicate entries; "
+            "refusing ambiguous peer configuration"
+        )
+    _require_peer_names(peers, source="DEPLOYMENT_K8S_SANDBOX_PEERS")
+    return tuple(sorted(peers))

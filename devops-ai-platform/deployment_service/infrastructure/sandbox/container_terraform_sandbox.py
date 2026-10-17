@@ -25,6 +25,7 @@ a typed fail-closed error and Terraform does not run at all.
 import os
 import signal
 import subprocess
+import time
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,7 @@ class _CliResult:
     stdout: bytes
     stderr: bytes
     timed_out: bool = False
+    cancelled: bool = False
 
 
 class ContainerTerraformSandbox:
@@ -142,7 +144,8 @@ class ContainerTerraformSandbox:
     # --- execution -----------------------------------------------------
 
     def execute(
-        self, step: TerraformSandboxStep, workspace_path: Path
+        self, step: TerraformSandboxStep, workspace_path: Path,
+        cancel_event=None,
     ) -> TerraformSandboxOutcome:
         validate_runtime_spec(self._spec)
 
@@ -172,7 +175,8 @@ class ContainerTerraformSandbox:
 
         try:
             result = self._run_cli(
-                plan.cli_argv, plan.wall_timeout_seconds, cli_env
+                plan.cli_argv, plan.wall_timeout_seconds, cli_env,
+                cancel_event=cancel_event
             )
         except FileNotFoundError as exc:
             raise TerraformSandboxUnavailableError(
@@ -187,6 +191,21 @@ class ContainerTerraformSandbox:
             self._destroy_container(container_name)
 
         limit = step.max_output_bytes
+        # Injected CLI runners (tests) may predate the cancelled field.
+        cancelled_flag = getattr(result, "cancelled", False)
+        if cancelled_flag:
+            return TerraformSandboxOutcome(
+                operation=step.operation,
+                exit_code=result.exit_code if isinstance(result.exit_code, int) else -1,
+                stdout=result.stdout[:limit].decode("utf-8", errors="replace"),
+                stderr=(result.stderr[:limit].decode("utf-8", errors="replace")
+                        + "\n[sandbox cancelled: execution lease lost]"),
+                timed_out=False,
+                output_truncated=(
+                    len(result.stdout) > limit or len(result.stderr) > limit
+                ),
+                cancelled=True,
+            )
         if result.timed_out:
             return TerraformSandboxOutcome(
                 operation=step.operation,
@@ -236,10 +255,12 @@ class ContainerTerraformSandbox:
 
     # --- docker CLI plumbing -------------------------------------------
 
-    def _run_cli(self, argv, timeout: float, env: Mapping[str, str]):
+    def _run_cli(self, argv, timeout: float, env: Mapping[str, str],
+                 cancel_event=None):
         if self._cli_runner is not None:
             return self._cli_runner(tuple(argv), timeout, dict(env))
-        return self._default_cli_runner(tuple(argv), timeout, dict(env))
+        return self._default_cli_runner(tuple(argv), timeout, dict(env),
+                                        cancel_event=cancel_event)
 
     def _destroy_container(self, container_name: str) -> None:
         """Unconditional best-effort cleanup on every exit path."""
@@ -253,7 +274,8 @@ class ContainerTerraformSandbox:
             pass
 
     @classmethod
-    def _default_cli_runner(cls, argv, timeout: float, env) -> _CliResult:
+    def _default_cli_runner(cls, argv, timeout: float, env,
+                            cancel_event=None) -> _CliResult:
         process = subprocess.Popen(
             list(argv),
             stdin=subprocess.DEVNULL,
@@ -283,11 +305,21 @@ class ContainerTerraformSandbox:
             reader.start()
 
         timed_out = False
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            cls._kill(process)
+        cancelled = False
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                cls._kill(process)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                cls._kill(process)
+                break
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                continue
 
         for reader in readers:
             reader.join(timeout=2.0)
@@ -300,6 +332,7 @@ class ContainerTerraformSandbox:
             bytes(stdout_buffer),
             bytes(stderr_buffer),
             timed_out=timed_out,
+            cancelled=cancelled,
         )
 
     @staticmethod

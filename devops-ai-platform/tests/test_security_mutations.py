@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shutil
 import sys
 import time
@@ -1929,8 +1930,8 @@ def test_mutation_m23_empty_app_env_local_fallback_detected(mutated_repo):
 
 
 def test_mutation_m24_redis_ci_flag_removal_detected(mutated_repo, monkeypatch):
-    # (1) Structural guard holds on the unmutated repo: both live-store
-    #     steps of the redis-integration job set REDIS_URL +
+    # (1) Structural guard holds on the unmutated repo: every live-store
+    #     step of the redis-integration job sets REDIS_URL +
     #     REDIS_INTEGRATION_REQUIRED=true.
     from security_guards import runtime_guard
 
@@ -1938,18 +1939,22 @@ def test_mutation_m24_redis_ci_flag_removal_detected(mutated_repo, monkeypatch):
     runtime_guard._check_redis_integration_contract(REPO_ROOT, violations)
     assert violations == [], f"unmutated repo violates the CI Redis contract: {violations}"
 
-    # (2) Mutation: remove the flag from the CI copy.
+    # (2) Mutation: remove the flag from the CI copy. Three live-store
+    #     steps carry it: the integration suite, the M19/M22 mutation
+    #     suite, and (Phase 8.8A Correction-1, F5) the execution-lease
+    #     safety scenarios.
     ci = mutated_repo / ".github/workflows/ci.yml"
     src = ci.read_text(encoding="utf-8")
     flag_line = '          REDIS_INTEGRATION_REQUIRED: "true"\n'
-    assert src.count(flag_line) == 2, (
-        "expected exactly two live-store steps carrying the fail-closed flag"
+    assert src.count(flag_line) == 3, (
+        "expected exactly three live-store steps carrying the "
+        "fail-closed flag (integration + mutation + execution-lease)"
     )
-    ci.write_text(src.replace(flag_line, "", 2), encoding="utf-8")
+    ci.write_text(src.replace(flag_line, ""), encoding="utf-8")
 
     violations2: list = []
     runtime_guard._check_redis_integration_contract(mutated_repo, violations2)
-    assert sum("REDIS_INTEGRATION_REQUIRED" in v for v in violations2) == 2, (
+    assert sum("REDIS_INTEGRATION_REQUIRED" in v for v in violations2) == 3, (
         "guard stayed green after REDIS_INTEGRATION_REQUIRED=true was "
         f"removed from the CI workflow (got {violations2})"
     )
@@ -2741,4 +2746,236 @@ def test_mutation_m32_grpc_false_success_detected(mutated_repo):
     )
     assert resp.dispatch_status == "SUCCESS", (
         "mutation did not take effect (unconditional SUCCESS not returned)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.8A Correction-1 (M33-M37): the runtime-security boundaries.
+# Each mutation weakens one F2/F3/F4/F5/F7 control on the throwaway copy
+# and asserts the detection suite turns red.
+# ---------------------------------------------------------------------------
+
+def _run_suite_on(mutated_repo: Path, *test_files: str) -> "subprocess.CompletedProcess":
+    import subprocess as sp
+
+    return sp.run(
+        [sys.executable, "-m", "pytest", *test_files, "-q", "--no-header"],
+        cwd=mutated_repo / "devops-ai-platform",
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(mutated_repo),
+            "PYTHONPATH": str(mutated_repo / "devops-ai-platform"),
+        },
+    )
+
+
+def test_mutation_m33_internal_token_auth_bypass_detected(mutated_repo):
+    """The constant-time internal-token check must refuse anything but
+    the exact configured token.
+
+    Mutation: a non-empty prefix of the configured token is accepted
+    (broken constant-time comparison).
+    """
+    auth_rel = (
+        "devops-ai-platform/deployment_service/application/services/"
+        "deployment_auth.py"
+    )
+    auth_path = mutated_repo / auth_rel
+    src = auth_path.read_text(encoding="utf-8")
+    anchor = (
+        "    if not provided or not hmac.compare_digest(provided.encode(), expected.encode()):\n"
+    )
+    assert anchor in src, "M33 target (constant-time token check) not found"
+    mutated = (
+        "    if not provided or not provided.startswith(expected[:10]):  # MUTATION: prefix match\n"
+    )
+    auth_path.write_text(src.replace(anchor, mutated, 1), encoding="utf-8")
+
+    # Direct behavioral proof on the mutated module: a 10-char prefix
+    # of the configured token now authenticates (the unmutated code
+    # refuses it with 401).
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "m33_mutated_auth", str(auth_path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["m33_mutated_auth"] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop("m33_mutated_auth", None)
+        raise
+    os.environ["AGENT_INTERNAL_TOKEN"] = "m33-internal-token-0123456789abcdef"
+    try:
+        identity = module.verify_service_token("m33-intern")
+        assert identity.subject == module.SERVICE_PRINCIPAL
+    finally:
+        os.environ.pop("AGENT_INTERNAL_TOKEN", None)
+    # and the same call on the REAL (unmutated) module is refused:
+    real_auth = importlib.import_module(
+        "deployment_service.application.services.deployment_auth")
+    os.environ["AGENT_INTERNAL_TOKEN"] = "m33-internal-token-0123456789abcdef"
+    try:
+        with pytest.raises(Exception):
+            real_auth.verify_service_token("m33-intern")
+    finally:
+        os.environ.pop("AGENT_INTERNAL_TOKEN", None)
+
+
+def test_mutation_m34_caller_supplied_approver_trusted(mutated_repo):
+    """The recorded approver must be the verified JWT subject.
+
+    Mutation: the legacy flaw is restored — the approve route accepts
+    the caller's ``approved_by`` body field and lets it override the
+    authenticated subject.
+    """
+    main_path = (
+        mutated_repo / "devops-ai-platform/deployment_service/main.py")
+    src = main_path.read_text(encoding="utf-8")
+    anchor = (
+        "class ApprovalRequest(BaseModel):\n"
+    )
+    assert anchor in src, "M34 target (ApprovalRequest) not found"
+    # (1) give the model a caller-writable approver field ...
+    src = src.replace(
+        anchor + "    \"\"\"Hash-bound approval request (Phase 8.8A Correction-1, F2).\n",
+        anchor + "    \"\"\"MUTATION: caller-supplied approver restored.\n",
+        1,
+    )
+    src = src.replace(
+        "    plan_hash: str = Field(min_length=64, max_length=64)\n\n\nclass ExecuteRequest(BaseModel):",
+        "    plan_hash: str = Field(min_length=64, max_length=64)\n"
+        "    approved_by: Optional[str] = None  # MUTATION\n\n\nclass ExecuteRequest(BaseModel):",
+        1,
+    )
+    assert "Optional" in src or "from typing import" in src
+    route_anchor = (
+        "            return engine.approve(\n"
+        "                run_id, identity.subject, request.artifact_hash, request.plan_hash\n"
+        "            ).to_dict()\n"
+    )
+    assert route_anchor in src, "M34 route anchor not found"
+    # (2) ... and make the route prefer it over the verified subject.
+    src = src.replace(
+        route_anchor,
+        "            return engine.approve(\n"
+        "                run_id, (request.approved_by or identity.subject),\n"
+        "                request.artifact_hash, request.plan_hash  # MUTATION\n"
+        "            ).to_dict()\n",
+        1,
+    )
+    main_path.write_text(src, encoding="utf-8")
+
+    # The ApproverIdentity tests must turn red on the mutated tree: the
+    # spoofed body field now becomes the recorded approver.
+    result = _run_suite_on(
+        mutated_repo,
+        "deployment_service/tests/test_deployment_auth.py",
+        "-k", "approver",
+    )
+    assert result.returncode != 0, (
+        "M34 escaped: trusting the caller's approved_by went undetected\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_mutation_m35_empty_peer_set_fail_open(mutated_repo):
+    """F3: a missing/empty peer configuration is a hard policy failure.
+
+    Mutation: the pre-correction fail-open path is restored — an empty
+    environment returns an empty tuple, which the caller treats as
+    "nothing to validate".
+    """
+    net_path = (
+        mutated_repo / "devops-ai-platform/deployment_service/"
+        "infrastructure/sandbox/kubernetes_sandbox_network.py"
+    )
+    src = net_path.read_text(encoding="utf-8")
+    anchor = (
+        "    raw = os.getenv(\"DEPLOYMENT_K8S_SANDBOX_PEERS\")\n"
+        "    if raw is None or not raw.strip():\n"
+        "        raise KubernetesSandboxNetworkError(\n"
+        "            \"DEPLOYMENT_K8S_SANDBOX_PEERS is missing or empty; the kubectl \"\n"
+        "            \"sandbox has no approved destination and must not run\"\n"
+        "        )\n"
+    )
+    assert anchor in src, "M35 target (fail-closed peer env) not found"
+    mutated = (
+        "    raw = os.getenv(\"DEPLOYMENT_K8S_SANDBOX_PEERS\")\n"
+        "    if raw is None or not raw.strip():\n"
+        "        return ()  # MUTATION: fail open (the original flaw)\n"
+    )
+    net_path.write_text(src.replace(anchor, mutated, 1), encoding="utf-8")
+
+    result = _run_suite_on(
+        mutated_repo,
+        "deployment_service/tests/test_sandbox_network_isolation.py",
+        "-k", "empty_peer_env or missing_peer_env or whitespace_peer_env",
+    )
+    assert result.returncode != 0, (
+        "M35 escaped: the fail-open empty peer set went undetected\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_mutation_m36_redelivery_reexecutes_terminal_run(mutated_repo):
+    """F5/F7: a redelivered task for a terminal run must return the
+    persisted outcome and start nothing.
+
+    Mutation: the idempotency short-circuit is removed — a redelivery
+    re-executes a run that is already DEPLOYED.
+    """
+    tasks_path = (
+        mutated_repo / "devops-ai-platform/deployment_service/"
+        "infrastructure/celery/tasks.py"
+    )
+    src = tasks_path.read_text(encoding="utf-8")
+    anchor = (
+        "            stored_state = stored.get(\"state\", \"\")\n"
+        "            if stored_state in _TERMINAL_STATES:\n"
+    )
+    assert anchor in src, "M36 target (terminal-state short-circuit) not found"
+    mutated = (
+        "            stored_state = stored.get(\"state\", \"\")\n"
+        "            if False:  # MUTATION: idempotency short-circuit removed\n"
+    )
+    tasks_path.write_text(src.replace(anchor, mutated, 1), encoding="utf-8")
+
+    result = _run_suite_on(
+        mutated_repo,
+        "deployment_service/tests/test_deployment_api_dispatch_contract.py",
+        "-k", "redelivery or concurrent_duplicate",
+    )
+    assert result.returncode != 0, (
+        "M36 escaped: re-executing a terminal run on redelivery went undetected\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_mutation_m37_world_readable_kubeconfig_staging(mutated_repo):
+    """F4: the staged kubeconfig must be 0600, sandbox-owned.
+
+    Mutation: the original flaw is restored — the credential is staged
+    world-readable (0444).
+    """
+    adapter_path = (
+        mutated_repo / "devops-ai-platform/deployment_service/"
+        "infrastructure/sandbox/container_kubectl_sandbox.py"
+    )
+    src = adapter_path.read_text(encoding="utf-8")
+    anchor = "_CREDENTIAL_MODE = 0o600"
+    assert anchor in src, "M37 target (credential mode) not found"
+    mutated = "_CREDENTIAL_MODE = 0o444  # MUTATION: world-readable credential"
+    adapter_path.write_text(src.replace(anchor, mutated, 1), encoding="utf-8")
+
+    result = _run_suite_on(
+        mutated_repo,
+        "deployment_service/tests/test_kubeconfig_staging_permissions.py",
+        "-k", "staging_layout_is_private or peer_cannot",
+    )
+    assert result.returncode != 0, (
+        "M37 escaped: world-readable kubeconfig staging went undetected\n"
+        f"{result.stdout}\n{result.stderr}"
     )

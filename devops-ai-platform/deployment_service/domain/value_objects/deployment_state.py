@@ -12,6 +12,12 @@ class DeploymentState(str, Enum):
     DRY_RUN_FAILED = "DRY_RUN_FAILED"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
     APPROVED = "APPROVED"
+    #: Phase 8.8A Correction-1 (F7): the durable, persisted acknowledgement
+    #: that an execution was dispatched — set by the API after validation
+    #: and BEFORE the broker dispatch, reverted to APPROVED if the
+    #: dispatch fails. The worker moves it to DEPLOYING once it owns the
+    #: fenced execution lease.
+    EXECUTION_REQUESTED = "EXECUTION_REQUESTED"
     DEPLOYING = "DEPLOYING"
     HEALTH_CHECKING = "HEALTH_CHECKING"
     DEPLOYED = "DEPLOYED"
@@ -19,6 +25,11 @@ class DeploymentState(str, Enum):
     ROLLBACK_PENDING = "ROLLBACK_PENDING"
     ROLLED_BACK = "ROLLED_BACK"
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
+    #: Phase 8.8A Correction-1 (F5): the executing worker lost ownership
+    #: of its lease (expired + superseded, or renewal failure past the
+    #: TTL). The run is terminal: the stale worker commits nothing
+    #: further and starts no subsequent side effects (no rollback).
+    LEASE_LOST = "LEASE_LOST"
 
 
 _ALLOWED = {
@@ -34,25 +45,34 @@ _ALLOWED = {
     },
     DeploymentState.DRY_RUN_PASSED: {DeploymentState.AWAITING_APPROVAL},
     DeploymentState.AWAITING_APPROVAL: {DeploymentState.APPROVED},
-    DeploymentState.APPROVED: {DeploymentState.DEPLOYING},
+    # F7: dispatch first persists EXECUTION_REQUESTED; a failed broker
+    # dispatch reverts it (APPROVED is the only legitimate outcome when
+    # nothing was enqueued). DEPLOYING stays reachable directly for the
+    # worker's defensive re-validation path.
+    DeploymentState.APPROVED: {DeploymentState.EXECUTION_REQUESTED, DeploymentState.DEPLOYING},
+    DeploymentState.EXECUTION_REQUESTED: {DeploymentState.DEPLOYING, DeploymentState.APPROVED},
     DeploymentState.DEPLOYING: {
         DeploymentState.HEALTH_CHECKING,
         DeploymentState.DEPLOYMENT_FAILED,
+        DeploymentState.LEASE_LOST,
     },
     DeploymentState.HEALTH_CHECKING: {
         DeploymentState.DEPLOYED,
         DeploymentState.DEPLOYMENT_FAILED,
+        DeploymentState.LEASE_LOST,
     },
     DeploymentState.DEPLOYMENT_FAILED: {DeploymentState.ROLLBACK_PENDING},
     DeploymentState.ROLLBACK_PENDING: {
         DeploymentState.ROLLED_BACK,
         DeploymentState.ROLLBACK_FAILED,
+        DeploymentState.LEASE_LOST,
     },
     DeploymentState.ROLLBACK_FAILED: {DeploymentState.ROLLBACK_PENDING},
     DeploymentState.VALIDATION_FAILED: set(),
     DeploymentState.DRY_RUN_FAILED: set(),
     DeploymentState.DEPLOYED: set(),
     DeploymentState.ROLLED_BACK: set(),
+    DeploymentState.LEASE_LOST: set(),
 }
 
 

@@ -60,6 +60,7 @@ class TerraformRunnerService:
         *,
         execution: bool,
         plan_file: Optional[str] = None,
+        cancel_event=None,
     ) -> Dict[str, Any]:
         """Run exactly one policy-owned Terraform operation."""
         sandbox = self._sandbox if self._sandbox is not None else _default_sandbox()
@@ -76,7 +77,7 @@ class TerraformRunnerService:
                     resolve_credential_env_keys() if execution else ()
                 ),
             )
-            outcome = sandbox.execute(step, Path(iac_dir))
+            outcome = sandbox.execute(step, Path(iac_dir), cancel_event=cancel_event)
         except TerraformSandboxError as exc:
             # Sandbox configuration / policy / availability / result
             # problems are ALL fail-closed. Terraform did not execute.
@@ -88,6 +89,18 @@ class TerraformRunnerService:
                 "stdout": "",
                 "stderr": "",
                 "executed": False,
+            }
+
+        if outcome.cancelled:
+            return {
+                "status": "CANCELLED",
+                "operation": operation.value,
+                "error_code": "SANDBOX_CANCELLED",
+                "exit_code": outcome.exit_code,
+                "stdout": outcome.stdout,
+                "stderr": outcome.stderr,
+                "output_truncated": outcome.output_truncated,
+                "executed": True,
             }
 
         if outcome.timed_out:
@@ -119,6 +132,7 @@ class TerraformRunnerService:
         iac_dir: str,
         execution: bool = False,
         plan_output_path: Optional[str] = None,
+        cancel_event=None,
     ) -> Dict[str, Any]:
         """fmt -> init -> validate -> plan, all inside the sandbox.
 
@@ -161,6 +175,7 @@ class TerraformRunnerService:
                 iac_dir,
                 execution=execution,
                 plan_file=plan_file if uses_plan_file else None,
+                cancel_event=cancel_event,
             )
             steps.append(result)
             if result["status"] != STATUS_PASS:
@@ -171,6 +186,8 @@ class TerraformRunnerService:
         statuses = [step["status"] for step in steps]
         if all(value == STATUS_PASS for value in statuses):
             status = STATUS_PASS
+        elif "CANCELLED" in statuses:
+            status = "CANCELLED"
         elif STATUS_BLOCKED in statuses:
             status = STATUS_BLOCKED
         elif STATUS_TIMEOUT in statuses:
@@ -213,6 +230,7 @@ class TerraformRunnerService:
         iac_dir: str,
         plan_output_path: str,
         expected_plan_file_hash: str = "",
+        cancel_event=None,
     ) -> Dict[str, Any]:
         """Apply EXACTLY the saved plan, after re-verifying its bytes.
 
@@ -275,6 +293,7 @@ class TerraformRunnerService:
             iac_dir,
             execution=True,
             plan_file=plan_file,
+            cancel_event=cancel_event,
         )
         result["plan_file_hash"] = actual_hash
         result["sandbox"] = self.describe_sandbox()
@@ -282,7 +301,7 @@ class TerraformRunnerService:
 
     # --- post-approval preparation ---------------------------------------
 
-    def initialize(self, iac_dir: str) -> Dict[str, Any]:
+    def initialize(self, iac_dir: str, cancel_event=None) -> Dict[str, Any]:
         """Run ONLY ``terraform init`` (no plan) in an existing workspace.
 
         Phase 8.5-A corrective, Workstream D: the execution path must be
@@ -291,7 +310,8 @@ class TerraformRunnerService:
         it cannot change what is about to be applied.
         """
         result = self._execute(
-            TerraformOperation.INIT, iac_dir, execution=True
+            TerraformOperation.INIT, iac_dir, execution=True,
+            cancel_event=cancel_event,
         )
         result["sandbox"] = self.describe_sandbox()
         return result

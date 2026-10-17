@@ -15,6 +15,7 @@ URL, a kubeconfig path or a filename. Those are all host-owned.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional, Protocol
 
@@ -57,6 +58,7 @@ class KubernetesSandboxPort(Protocol):
         manifest_yaml: str,
         kubeconfig_yaml: str,
         namespace: str,
+        cancel_event: Optional["threading.Event"] = None,
     ) -> Any:
         ...
 
@@ -206,6 +208,7 @@ class KubectlRunnerService:
         rollout_timeout_seconds: int = 300,
         extra: Optional[Dict[str, Any]] = None,
         approved_identity: Optional[KubernetesExecutionIdentity] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         namespace = self.namespace()
         try:
@@ -251,14 +254,20 @@ class KubectlRunnerService:
                 manifest_yaml=manifest_yaml,
                 kubeconfig_yaml=kubeconfig.content,
                 namespace=namespace,
+                cancel_event=cancel_event,
             )
         except (KubectlSandboxPolicyViolation, KubectlSandboxConfigurationError) as exc:
             return self._blocked(f"sandbox refused the step: {exc}")
 
         timed_out = bool(getattr(result, "timed_out", False))
+        cancelled = bool(getattr(result, "cancelled", False))
         exit_code = int(getattr(result, "exit_code", 1))
         payload: Dict[str, Any] = {
-            "status": "TIMEOUT" if timed_out else ("PASS" if exit_code == 0 else "FAIL"),
+            "status": (
+                "CANCELLED" if cancelled
+                else "TIMEOUT" if timed_out
+                else ("PASS" if exit_code == 0 else "FAIL")
+            ),
             "exit_code": exit_code,
             "operation": operation.value,
             "stdout": getattr(result, "stdout", ""),
@@ -277,7 +286,8 @@ class KubectlRunnerService:
 
     # ----------------------------------------------------------------- public
 
-    def dry_run(self, manifest_path: str, namespace: Optional[str] = None) -> Dict[str, Any]:
+    def dry_run(self, manifest_path: str, namespace: Optional[str] = None,
+                cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
         """Server-side dry run against the real cluster.
 
         Fails closed. There is no client-side fallback: a client dry run
@@ -298,10 +308,12 @@ class KubectlRunnerService:
                 "manifest_policy_identity": approved.policy_identity,
                 "validation_mode": "server-side-dry-run",
             },
+            cancel_event=cancel_event,
         )
 
     def apply(self, manifest_path: str, namespace: Optional[str] = None,
-              approved_identity: Optional[KubernetesExecutionIdentity] = None) -> Dict[str, Any]:
+              approved_identity: Optional[KubernetesExecutionIdentity] = None,
+              cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
             return blocked
@@ -317,6 +329,7 @@ class KubectlRunnerService:
                 "manifest_policy_identity": approved.policy_identity,
                 "applied_resources": approved.resources,
             },
+            cancel_event=cancel_event,
         )
 
     def rollout_status(
@@ -324,6 +337,7 @@ class KubectlRunnerService:
         deployment_name: str,
         namespace: Optional[str] = None,
         timeout_seconds: int = 300,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
@@ -333,6 +347,7 @@ class KubectlRunnerService:
             manifest_yaml="",
             deployment_name=deployment_name,
             rollout_timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
         )
 
     def rollout_undo(
@@ -340,6 +355,7 @@ class KubectlRunnerService:
         deployment_name: str,
         namespace: Optional[str] = None,
         approved_identity: Optional[KubernetesExecutionIdentity] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
@@ -349,4 +365,5 @@ class KubectlRunnerService:
             approved_identity=approved_identity,
             manifest_yaml="",
             deployment_name=deployment_name,
+            cancel_event=cancel_event,
         )

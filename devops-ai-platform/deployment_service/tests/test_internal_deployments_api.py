@@ -6,9 +6,21 @@ revision), which is what the remediation target binding later enforces. The
 record must come from the real deployment run store - never be synthesized.
 """
 
+import os
 import unittest
 
 from deployment_service import main as deployment_main
+from deployment_service.application.services import deployment_auth
+
+# Phase 8.8A Correction-1 (F2): run inspection is authenticated.
+os.environ.setdefault(
+    "JWT_SECRET", "internal-api-test-jwt-secret-0123456789abcd")
+os.environ.setdefault(
+    "AGENT_INTERNAL_TOKEN", "internal-api-test-internal-token-0123456")
+
+_OPERATOR_TOKEN = deployment_auth.create_access_token(
+    "internal-api-operator", ["operator"], os.environ["JWT_SECRET"])
+_AUTH_HEADERS = {"Authorization": f"Bearer {_OPERATOR_TOKEN}"}
 
 
 class _FakeRunStore:
@@ -45,7 +57,7 @@ class InternalDeploymentApiTests(unittest.TestCase):
         }
 
         resp = TestClient(deployment_main.app).get(
-            "/api/internal/deployments/run-42"
+            "/api/internal/deployments/run-42", headers=_AUTH_HEADERS
         )
 
         self.assertEqual(resp.status_code, 200)
@@ -60,7 +72,7 @@ class InternalDeploymentApiTests(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         resp = TestClient(deployment_main.app).get(
-            "/api/internal/deployments/run-missing"
+            "/api/internal/deployments/run-missing", headers=_AUTH_HEADERS
         )
         self.assertEqual(resp.status_code, 404)
 

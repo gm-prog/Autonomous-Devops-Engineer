@@ -4,9 +4,10 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -31,11 +32,33 @@ from deployment_service.application.services.terraform_sandbox import (
 )
 from deployment_service.domain.entities.deployment_run import DeploymentRun
 from deployment_service.domain.value_objects.deployment_state import DeploymentState
+from deployment_service.infrastructure.persistence.execution_lease import (
+    ExecutionLeaseGuard,
+    LeaseLostError,
+)
 from deployment_service.infrastructure.persistence.redis_pipeline_store import RedisPipelineStore
 
 
 class DeploymentActionError(RuntimeError):
     pass
+
+
+class DeploymentExecutionLeaseHeld(RuntimeError):
+    """The run's execution lease is already owned by another worker.
+
+    Distinct from :class:`DeploymentActionError` on purpose: this is not
+    a refusal of the RUN (its state is untouched) — it is a duplicate
+    dispatch/redelivery, which the caller reports truthfully without
+    mutating anything.
+    """
+
+
+class LeaseLostDuringExecutionError(RuntimeError):
+    """This worker lost ownership of its execution lease mid-run.
+
+    The run has been (or was about to be) marked LEASE_LOST; no
+    subsequent side effect may start from this worker.
+    """
 
 
 #: States after which an approved plan can never legitimately be applied.
@@ -45,13 +68,32 @@ _TERMINAL_STATES = frozenset(
         DeploymentState.DEPLOYMENT_FAILED,
         DeploymentState.ROLLED_BACK,
         DeploymentState.ROLLBACK_FAILED,
+        DeploymentState.LEASE_LOST,
     }
 )
 
+#: The lease TTL must comfortably exceed the renewal interval while
+#: staying short enough that a dead worker cannot hold a run hostage.
+#: Renewals run at ttl/3 (see ExecutionLeaseGuard), so a healthy worker
+#: renews long before expiry; a crashed one is overtaken within the TTL.
+_LEASE_TTL_SECONDS = 120
+
+#: Bounded retries for a fence-guarded commit that failed while the
+#: watchdog still believes ownership (store blip inside the grace window).
+_COMMIT_RETRIES = 3
+_COMMIT_RETRY_DELAY = 0.5
+
 
 class DeploymentEngine:
-    def __init__(self, store=None, validator=None, terraform=None, kubectl=None, health_checker=None, source_verifier=None):
+    def __init__(self, store=None, validator=None, terraform=None, kubectl=None, health_checker=None, source_verifier=None, lease_factory=None):
         self.store = store or RedisPipelineStore()
+        # F5: builds the fenced execution lease for a run. Production
+        # uses the real Redis client of the store; tests inject a
+        # deterministic factory.
+        self.lease_factory = lease_factory or (
+            lambda run_id: ExecutionLeaseGuard(
+                self.store.client, run_id, ttl_seconds=_LEASE_TTL_SECONDS)
+        )
         self.validator = validator or IaCValidator()
         self.terraform = terraform or TerraformRunnerService()
         self.kubectl = kubectl or KubectlRunnerService()
@@ -334,11 +376,16 @@ class DeploymentEngine:
         source_verification = self.source_verifier.verify(
             payload["repository_name"], source_revision.get("head_sha", "")
         )
+        # F2: the creating principal is the VERIFIED identity passed by
+        # the authenticated API layer (never a free request field); it
+        # drives run-inspection visibility.
+        created_by = payload.pop("created_by", None)
         run = DeploymentRun(
             id=f"run_{uuid.uuid4().hex[:12]}",
             repository_id=int(payload["repository_id"]),
             repository_name=payload["repository_name"],
             requested_by=payload.get("requested_by"),
+            created_by=created_by,
             source_revision=source_revision,
         )
         run.source_verification = dict(source_verification)
@@ -503,34 +550,52 @@ class DeploymentEngine:
         return None
 
     def _require_execution_enabled(self) -> None:
-        if os.getenv("DEPLOYMENT_EXECUTION_ENABLED", "false").lower() != "true":
+        if not self.execution_enabled():
             raise DeploymentActionError("Real deployment execution is disabled. Set DEPLOYMENT_EXECUTION_ENABLED=true only after explicit runtime credentials are provisioned.")
 
-    def _rollback(self, run, temp_dir, namespace, deployment_names, previous_good_terraform_tf):
+    @staticmethod
+    def execution_enabled() -> bool:
+        return os.getenv("DEPLOYMENT_EXECUTION_ENABLED", "false").strip().lower() == "true"
+
+    def _rollback(self, run, temp_dir, namespace, deployment_names, previous_good_terraform_tf, guard=None):
+        # Rollback is itself side-effectful: under a lease, every step
+        # re-proves ownership first (a stale worker must not roll back
+        # the NEW owner's deployment), and every commit is fenced.
+        if guard is not None:
+            self._require_lease(guard)
         run.move(DeploymentState.ROLLBACK_PENDING)
         run.add_log("ROLLBACK_PENDING: attempting deterministic rollback.")
+        if guard is not None:
+            self._commit(run, guard)
         results = []
         for name in deployment_names:
+            if guard is not None:
+                self._require_lease(guard)
             results.append({"component": f"kubernetes:{name}", "result": self.kubectl.rollout_undo(
                 name, namespace,
-                approved_identity=self._approved_kubernetes_identity(run))})
+                approved_identity=self._approved_kubernetes_identity(run),
+                cancel_event=guard.cancel_event if guard is not None else None)})
 
         if run.execution.get("terraform_applied"):
             if not previous_good_terraform_tf.strip():
                 results.append({"component": "terraform", "result": {"status": "BLOCKED", "error": "No previous known-good Terraform configuration was supplied."}})
             else:
+                if guard is not None:
+                    self._require_lease(guard)
                 rollback_dir = Path(temp_dir, "rollback")
                 rollback_dir.mkdir(parents=True, exist_ok=True)
                 previous_path = rollback_dir / "main.tf"
                 previous_path.write_text(previous_good_terraform_tf, encoding="utf-8")
                 plan_path = rollback_dir / "rollback.tfplan"
-                plan = self.terraform.run_plan(str(rollback_dir), execution=True, plan_output_path=str(plan_path))
+                plan = self.terraform.run_plan(str(rollback_dir), execution=True, plan_output_path=str(plan_path),
+                                               cancel_event=guard.cancel_event if guard is not None else None)
                 results.append({
                     "component": "terraform",
                     "result": plan if plan.get("status") != "PASS" else self.terraform.apply_plan(
                         str(rollback_dir),
                         str(plan_path),
                         expected_plan_file_hash=plan.get("plan_file_hash", ""),
+                        cancel_event=guard.cancel_event if guard is not None else None,
                     ),
                 })
 
@@ -542,44 +607,227 @@ class DeploymentEngine:
         else:
             run.move(DeploymentState.ROLLED_BACK)
             run.add_log("ROLLED_BACK: all rollback components reported success.")
-        self.store.save(run)
+        if guard is not None:
+            self._commit(run, guard)
+        else:
+            self.store.save(run)
         return run
 
-    def execute(self, run_id: str, payload: Dict[str, Any], artifact_hash: str, plan_hash: str, namespace="devops-production-namespace", healthcheck_url="", previous_good_terraform_tf=""):
+    # ------------------------------------------------- F5: lease helpers
+
+    def _commit(self, run, guard) -> None:
+        """Fence-guarded durable state save.
+
+        Retries a bounded number of times while the watchdog still
+        believes we own the lease (a store blip inside the grace
+        window is not ownership loss). If the fence rejects the commit
+        — or retries are exhausted — ownership is gone: raise
+        LeaseLostDuringExecutionError so the run is marked LEASE_LOST
+        and NO further side effect starts.
+        """
+        for _attempt in range(_COMMIT_RETRIES):
+            if guard.commit(json.dumps(run.to_dict())):
+                return
+            if not guard.alive():
+                break
+            time.sleep(_COMMIT_RETRY_DELAY)
+        guard.request_cancel()
+        raise LeaseLostDuringExecutionError(
+            "durable state commit was rejected: this worker no longer "
+            "owns the execution lease"
+        )
+
+    def _require_lease(self, guard) -> None:
+        """Before every side effect: prove we still own the lease."""
+        if not guard.alive():
+            guard.request_cancel()
+            raise LeaseLostDuringExecutionError(
+                "execution lease lost before this step; refusing to start "
+                "a further side effect"
+            )
+
+    def _mark_lease_lost(self, run, guard) -> None:
+        """Best-effort terminal LEASE_LOST mark. The commit is fenced, so
+        a stale owner cannot overwrite the new owner's state — if the
+        mark is rejected, the new owner's state simply stands."""
+        try:
+            run.move(DeploymentState.LEASE_LOST)
+        except Exception:  # noqa: BLE001 - already terminal
+            return
+        run.add_log("LEASE_LOST: the executing worker lost ownership of its "
+                    "lease; no further side effects or rollback are "
+                    "performed by the stale worker.")
+        guard.commit(json.dumps(run.to_dict()))
+
+    # ------------------------------------------- F7: dispatch contract
+
+    def prepare_dispatch(
+        self,
+        run_id: str,
+        payload: Dict[str, Any],
+        artifact_hash: str,
+        plan_hash: str,
+        namespace: str = "devops-production-namespace",
+        healthcheck_url: str = "",
+        previous_good_terraform_tf: str = "",
+    ) -> "DeploymentRun":
+        """Validate a dispatch and durably persist EXECUTION_REQUESTED.
+
+        Called by the API BEFORE the task is enqueued. Every check is
+        fail-closed; on any refusal the run is untouched. On success the
+        run is persisted in EXECUTION_REQUESTED so that (a) a second
+        dispatch is refused by the state machine and (b) a worker crash
+        leaves a truthful, inspectable state — never a silent loss.
+        """
         self._require_execution_enabled()
         stored = self.store.get(run_id)
         if not stored:
             raise DeploymentActionError("Deployment run not found.")
         run = DeploymentRun.from_dict(stored)
         if run.state != DeploymentState.APPROVED:
-            raise DeploymentActionError("Only an APPROVED deployment can execute.")
+            raise DeploymentActionError(
+                f"Only an APPROVED deployment can be dispatched for "
+                f"execution (state={run.state.value})."
+            )
+        if run.approval.get("artifact_hash") != artifact_hash or run.approval.get("plan_hash") != plan_hash:
+            raise DeploymentActionError("Execution hashes do not match the approval record.")
+        effective_payload = self._effective_payload(
+            payload, run.id, run.source_revision.get("head_sha", ""))
+        if self._artifact_hash(effective_payload) != artifact_hash:
+            raise DeploymentActionError("Submitted artifacts do not match the immutable approved artifact hash.")
+        # Host-owned namespace: a request may not move the execution
+        # target away from the approved one (defence in depth — the
+        # runner re-checks at execution time as well).
+        if namespace and namespace != self.kubectl.namespace():
+            raise DeploymentActionError(
+                f"Namespace {namespace!r} is not the host-owned execution "
+                f"namespace; cross-namespace dispatch is refused."
+            )
+        # The approval must have been recorded BEFORE dispatch (F2.5):
+        # an approval with no bound identity cannot authorize execution.
+        if not (run.terraform_plan or {}).get("credential_profile_id", ""):
+            pass  # terraform may legitimately be undeclared
+        run.move(DeploymentState.EXECUTION_REQUESTED)
+        run.add_log("EXECUTION_REQUESTED: dispatch validated; the durable run "
+                    "is persisted before the task is enqueued.")
+        self.store.save(run)
+        return run
+
+    def revert_dispatch(self, run_id: str) -> None:
+        """Undo a dispatch whose broker publish failed.
+
+        Only EXECUTION_REQUESTED reverts to APPROVED: if the worker has
+        already taken the run (DEPLOYING/...) nothing is touched, and a
+        terminal run can never be resurrected.
+        """
+        stored = self.store.get(run_id)
+        if not stored:
+            return
+        run = DeploymentRun.from_dict(stored)
+        if run.state != DeploymentState.EXECUTION_REQUESTED:
+            return
+        run.move(DeploymentState.APPROVED)
+        run.add_log("Dispatch reverted: the task never reached the broker; "
+                    "the run remains approved and nothing was executed.")
+        self.store.save(run)
+
+    def execute(self, run_id: str, payload: Dict[str, Any], artifact_hash: str, plan_hash: str, namespace="devops-production-namespace", healthcheck_url="", previous_good_terraform_tf=""):
+        """Worker-owned execution under a fenced, renewable lease (F5/F7).
+
+        The API only validates + persists + enqueues; THIS method is the
+        single execution pathway. It acquires the run's lease (unique
+        owner token + monotonic fence); while it owns the lease every
+        side effect and every state commit is fenced. Losing ownership
+        (expiry + reacquisition, or renewal failure past the TTL)
+        cancels the running sandbox and marks the run LEASE_LOST — the
+        stale worker commits nothing further and rolls back nothing.
+        """
+        self._require_execution_enabled()
+        # F5 crash-redelivery contract: the states a worker may
+        # (re)start are the approved-dispatch states plus the in-flight
+        # states a crashed worker may have left behind. Their side
+        # effects are idempotent/convergent (the EXACT approved plan,
+        # declarative kubectl apply), so a redelivery after the lease is
+        # free completes the run instead of losing it — and while the
+        # lease is held, a duplicate is refused (ALREADY_EXECUTING).
+        resumable_states = (
+            DeploymentState.APPROVED,
+            DeploymentState.EXECUTION_REQUESTED,
+            DeploymentState.DEPLOYING,
+            DeploymentState.HEALTH_CHECKING,
+        )
+        stored = self.store.get(run_id)
+        if not stored:
+            raise DeploymentActionError("Deployment run not found.")
+        run = DeploymentRun.from_dict(stored)
+        if run.state not in resumable_states:
+            raise DeploymentActionError(
+                f"Only an approved or in-flight deployment can execute "
+                f"(state={run.state.value})."
+            )
         if run.approval.get("artifact_hash") != artifact_hash or run.approval.get("plan_hash") != plan_hash:
             raise DeploymentActionError("Execution hashes do not match the approval record.")
         # Phase 6.5.2 corrective — deterministically derive the SAME
         # effective payload (caller artifacts + THIS run's authoritative
         # identity) and compare its hash to the approved artifact hash.
-        # One artifact representation crosses the approval boundary: this
-        # exact payload is written to disk and applied without any
-        # post-approval mutation.
         effective_payload = self._effective_payload(
-            payload, run.id, run.source_revision.get("head_sha", "")
-        )
+            payload, run.id, run.source_revision.get("head_sha", ""))
         if self._artifact_hash(effective_payload) != artifact_hash:
             raise DeploymentActionError("Submitted artifacts do not match the immutable approved artifact hash.")
-        if not self.store.acquire_lock(run.id):
-            raise DeploymentActionError("Deployment is already executing.")
+        if namespace and namespace != self.kubectl.namespace():
+            raise DeploymentActionError(
+                f"Namespace {namespace!r} is not the host-owned execution "
+                f"namespace; cross-namespace execution is refused."
+            )
 
-        # The Kubernetes manifest still needs an ephemeral workspace, but
-        # Terraform does NOT: it reuses the exact approval workspace that
-        # already holds the approved plan.
+        # F5: the fenced lease. A duplicate dispatch/redelivery finds
+        # the lease held and is refused WITHOUT touching the run.
+        guard = self.lease_factory(run.id)
+        if not guard.acquire():
+            raise DeploymentExecutionLeaseHeld(
+                "this run is already executing under another worker's lease")
+        # Re-read UNDER the lease: the state may have advanced between
+        # the check above and the acquisition (a concurrent worker
+        # finished, or was marked terminal, in that window).
+        fresh = self.store.get(run_id)
+        if not fresh:
+            guard.release()
+            raise DeploymentActionError("Deployment run not found.")
+        run = DeploymentRun.from_dict(fresh)
+        if run.state not in resumable_states:
+            guard.release()
+            raise DeploymentActionError(
+                f"run state advanced to {run.state.value} before this "
+                f"execution could start; refusing a second execution")
+
         temp_dir = self._new_workspace(f"devops-exec-{run.id}-")
         approved = run.terraform_plan or {}
         approved_plan_hash = approved.get("plan_file_hash", "")
         tf_workspace = approved.get("approval_workspace", "")
         deployment_names = self._deployment_names(effective_payload.get("k8s_yaml", ""))
         try:
-            run.move(DeploymentState.DEPLOYING)
-            run.add_log("DEPLOYING: starting controlled Terraform and Kubernetes execution.")
+            resumed_in_flight = run.state in (
+                DeploymentState.DEPLOYING, DeploymentState.HEALTH_CHECKING)
+            if resumed_in_flight:
+                run.add_log(
+                    "RECOVERING: resuming an orphaned in-flight execution "
+                    "(the previous worker's lease is no longer held); the "
+                    "apply is idempotent against the exact approved "
+                    "artifact, so nothing is double-applied.")
+                self._commit(run, guard)
+            if run.state == DeploymentState.APPROVED:
+                # Defensive: the API normally persisted
+                # EXECUTION_REQUESTED; a worker that sees APPROVED (e.g.
+                # an in-flight API revert race) records the transition
+                # itself before doing anything.
+                self._require_lease(guard)
+                run.move(DeploymentState.EXECUTION_REQUESTED)
+                self._commit(run, guard)
+            if run.state == DeploymentState.EXECUTION_REQUESTED:
+                self._require_lease(guard)
+                run.move(DeploymentState.DEPLOYING)
+                run.add_log("DEPLOYING: starting controlled Terraform and Kubernetes execution.")
+                self._commit(run, guard)
             paths = self._write_iac(effective_payload, temp_dir)
 
             # ---- Phase 8.5-A corrective, Workstream D ----------------
@@ -596,7 +844,8 @@ class DeploymentEngine:
                 )
             )
             if blocked is None and terraform_declared:
-                init = self.terraform.initialize(tf_workspace)
+                self._require_lease(guard)
+                init = self.terraform.initialize(tf_workspace, cancel_event=guard.cancel_event)
                 run.execution["terraform_init"] = init
                 blocked = (
                     None
@@ -614,7 +863,7 @@ class DeploymentEngine:
                     "DEPLOYMENT_FAILED: the approved Terraform plan could not "
                     "be recovered and verified; nothing was applied."
                 )
-                self.store.save(run)
+                self._commit(run, guard)
                 return run
 
             # Contract-preserving evidence: the plan recorded against the
@@ -626,11 +875,13 @@ class DeploymentEngine:
             run.execution["terraform_plan"] = terraform_plan
             run.execution["approved_plan_hash"] = approved_plan_hash
 
+            self._require_lease(guard)
             terraform_apply = (
                 self.terraform.apply_plan(
                     tf_workspace,
                     str(Path(tf_workspace, PLAN_FILENAME)),
                     expected_plan_file_hash=approved_plan_hash,
+                    cancel_event=guard.cancel_event,
                 )
                 if terraform_declared
                 else self._terraform_not_applicable()
@@ -646,16 +897,19 @@ class DeploymentEngine:
             if not run.execution["terraform_applied"]:
                 run.error = "Terraform apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
+                return self._rollback(run, temp_dir, namespace, deployment_names,
+                                      previous_good_terraform_tf, guard)
 
             # Phase 6.5.2 corrective — the manifest file written above IS
             # the approved artifact (identity already bound in
             # create_dry_run); apply it byte-for-byte with no further
             # mutation after the hash check.
             approved_k8s_identity = self._approved_kubernetes_identity(run)
+            self._require_lease(guard)
             kubernetes_apply = (
                 self.kubectl.apply(paths["kubernetes"], namespace,
-                                   approved_identity=approved_k8s_identity)
+                                   approved_identity=approved_k8s_identity,
+                                   cancel_event=guard.cancel_event)
                 if self._kubernetes_is_declared(effective_payload)
                 else self._kubernetes_not_applicable()
             )
@@ -665,30 +919,46 @@ class DeploymentEngine:
             if not run.execution["kubernetes_applied"]:
                 run.error = "Kubernetes apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
+                return self._rollback(run, temp_dir, namespace, deployment_names,
+                                      previous_good_terraform_tf, guard)
 
-            run.move(DeploymentState.HEALTH_CHECKING)
-            run.add_log("HEALTH_CHECKING: verifying rollout and optional HTTP readiness.")
-            run.health_check = self.health_checker.check(self.kubectl, deployment_names, namespace, healthcheck_url)
+            self._require_lease(guard)
+            if run.state != DeploymentState.HEALTH_CHECKING:
+                run.move(DeploymentState.HEALTH_CHECKING)
+                run.add_log("HEALTH_CHECKING: verifying rollout and optional HTTP readiness.")
+                self._commit(run, guard)
+            run.health_check = self.health_checker.check(
+                self.kubectl, deployment_names, namespace, healthcheck_url,
+                cancel_event=guard.cancel_event)
             if run.health_check.get("status") != "PASS":
                 run.error = "Post-deployment health verification failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
+                return self._rollback(run, temp_dir, namespace, deployment_names,
+                                      previous_good_terraform_tf, guard)
 
             run.move(DeploymentState.DEPLOYED)
             run.add_log("DEPLOYED: execution and deterministic health verification succeeded.")
-            self.store.save(run)
+            self._commit(run, guard)
+            return run
+        except LeaseLostDuringExecutionError as exc:
+            # Ownership is gone. Cancel anything in flight, mark
+            # LEASE_LOST (fenced: the new owner's state wins if it is
+            # further along), and do NOTHING else — no rollback, no
+            # further side effects, no "failure" claim by a stale worker.
+            run.add_log(f"LEASE_LOST: {exc}")
+            self._mark_lease_lost(run, guard)
             return run
         except Exception as exc:
             run.error = type(exc).__name__
             if run.state in {DeploymentState.DEPLOYING, DeploymentState.HEALTH_CHECKING}:
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
             if run.execution.get("terraform_applied") or run.execution.get("kubernetes_applied"):
-                return self._rollback(run, temp_dir, namespace, deployment_names, previous_good_terraform_tf)
-            self.store.save(run)
+                return self._rollback(run, temp_dir, namespace, deployment_names,
+                                      previous_good_terraform_tf, guard)
+            self._commit(run, guard)
             return run
         finally:
-            self.store.release_lock(run.id)
+            guard.release()
             shutil.rmtree(temp_dir, ignore_errors=True)
             # A saved plan is sensitive and single-use: once the run has
             # reached a terminal state it can never be applied again, so

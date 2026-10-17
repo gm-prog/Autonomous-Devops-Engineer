@@ -44,9 +44,11 @@ class HealthCheckService:
         deployment_names: Iterable[str],
         namespace: str,
         healthcheck_url: str = "",
+        cancel_event=None,
     ) -> Dict[str, Any]:
         checks = [
-            {"deployment": name, "result": kubectl.rollout_status(name, namespace)}
+            {"deployment": name,
+             "result": kubectl.rollout_status(name, namespace, cancel_event=cancel_event)}
             for name in deployment_names
         ]
         if healthcheck_url.strip():

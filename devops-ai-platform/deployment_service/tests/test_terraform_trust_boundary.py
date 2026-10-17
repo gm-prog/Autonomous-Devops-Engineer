@@ -94,7 +94,7 @@ class FakeTerraformSandbox:
         self._outcome = outcome
         self._raises = raises
 
-    def execute(self, step, workspace_path):
+    def execute(self, step, workspace_path, cancel_event=None):
         self.calls.append(
             {
                 "operation": step.operation,
@@ -794,7 +794,7 @@ class TestPlanArtifactBinding:
         plan_path = tmp_path / "terraform.tfplan"
 
         class WritingSandbox(FakeTerraformSandbox):
-            def execute(self, step, workspace_path):
+            def execute(self, step, workspace_path, cancel_event=None):
                 if step.operation is TerraformOperation.PLAN:
                     plan_path.write_bytes(b"saved-plan-bytes")
                 return super().execute(step, workspace_path)

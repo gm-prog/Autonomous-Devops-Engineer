@@ -4,22 +4,30 @@
 #
 #   docker compose -f devops-ai-platform/docker-compose.yml -f docker-compose.e2e.yml config
 #
-# This override covers ONLY the deployment service (the canonical stack
-# is the Phase 8.7-D.1 gateway + agent + Redis contract). The broad
-# Phase 8 integration-stack overrides from the candidate source (postgres,
+# This override covers ONLY the deployment runtime — the two services
+# `deployment-api` and `deployment-worker` that share one canonical
+# image (the Phase 8.8A Correction-1 split; the canonical stack is the
+# Phase 8.7-D.1 gateway + agent + Redis contract). The broad Phase 8
+# integration-stack overrides from the candidate source (postgres,
 # qdrant, repo/incident/agent E2E Dockerfiles and their env) are NOT
 # ported: they describe services that do not exist in this baseline.
+#
+# The override ENABLES execution (disposable environment only) and gives
+# the WORKER — the only role that executes — the daemon, the kubeconfig
+# and the workspace roots. The API keeps no daemon access: it validates,
+# persists and enqueues; execution is worker-owned.
 #
 # Image refs are digest-resolved by the harness before `up` (committed
 # pins in devops-ai-platform/e2e/pinned-images.txt); the placeholders
 # below only exist so `compose config` validation can run in CI.
 services:
-  deployment-service:
-    build:
-      context: ./devops-ai-platform
-      dockerfile: ./deployment_service/Dockerfile.e2e
-      args:
-        BASE_IMAGE: ${E2E_PYTHON_BASE_IMAGE:?BASE_IMAGE must be a name@sha256:<64hex> reference}
+  deployment-api:
+    environment:
+      # Disposable E2E only: execution is turned ON here. The API still
+      # performs no execution — it dispatches to the worker.
+      - DEPLOYMENT_EXECUTION_ENABLED=true
+      - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
+  deployment-worker:
     environment:
       - DEPLOYMENT_EXECUTION_ENABLED=true
       - GITHUB_OAUTH_TOKEN=${E2E_FIXTURE_GITHUB_TOKEN:-}
@@ -41,13 +49,15 @@ services:
     volumes:
       - ${E2E_KUBECONFIG_HOST_PATH:-/tmp/ares-e2e-kubeconfig}:/etc/deployment/kubeconfig:ro
       # TRUST BOUNDARY NOTE. The socket is mounted into the deployment
-      # service because that service IS the trusted control plane: it
-      # launches the sandbox. It is NEVER passed into the sandbox
-      # container itself — the Terraform workload gets --network none,
-      # no socket, and only its own workspace. Mounting the socket here
+      # WORKER because it is the only role that launches sandboxes. It
+      # is NEVER passed into the sandbox container itself — the
+      # Terraform workload gets --network none, no socket, and only its
+      # own workspace; the kubectl sandbox gets its dedicated
+      # destination-isolated network only. Mounting the socket here
       # grants this container control-plane authority over the daemon,
-      # which is exactly the privilege it already needs and must be
-      # treated as such when reviewing changes to this service.
+      # which is exactly the privilege it needs and must be treated as
+      # such when reviewing changes to this service. The deployment-api
+      # service receives NO socket in any stack.
       - /var/run/docker.sock:/var/run/docker.sock
       # Workspace root bind-mounted at an IDENTICAL absolute path on
       # both sides: the control plane asks the daemon to bind-mount a

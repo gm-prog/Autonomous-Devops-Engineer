@@ -224,8 +224,18 @@ jobs:
           set -euo pipefail
           PYTHONPATH=. python -m security_guards | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Phase 8.8A Correction-1 (F6): the deployment runtime chain must
+      # use only the approved, digest-pinned base image. Floating tags,
+      # truncated digests and digests that differ from the committed pin
+      # are structural violations. The digest is echoed as CI evidence
+      # (digest parity across API, worker, gateway and agent images).
+      - name: Deployment base images are the approved pin (F6 digest parity)
+        run: |
+          set -euo pipefail
+          python scripts/assert_deployment_base_images.py | tee -a "$GITHUB_STEP_SUMMARY"
+
   redis-integration:
-    name: Real-Redis integration tests (shared budget ledger + shared rate limiter)
+    name: Real-Redis integration tests (budget ledger, rate limiter, execution lease)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -259,6 +269,26 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest tests/test_redis_integration.py -v 2>&1 | tee redis-integration.txt
+      # Phase 8.8A Correction-1 (F5): the fenced execution lease is
+      # proven against THIS live Redis — mutual-exclusion acquire,
+      # compare-and-delete release, compare-and-expire renewal,
+      # monotonic fencing, stale-worker commit rejection, watchdog
+      # renewal, blip grace, 24 concurrent duplicate dispatches and the
+      # crash-redelivery no-double-apply engine proof. Fail-closed:
+      # REDIS_INTEGRATION_REQUIRED=true makes a missing Redis a hard
+      # failure, never a silent skip.
+      - name: Execution lease safety against the live store (F5, 9 scenarios)
+        working-directory: devops-ai-platform
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          REDIS_INTEGRATION_REQUIRED: "true"
+          DEPLOYMENT_EXECUTION_ENABLED: "true"
+          JWT_SECRET: ci-lease-test-jwt-secret-not-a-real-secret
+          AGENT_INTERNAL_TOKEN: ci-lease-test-internal-token-not-a-real-secret
+        run: |
+          set -euo pipefail
+          python -m pytest deployment_service/tests/test_execution_lease.py \
+            -v 2>&1 | tee redis-execution-lease.txt
       - name: Mutation suite against the live store (M19/M22 behavioral proofs — weakened finalize script double-counts; pre-provider probe bypass wedges the breaker, both on the real code paths)
         working-directory: devops-ai-platform
         env:
@@ -275,6 +305,7 @@ jobs:
           path: |
             devops-ai-platform/redis-integration.txt
             devops-ai-platform/redis-mutations.txt
+            devops-ai-platform/redis-execution-lease.txt
           if-no-files-found: warn
       - name: Tear down Redis
         if: always()
@@ -302,9 +333,9 @@ jobs:
         working-directory: devops-ai-platform
         run: docker compose config --quiet
 
-      - name: Build gateway + agent images (digest-pinned bases)
+      - name: Build gateway + agent + deployment images (digest-pinned bases)
         working-directory: devops-ai-platform
-        run: docker compose build api-gateway agent-service
+        run: docker compose build api-gateway agent-service deployment-api deployment-worker
 
       - name: Boot the canonical stack (NO real provider credentials)
         working-directory: devops-ai-platform
@@ -328,6 +359,39 @@ jobs:
           done
           echo "gateway /api/v1/health:"
           curl -fsS http://127.0.0.1:8000/api/v1/health; echo
+
+          # 1b) Deployment API readiness (F1): /health measures the
+          #     DECLARED contract - the process answers AND its broker
+          #     (Redis store for dry-run persistence + dispatch) is
+          #     reachable. A down broker is a degraded service: 503,
+          #     never a success-shaped 200. The loop below fails the
+          #     job on unhealthy (no || true, no always-success).
+          for i in $(seq 1 45); do
+            docker compose exec -T deployment-service python -c               "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5).status == 200 else 1)"               && break
+            if [ "$i" -eq 45 ]; then docker compose ps; docker compose logs deployment-service; exit 1; fi
+            sleep 2
+          done
+          echo "deployment-service /health:"
+          docker compose exec -T deployment-service python -c             "import urllib.request,json; print(json.load(urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5)))"
+          # the contract itself: broker reachable AND execution still
+          # disabled in the canonical (non-disposable) stack
+          docker compose exec -T deployment-service python -c             "import json,urllib.request as u; h = json.load(u.urlopen('http://127.0.0.1:8030/health', timeout=5)); assert h['redis'] == 'ok', f'broker unreachable: {h}'; assert h['execution_enabled'] is False, f'canonical stack must ship execution disabled: {h}'; print('deployment API contract: redis ok, execution disabled: OK')"
+
+          # 1c) Deployment worker readiness: the celery process is
+          #     alive and answers inspect ping.
+          for i in $(seq 1 30); do
+            docker compose exec -T deployment-worker python -c               "import subprocess,sys; p = subprocess.run(['celery', '-A', 'deployment_service.infrastructure.celery.tasks.celery_app', 'inspect', 'ping', '--timeout', '3'], capture_output=True, text=True); sys.exit(0 if p.returncode == 0 else 1)"               && break
+            if [ "$i" -eq 30 ]; then docker compose ps; docker compose logs deployment-worker; exit 1; fi
+            sleep 2
+          done
+          echo "deployment-worker celery ping: OK"
+
+          # 1d) Authenticated contract (F2): sensitive routes refuse
+          #     anonymous callers with 401 ...
+          docker compose exec -T deployment-service python -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8030, timeout=5); c.request('GET', '/api/internal/deployments/run-unknown-ci'); code = c.getresponse().status; print(f'anonymous sensitive request -> {code}'); assert code == 401, f'expected 401, got {code}'; print('anonymous sensitive request refused with 401: OK')"
+          # ... while a verified operator JWT is accepted (the unknown
+          # run then answers 404 - authenticated, not leaked, not 401).
+          docker compose exec -T deployment-service python -c "import http.client,os; from deployment_service.application.services import deployment_auth as a; t = a.create_access_token('ci-compose-smoke', ['operator'], os.environ['JWT_SECRET']); c = http.client.HTTPConnection('127.0.0.1', 8030, timeout=5); c.request('GET', '/api/internal/deployments/run-unknown-ci', headers={'Authorization': f'Bearer {t}'}); code = c.getresponse().status; print(f'authenticated operator request -> {code}'); assert code == 404, f'expected 404 for authenticated unknown run, got {code}'; print('authenticated operator request accepted (unknown run -> 404): OK')"
 
           # 2) Agent reachable through the COMPOSE NETWORK (never via host).
           docker compose exec -T api-gateway python -c \
@@ -559,8 +623,13 @@ jobs:
       - name: Kubernetes trust-boundary suite
         run: |
           set -euo pipefail
+          # Phase 8.8A Correction-1: the exact-membership network
+          # validation (F3) and the private credential staging (F4)
+          # suites run here as first-class unit gates.
           PYTHONPATH=. python -m pytest \
             deployment_service/tests/test_kubernetes_trust_boundary.py \
+            deployment_service/tests/test_sandbox_network_isolation.py \
+            deployment_service/tests/test_kubeconfig_staging_permissions.py \
             -q --no-header | tee k8s-unit.txt
       - name: No host kubectl execution path exists
         run: PYTHONPATH=. python scripts/assert_no_host_terraform_execution.py

@@ -558,7 +558,7 @@ class RecordingSandbox:
         self._exit_code = exit_code
         self._stdout = stdout
 
-    def execute(self, step, *, manifest_yaml, kubeconfig_yaml, namespace):
+    def execute(self, step, *, manifest_yaml, kubeconfig_yaml, namespace, cancel_event=None):
         self.calls.append({"step": step, "manifest": manifest_yaml,
                            "kubeconfig": kubeconfig_yaml, "namespace": namespace})
 

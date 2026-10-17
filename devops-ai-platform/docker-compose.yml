@@ -11,6 +11,13 @@
 #   * redis        — shared state for the gateway's analysis rate limiter
 #                    and the agent's AI budget ledger (NOT exposed to the
 #                    host).
+#   * deployment-api    — the deployment engine's authenticated HTTP
+#                    contract (NOT exposed to the host; canonical DNS
+#                    name `deployment-service`, port 8030 over d1).
+#   * deployment-worker — the same image with the celery entrypoint;
+#                    owns sandbox execution (disabled by default; no
+#                    daemon access in this canonical stack — see the
+#                    service comments and SECURITY.md).
 #
 # The older broad stack (postgres/qdrant/celery) is quarantined in
 # docker-compose.legacy.yml — do not use it for the D1 path.
@@ -109,11 +116,34 @@ services:
       retries: 12
       start_period: 10s
 
-  deployment-service:
+  # ---------------------------------------------------------------------
+  # Phase 8.8A Correction-1 (F1/F7): the deployment runtime is SPLIT into
+  # an API and a worker that share ONE image (deployment_service/
+  # Dockerfile, pinned base + hash-pinned lock):
+  #   * deployment-api    — uvicorn on 8030 (the canonical
+  #                         `deployment-service` DNS name, which the
+  #                         gateway's deployment route depends on);
+  #                         validates, persists and enqueues. It holds NO
+  #                         Docker daemon access and NO sandbox authority.
+  #   * deployment-worker — the same image with the celery `command:`;
+  #                         the ONLY deployment role with execution
+  #                         authority, and in this canonical stack it
+  #                         holds NO daemon access either: sandbox
+  #                         execution is deliberately unavailable here
+  #                         (execution disabled by default + no daemon ⇒
+  #                         any execute fails closed with a typed state).
+  #                         The disposable E2E overlay
+  #                         (docker-compose.e2e.yml) is the only place
+  #                         that grants the daemon, and only to this
+  #                         service, in a disposable environment.
+  # ---------------------------------------------------------------------
+  deployment-api:
     build:
       context: .
       dockerfile: ./deployment_service/Dockerfile
-    container_name: devops_d1_deployment_service
+    # The canonical DNS name the gateway's deployment route
+    # (deployment-service:8030) depends on.
+    container_name: deployment-service
     # NOT exposed to the host: the deployment execution boundary is
     # internal (Phase 8.8A) and is reached only over the d1 network —
     # the gateway's deployment route uses deployment-service:8030 and
@@ -122,8 +152,15 @@ services:
     expose:
       - "8030"
     environment:
-      # Celery broker: the shared internal Redis (same store the D1
-      # services already use).
+      # Authenticated deployment API (Phase 8.8A Correction-1, F2): the
+      # same HS256 JWT contract as the gateway, plus the internal
+      # service token. Both are REQUIRED by the :? operator above; a
+      # misconfigured process fails closed (503) on every sensitive
+      # route — there is no bundled fallback secret.
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set — see SECURITY.md}
+      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see SECURITY.md}
+      # Broker: the shared internal Redis (same store the D1 services
+      # already use) — dry-run persistence and execution dispatch.
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       # FAIL CLOSED BY DEFAULT: real cluster execution is refused with a
@@ -143,11 +180,49 @@ services:
     networks:
       - d1
     healthcheck:
+      # The declared contract: a live API process AND a reachable broker.
+      # A worker-only image can never satisfy this — that is exactly the
+      # mismatch this split exists to close (F1).
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=3).status == 200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 15s
+
+  deployment-worker:
+    build:
+      context: .
+      dockerfile: ./deployment_service/Dockerfile
+    container_name: devops_d1_deployment_worker
+    # Same image as the API — different entrypoint. The worker consumes
+    # the deployment queue and owns sandbox execution under a fenced
+    # Redis lease (Phase 8.8A Correction-1, F5/F7).
+    command: ["celery", "-A", "deployment_service.infrastructure.celery.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+    # No ports and, in the canonical stack, no volumes: the worker is
+    # reachable only over the d1 network and has no daemon, no
+    # kubeconfig and no staging root to execute against. Enabling
+    # execution here is therefore fail-closed by construction.
+    environment:
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET must be set — see SECURITY.md}
+      - AGENT_INTERNAL_TOKEN=${AGENT_INTERNAL_TOKEN:?AGENT_INTERNAL_TOKEN must be set — see SECURITY.md}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DEPLOYMENT_EXECUTION_ENABLED=${DEPLOYMENT_EXECUTION_ENABLED:-false}
+      - GITHUB_OAUTH_TOKEN=${GITHUB_OAUTH_TOKEN:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - d1
+    healthcheck:
+      # Worker liveness/readiness: the worker must answer a live broker
+      # round-trip (celery inspect ping) — a started-but-wedged worker
+      # is not ready.
+      test: ["CMD", "celery", "-A", "deployment_service.infrastructure.celery.tasks.celery_app", "inspect", "ping", "--timeout", "5"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
 
 networks:
   d1:

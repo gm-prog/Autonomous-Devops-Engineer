@@ -60,6 +60,21 @@ SERVICE_NAME = "ares-k8s-http-service"
 REDIS_NAME = "ares-k8s-http-redis"
 SERVICE_NET = "ares-k8s-http-net"
 SERVICE_PORT = 8041
+
+# Phase 8.8A Correction-1 (F2): the deployment API authenticates. The
+# driver mints a real operator JWT with a per-run random secret and
+# passes that same secret to the service container; every api() call
+# below carries the verified identity.
+import secrets as _secrets  # noqa: E402
+
+JWT_SECRET = _secrets.token_urlsafe(36)
+AGENT_INTERNAL_TOKEN = _secrets.token_urlsafe(36)
+
+from deployment_service.application.services import deployment_auth  # noqa: E402
+
+_OPERATOR_TOKEN = deployment_auth.create_access_token(
+    "ares-e2e-operator", ["operator"], JWT_SECRET)
+AUTH_HEADERS = {"Authorization": f"Bearer {_OPERATOR_TOKEN}"}
 STAGING_ROOT = "/tmp/ares-k8s-http-staging"
 NAMESPACE = "devops-production-namespace"
 CREDENTIAL_PROFILE = "ares-k8s-deployer-v1"
@@ -95,9 +110,11 @@ def api(method: str, path: str, body: Optional[dict] = None,
         expect: Tuple[int, ...] = (200, 201)) -> Tuple[int, Any]:
     """The only way this driver is allowed to touch the system."""
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    headers.update(AUTH_HEADERS)
     request = urllib.request.Request(
         f"http://127.0.0.1:{SERVICE_PORT}{path}", data=data, method=method,
-        headers={"Content-Type": "application/json"})
+        headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
             payload = response.read()
@@ -264,6 +281,10 @@ def start_service(service_image: str, sandbox_digest: str, kubeconfig: Path,
         "--network", SERVICE_NET,
         "-p", f"{SERVICE_PORT}:8030",
         "-e", "REDIS_HOST=redis", "-e", "REDIS_PORT=6379",
+        # F2: the API verifies caller identity against these; they are
+        # generated per run (never committed, never printed).
+        "-e", f"JWT_SECRET={JWT_SECRET}",
+        "-e", f"AGENT_INTERNAL_TOKEN={AGENT_INTERNAL_TOKEN}",
         # TRUSTED control plane. It needs daemon authority to launch the
         # sandbox; the sandbox itself never receives the socket. This is
         # the documented v1 residual risk, not an accident.
@@ -360,6 +381,30 @@ def approve(run_id: str, dry: dict) -> Tuple[int, Any]:
                 "plan_hash": dry.get("plan_hash")})
 
 
+TERMINAL_STATES = ("DEPLOYED", "DEPLOYMENT_FAILED", "ROLLED_BACK",
+                   "ROLLBACK_FAILED", "LEASE_LOST")
+
+
+def poll_run(run_id: str, timeout: int = 900) -> dict:
+    """Poll the durable run record until it reaches a terminal state.
+
+    The dispatch is at-least-once and worker-owned: the driver never
+    infers completion from the dispatch response and never treats a
+    non-terminal state as success.
+    """
+    deadline = time.time() + timeout
+    last = {}
+    while time.time() < deadline:
+        code, last = api("GET", f"/api/internal/deployments/{run_id}")
+        if code in (200, 201) and last.get("state") in TERMINAL_STATES:
+            return last
+        time.sleep(3)
+    raise RuntimeError(
+        f"run {run_id} did not reach a terminal state within {timeout}s; "
+        f"last state={last.get('state')} error={last.get('error')} "
+        f"logs={json.dumps((last.get('logs') or [])[-4:])[:500]}")
+
+
 def k8s_leg(result: dict) -> dict:
     """The Kubernetes leg of an EXECUTED run."""
     execution = result.get("execution") or {}
@@ -421,15 +466,30 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
            f"status={code} state={approved.get('state')}",
            code in (200, 201) and approved.get("state") == "APPROVED")
 
-    # ---- 12. execute over HTTP ----
-    code, executed = api("POST", f"/api/internal/deployments/{run_id}/execute",
+    # ---- 12. execute over HTTP (F7: dispatch + worker-owned execution)
+    # The API only DISPATCHES: a truthful 200 with dispatched=true and
+    # state=EXECUTION_REQUESTED means the durable run moved and the task
+    # reached the broker. The WORKER performs the mutation; the driver
+    # polls the run record until the terminal state (at-least-once
+    # delivery, never a fabricated inline result).
+    code, dispatch = api("POST", f"/api/internal/deployments/{run_id}/execute",
                          execute_body(body, dry))
+    record("http:dispatch-truthful",
+           "execute dispatches (persist + enqueue), it does not claim completion",
+           f"status={code} dispatched={dispatch.get('dispatched')} "
+           f"state={dispatch.get('state')} run_id={dispatch.get('run_id')}",
+           code in (200, 201)
+           and dispatch.get("dispatched") is True
+           and dispatch.get("state") == "EXECUTION_REQUESTED"
+           and dispatch.get("run_id") == run_id)
+    executed = poll_run(run_id)
     applied = k8s_leg(executed)
     record("http:execute-over-the-real-path",
            "the mutation is driven through the service, not the runner",
-           f"status={code} state={executed.get('state')} "
+           f"final_state={executed.get('state')} "
            f"kubernetes={json.dumps(applied)[:220]}",
-           code in (200, 201) and applied.get("status") == "PASS")
+           executed.get("state") == "DEPLOYED"
+           and applied.get("status") == "PASS")
 
     # ---- 13. approved manifest == applied manifest ----
     approved_hash = identity.get("approved_manifest_hash") or dry.get("artifact_hash")
@@ -550,6 +610,32 @@ def run_sequence(cluster: str, control_plane: str, workload_image: str) -> None:
            "the workload is in a defined state after the sequence",
            f"replicas={after.stdout.strip()!r} rc={after.returncode}",
            after.returncode == 0)
+
+    # ---- F4: the staged-credential mode is proven against a real
+    # unprivileged UID, not just asserted with a stat() call. The driver
+    # lays down a private staged-credential layout (0700 dirs, 0600
+    # file) at the same path the app uses, then a real `nobody` read
+    # must fail while the owner read succeeds.
+    proof_root = Path(STAGING_ROOT) / "ares-peer-proof"
+    proof_run = proof_root / "runs" / "peer-proof"
+    proof_run.mkdir(parents=True, exist_ok=True)
+    os.chmod(str(proof_root), 0o700)
+    os.chmod(str(proof_run.parent), 0o700)
+    canary = _secrets.token_hex(16)
+    proof_file = proof_run / "kubeconfig"
+    proof_file.write_text(f"apiVersion: v1\n# canary {canary}\n")
+    os.chmod(str(proof_file), 0o600)
+    peer = sh(["sudo", "-n", "-u", "nobody", "cat", str(proof_file)])
+    owner = sh(["cat", str(proof_file)])
+    record("credential:unprivileged-peer-cannot-read-staged-file",
+           "a 0700/0600 staged credential is unreadable to an unprivileged "
+           "local UID (real nobody read, not a stat assertion)",
+           f"nobody_rc={peer.returncode} "
+           f"nobody_err={peer.stderr.strip()[:120]!r} owner_ok="
+           f"{canary in owner.stdout}",
+           peer.returncode != 0 and canary not in peer.stdout
+           and canary in owner.stdout)
+    shutil.rmtree(proof_root, ignore_errors=True)
 
 
 class SandboxWatcher:
@@ -734,7 +820,9 @@ def main() -> int:
     workspace_root = Path("/tmp/ares-k8s-http-workspace")
     workspace_root.mkdir(parents=True, exist_ok=True)
     Path(STAGING_ROOT).mkdir(parents=True, exist_ok=True)
-    os.chmod(STAGING_ROOT, 0o711)
+    # F4: the staging root is PRIVATE (0700). The pre-correction mode
+    # (0711) let any local user traverse into the staged credentials.
+    os.chmod(STAGING_ROOT, 0o700)
     exec_network = None
     started = False
 

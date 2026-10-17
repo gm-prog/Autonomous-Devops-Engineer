@@ -27,12 +27,48 @@ from deployment_service.tests.test_deployment_engine import (
 )
 from shared_kernel.domain.provenance import verify_provenance_record
 
-from fastapi.testclient import TestClient
+import os
+
+from fastapi.testclient import TestClient as _TestClient
+
+from deployment_service.application.services import deployment_auth
+
+# Authenticated-contract test environment (Phase 8.8A Correction-1, F2):
+# the routes under test now REQUIRE a verified caller identity, so the
+# contract client mints a real operator JWT under a test secret.
+os.environ.setdefault(
+    "JWT_SECRET", "contract-test-jwt-secret-0123456789abcdef")
+os.environ.setdefault(
+    "AGENT_INTERNAL_TOKEN", "contract-test-internal-token-0123456789")
+
+_OPERATOR_TOKEN = deployment_auth.create_access_token(
+    "contract-operator", ["operator"], os.environ["JWT_SECRET"])
+_AUTH_HEADERS = {"Authorization": f"Bearer {_OPERATOR_TOKEN}"}
+
+
+class AuthedClient:
+    """TestClient wrapper: every request carries the operator JWT."""
+
+    def __init__(self, app):
+        self._client = _TestClient(app)
+
+    def post(self, url, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.update(_AUTH_HEADERS)
+        return self._client.post(url, headers=headers, **kwargs)
+
+    def get(self, url, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.update(_AUTH_HEADERS)
+        return self._client.get(url, headers=headers, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
 
 SHA_A = "a" * 40
 SHA_B = "B" * 40  # uppercase in requests must normalize to lowercase
 
-client = TestClient(deployment_app)
+client = AuthedClient(deployment_app)
 
 
 def _payload(repository_name="acme/checkout", head_sha=SHA_A, **overrides):
@@ -51,7 +87,13 @@ class DeploymentHttpContractTests(unittest.TestCase):
     def setUp(self):
         self.store = FakeStore()
         import deployment_service.main as deployment_main
+        from deployment_service.tests.test_deployment_engine import (
+            FakeLeaseFactory,
+            FakeLeaseGuard,
+        )
 
+        self.lease_factory = FakeLeaseFactory(self.store)
+        FakeLeaseGuard.holders.clear()
         self._originals = {
             name: getattr(deployment_main.engine, name)
             for name in (
@@ -61,6 +103,7 @@ class DeploymentHttpContractTests(unittest.TestCase):
                 "kubectl",
                 "health_checker",
                 "source_verifier",
+                "lease_factory",
             )
         }
         deployment_main.engine.store = self.store
@@ -70,6 +113,8 @@ class DeploymentHttpContractTests(unittest.TestCase):
         deployment_main.engine.health_checker = FakeHealth()
         # deterministic source verification (no network in contract tests)
         deployment_main.engine.source_verifier = FakeSourceVerifier()
+        # deterministic fenced lease (no Redis in contract tests)
+        deployment_main.engine.lease_factory = self.lease_factory
         self.addCleanup(self._restore)
 
     def _restore(self):

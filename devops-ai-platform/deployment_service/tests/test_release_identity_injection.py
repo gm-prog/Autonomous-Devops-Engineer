@@ -143,13 +143,21 @@ def _payload(**overrides):
 
 
 def _build_engine(kubectl):
+    from deployment_service.tests.test_deployment_engine import (
+        FakeLeaseFactory,
+        FakeLeaseGuard,
+    )
+
+    FakeLeaseGuard.holders.clear()
+    store = FakeStore()
     return DeploymentEngine(
-        store=FakeStore(),
+        store=store,
         validator=FakeValidator(),
         terraform=FakeTerraform(),
         kubectl=kubectl,
         health_checker=FakeHealth(),
         source_verifier=FakeSourceVerifier(),
+        lease_factory=FakeLeaseFactory(store),
     )
 
 
@@ -157,20 +165,24 @@ class RecordingKubectl(FakeKubectl):
     """Captures the exact manifest bytes handed to dry_run and apply."""
 
     def __init__(self):
+        super().__init__()
         self.applied_manifests = []
         self.dry_run_manifests = []
 
-    def dry_run(self, manifest_path, namespace="devops-production-namespace"):
+    def dry_run(self, manifest_path, namespace=None, cancel_event=None):
         self.dry_run_manifests.append(
             Path(manifest_path).read_text(encoding="utf-8")
         )
-        return super().dry_run(manifest_path, namespace)
+        return super().dry_run(manifest_path, namespace, cancel_event=cancel_event)
 
-    def apply(self, manifest_path, namespace=None, approved_identity=None):
+    def apply(self, manifest_path, namespace=None, approved_identity=None,
+              cancel_event=None):
         self.applied_manifests.append(
             Path(manifest_path).read_text(encoding="utf-8")
         )
-        return super().apply(manifest_path, namespace)
+        return super().apply(manifest_path, namespace,
+                             approved_identity=approved_identity,
+                             cancel_event=cancel_event)
 
 
 def _execute_approved(kubectl, payload):

@@ -69,6 +69,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PLATFORM_ROOT = HERE.parent
 REPO_ROOT = PLATFORM_ROOT.parent
+sys.path.insert(0, str(PLATFORM_ROOT))
 FIXTURE_TF = HERE / "terraform" / "main.tf"
 FIXTURES = HERE / "fixtures"
 
@@ -76,6 +77,23 @@ SERVICE_NAME = "ares-e2e-deployment-service"
 REDIS_NAME = "ares-e2e-redis"
 NETWORK_NAME = "ares-e2e-net"
 SERVICE_PORT = 8030
+
+# Phase 8.8A Correction-1 (F2): the deployment API authenticates. The
+# driver mints a real operator JWT with a per-run random secret and
+# passes that same secret to the service container.
+import secrets as _secrets
+
+JWT_SECRET = _secrets.token_urlsafe(36)
+AGENT_INTERNAL_TOKEN = _secrets.token_urlsafe(36)
+
+from deployment_service.application.services import deployment_auth  # noqa: E402
+
+_OPERATOR_TOKEN = deployment_auth.create_access_token(
+    "ares-e2e-operator", ["operator"], JWT_SECRET)
+AUTH_HEADERS = {"Authorization": f"Bearer {_OPERATOR_TOKEN}"}
+
+TERMINAL_STATES = ("DEPLOYED", "DEPLOYMENT_FAILED", "ROLLED_BACK",
+                   "ROLLBACK_FAILED", "LEASE_LOST")
 FIXTURE_SHA = "a" * 40
 FIXTURE_REPO = "ares-e2e/fixture"
 
@@ -358,6 +376,10 @@ def start_service(image, workspace_root: Path, sandbox_digest,
         "-p", f"{SERVICE_PORT}:8030",
         "-e", "REDIS_HOST=redis",
         "-e", "REDIS_PORT=6379",
+        # F2: the API verifies caller identity against these (random
+        # per run; never committed, never printed).
+        "-e", f"JWT_SECRET={JWT_SECRET}",
+        "-e", f"AGENT_INTERNAL_TOKEN={AGENT_INTERNAL_TOKEN}",
         # TRUSTED control plane: it needs daemon authority to launch the
         # sandbox. This is the documented v1 residual risk.
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
@@ -410,9 +432,11 @@ def wait_for_health(timeout=120) -> dict:
 def api(method, path, body=None, expect=(200, 201)):
     url = f"http://127.0.0.1:{SERVICE_PORT}{path}"
     data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    headers.update(AUTH_HEADERS)
     request = urllib.request.Request(
         url, data=data, method=method,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
     )
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
@@ -427,6 +451,23 @@ def api(method, path, body=None, expect=(200, 201)):
 
 def exec_in_service(command):
     return sh(["docker", "exec", SERVICE_NAME, "sh", "-c", command])
+
+
+def poll_run(run_id, timeout=900):
+    """F7: execution is worker-owned and at-least-once. The driver
+    polls the durable run record until the terminal state; it never
+    infers completion from the dispatch response."""
+    deadline = time.time() + timeout
+    last = {}
+    while time.time() < deadline:
+        code, last = api("GET", f"/api/internal/deployments/{run_id}")
+        if code in (200, 201) and last.get("state") in TERMINAL_STATES:
+            return last
+        time.sleep(3)
+    raise RuntimeError(
+        f"run {run_id} did not reach a terminal state within {timeout}s; "
+        f"last state={last.get('state')} error={last.get('error')} "
+        f"logs={json.dumps((last.get('logs') or [])[-4:])[:500]}")
 
 
 # =====================================================================
@@ -688,9 +729,19 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
     st.record("approved plan exists before tampering",
               "plan artifact present", "present", True)
     host_append(saved, b"\x00tampered")
-    status, tampered = api(
+    status, dispatch = api(
         "POST", f"/api/internal/deployments/{run_id}/execute",
-        execute_body(payload, dry))
+        execute_body(payload, dry), expect=(200, 201, 409))
+    st.record("tamper dispatch outcome is truthful",
+              "a tampered plan is either refused at dispatch or fails "
+              "closed in the worker (never silently applied)",
+              f"status={status} dispatched={dispatch.get('dispatched')} "
+              f"state={dispatch.get('state') or dispatch.get('detail')}",
+              status in (200, 201, 409))
+    if status in (200, 201):
+        tampered = poll_run(run_id)
+    else:
+        tampered = {"state": "DISPATCH_REFUSED"}
     tampered_state = tampered.get("state", "")
     st.truthy("tampered plan execution fails closed",
               tampered_state not in {"DEPLOYED", "HEALTH_CHECKING"},
@@ -709,8 +760,12 @@ def run_deployment_flow(st: Checks, workspace_root: Path):
         {"approved_by": "ares-e2e", "artifact_hash": dry2.get("artifact_hash"),
          "plan_hash": dry2.get("plan_hash")})
 
-    status, done = api("POST", f"/api/internal/deployments/{run2}/execute",
-                       execute_body(payload, dry2))
+    status, dispatch = api("POST", f"/api/internal/deployments/{run2}/execute",
+                           execute_body(payload, dry2))
+    st.equals("execute dispatches truthfully", True, dispatch.get("dispatched"))
+    st.equals("dispatch persisted the durable state", "EXECUTION_REQUESTED",
+              dispatch.get("state"))
+    done = poll_run(run2)
     execution = done.get("execution") or {}
     st.equals("deployment reached DEPLOYED", "DEPLOYED", done.get("state"))
     st.equals("approved_plan_hash == applied_plan_hash",

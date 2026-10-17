@@ -1,4 +1,3 @@
-
 import json
 import os
 from typing import Optional
@@ -17,6 +16,10 @@ class RedisPipelineStore:
             decode_responses=True,
         )
 
+    def ping(self) -> bool:
+        """Broker readiness probe for the API health contract (F1)."""
+        return bool(self.client.ping())
+
     def save(self, run: DeploymentRun) -> None:
         self.client.setex(
             f"deployment_run:{run.id}",
@@ -27,16 +30,3 @@ class RedisPipelineStore:
     def get(self, run_id: str) -> Optional[dict]:
         raw = self.client.get(f"deployment_run:{run_id}")
         return json.loads(raw) if raw else None
-
-    def acquire_lock(self, run_id: str, ttl_seconds: int = 900) -> bool:
-        return bool(
-            self.client.set(
-                f"deployment_lock:{run_id}",
-                "1",
-                nx=True,
-                ex=ttl_seconds,
-            )
-        )
-
-    def release_lock(self, run_id: str) -> None:
-        self.client.delete(f"deployment_lock:{run_id}")

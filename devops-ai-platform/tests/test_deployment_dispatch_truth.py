@@ -86,7 +86,10 @@ class _FakeEngine:
     def __init__(self, store=None, run_factory=None):
         import uuid
 
-        self.store = store
+        # The worker task consults the durable store for idempotency
+        # before executing; an empty store mirrors "run exists only as
+        # the task's payload" (nothing terminal to short-circuit).
+        self.store = store or _FakeStore()
         # A FRESH identifier per run, mirroring the real engine's
         # uuid-based run IDs (a constant would make "no fabricated run
         # ID" unprovable).
@@ -222,7 +225,7 @@ def test_task_execution_disabled_is_typed_blocked(monkeypatch):
 
     class _Engine:
         def __init__(self):
-            pass
+            self.store = _FakeStore()
 
         def execute(self, *a, **k):
             from deployment_service.application.services.deployment_engine import (

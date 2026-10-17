@@ -277,6 +277,7 @@ class TerraformSandboxOutcome:
     stderr: str
     timed_out: bool
     output_truncated: bool
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -313,7 +314,8 @@ class TerraformSandboxPort(Protocol):
     """The single execution seam for Terraform workloads."""
 
     def execute(
-        self, step: TerraformSandboxStep, workspace_path: Path
+        self, step: TerraformSandboxStep, workspace_path: Path,
+        cancel_event: object = None,
     ) -> TerraformSandboxOutcome: ...
 
     def describe(self) -> Mapping[str, str]: ...

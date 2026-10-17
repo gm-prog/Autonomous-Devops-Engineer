@@ -67,7 +67,9 @@ def _check_redis_integration_contract(repo_root: Path, violations: List[str]) ->
         if not isinstance(step, dict):
             continue
         run = str(step.get("run") or "")
-        if "tests/test_redis_integration.py" in run or "tests/test_security_mutations.py" in run:
+        if ("tests/test_redis_integration.py" in run
+                or "tests/test_security_mutations.py" in run
+                or "tests/test_execution_lease.py" in run):
             live_store_steps.append(step)
     if not live_store_steps:
         violations.append(

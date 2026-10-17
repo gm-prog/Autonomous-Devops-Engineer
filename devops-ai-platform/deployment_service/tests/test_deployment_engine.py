@@ -1,5 +1,7 @@
 
 import hashlib
+import json
+import threading as _threading
 from pathlib import Path
 import pytest
 
@@ -60,10 +62,101 @@ class FakeStore:
         self.data, self.locks = {}, set()
     def save(self, run): self.data[run.id] = run.to_dict()
     def get(self, run_id): return self.data.get(run_id)
+    def ping(self): return True
     def acquire_lock(self, run_id, ttl_seconds=900):
         if run_id in self.locks: return False
         self.locks.add(run_id); return True
     def release_lock(self, run_id): self.locks.discard(run_id)
+
+
+class FakeLeaseGuard:
+    """Deterministic stand-in for ExecutionLeaseGuard (same contract).
+
+    One shared holder registry per run id: a second acquire for the
+    same run fails, exactly like the real NX lease. ``lose()`` simulates
+    ownership loss (expiry + re-acquisition elsewhere): commits are
+    rejected from that moment on.
+    """
+    holders = {}
+
+    def __init__(self, run_id, store=None):
+        self.run_id = run_id
+        self.fence = 1
+        self.commits = []
+        self._store = store
+        self._lost = _threading.Event()
+        self._cancel = _threading.Event()
+
+    def acquire(self):
+        if self.run_id in FakeLeaseGuard.holders:
+            return False
+        FakeLeaseGuard.holders[self.run_id] = self
+        return True
+
+    def alive(self):
+        return not self._lost.is_set()
+
+    def request_cancel(self):
+        self._cancel.set()
+
+    @property
+    def cancel_event(self):
+        return self._cancel
+
+    def commit(self, payload, ttl_seconds=86400):
+        """Fence-guarded durable commit — mirrors the real guard,
+        which rewrites the run record only while the fence matches.
+        The fake persists into the (fake) store so subsequent reads
+        observe the committed state exactly like production."""
+        if self._lost.is_set():
+            return False
+        self.commits.append(payload)
+        if self._store is not None:
+            data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+            if hasattr(self._store, "data"):
+                self._store.data[data["id"]] = data
+            else:
+                # real store (e.g. RedisPipelineStore): persist through
+                # the same save path the engine uses
+                from deployment_service.domain.entities.deployment_run import (
+                    DeploymentRun,
+                )
+                self._store.save(DeploymentRun.from_dict(data))
+        return True
+
+    def release(self):
+        if FakeLeaseGuard.holders.get(self.run_id) is self:
+            del FakeLeaseGuard.holders[self.run_id]
+
+    def lose(self):
+        """Test hook: simulate losing ownership of the lease."""
+        self._lost.set()
+        self._cancel.set()
+
+
+class FakeLeaseFactory:
+    """Engine lease seam for tests.
+
+    Pass the engine's store so fenced commits are observable by
+    subsequent reads (as in production).
+    """
+
+    def __init__(self, store=None):
+        self.created = []
+        self.store = store
+
+    def __call__(self, run_id):
+        guard = FakeLeaseGuard(run_id, store=self.store)
+        self.created.append(guard)
+        return guard
+
+    def acquire(self, run_id):
+        """Convenience for tests: occupy the lease as another owner."""
+        guard = FakeLeaseGuard(run_id, store=self.store)
+        self.created.append(guard)
+        if not guard.acquire():
+            raise AssertionError(f"lease for {run_id} already held")
+        return guard
 
 
 class FakeTerraform:
@@ -82,7 +175,7 @@ class FakeTerraform:
         self.applied_with_hash = None
         self.applied_from = None
 
-    def run_plan(self, iac_dir, execution=False, plan_output_path=None):
+    def run_plan(self, iac_dir, execution=False, plan_output_path=None, cancel_event=None):
         self.plan_calls += 1
         plan_file_hash = ""
         if plan_output_path:
@@ -97,11 +190,11 @@ class FakeTerraform:
             "sandbox": {"sandbox_policy_identity": "fake-sandbox-v1"},
         }
 
-    def initialize(self, iac_dir):
+    def initialize(self, iac_dir, cancel_event=None):
         self.init_calls += 1
         return {"status": "PASS", "operation": "init", "stdout": "init-ok"}
 
-    def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash=""):
+    def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash="", cancel_event=None):
         # The engine re-verifies the saved plan's hash at the apply
         # boundary; mirror that so a mismatch cannot pass unnoticed.
         self.applied_with_hash = expected_plan_file_hash
@@ -117,14 +210,23 @@ class FakeTerraform:
 
 
 class FakeKubectl:
-    def dry_run(self, manifest_path, namespace="devops-production-namespace"): return {"status": "PASS", "stdout": "dry-run-ok", "cluster_access": False}
-    def apply(self, manifest_path, namespace=None, approved_identity=None): return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
-    def rollout_status(self, deployment_name, namespace): return {"status": "PASS", "stdout": "rollout-ok", "cluster_access": True}
-    def rollout_undo(self, deployment_name, namespace=None, approved_identity=None): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
+    def __init__(self):
+        self.dry_run_calls = []
+        self.applied_calls = []
+
+    def namespace(self): return "devops-production-namespace"
+    def dry_run(self, manifest_path, namespace=None, cancel_event=None):
+        self.dry_run_calls.append((manifest_path, namespace))
+        return {"status": "PASS", "stdout": "dry-run-ok", "cluster_access": False}
+    def apply(self, manifest_path, namespace=None, approved_identity=None, cancel_event=None):
+        self.applied_calls.append((manifest_path, namespace, approved_identity))
+        return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
+    def rollout_status(self, deployment_name, namespace=None, timeout_seconds=300, cancel_event=None): return {"status": "PASS", "stdout": "rollout-ok", "cluster_access": True}
+    def rollout_undo(self, deployment_name, namespace=None, approved_identity=None, cancel_event=None): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
 
 
 class FakeHealth:
-    def check(self, kubectl, deployment_names, namespace, healthcheck_url): return {"status": "PASS", "checks": [{"status": "PASS"}]}
+    def check(self, kubectl, deployment_names, namespace, healthcheck_url="", cancel_event=None): return {"status": "PASS", "checks": [{"status": "PASS"}]}
 
 
 class FakeValidator:
@@ -146,7 +248,9 @@ VALID_PAYLOAD = {
 
 
 def build_engine(source_verifier=None):
-    return DeploymentEngine(store=FakeStore(), validator=FakeValidator(), terraform=FakeTerraform(), kubectl=FakeKubectl(), health_checker=FakeHealth(), source_verifier=source_verifier or FakeSourceVerifier())
+    FakeLeaseGuard.holders.clear()
+    store = FakeStore()
+    return DeploymentEngine(store=store, validator=FakeValidator(), terraform=FakeTerraform(), kubectl=FakeKubectl(), health_checker=FakeHealth(), source_verifier=source_verifier or FakeSourceVerifier(), lease_factory=FakeLeaseFactory(store))
 
 
 def test_dry_run_waits_for_human_approval():

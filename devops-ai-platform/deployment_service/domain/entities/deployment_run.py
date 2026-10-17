@@ -23,6 +23,11 @@ class DeploymentRun:
     repository_id: int
     repository_name: str
     requested_by: Optional[str] = None
+    #: Phase 8.8A Correction-1 (F2): the VERIFIED subject of the caller
+    #: that created the run (operator JWT ``sub`` or the service
+    #: principal name). Never taken from a request field; used for
+    #: run-inspection visibility.
+    created_by: Optional[str] = None
     source_revision: Dict[str, Any] = field(default_factory=dict)
     # Independent source-revision attestation recorded by the engine's
     # source verifier before any run state is persisted (Stage 5).
@@ -58,6 +63,7 @@ class DeploymentRun:
             "repository_id": self.repository_id,
             "repository_name": self.repository_name,
             "requested_by": self.requested_by,
+            "created_by": self.created_by,
             "source_revision": self.source_revision,
             "source_verification": self.source_verification,
             "state": self.state.value,
@@ -114,6 +120,7 @@ class DeploymentRun:
             repository_id=int(payload["repository_id"]),
             repository_name=str(payload["repository_name"]),
             requested_by=payload.get("requested_by"),
+            created_by=payload.get("created_by"),
             source_revision=payload.get("source_revision") or {},
             source_verification=payload.get("source_verification") or {},
             state=DeploymentState(payload.get("state", DeploymentState.CREATED.value)),
