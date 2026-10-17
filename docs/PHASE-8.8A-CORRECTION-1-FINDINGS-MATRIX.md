@@ -142,3 +142,48 @@ Additional mutation evidence (not pytest-mutation IDs):
 9. kubernetes-trust-boundary — unit run now includes `test_sandbox_network_isolation.py` + `test_kubeconfig_staging_permissions.py`; + 6 new k8s probes (empty-peer, malformed-peer, prefix-bypass, staging fallback/adopt/symlink).
 10. kubernetes-kind-e2e — driver-level (staging 0700, kubeconfig 0600).
 11. kubernetes-service-http-e2e — driver: per-run random JWT + operator token on every call, async execute (dispatched=true, EXECUTION_REQUESTED) + poll to terminal state, real `nobody` peer-read proof of the 0700/0600 staged credential.
+
+## CI resolution record (post-1fcb278, session branch)
+
+The correction branch's first two CI runs were red; the root causes found
+(and the commits that fixed them, all on the session branch):
+
+1. **7137f5e** — compose readiness exec used the pre-split service name
+   (`deployment-service` → `deployment-api`); the Celery worker's task-time
+   import path lost the platform root (celery's `cwd_in_path()` inserts and
+   later removes the cwd, so a guarded `sys.path` pin in the -A module never
+   fired — the pin is now unconditional in `celery/tasks.py`); the kind E2E
+   driver did not set `DEPLOYMENT_K8S_SANDBOX_PEERS` (now fail-closed, so the
+   driver names the single approved peer); the auth test's store construction
+   was made deterministic (`_FakeStore`).
+2. **231c770** — the launch seam of `container_kubectl_sandbox.py` had two
+   latent NameErrors invisible to unit tests (the tests patch the launch seam)
+   and to the mutation probes (they stop at the network/staging boundary):
+   `_monotonic()` referenced but never defined (first real sandbox launch),
+   and `KubectlSandboxResult(operation=step.operation)` built without `step`
+   in scope (success path). Reproduced in-situ with a fake docker runtime:
+   the dry run then reached AWAITING_APPROVAL. The dry-run handler now records
+   the exception message, not only the type.
+3. **4b8ab82** — three distinct causes surfaced via the new failure
+   annotations: (a) the kind E2E driver runs the sandbox on the non-root CI
+   runner, and F4 staging chowns the credential to the sandbox identity —
+   impossible unprivileged. The proven F4 property is that the sandbox
+   process's uid owns the 0600 credential; on a non-root proof host the
+   sandbox now runs as the driver's own identity (chown-to-self), root keeps
+   the least-privilege nobody. (b) The F7 dispatch-contract tests exercise
+   the real durable store by design; the security job now starts the same
+   digest-pinned redis:7.2-alpine as the redis-integration job. (c) The http
+   driver used `shutil` in teardown without a module-level import.
+4. **514be7f / bb5eca3** — digest transcription error (a 65-char redis digest
+   in the new step; the correction briefly touched the wrong line) restored to
+   the exact 64-char digest verified green previously, checked
+   programmatically; and the if-always publish step's `grep | head` pipeline
+   (exit 1 on a GREEN suite under pipefail) made red by its own diagnostics —
+   the no-match case is now explicit.
+
+Final state: CI run **39074230769** at **bb5eca3** — 11/11 jobs green at the
+exact SHA, including live Compose boot/readiness, real-Redis integration
+(execution lease, 9 scenarios), containerized terraform E2E, live Kind
+kubernetes E2E (driver-level staging proof, non-root sandbox identity) and the
+service→HTTP→Kind E2E at **36/36 PASS** (real dispatch, worker-owned
+execution, terminal DEPLOYED on Kind, deterministic health verification).
