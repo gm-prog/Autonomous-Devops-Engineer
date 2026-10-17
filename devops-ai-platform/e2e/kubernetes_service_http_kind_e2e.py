@@ -32,6 +32,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess  # noqa: S404 - E2E driver; orchestrates docker/kind/kubectl
 import sys
 import time

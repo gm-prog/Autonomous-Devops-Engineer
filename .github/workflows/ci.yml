@@ -56,9 +56,29 @@ jobs:
       - name: Adversarial mutations — weakening each control must turn the suite red
         run: python -m pytest tests/test_security_mutations.py -v
 
+      # Phase 8.8A Correction-1: the F7 dispatch-contract tests exercise
+      # the REAL durable store (a fake store would falsify the
+      # at-least-once/idempotency proof), so this job must provide a
+      # live Redis exactly as the redis-integration job does —
+      # digest-pinned, fail-closed on absence.
+      - name: Start a real Redis (digest-pinned)
+        run: |
+          set -euo pipefail
+          docker run -d --name security-redis -p 127.0.0.1:6379:6379 \
+            redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e6199aa0ee78de08c6ca0
+          for i in $(seq 1 15); do
+            docker exec security-redis redis-cli ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+          done
+          docker exec security-redis redis-cli ping
+
       - name: Full Phase 8.7-C/D.1 security suite (evidence)
         # Phase 8.8A: the ported deployment slice's tests are part of the
         # full-suite evidence (the gate at the final commit covers them).
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          REDIS_HOST: "127.0.0.1"
+          REDIS_PORT: "6379"
         run: |
           set -euo pipefail
           python -m pytest tests/ deployment_service/tests -q --junitxml=security-tests.xml 2>&1 | tee security-tests.txt

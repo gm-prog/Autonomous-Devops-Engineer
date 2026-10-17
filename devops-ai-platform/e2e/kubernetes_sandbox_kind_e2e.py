@@ -915,8 +915,21 @@ def main() -> int:
                network_identity.internal and network_identity.driver == "bridge"
                and list(network_identity.approved_peers) == approved_peers)
 
+        # Phase 8.8A Correction-1: the staged credential must be owned
+        # by the sandbox process's own identity (F4). A root proof host
+        # chowns the credential to the least-privilege nobody (the
+        # default). A non-root proof host (the CI runner) cannot chown
+        # to 65532 — so the sandbox runs as THIS process's identity,
+        # which owns the staged 0600 file. The proven property is the
+        # same either way: the sandbox uid reads the credential and no
+        # other user can.
+        if os.geteuid() == 0:
+            spec_user = "65532:65532"
+        else:
+            spec_user = f"{os.geteuid()}:{os.getegid()}"
         spec = KubectlSandboxSpec(image=pinned, network=sandbox_network,
-                                  kubectl_version=args.kubectl_version)
+                                  kubectl_version=args.kubectl_version,
+                                  user=spec_user)
         policy_id = sandbox_policy_identity(spec, NAMESPACE)
         notice(f"8.6-A sandbox: image_digest={image_id} "
                f"kubectl={args.kubectl_version} policy={policy_id}")
