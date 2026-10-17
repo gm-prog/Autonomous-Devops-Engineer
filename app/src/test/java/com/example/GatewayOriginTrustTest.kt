@@ -111,7 +111,8 @@ class GatewayOriginTrustTest {
         .followSslRedirects(false)
         .addInterceptor { chain ->
           calls[0]++
-          Response.Builder(chain.request())
+          Response.Builder()
+            .request(chain.request())
             .protocol(Protocol.HTTP_1_1)
             .code(302)
             .message("Found")
@@ -288,7 +289,8 @@ class GatewayOriginTrustTest {
         .addInterceptor { chain ->
           calls[0]++
           bearerSeen = chain.request().header("Authorization")
-          Response.Builder(chain.request())
+          Response.Builder()
+            .request(chain.request())
             .protocol(Protocol.HTTP_1_1)
             .code(200)
             .message("OK")
@@ -336,7 +338,8 @@ class GatewayOriginTrustTest {
           .followSslRedirects(false)
           .addInterceptor { chain ->
             calls[0]++
-            Response.Builder(chain.request())
+            Response.Builder()
+            .request(chain.request())
               .protocol(Protocol.HTTP_1_1)
               .code(307)
               .message("Temporary Redirect")
