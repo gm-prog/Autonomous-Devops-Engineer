@@ -280,7 +280,7 @@ jobs:
         run: |
           set -euo pipefail
           docker run -d --name d1-redis -p 127.0.0.1:6379:6379 \
-            redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e619aa0ee78de08c6ca0
+            redis:7.2-alpine@sha256:29e8589c3f9ba699b5f7aa4b3c7733c58852a3626439e6199aa0ee78de08c6ca0
           for i in $(seq 1 15); do
             docker exec d1-redis redis-cli ping 2>/dev/null | grep -q PONG && break
             sleep 1
