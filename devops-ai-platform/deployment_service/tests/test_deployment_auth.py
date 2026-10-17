@@ -81,6 +81,33 @@ def _headers(token):
     return {"Authorization": f"Bearer {token}"}
 
 
+class _FakeStore:
+    """In-memory stand-in for the durable run store.
+
+    Authentication is verified against a DETERMINISTIC store: a CI
+    job that does not run a live Redis (the focused security suites)
+    must still exercise the authenticated success paths — the tests
+    assert authn/authz behaviour, not broker behaviour (the broker
+    contract is covered by the real-Redis jobs and the health tests
+    below, which deliberately point at an unreachable store).
+    """
+
+    def __init__(self):
+        self._runs = {}
+
+    def ping(self) -> bool:
+        return True
+
+    def save(self, run) -> None:
+        self._runs[run.id] = run.to_dict()
+
+    def get(self, run_id):
+        return self._runs.get(run_id)
+
+    def delete(self, run_id) -> None:
+        self._runs.pop(run_id, None)
+
+
 DRY_RUN_BODY = {
     "repository_id": 1,
     "repository_name": "acme/checkout",
@@ -102,6 +129,9 @@ class _AuthedAppTestCase(unittest.TestCase):
             }
         )
         self.addCleanup(_restore_env, self._env_snapshot)
+        # Deterministic store: the authenticated success paths must be
+        # testable without a live Redis (see _FakeStore).
+        self.app.state.engine.store = _FakeStore()
         self.client = TestClient(self.app)
 
     def _jwt(self, sub=OPERATOR_SUB, roles=("operator",), secret=TEST_SECRET,
@@ -365,6 +395,10 @@ class FailClosedConfigTests(unittest.TestCase):
     def test_missing_internal_token_still_allows_human_jwt(self):
         app, snap = _apply_env({"JWT_SECRET": TEST_SECRET})
         self.addCleanup(_restore_env, snap)
+        # Authentication succeeds here, so the route reaches the store:
+        # a deterministic fake keeps the assertion about AUTH (404,
+        # never 401/503) independent of whether CI runs a live Redis.
+        app.state.engine.store = _FakeStore()
         client = TestClient(app)
         resp = client.get(
             "/api/internal/deployments/run-1",

@@ -19,6 +19,12 @@ FROM python:3.11-slim@sha256:0dd364ba7e10242f07755449e3a3d0e35f9efd987952737b90d
 
 WORKDIR /app
 
+# The runtime ships top-level sibling packages (deployment_service,
+# shared_kernel). uvicorn inserts the cwd itself, but the celery
+# entrypoint does not keep it on sys.path once the worker is running —
+# declare it explicitly so both entrypoints resolve the same tree.
+ENV PYTHONPATH=/app
+
 # Phase 8.8A: the sanctioned hash-pinned runtime lock — no broad
 # requirements.txt, no unpinned transitive resolution at build time.
 COPY requirements-runtime.txt /app/requirements-runtime.txt

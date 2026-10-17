@@ -81,6 +81,10 @@ RUN set -eu; \
     kubectl version --client
 
 WORKDIR /app
+# The runtime ships top-level sibling packages (deployment_service,
+# shared_kernel). The celery entrypoint does not keep the cwd on
+# sys.path once the worker is running — declare it explicitly.
+ENV PYTHONPATH=/app
 # Phase 8.8A: the sanctioned hash-pinned runtime lock — no broad
 # requirements.txt, no unpinned transitive resolution at build time.
 COPY requirements-runtime.txt /app/requirements-runtime.txt

@@ -34,6 +34,21 @@ from typing import Any, Dict, List, Optional
 
 from celery import Celery
 import os
+import sys
+from pathlib import Path
+
+# Worker import bootstrap: celery imports this module (-A target)
+# inside a ``cwd_in_path()`` context (celery/utils/imports.py) that
+# adds the cwd to sys.path TEMPORARILY and removes it again right
+# after the import. The task's deferred imports
+# (deployment_engine -> deployment_run -> shared_kernel) therefore
+# cannot rely on the cwd entry: pin the platform root UNCONDITIONALLY
+# (a permanent list entry, derived from THIS file's location, never
+# from the process cwd). The ``not in sys.path`` guard would be wrong
+# here — it would see celery's temporary cwd entry and skip the pin,
+# which celery then removes.
+_PLATFORM_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path.insert(0, _PLATFORM_ROOT)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")

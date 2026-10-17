@@ -895,6 +895,13 @@ def main() -> int:
         sandbox_network = exec_network.name
         os.environ["DEPLOYMENT_KUBECTL_SANDBOX_NETWORK"] = sandbox_network
         os.environ["DEPLOYMENT_K8S_SANDBOX_NETWORK_IDENTITY"] = network_identity.digest()
+        # Phase 8.8A Correction-1 (F3): the sandbox verifies its
+        # destination network against an EXPLICIT approved-peer list.
+        # A missing/empty list is a hard policy error (fail-open
+        # removed), so the driver — the host of this proof — names the
+        # one peer this execution may reach, exactly the peer set the
+        # dedicated network was created with.
+        os.environ["DEPLOYMENT_K8S_SANDBOX_PEERS"] = ",".join(approved_peers)
         notice(f"8.6-A network: {sandbox_network} "
                f"identity={network_identity.digest()} "
                f"internal={network_identity.internal} "

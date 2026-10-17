@@ -367,15 +367,15 @@ jobs:
           #     never a success-shaped 200. The loop below fails the
           #     job on unhealthy (no || true, no always-success).
           for i in $(seq 1 45); do
-            docker compose exec -T deployment-service python -c               "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5).status == 200 else 1)"               && break
-            if [ "$i" -eq 45 ]; then docker compose ps; docker compose logs deployment-service; exit 1; fi
+            docker compose exec -T deployment-api python -c               "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5).status == 200 else 1)"               && break
+            if [ "$i" -eq 45 ]; then docker compose ps; docker compose logs deployment-api; exit 1; fi
             sleep 2
           done
           echo "deployment-service /health:"
-          docker compose exec -T deployment-service python -c             "import urllib.request,json; print(json.load(urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5)))"
+          docker compose exec -T deployment-api python -c             "import urllib.request,json; print(json.load(urllib.request.urlopen('http://127.0.0.1:8030/health', timeout=5)))"
           # the contract itself: broker reachable AND execution still
           # disabled in the canonical (non-disposable) stack
-          docker compose exec -T deployment-service python -c             "import json,urllib.request as u; h = json.load(u.urlopen('http://127.0.0.1:8030/health', timeout=5)); assert h['redis'] == 'ok', f'broker unreachable: {h}'; assert h['execution_enabled'] is False, f'canonical stack must ship execution disabled: {h}'; print('deployment API contract: redis ok, execution disabled: OK')"
+          docker compose exec -T deployment-api python -c             "import json,urllib.request as u; h = json.load(u.urlopen('http://127.0.0.1:8030/health', timeout=5)); assert h['redis'] == 'ok', f'broker unreachable: {h}'; assert h['execution_enabled'] is False, f'canonical stack must ship execution disabled: {h}'; print('deployment API contract: redis ok, execution disabled: OK')"
 
           # 1c) Deployment worker readiness: the celery process is
           #     alive and answers inspect ping.
@@ -388,10 +388,10 @@ jobs:
 
           # 1d) Authenticated contract (F2): sensitive routes refuse
           #     anonymous callers with 401 ...
-          docker compose exec -T deployment-service python -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8030, timeout=5); c.request('GET', '/api/internal/deployments/run-unknown-ci'); code = c.getresponse().status; print(f'anonymous sensitive request -> {code}'); assert code == 401, f'expected 401, got {code}'; print('anonymous sensitive request refused with 401: OK')"
+          docker compose exec -T deployment-api python -c "import http.client; c = http.client.HTTPConnection('127.0.0.1', 8030, timeout=5); c.request('GET', '/api/internal/deployments/run-unknown-ci'); code = c.getresponse().status; print(f'anonymous sensitive request -> {code}'); assert code == 401, f'expected 401, got {code}'; print('anonymous sensitive request refused with 401: OK')"
           # ... while a verified operator JWT is accepted (the unknown
           # run then answers 404 - authenticated, not leaked, not 401).
-          docker compose exec -T deployment-service python -c "import http.client,os; from deployment_service.application.services import deployment_auth as a; t = a.create_access_token('ci-compose-smoke', ['operator'], os.environ['JWT_SECRET']); c = http.client.HTTPConnection('127.0.0.1', 8030, timeout=5); c.request('GET', '/api/internal/deployments/run-unknown-ci', headers={'Authorization': f'Bearer {t}'}); code = c.getresponse().status; print(f'authenticated operator request -> {code}'); assert code == 404, f'expected 404 for authenticated unknown run, got {code}'; print('authenticated operator request accepted (unknown run -> 404): OK')"
+          docker compose exec -T deployment-api python -c "import http.client,os; from deployment_service.application.services import deployment_auth as a; t = a.create_access_token('ci-compose-smoke', ['operator'], os.environ['JWT_SECRET']); c = http.client.HTTPConnection('127.0.0.1', 8030, timeout=5); c.request('GET', '/api/internal/deployments/run-unknown-ci', headers={'Authorization': f'Bearer {t}'}); code = c.getresponse().status; print(f'authenticated operator request -> {code}'); assert code == 404, f'expected 404 for authenticated unknown run, got {code}'; print('authenticated operator request accepted (unknown run -> 404): OK')"
 
           # 2) Agent reachable through the COMPOSE NETWORK (never via host).
           docker compose exec -T api-gateway python -c \
