@@ -484,12 +484,27 @@ jobs:
             export "$KEY=$REF"
           done < <(PYTHONPATH=devops-ai-platform python3 -m e2e.image_pins "$PINS" --refs)
           export JWT_SECRET=compose-config-validation-only
-          AGENT_INTERNAL_TOKEN=compose-config-validation-only
+          export AGENT_INTERNAL_TOKEN=compose-config-validation-only
           ZERO=$(printf '0%.0s' $(seq 64))
           export TERRAFORM_SANDBOX_IMAGE="placeholder@sha256:${ZERO}"
+          # Surface the full compose error on failure: the log blob store
+          # is not reachable from every review environment, so the step
+          # summary + artifact are the durable error record.
+          set +e
           docker compose \
             -f devops-ai-platform/docker-compose.yml \
-            -f docker-compose.e2e.yml config >/dev/null
+            -f docker-compose.e2e.yml config > e2e-compose-config.out 2>&1
+          CODE=$?
+          set -e
+          if [ "$CODE" != "0" ]; then
+            {
+              echo '### E2E compose topology validation FAILED'
+              echo '```'
+              cat e2e-compose-config.out
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$CODE"
+          fi
           echo "E2E compose topology is valid" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Containerized deployment-service trust boundary proof
         run: |
@@ -526,7 +541,9 @@ jobs:
         if: always()
         with:
           name: terraform-container-e2e-evidence
-          path: devops-ai-platform/terraform-container-e2e-evidence.json
+          path: |
+            devops-ai-platform/terraform-container-e2e-evidence.json
+            e2e-compose-config.out
           if-no-files-found: warn
 
   kubernetes-trust-boundary:
