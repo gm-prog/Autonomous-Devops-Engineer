@@ -111,11 +111,10 @@ class GatewayOriginTrustTest {
         .followSslRedirects(false)
         .addInterceptor { chain ->
           calls[0]++
-          Response.Builder()
+          Response.Builder(chain.request())
             .protocol(Protocol.HTTP_1_1)
             .code(302)
             .message("Found")
-            .url(chain.request().url)
             .header("Location", location)
             .build()
         }
@@ -139,13 +138,13 @@ class GatewayOriginTrustTest {
     assertEquals("exactly one call — the redirect must NOT be followed", 1, calls[0])
     assertEquals(302, failure!!.httpCode)
     assertTrue(
-      "the failure must say redirects are never followed: ${failure.reason}",
-      failure.reason.contains("redirect", ignoreCase = true) &&
-        failure.reason.contains("never followed")
+      "the failure must say redirects are never followed: ${failure!!.reason}",
+      failure!!.reason.contains("redirect", ignoreCase = true) &&
+        failure!!.reason.contains("never followed")
     )
     // The Location target (host or marker) must never be surfaced:
-    assertFalse("Location host leaked: ${failure.reason}", failure.reason.contains("evil.example.com"))
-    assertFalse("Location marker leaked: ${failure.reason}", failure.reason.contains("steal"))
+    assertFalse("Location host leaked: ${failure!!.reason}", failure!!.reason.contains("evil.example.com"))
+    assertFalse("Location marker leaked: ${failure!!.reason}", failure!!.reason.contains("steal"))
   }
 
   // ------------------------------------------------------------------
@@ -272,8 +271,8 @@ class GatewayOriginTrustTest {
     val failure = outcome as? BackendGatewayClient.AnalysisOutcome.Failure
     assertNotNull("an untrusted origin must yield a typed failure", failure)
     assertTrue(
-      "the failure must cite the trust confirmation: ${failure.reason}",
-      failure.reason.contains("not trusted")
+      "the failure must cite the trust confirmation: ${failure!!.reason}",
+      failure!!.reason.contains("not trusted")
     )
     assertEquals("zero network calls for an untrusted origin", 0, networkCalls)
   }
@@ -289,11 +288,10 @@ class GatewayOriginTrustTest {
         .addInterceptor { chain ->
           calls[0]++
           bearerSeen = chain.request().header("Authorization")
-          Response.Builder()
+          Response.Builder(chain.request())
             .protocol(Protocol.HTTP_1_1)
             .code(200)
             .message("OK")
-            .url(chain.request().url)
             .header("Content-Type", "application/json")
             .body(analysisJson().toResponseBody("application/json".toMediaType()))
             .build()
@@ -338,11 +336,10 @@ class GatewayOriginTrustTest {
           .followSslRedirects(false)
           .addInterceptor { chain ->
             calls[0]++
-            Response.Builder()
+            Response.Builder(chain.request())
               .protocol(Protocol.HTTP_1_1)
               .code(307)
               .message("Temporary Redirect")
-              .url(chain.request().url)
               .header("Location", location)
               .build()
           }
