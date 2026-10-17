@@ -13,6 +13,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -117,6 +118,9 @@ class GatewayOriginTrustTest {
             .code(302)
             .message("Found")
             .header("Location", location)
+            // A valid (empty) body: a body-less synthetic response is not
+            // a valid wire response for OkHttp 4.10's interceptor chain.
+            .body("".toResponseBody("application/json".toMediaType()))
             .build()
         }
         .build()
@@ -143,9 +147,11 @@ class GatewayOriginTrustTest {
       failure!!.reason.contains("redirect", ignoreCase = true) &&
         failure!!.reason.contains("never followed")
     )
-    // The Location target (host or marker) must never be surfaced:
+    // The Location target (host, path, or token marker) must never be
+    // surfaced in the returned reason:
     assertFalse("Location host leaked: ${failure!!.reason}", failure!!.reason.contains("evil.example.com"))
-    assertFalse("Location marker leaked: ${failure!!.reason}", failure!!.reason.contains("steal"))
+    assertFalse("Location path marker leaked: ${failure!!.reason}", failure!!.reason.contains("steal"))
+    assertFalse("Location token marker leaked: ${failure!!.reason}", failure!!.reason.contains("token=leak"))
   }
 
   // ------------------------------------------------------------------
@@ -191,10 +197,15 @@ class GatewayOriginTrustTest {
     // Any part of the (scheme, host, port) triple changing is a DIFFERENT
     // origin:
     val https443 = BackendGatewayClient.parseGatewayOrigin("https://gw.example.com")!!
-    val http80 = BackendGatewayClient.parseGatewayOrigin("http://gw.example.com")!!
     val port8443 = BackendGatewayClient.parseGatewayOrigin("https://gw.example.com:8443")!!
     val otherHost = BackendGatewayClient.parseGatewayOrigin("https://other.example.com")!!
-    assertFalse(https443.canonical == http80.canonical)
+    // Scheme difference: cleartext to a NON-local host is policy-invalid in
+    // every build, so the scheme variant is demonstrated on the local
+    // emulator host (where debug-local HTTP is the explicit exception):
+    val localHttps = BackendGatewayClient.parseGatewayOrigin("https://127.0.0.1:8443")!!
+    val localHttp =
+      BackendGatewayClient.parseGatewayOrigin("http://127.0.0.1:8443", debugBuild = true)!!
+    assertFalse(localHttps.canonical == localHttp.canonical)
     assertFalse(https443.canonical == port8443.canonical)
     assertFalse(https443.canonical == otherHost.canonical)
 
@@ -227,10 +238,11 @@ class GatewayOriginTrustTest {
         BackendGatewayClient.parseGatewayOrigin("https://other.example.com:8443")!!
       )
     )
-    assertFalse(
-      BackendGatewayClient.TrustedGatewayOrigin.isApproved(
-        BackendGatewayClient.parseGatewayOrigin("http://gw.example.com:8443")!!
-      )
+    // Scheme change: a cleartext non-local URL no longer yields a
+    // confirmable origin at all (shared URL policy), so it can never
+    // satisfy the approval:
+    assertNull(
+      BackendGatewayClient.parseGatewayOrigin("http://gw.example.com:8443")
     )
 
     // Explicit revocation:
@@ -339,11 +351,14 @@ class GatewayOriginTrustTest {
           .addInterceptor { chain ->
             calls[0]++
             Response.Builder()
-            .request(chain.request())
+              .request(chain.request())
               .protocol(Protocol.HTTP_1_1)
               .code(307)
               .message("Temporary Redirect")
               .header("Location", location)
+              // A valid (empty) body: a body-less synthetic response is
+              // not a valid wire response for OkHttp 4.10's chain.
+              .body("".toResponseBody("application/json".toMediaType()))
               .build()
           }
           .build()
@@ -364,8 +379,121 @@ class GatewayOriginTrustTest {
       assertNotNull("a redirect must be a typed failure ($location)", failure)
       assertEquals("exactly one call ($location)", 1, calls[0])
       assertEquals(307, failure!!.httpCode)
+      // The Location value (host, path, or any marker) must never be
+      // surfaced in the returned reason:
+      assertFalse(
+        "the Location value ($location) must never be surfaced in: ${failure!!.reason}",
+        failure!!.reason.contains(location) ||
+          failure!!.reason.contains(location.substringAfter("://").substringBefore("/"))
+      )
       BackendGatewayClient.TrustedGatewayOrigin.clear()
     }
+  }
+
+  // ------------------------------------------------------------------
+  // Closeout: the trust UI and the request path share ONE URL policy —
+  // a URL the authenticated request path rejects can never yield a
+  // confirmable/trusted origin, and the explicit debug-only local HTTP
+  // exception is preserved.
+  // ------------------------------------------------------------------
+
+  @Test
+  fun parse_gateway_origin_rejects_policy_invalid_urls() {
+    // Userinfo, query, fragment, unsupported scheme, cleartext remote,
+    // and malformed input: NONE may yield a confirmable origin — the
+    // trust UI applies the exact policy the request path enforces.
+    assertNull(
+      "userinfo must not yield a confirmable origin",
+      BackendGatewayClient.parseGatewayOrigin("https://user:pass@gw.example.com", debugBuild = true)
+    )
+    assertNull(
+      "a query string must not yield a confirmable origin",
+      BackendGatewayClient.parseGatewayOrigin("https://gw.example.com/api?x=1", debugBuild = true)
+    )
+    assertNull(
+      "a fragment must not yield a confirmable origin",
+      BackendGatewayClient.parseGatewayOrigin("https://gw.example.com/api#f", debugBuild = true)
+    )
+    assertNull(
+      "an unsupported scheme must not yield a confirmable origin",
+      BackendGatewayClient.parseGatewayOrigin("ftp://gw.example.com/file", debugBuild = true)
+    )
+    assertNull(
+      "cleartext remote http must not yield a confirmable origin (even in debug)",
+      BackendGatewayClient.parseGatewayOrigin("http://remote.example.com", debugBuild = true)
+    )
+    assertNull(
+      "malformed input must not yield a confirmable origin",
+      BackendGatewayClient.parseGatewayOrigin("not a url", debugBuild = true)
+    )
+  }
+
+  @Test
+  fun parse_gateway_origin_keeps_valid_https_and_debug_local_http() {
+    val origin =
+      BackendGatewayClient.parseGatewayOrigin("https://gw.example.com:8443/base/", debugBuild = true)
+    assertNotNull("a valid HTTPS origin must stay confirmable", origin)
+    assertEquals("https", origin!!.scheme)
+    assertEquals("gw.example.com", origin.host)
+    assertEquals(8443, origin.port)
+    // The explicit debug-only local cleartext exception is preserved:
+    val local =
+      BackendGatewayClient.parseGatewayOrigin("http://10.0.2.2:8080", debugBuild = true)
+    assertNotNull("debug-local http must stay confirmable in debug builds", local)
+    assertEquals("10.0.2.2", local!!.host)
+    assertEquals(8080, local.port)
+    assertNull(
+      "the same local cleartext URL must NOT be confirmable in production builds",
+      BackendGatewayClient.parseGatewayOrigin("http://10.0.2.2:8080", debugBuild = false)
+    )
+  }
+
+  @Test
+  fun policy_invalid_and_untrusted_origins_send_zero_network_calls() = runBlocking {
+    // Both a policy-invalid URL (query-bearing) and a policy-valid but
+    // untrusted URL must fail BEFORE any network call on the
+    // authenticated client.
+    val networkCalls = intArrayOf(0)
+    BackendGatewayClient.authenticatedHttpClient =
+      OkHttpClient.Builder()
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .addInterceptor { chain ->
+          networkCalls[0]++
+          chain.proceed(chain.request())
+        }
+        .build()
+    BackendGatewayClient.TrustedGatewayOrigin.clear()
+
+    val invalidOutcome =
+      BackendGatewayClient.requestRepositoryAnalysis(
+        baseUrlStr = "https://gw.example.com:8443?x=1",
+        jwtToken = "test-jwt-must-not-leak",
+        repoName = "x",
+        repoUrl = "https://github.com/o/r.git",
+        framework = "FastAPI",
+        technology = "Python 3.12"
+      )
+    assertTrue(
+      "a policy-invalid URL must be a typed failure: $invalidOutcome",
+      invalidOutcome is BackendGatewayClient.AnalysisOutcome.Failure
+    )
+    assertEquals("zero network calls for a policy-invalid URL", 0, networkCalls[0])
+
+    val untrustedOutcome =
+      BackendGatewayClient.requestRepositoryAnalysis(
+        baseUrlStr = "https://untrusted.example.com:8443",
+        jwtToken = "test-jwt-must-not-leak",
+        repoName = "x",
+        repoUrl = "https://github.com/o/r.git",
+        framework = "FastAPI",
+        technology = "Python 3.12"
+      )
+    assertTrue(
+      "an untrusted origin must be a typed failure: $untrustedOutcome",
+      untrustedOutcome is BackendGatewayClient.AnalysisOutcome.Failure
+    )
+    assertEquals("zero network calls for an untrusted origin", 0, networkCalls[0])
   }
 }
 

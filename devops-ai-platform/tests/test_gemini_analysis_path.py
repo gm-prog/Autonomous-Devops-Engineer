@@ -1484,6 +1484,54 @@ class TestInputBounds:
         assert result == GOOD_ASSETS
         assert transport.calls == 1
 
+    def test_oversized_individual_metadata_value_rejected_before_serialization(self):
+        """A single value above the per-value cap is rejected by the
+        preflight BEFORE json.dumps() — provider and budget ledger
+        untouched."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter()
+        oversized_value = "x" * (gc.MAX_TECH_METADATA_STRING_VALUE_CHARS + 1)
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_iac_blueprint({"notes": oversized_value})
+        assert transport.calls == 0, "no provider contact for oversized metadata"
+        assert ledger.accumulated_spend == 0.0, "no cost committed"
+        assert ledger._reserved == 0.0, "no reservation may be created"
+
+    def test_aggregate_metadata_preflight_rejects_before_serialization(self):
+        """Each value is well under the per-value cap, but the aggregate
+        serialized size exceeds the bound: the preflight must reject
+        BEFORE json.dumps() allocates the serialized form."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter()
+        n_items = 60
+        value_len = 130  # per item: 8 (key) + 132 (value) + 3 = 143 chars
+        metadata = {f"key-{i:02d}": "a" * value_len for i in range(n_items)}
+        # Sanity: the per-item caps must NOT be the trigger here — only
+        # the aggregate preflight may reject this input.
+        assert value_len <= gc.MAX_TECH_METADATA_STRING_VALUE_CHARS
+        assert n_items <= gc.MAX_TECH_METADATA_ITEMS
+        assert 2 + n_items * (8 + value_len + 2 + 3) > gc.MAX_TECH_METADATA_SERIALIZED_CHARS
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_iac_blueprint(metadata)
+        assert transport.calls == 0, "no provider contact for oversized metadata"
+        assert ledger.accumulated_spend == 0.0, "no cost committed"
+        assert ledger._reserved == 0.0, "no reservation may be created"
+
+    def test_huge_int_metadata_value_rejected_before_serialization(self):
+        """An integer with more digits than the bound is rejected by the
+        preflight (a 31-digit int would serialize to 31+ characters)."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter()
+        assert len(str(10 ** 30)) > gc.MAX_TECH_METADATA_INT_DIGITS
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_iac_blueprint({"huge": 10 ** 30})
+        assert transport.calls == 0, "no provider contact for oversized metadata"
+        assert ledger.accumulated_spend == 0.0, "no cost committed"
+        assert ledger._reserved == 0.0, "no reservation may be created"
+
 
 # ---------------------------------------------------------------------------
 # Phase 8.7-D.1-CORRECTION-3 — Finding D: retry-chain cost reconciliation —

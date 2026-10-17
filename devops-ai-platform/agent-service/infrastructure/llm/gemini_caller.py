@@ -238,9 +238,40 @@ MAX_SYSTEM_INSTRUCTION_CHARS = 4_000
 # there is no implicit str() of unbounded arbitrary objects.
 MAX_TECH_METADATA_SERIALIZED_CHARS = 8_000
 
+# Phase 8.7-D.1-CORRECTION-3 closeout: cheap PRE-serialization preflight
+# bounds for tech_metadata.  These reject oversized input with O(n)
+# checks BEFORE json.dumps() allocates the serialized form; the final
+# serialized-size check after dumps() remains the authoritative bound.
+MAX_TECH_METADATA_ITEMS = 128
+MAX_TECH_METADATA_STRING_VALUE_CHARS = 4_096
+MAX_TECH_METADATA_INT_DIGITS = 16  # covers signed 64-bit integers with headroom
+
 # Documented framing overhead (tokens) added to the input byte bound to
 # cover the provider message structure around the prompt/system parts.
 _INPUT_FRAMING_OVERHEAD_TOKENS = 64
+
+
+def _json_string_len(s: str) -> int:
+    """Conservative upper bound on the JSON-serialized length of ``s``.
+
+    Two delimiting quotes, then per character: ordinary characters count
+    1, ``"`` and ``\\`` count 2 (escaped), and every control character
+    counts 6 (a ``\\uXXXX`` escape).  Under ``ensure_ascii=False`` the
+    five printable control escapes (``\\b \\f \\n \\r \\t``) actually use
+    2 characters, so this bound overestimates them — it never
+    underestimates.  O(n) with no allocation; used by the
+    pre-serialization preflight of ``generate_iac_blueprint``.
+    """
+    n = 2
+    for ch in s:
+        code = ord(ch)
+        if code < 0x20:
+            n += 6
+        elif ch == '"' or ch == "\\":
+            n += 2
+        else:
+            n += 1
+    return n
 
 
 @dataclass(frozen=True)
@@ -1405,8 +1436,15 @@ class GeminiCallerAdapter(RemoteLLMInterface):
           arbitrary objects (a hostile ``__str__`` cannot inject
           unbounded content);
         * keys must be strings of at most 128 characters;
-        * the serialized (JSON, sorted) metadata must fit
-          ``MAX_TECH_METADATA_SERIALIZED_CHARS``.
+        * at most ``MAX_TECH_METADATA_ITEMS`` items;
+        * string values are capped at
+          ``MAX_TECH_METADATA_STRING_VALUE_CHARS`` and integer values at
+          ``MAX_TECH_METADATA_INT_DIGITS`` decimal digits;
+        * a conservative estimate of the serialized (JSON, sorted) size —
+          computed WITHOUT allocating the JSON string — must fit
+          ``MAX_TECH_METADATA_SERIALIZED_CHARS`` (a cheap preflight
+          BEFORE ``json.dumps()``); the final serialized-size check after
+          ``json.dumps()`` remains the authoritative bound.
         Oversized metadata raises GeminiInputBoundException before any
         reservation or provider contact; ``_generate_text`` re-validates
         the resulting prompt at the single choke point anyway.
@@ -1415,12 +1453,26 @@ class GeminiCallerAdapter(RemoteLLMInterface):
             raise GeminiInputBoundException(
                 "tech_metadata must be a non-empty dictionary."
             )
+        if len(tech_metadata) > MAX_TECH_METADATA_ITEMS:
+            raise GeminiInputBoundException(
+                f"tech_metadata has {len(tech_metadata)} items; at most "
+                f"{MAX_TECH_METADATA_ITEMS} are accepted. The input is rejected "
+                "before serialization."
+            )
+        # Phase 8.7-D.1-CORRECTION-3 closeout: cheap PRE-serialization
+        # preflight — per-value bounds and a conservative estimate of the
+        # serialized size, computed WITHOUT allocating the JSON string.
+        # Oversized input is rejected here, before json.dumps() runs.
+        estimated_serialized = 2  # the outer object braces
         for k, v in tech_metadata.items():
             if not isinstance(k, str) or not k or len(k) > 128:
                 raise GeminiInputBoundException(
                     "tech_metadata keys must be non-empty strings of at most 128 characters."
                 )
+            key_len = _json_string_len(k)
             if isinstance(v, bool):
+                # "true" (4) / "false" (5) + ": " + ","
+                estimated_serialized += key_len + 5 + 3
                 continue  # bool is an accepted scalar (int subclass)
             if not isinstance(v, (str, int, float)):
                 raise GeminiInputBoundException(
@@ -1428,10 +1480,37 @@ class GeminiCallerAdapter(RemoteLLMInterface):
                     f"(got {type(v).__name__} for key {k!r}); no implicit str() "
                     "of arbitrary objects."
                 )
-            if isinstance(v, float) and not math.isfinite(v):
-                raise GeminiInputBoundException(
-                    f"tech_metadata value for key {k!r} must be a finite float."
-                )
+            if isinstance(v, str):
+                if len(v) > MAX_TECH_METADATA_STRING_VALUE_CHARS:
+                    raise GeminiInputBoundException(
+                        f"tech_metadata value for key {k!r} is {len(v)} characters; "
+                        f"at most {MAX_TECH_METADATA_STRING_VALUE_CHARS} are accepted. "
+                        "The input is rejected before serialization."
+                    )
+                estimated_serialized += key_len + _json_string_len(v) + 3
+            elif isinstance(v, int):
+                digits = len(str(v))  # includes the sign, if any
+                if digits > MAX_TECH_METADATA_INT_DIGITS:
+                    raise GeminiInputBoundException(
+                        f"tech_metadata integer value for key {k!r} has {digits} "
+                        f"decimal digits; at most {MAX_TECH_METADATA_INT_DIGITS} are "
+                        "accepted. The input is rejected before serialization."
+                    )
+                estimated_serialized += key_len + digits + 3
+            else:  # float
+                if not math.isfinite(v):
+                    raise GeminiInputBoundException(
+                        f"tech_metadata value for key {k!r} must be a finite float."
+                    )
+                # json serializes a finite float via its repr (== str).
+                estimated_serialized += key_len + len(str(v)) + 3
+        if estimated_serialized > MAX_TECH_METADATA_SERIALIZED_CHARS:
+            raise GeminiInputBoundException(
+                f"tech_metadata aggregate size (estimated {estimated_serialized} "
+                f"serialized characters) exceeds the bound of "
+                f"{MAX_TECH_METADATA_SERIALIZED_CHARS} characters. The input is "
+                "rejected before serialization."
+            )
         serialized = json.dumps(
             {k: v for k, v in sorted(tech_metadata.items())}, ensure_ascii=False
         )

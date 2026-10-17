@@ -139,6 +139,22 @@ object BackendGatewayClient {
             Log.w(TAG, "Gateway URL parse failure: ${e.javaClass.simpleName}")
             return "Gateway URL is malformed."
         }
+        return policyRejection(url, debugBuild)
+    }
+
+    /**
+     * The SHARED analysis-URL policy (Phase 8.7-D.1-CORRECTION-3 closeout).
+     *
+     * Both [validateAnalysisUrl] (the authenticated request path) and
+     * [parseGatewayOrigin] (the trust UI) apply EXACTLY this check, so a
+     * URL the request path would reject can never yield a confirmable
+     * origin in the trust UI, and vice versa.  The explicit debug-only
+     * local cleartext HTTP exception is part of this shared policy.
+     *
+     * @return a truthful rejection reason, or null when the parsed URL is
+     *   permitted.
+     */
+    private fun policyRejection(url: HttpUrl, debugBuild: Boolean): String? {
         // Phase 8.7-D.1-CORRECTION-3 (Finding F): canonicalize the gateway
         // URL BEFORE any token handling.  The analysis destination is
         // exactly scheme://host[:port][/base-path] + the fixed analysis
@@ -190,9 +206,17 @@ object BackendGatewayClient {
 
     /**
      * Parses the normalized origin of a gateway URL, or null when the URL
-     * cannot be parsed.  Pure function — no network, no state.
+     * cannot be parsed OR fails the shared analysis URL policy
+     * ([policyRejection] — the exact check [validateAnalysisUrl] applies).
+     *
+     * Phase 8.7-D.1-CORRECTION-3 closeout: the trust UI derives the
+     * confirmable origin from this function, so malformed,
+     * userinfo/query/fragment-bearing, or unsupported-scheme URLs can
+     * never appear trusted/confirmable.  The explicit debug-only local
+     * HTTP exception is preserved through the shared policy.
+     * Pure function — no network, no state.
      */
-    fun parseGatewayOrigin(rawUrl: String): GatewayOrigin? {
+    fun parseGatewayOrigin(rawUrl: String, debugBuild: Boolean = BuildConfig.DEBUG): GatewayOrigin? {
         val clean = rawUrl.trim().removeSuffix("/")
         if (clean.isEmpty()) return null
         val url: HttpUrl = try {
@@ -200,6 +224,7 @@ object BackendGatewayClient {
         } catch (e: Exception) {
             return null
         }
+        if (policyRejection(url, debugBuild) != null) return null
         return GatewayOrigin(url.scheme, url.host.lowercase(), url.port)
     }
 

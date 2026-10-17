@@ -68,7 +68,7 @@ M27. Caller:   the hard input bounds are bypassed at the generation choke
                point (unbounded prompts reach the provider) and the
                per-request estimate floor is dropped (a tiny operator-set
                estimate under-reserves multibyte input).
-M29. Caller:   the reservation finalizes with only the FINAL attempt's
+M28. Caller:   the reservation finalizes with only the FINAL attempt's
                usage — every preceding timeout/5xx attempt is silently
                free (retry-chain cost undercount).
 
