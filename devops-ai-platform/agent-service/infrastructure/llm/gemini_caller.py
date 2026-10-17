@@ -44,6 +44,36 @@ Security / resilience contract
   circuit opens and calls fail fast until the cooldown elapses (half-open
   probe).  State lives on the shared application-lifetime adapter (see
   ``main.create_app``), never per request.
+* **Half-open single probe** (Phase 8.7-D.1-CORRECTION-3, Finding A): the
+  half-open probe lease gets EXACTLY ONE provider attempt — no retry after
+  a timeout, connection error, 429, 5xx, or malformed response.  A
+  transient failure re-opens the circuit with a fresh cooldown; a second
+  caller is rejected until the next cooldown.  Closed-circuit calls keep
+  the configured bounded retry budget.  The allowed attempt count is
+  computed once per call and passed explicitly to the attempt loop (never
+  re-inferred from mutable breaker state per iteration).
+* **Bounded inputs** (Finding C): every path through ``_generate_text`` is
+  bounded at that single choke point before any reservation or provider
+  contact: prompt <= ``MAX_PROMPT_CHARS``, system instruction <=
+  ``MAX_SYSTEM_INSTRUCTION_CHARS``, IaC tech metadata by accepted scalar
+  types + serialized size.  The per-request input ALLOWANCE is a
+  documented conservative bound (UTF-8 byte count + framing overhead — an
+  upper bound because every BPE token encodes >= 1 byte); the configured
+  ``GEMINI_ESTIMATED_PROMPT_TOKENS`` is a FLOOR only and can never lower
+  the per-request safe bound.  The allowance is a reservation estimate,
+  NOT a provider billing guarantee.
+* **Retry-chain cost reconciliation** (Finding D): the reservation is
+  sized (worst-case per-attempt cost) x (allowed attempts).  Finalization
+  reconciles the WHOLE chain from the explicit per-attempt billing
+  evidence: known usage -> real cost; every attempt with unknown/missing
+  usage (timeout, 5xx, absent metadata) -> the worst-case per-attempt
+  allowance (a failed or timed-out attempt is never free).  Total failure
+  keeps the full reservation.  The committed amount for a reservation
+  never exceeds what that reservation held.
+* **Finite configuration** (Finding B): NaN/+-inf are rejected for every
+  float config field at construction (both ``from_env`` and direct
+  ``GeminiRuntimeConfig(...)``) and in both ledger constructors; invalid
+  configuration fails closed before any provider contact.
 * **Structured extraction**: a 200 response that is not well-formed
   (missing candidates / parts / text) raises ``GeminiMalformedResponseException``.
 
@@ -59,19 +89,23 @@ Error taxonomy (callers may branch on these precisely):
 * ``BudgetStoreUnavailableException``    — the shared budget store (Redis) is
                                            unreachable; the call is blocked
                                            (fail closed, never free of limits).
+* ``GeminiInputBoundException``          — an input exceeded its documented
+                                           hard bound; rejected before any
+                                           reservation or provider contact.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 import threading
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Mapping, Optional, Protocol
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol
 
 import requests
 
@@ -128,6 +162,18 @@ class BudgetStoreUnavailableException(Exception):
     than proceeding without a spend limit (fail closed)."""
 
 
+class GeminiInputBoundException(Exception):
+    """A generation input exceeded its documented hard bound (Phase
+    8.7-D.1-CORRECTION-3, Finding C).
+
+    Every call path through ``_generate_text`` — repository analysis, the
+    (currently unwired) agent-task path, IaC blueprint generation, and any
+    direct ``generate_remediation`` call — is bounded at this single choke
+    point BEFORE any budget reservation or provider contact.  Oversized
+    input is rejected fail-closed: no reservation is created, no budget
+    state is mutated, and the provider is never contacted."""
+
+
 # ---------------------------------------------------------------------------
 # Runtime configuration — the SINGLE source of defaults (D1 P0-1)
 # ---------------------------------------------------------------------------
@@ -172,6 +218,30 @@ _FLOAT_EPS = 1e-9
 # mirroring the gateway's analysis-rate-limit classification exactly.
 _LOCAL_STATE_ENVS = frozenset({"development", "test"})
 
+# Phase 8.7-D.1-CORRECTION-3 (Finding C): HARD input bounds enforced at the
+# single _generate_text choke point for EVERY generation path.
+#
+# * The authenticated repository-analysis contract bounds its fields at
+#   120 (name) + 2048 (url) + 200 (framework) + 200 (technology) = 2568
+#   user characters, plus a ~450-character fixed prompt template — so the
+#   legal analysis prompt is < 3000 characters.  MAX_PROMPT_CHARS gives
+#   ~5x headroom for future bounded fields while still being a hard cap
+#   that an operator cannot override.
+# * The system instruction is a short fixed constant in every current
+#   caller (~230 characters); 4000 is a generous hard cap.
+MAX_PROMPT_CHARS = 16_000
+MAX_SYSTEM_INSTRUCTION_CHARS = 4_000
+
+# generate_iac_blueprint: caller-supplied tech metadata must JSON-serialize
+# within this bound (the resulting prompt is then inside MAX_PROMPT_CHARS
+# by construction).  Only scalar values (str/int/float/bool) are accepted —
+# there is no implicit str() of unbounded arbitrary objects.
+MAX_TECH_METADATA_SERIALIZED_CHARS = 8_000
+
+# Documented framing overhead (tokens) added to the input byte bound to
+# cover the provider message structure around the prompt/system parts.
+_INPUT_FRAMING_OVERHEAD_TOKENS = 64
+
 
 @dataclass(frozen=True)
 class GeminiRuntimeConfig:
@@ -196,6 +266,55 @@ class GeminiRuntimeConfig:
     budget_store: str = "local"
     redis_url: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        """Finiteness + range validation for EVERY construction path.
+
+        Phase 8.7-D.1-CORRECTION-3 (Finding B): this runs for BOTH
+        ``GeminiRuntimeConfig.from_env(...)`` (which constructs ``cls(...)``)
+        and direct ``GeminiRuntimeConfig(...)`` construction, so no path can
+        bypass it.
+
+        * Non-finite values (NaN / +/-inf) are rejected for every float
+          field.  NaN comparisons silently defeat the budget ceiling
+          (``x > nan`` is False); +/-inf disable it.  Rejection happens at
+          config construction — before any provider contact, with no
+          permissive fallback.
+        * Ranges (documented semantics):
+            - ``monthly_budget_usd`` >= 0.  A ZERO budget is legal and means
+              "no calls this period" — every reservation is rejected
+              immediately (fail closed); it must never mean "unlimited".
+            - ``input_cost_per_million`` / ``output_cost_per_million`` > 0.
+              A zero rate would silently turn cost accounting off while
+              calls still happen; fail closed instead.
+            - ``timeout_seconds`` > 0 (zero would make every call fail on
+              its own guard; a provider call needs a positive timeout).
+            - ``backoff_base_seconds`` >= 0 (zero = no wait between
+              attempts; used deliberately by some tests).
+            - ``max_output_tokens`` / ``estimated_prompt_tokens`` /
+              ``max_retries``: int >= 1.
+        """
+
+        def _finite(name: str, value: object, minimum: float, strict: bool) -> None:
+            try:
+                v = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be a finite number (got {value!r}).") from exc
+            if not math.isfinite(v):
+                raise ValueError(f"{name} must be a finite number (got {value!r}).")
+            if strict and v <= minimum or (not strict) and v < minimum:
+                bound = f">{minimum:g}" if strict else f">={minimum:g}"
+                raise ValueError(f"{name} must be {bound} (got {value!r}).")
+
+        _finite("monthly_budget_usd", self.monthly_budget_usd, 0.0, strict=False)
+        _finite("input_cost_per_million", self.input_cost_per_million, 0.0, strict=True)
+        _finite("output_cost_per_million", self.output_cost_per_million, 0.0, strict=True)
+        _finite("timeout_seconds", self.timeout_seconds, 0.0, strict=True)
+        _finite("backoff_base_seconds", self.backoff_base_seconds, 0.0, strict=False)
+        for _intname in ("max_output_tokens", "estimated_prompt_tokens", "max_retries"):
+            _v = getattr(self, _intname)
+            if not isinstance(_v, int) or isinstance(_v, bool) or _v < 1:
+                raise ValueError(f"{_intname} must be an int >= 1 (got {_v!r}).")
+
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "GeminiRuntimeConfig":
         e: Mapping[str, str] = os.environ if env is None else env
@@ -205,6 +324,12 @@ class GeminiRuntimeConfig:
             if not raw:
                 return default
             value = float(raw)
+            # Finding B: report non-finite values as non-finite (even -inf,
+            # which would otherwise hit the >= 0 check first); the
+            # authoritative validation also runs in __post_init__ for
+            # direct construction.
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number (got {raw!r}).")
             if value < 0:
                 raise ValueError(f"{name} must be >= 0 (got {raw!r}).")
             return value
@@ -327,6 +452,23 @@ class BudgetLedger(Protocol):
     def accumulated_spend(self) -> float: ...
 
 
+def _require_finite_non_negative(name: str, value: object) -> float:
+    """Coerce + validate a monetary/tuning float (Finding B).
+
+    NaN/inf are rejected for the same reason the config rejects them: NaN
+    comparisons silently defeat the ceiling and infinity disables it.  Both
+    ledgers validate at construction so even a directly-built ledger fails
+    closed instead of accounting garbage.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number (got {value!r}).") from exc
+    if not math.isfinite(v) or v < 0:
+        raise ValueError(f"{name} must be a finite number >= 0 (got {value!r}).")
+    return v
+
+
 class InProcessBudgetLedger:
     """Lock-protected calendar-month budget for a SINGLE process.
 
@@ -346,9 +488,11 @@ class InProcessBudgetLedger:
         output_cost_per_million: float,
         now_fn: Optional[Callable[[], datetime]] = None,
     ):
-        self.monthly_budget = float(monthly_budget_usd)
-        self.input_cost_per_million = float(input_cost_per_million)
-        self.output_cost_per_million = float(output_cost_per_million)
+        # Finding B: the ledger itself refuses non-finite accounting
+        # parameters at construction (fail closed; no permissive fallback).
+        self.monthly_budget = _require_finite_non_negative("monthly_budget_usd", monthly_budget_usd)
+        self.input_cost_per_million = _require_finite_non_negative("input_cost_per_million", input_cost_per_million)
+        self.output_cost_per_million = _require_finite_non_negative("output_cost_per_million", output_cost_per_million)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self._lock = threading.Lock()
         self._period_key = utc_period_key(self._now_fn())
@@ -553,7 +697,10 @@ return 1
             raise BudgetStoreUnavailableException(
                 "The 'redis' package is required for GEMINI_BUDGET_STORE=redis."
             ) from exc
-        self.monthly_budget = float(monthly_budget_usd)
+        # Finding B: same construction-time finiteness validation as the
+        # in-process ledger, so local and shared stores fail closed
+        # identically on NaN/inf.
+        self.monthly_budget = _require_finite_non_negative("monthly_budget_usd", monthly_budget_usd)
         self._client = redis.Redis.from_url(
             redis_url, socket_connect_timeout=3, socket_timeout=3
         )
@@ -858,35 +1005,122 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
     # -- budget reservation (D1 P0-2) ----------------------------------------
 
-    def _max_estimated_cost_usd(self) -> float:
-        """Conservative worst-case cost of one generation call.
-
-        Covers the bounded retry budget: every attempt can cost up to
-        (estimated prompt + max output tokens).  Reserving the worst case
-        guarantees concurrent callers can never commit more than the
-        ceiling, and reconciliation with real usage corrects downward.
-        """
+    def _per_attempt_cost_usd(self, input_tokens: int) -> float:
+        """Worst-case billable cost of ONE provider attempt: the per-request
+        input allowance + the bounded maximum output."""
         cfg = self.config
-        per_attempt = (
-            cfg.estimated_prompt_tokens * cfg.input_cost_per_million
+        return (
+            input_tokens * cfg.input_cost_per_million
             + cfg.max_output_tokens * cfg.output_cost_per_million
         ) / 1_000_000
-        return per_attempt * self.max_retries
+
+    def _max_estimated_cost_usd(self, input_tokens: int, allowed_attempts: int) -> float:
+        """Conservative worst-case cost of this logical generation call.
+
+        Phase 8.7-D.1-CORRECTION-3 (Findings A+C): the reservation is
+        sized as (worst-case per-attempt cost) x (ALLOWED ATTEMPTS) where
+        the allowed attempt count is the explicit value computed ONCE at
+        call start — 1 for a half-open probe (Finding A), max_retries for
+        a closed-circuit call — and the per-request input allowance is
+        derived from the ACTUAL validated input (Finding C), not only from
+        the configured estimate.  Reserving the worst case guarantees
+        concurrent callers can never commit more than the ceiling, and
+        reconciliation with real usage corrects downward.
+        """
+        return self._per_attempt_cost_usd(input_tokens) * allowed_attempts
+
+    def _validate_input_bounds(self, prompt: str, system_instruction: str) -> None:
+        """Hard input bounds for EVERY path through _generate_text (Finding C).
+
+        Raises GeminiInputBoundException (and therefore reserves nothing
+        and contacts no provider) when the prompt or system instruction
+        exceeds its documented bound.
+        """
+        if not isinstance(prompt, str):
+            raise GeminiInputBoundException("prompt must be a string.")
+        if not isinstance(system_instruction, str):
+            raise GeminiInputBoundException("system_instruction must be a string.")
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise GeminiInputBoundException(
+                f"prompt exceeds the hard bound of {MAX_PROMPT_CHARS} characters "
+                f"(got {len(prompt)}); the input is rejected before any provider call."
+            )
+        if len(system_instruction) > MAX_SYSTEM_INSTRUCTION_CHARS:
+            raise GeminiInputBoundException(
+                f"system instruction exceeds the hard bound of "
+                f"{MAX_SYSTEM_INSTRUCTION_CHARS} characters (got {len(system_instruction)})."
+            )
+
+    def _estimated_input_tokens(self, prompt: str, system_instruction: str) -> int:
+        """Conservative per-request input token ALLOWANCE for reservation.
+
+        Documented bound (Finding C): the Gemini tokenizer is a BPE over
+        UTF-8 bytes, and every token encodes at least one input byte, so
+        the UTF-8 byte count of (prompt + system instruction) is an upper
+        bound on the provider's input token count.  A small documented
+        framing overhead covers the message structure around the parts.
+
+        ``GEMINI_ESTIMATED_PROMPT_TOKENS`` is retained for compatibility as
+        a FLOOR ONLY: the effective allowance is max(per-request bound,
+        configured estimate), so an operator can never lower the
+        per-request safe bound by setting it small.
+
+        This is a RESERVATION allowance (a conservative over-estimate), not
+        a provider billing guarantee — see SECURITY.md.
+        """
+        byte_bound = (
+            len((prompt + system_instruction).encode("utf-8"))
+            + _INPUT_FRAMING_OVERHEAD_TOKENS
+        )
+        return max(byte_bound, int(self.config.estimated_prompt_tokens))
 
     @staticmethod
     def _cost_from_usage(data: Dict[str, Any], cfg: GeminiRuntimeConfig) -> Optional[float]:
-        """Actual cost from provider ``usageMetadata``, or None when the
-        metadata is absent (the caller then keeps the full reservation —
-        conservative, never undercount)."""
+        """Actual cost from provider ``usageMetadata``, or None when there
+        is no reliable usage evidence.
+
+        Phase 8.7-D.1-CORRECTION-3 (Finding D): a None result means the
+        caller conservatively counts that attempt's WORST-CASE allowance —
+        a timeout or 5xx is never treated as free, and absent usage
+        metadata is never treated as zero billable.
+
+        Billable dimensions (the official usageMetadata fields):
+        * ``promptTokenCount`` — input rate.
+        * ``cachedContentTokenCount`` — billed at the FULL input rate
+          (conservative: real cache-read pricing is lower, so this can
+          only overcount).
+        * ``candidatesTokenCount`` — output rate.
+        * ``thoughtsTokenCount`` / ``thoughtSummariesTokenCount`` — the
+          thinking-model extra output, billed at the output rate.
+        * ``totalTokenCount`` — when only the total is present, billed at
+          the HIGHER of the two configured rates (conservative).
+        Absent or all-zero metadata => None (unknown).
+        """
         usage = data.get("usageMetadata") if isinstance(data, dict) else None
-        if isinstance(usage, dict):
-            prompt_tokens = int(usage.get("promptTokenCount") or 0)
-            completion_tokens = int(usage.get("candidatesTokenCount") or 0)
-            if prompt_tokens or completion_tokens:
-                return (
-                    prompt_tokens * cfg.input_cost_per_million
-                    + completion_tokens * cfg.output_cost_per_million
-                ) / 1_000_000
+        if not isinstance(usage, dict):
+            return None
+
+        def _tok(key: str) -> int:
+            v = usage.get(key)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                return 0
+            return int(v)
+
+        prompt_tokens = _tok("promptTokenCount")
+        cached_tokens = _tok("cachedContentTokenCount")
+        candidates_tokens = _tok("candidatesTokenCount")
+        thoughts_tokens = _tok("thoughtsTokenCount") or _tok("thoughtSummariesTokenCount")
+        total_tokens = _tok("totalTokenCount")
+
+        if prompt_tokens or cached_tokens or candidates_tokens or thoughts_tokens:
+            return (
+                (prompt_tokens + cached_tokens) * cfg.input_cost_per_million
+                + (candidates_tokens + thoughts_tokens) * cfg.output_cost_per_million
+            ) / 1_000_000
+        if total_tokens:
+            return (
+                total_tokens * max(cfg.input_cost_per_million, cfg.output_cost_per_million)
+            ) / 1_000_000
         return None
 
     # -- core generation -----------------------------------------------------
@@ -960,14 +1194,39 @@ class GeminiCallerAdapter(RemoteLLMInterface):
         lease exactly once: success closes the circuit, any failure re-
         opens it with a fresh cooldown.  No per-branch remember-to-settle
         discipline exists that an exception could bypass."""
+        # Finding C: EVERY input path is bounded at this single choke
+        # point BEFORE any budget reservation or provider contact.  The
+        # rejection leaves budget state untouched and the provider
+        # uncontacted (fail closed).
+        self._validate_input_bounds(prompt, system_instruction)
+
         probing = self._check_circuit()
         try:
             self._assert_provider_configured()
 
-            # Atomic worst-case reservation BEFORE any provider contact.
-            reservation = self.budget_service.reserve(self._max_estimated_cost_usd())
+            # Finding A: the allowed provider-attempt count is decided ONCE
+            # here and passed explicitly through to the attempt loop — it
+            # is never re-inferred from mutable breaker state per iteration.
+            # A half-open probe gets exactly ONE attempt (its whole purpose
+            # is to test the provider; a transient failure must not
+            # consume the retry budget or let two "probes" run); a
+            # closed-circuit call keeps the configured bounded retry
+            # budget.
+            allowed_attempts = 1 if probing else self.max_retries
+            # Finding C: the reservation uses the per-request input
+            # allowance derived from the ACTUAL validated input (a
+            # conservative bound; the configured estimate is a floor only).
+            input_tokens = self._estimated_input_tokens(prompt, system_instruction)
+
+            # Atomic worst-case reservation BEFORE any provider contact:
+            # (worst-case per-attempt cost) x (allowed attempts).
+            reservation = self.budget_service.reserve(
+                self._max_estimated_cost_usd(input_tokens, allowed_attempts)
+            )
             try:
-                return self._generate_text_with_reservation(prompt, system_instruction, reservation)
+                return self._generate_text_with_reservation(
+                    prompt, system_instruction, reservation, allowed_attempts, input_tokens
+                )
             except Exception:
                 # Any failure path keeps the FULL reservation (conservative).
                 # The provider-side failure itself is already registered
@@ -985,16 +1244,41 @@ class GeminiCallerAdapter(RemoteLLMInterface):
             raise
 
     def _generate_text_with_reservation(
-        self, prompt: str, system_instruction: str, reservation: BudgetReservation
+        self,
+        prompt: str,
+        system_instruction: str,
+        reservation: BudgetReservation,
+        allowed_attempts: int,
+        input_tokens: int,
     ) -> str:
+        """Attempt loop with EXPLICIT attempt budget + per-attempt billing
+        evidence (Phase 8.7-D.1-CORRECTION-3).
+
+        * ``allowed_attempts`` is the explicit count decided once in
+          ``_generate_text`` (1 for a half-open probe — Finding A; the
+          configured bounded retry budget otherwise).  The loop NEVER
+          consults ``self.max_retries`` or the mutable breaker state, so a
+          probe cannot expand into a retry storm and a state change cannot
+          silently change the loop's bound mid-flight.
+        * ``attempts`` is the explicit per-attempt billing-evidence list
+          (Finding D): one entry per provider attempt — the actual cost
+          from ``usageMetadata`` where known, or None where the attempt's
+          billable cost is unknown (timeout, 5xx, missing metadata).  No
+          hidden globals; the list is passed by construction into the
+          finalize reconciliation below.
+        """
         payload = self._build_payload(prompt, system_instruction)
         backoff_delay = self.backoff_base_seconds
-        for attempt in range(1, self.max_retries + 1):
+        attempts: List[Optional[float]] = []
+        for attempt in range(1, allowed_attempts + 1):
             try:
                 response = self._post(payload)
             except requests.Timeout as exc:
+                # A timed-out attempt may still have consumed billable
+                # provider work: record it as UNKNOWN cost, never free.
+                attempts.append(None)
                 self._register_failure()
-                if attempt == self.max_retries:
+                if attempt == allowed_attempts:
                     logger.error("[GEMINI] Timeout after %d attempts.", attempt)
                     raise GeminiTimeoutException(
                         "Gemini provider did not answer within the bounded timeout."
@@ -1004,8 +1288,9 @@ class GeminiCallerAdapter(RemoteLLMInterface):
                 backoff_delay *= 2.0
                 continue
             except requests.ConnectionError as exc:
+                attempts.append(None)
                 self._register_failure()
-                if attempt == self.max_retries:
+                if attempt == allowed_attempts:
                     raise GeminiUpstreamException(
                         "Network-level failure reaching the Gemini provider."
                     ) from exc
@@ -1015,8 +1300,9 @@ class GeminiCallerAdapter(RemoteLLMInterface):
                 continue
             except requests.RequestException as exc:
                 # Any other requests-level failure: treat as transient.
+                attempts.append(None)
                 self._register_failure()
-                if attempt == self.max_retries:
+                if attempt == allowed_attempts:
                     raise GeminiUpstreamException(
                         "Transport failure reaching the Gemini provider."
                     ) from exc
@@ -1029,15 +1315,18 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
             # Permanent provider-auth failure: never retry, never leak the key.
             if status in _AUTH_STATUS_CODES:
+                attempts.append(None)
                 self._register_failure()
                 raise GeminiAuthException(
                     "Gemini provider rejected the server-side credential (HTTP %d)." % status
                 )
 
-            # Transient statuses: bounded retry with backoff.
+            # Transient statuses: bounded retry with backoff.  A 5xx/429
+            # attempt is NOT free: record it as unknown cost.
             if status in _TRANSIENT_STATUS_CODES:
+                attempts.append(None)
                 self._register_failure()
-                if attempt == self.max_retries:
+                if attempt == allowed_attempts:
                     if status == 429:
                         raise GeminiRateLimitException(
                             "Gemini provider rate limit persisted (HTTP 429) after bounded retries."
@@ -1052,6 +1341,7 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
             if status != 200:
                 # Non-2xx that is neither auth nor a known transient: fail now.
+                attempts.append(None)
                 self._register_failure()
                 raise GeminiUpstreamException(
                     "Gemini provider returned an unexpected status (HTTP %d)." % status
@@ -1060,6 +1350,7 @@ class GeminiCallerAdapter(RemoteLLMInterface):
             try:
                 data = response.json()
             except ValueError as exc:
+                attempts.append(None)
                 self._register_failure()
                 raise GeminiMalformedResponseException(
                     "Gemini provider response was not valid JSON."
@@ -1067,11 +1358,24 @@ class GeminiCallerAdapter(RemoteLLMInterface):
 
             text = self._extract_text(data)
 
-            # Success: reconcile the reservation with real usage (or keep
-            # the full reservation when usage metadata is absent).
-            self.budget_service.finalize(
-                reservation, self._cost_from_usage(data, self.config)
-            )
+            # Finding D: reconcile the WHOLE retry chain, not just the
+            # final attempt.  Every attempt that touched the provider has
+            # billable cost: known usage -> real cost; unknown/missing
+            # usage (every preceding failure) -> the worst-case
+            # per-attempt allowance.  This finalizes
+            #   committed = sum(known usage) + unknown_attempts x
+            #   worst-case per-attempt cost
+            # which can only equal the reservation when every attempt's
+            # usage was missing (the all-unknown case = the previous
+            # full-reservation fallback), and is capped at the reservation
+            # so a single reservation can never commit more than it held.
+            attempt_cost = self._cost_from_usage(data, self.config)
+            attempts.append(attempt_cost)
+            known_cost = sum(c for c in attempts if c is not None)
+            unknown_attempts = sum(1 for c in attempts if c is None)
+            total_cost = known_cost + unknown_attempts * self._per_attempt_cost_usd(input_tokens)
+            total_cost = min(total_cost, reservation.reserved_usd)
+            self.budget_service.finalize(reservation, total_cost)
             self._register_success()
             return text
 
@@ -1093,7 +1397,50 @@ class GeminiCallerAdapter(RemoteLLMInterface):
         Uses the SAME strict five-field parse/validate contract as the
         repository-analysis path (``parse_strict_asset_payload``) — there is
         no alternate lenient parser in the codebase (D1 P0-6).
+
+        Phase 8.7-D.1-CORRECTION-3 (Finding C): the caller-supplied
+        ``tech_metadata`` is bounded BEFORE serialization —
+        * accepted value types are exactly the scalars str / int /
+          finite float / bool; there is NO implicit ``str()`` of
+          arbitrary objects (a hostile ``__str__`` cannot inject
+          unbounded content);
+        * keys must be strings of at most 128 characters;
+        * the serialized (JSON, sorted) metadata must fit
+          ``MAX_TECH_METADATA_SERIALIZED_CHARS``.
+        Oversized metadata raises GeminiInputBoundException before any
+        reservation or provider contact; ``_generate_text`` re-validates
+        the resulting prompt at the single choke point anyway.
         """
+        if not isinstance(tech_metadata, dict) or not tech_metadata:
+            raise GeminiInputBoundException(
+                "tech_metadata must be a non-empty dictionary."
+            )
+        for k, v in tech_metadata.items():
+            if not isinstance(k, str) or not k or len(k) > 128:
+                raise GeminiInputBoundException(
+                    "tech_metadata keys must be non-empty strings of at most 128 characters."
+                )
+            if isinstance(v, bool):
+                continue  # bool is an accepted scalar (int subclass)
+            if not isinstance(v, (str, int, float)):
+                raise GeminiInputBoundException(
+                    "tech_metadata values must be str, int, finite float, or bool "
+                    f"(got {type(v).__name__} for key {k!r}); no implicit str() "
+                    "of arbitrary objects."
+                )
+            if isinstance(v, float) and not math.isfinite(v):
+                raise GeminiInputBoundException(
+                    f"tech_metadata value for key {k!r} must be a finite float."
+                )
+        serialized = json.dumps(
+            {k: v for k, v in sorted(tech_metadata.items())}, ensure_ascii=False
+        )
+        if len(serialized) > MAX_TECH_METADATA_SERIALIZED_CHARS:
+            raise GeminiInputBoundException(
+                f"tech_metadata exceeds the serialized bound of "
+                f"{MAX_TECH_METADATA_SERIALIZED_CHARS} characters "
+                f"(got {len(serialized)}); the input is rejected before any provider call."
+            )
         tech_lines = ", ".join(f"{k}: {v}" for k, v in sorted(tech_metadata.items()))
         prompt = (
             f"Technology metadata: {tech_lines}\n"

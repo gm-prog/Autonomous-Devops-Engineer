@@ -1,12 +1,16 @@
-# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION / 8.7-D.1-CORRECTION-2)
+# Security Model — Autonomous DevOps AI Platform (Phases 8.7-C / 8.7-D / 8.7-D.1 / 8.7-D.1-CORRECTION / 8.7-D.1-CORRECTION-2 / 8.7-D.1-CORRECTION-3)
 
 This document describes the **current** trust model of the platform after the
 Phase 8.7-C security integrity corrections, the Phase 8.7-D.1 production
-security & runtime hardening, and the Phase 8.7-D.1-CORRECTION fixes
+security & runtime hardening, the Phase 8.7-D.1-CORRECTION fixes
 (idempotent Redis budget finalize, production shared-state requirements,
 single-probe half-open circuit recovery, and the verified real-Redis test
-suite). It is normative for the gateway, monitoring, agent-service, and
-Android client. Historical phase reports may describe
+suite), and the Phase 8.7-D.1-CORRECTION-3 corrections (single-probe
+provider-attempt budget, non-finite config rejection, hard input bounds at
+the generation choke point, retry-chain cost reconciliation, one
+hash-pinned compatible dependency set, and the Android redirect /
+origin-trust contract — §6.9). It is normative for the gateway, monitoring,
+agent-service, and Android client. Historical phase reports may describe
 earlier states; where they disagree, this document and the code are
 authoritative.
 
@@ -211,7 +215,36 @@ source** (AST where meaningful) so these weaknesses cannot silently return:
   invoked before the Authorization header is attached, the policy keeps
   https-only with the debug-local exception, the main Network Security
   Configuration permits no cleartext, the manifest wires the NSC, and the
-  debug overlay is restricted to local hosts.
+  debug overlay is restricted to local hosts. Since Phase
+  8.7-D.1-CORRECTION-3 (Finding F) the guard also enforces the redirect +
+  trust policy: the JWT-bearing client must set `followRedirects(false)`
+  and `followSslRedirects(false)`, no 3xx-follow or `Location` reading may
+  exist on the authenticated path, the URL policy must reject userinfo /
+  query / fragment, the trust gate (`TrustedGatewayOrigin.isApproved`)
+  must guard the bearer request, and the ViewModel must require the origin
+  trust for live analysis without persisting the JWT.
+* `gemini-resilience-contract` (Phase 8.7-D.1-CORRECTION-3) — the Gemini
+  caller resilience contract in `agent-service/infrastructure/llm/
+  gemini_caller.py`: the half-open probe gets an explicit
+  `allowed_attempts = 1 if probing else self.max_retries` passed to an
+  attempt loop that iterates `allowed_attempts` (never re-inferring
+  `self.max_retries`); NaN/±inf are rejected for every float field in
+  `GeminiRuntimeConfig.__post_init__`, the `from_env` float parser, and
+  the shared ledger validation used by both ledgers; every input path is
+  bound at the single `_generate_text` choke point before reservation /
+  provider contact with the configured estimate acting as a FLOOR only;
+  the reservation finalizes from the explicit per-attempt billing evidence
+  (known usage + worst-case allowance per unknown attempt, capped at the
+  reservation).
+* `dependency-parity-contract` (Phase 8.7-D.1-CORRECTION-3, Finding E) —
+  ONE compatible, hash-pinned dependency set: the container
+  (`requirements-runtime.txt`) and every CI test job
+  (`requirements-test.txt`) must share identical pinned versions for every
+  shared package, both locks must be `pip-compile --generate-hashes`
+  generated with per-package sha256 hashes, both service Dockerfiles must
+  install the runtime lock with `pip install --require-hashes`, all five
+  CI Python install paths must use `--require-hashes`, and the retired
+  broad `requirements.txt` must not reappear.
 * `jwt-fail-closed` — no bundled `JWT_SECRET` fallback, no hard-coded signing
   secret, legacy secret quarantined, development fallback gated behind the
   explicit switch.
@@ -281,18 +314,29 @@ configuration source**: every tunable (model, budget, costs, retries,
 timeout, budget store) has exactly one env var and exactly one default, so
 two places can no longer disagree (the 150 vs 100 budget defect).
 
-### 6.2 Atomic budget reservation (P0-2)
+### 6.2 Atomic budget reservation (P0-2; math updated in 8.7-D.1-CORRECTION-3)
 
 Before any provider contact, the adapter **atomically reserves the
-conservative worst-case cost** of the call (retries × (estimated prompt
-tokens × input price + `maxOutputTokens` × output price)) against the
-**application-level monthly (UTC calendar-month) ceiling**. If the
-reservation would exceed the ceiling, the call is rejected with a typed
-`BudgetExceededException` **before** the provider is contacted. After the
-call, the reservation is reconciled from the provider's `usageMetadata`: the
-actual cost is committed when present, and the **full reservation is kept
-when usage metadata is missing** (never undercount). Any failure path keeps
-the full reservation.
+conservative worst-case cost** of the call —
+**(worst-case per-attempt cost) × (allowed attempts)**, where the
+per-attempt cost = (per-request input allowance × input price +
+`maxOutputTokens` × output price) and the allowed attempt count is the
+**explicit** value computed once per call: **1 for a half-open probe**,
+`max_retries` for a closed-circuit call (Finding A; the probe may not
+retry). The per-request input allowance is the documented UTF-8 byte bound
++ framing, with `GEMINI_ESTIMATED_PROMPT_TOKENS` as a **floor only**
+(Finding C; §6.9.3). If the reservation would exceed the
+**application-level monthly (UTC calendar-month) ceiling**, the call is
+rejected with a typed `BudgetExceededException` **before** the provider is
+contacted.
+
+After the call, the reservation is reconciled from the **whole retry
+chain** (Finding D; §6.9.4): known usage → real cost; every attempt with
+unknown/missing usage (timeout, 5xx, absent metadata) → the worst-case
+per-attempt allowance (never free); total failure → the full reservation;
+the committed amount for a reservation never exceeds what it held. This is
+an **application-level safety budget, NOT a Google billing cap** — the
+allowance is a conservative estimate, not a billing guarantee.
 
 **Finalize is exactly-once per reservation while the finalization claim is
 retained.** The ledger's finalize step returns a boolean: the accounting
@@ -506,6 +550,278 @@ ceiling), A4 (provider failure → OPEN), A5 (recovery → CLOSED), A6
 the circuit `HALF-OPEN`: ten fresh cooldowns pass, the credential is
 restored and the provider is healthy, and the circuit still never probes
 again).
+
+### 6.9 Phase 8.7-D.1-CORRECTION-3 (Findings A–F)
+
+The independent audit of `7b8e050` found six concrete weaknesses. All six
+are corrected below; each has regression tests, a permanent structural
+guard, and an adversarial mutation (M25–M30) that proves CI turns red when
+the control is removed or weakened.
+
+#### 6.9.1 Finding A — the half-open probe makes EXACTLY ONE provider attempt
+
+Before: the attempt loop iterated `range(1, self.max_retries + 1)` and
+consulted mutable state per iteration, so a half-open probe (whose only
+purpose is to test the provider) inherited the full retry budget — a
+flapping upstream got a retry storm during circuit recovery, and the
+"single probe" contract was not actually single.
+
+Now, in `_generate_text`:
+
+* the allowed attempt count is computed **once** per call —
+  `allowed_attempts = 1 if probing else self.max_retries` — and passed
+  **explicitly** into `_generate_text_with_reservation(prompt, system,
+  reservation, allowed_attempts, input_tokens)`. The loop iterates
+  `range(1, allowed_attempts + 1)` and its final-attempt checks key off
+  `allowed_attempts`; it never re-infers `self.max_retries` or reads the
+  breaker state per iteration;
+* a probe that fails (timeout, connection error, 429, 5xx, malformed)
+  makes exactly **one** transport call, re-opens the circuit to `OPEN`
+  with a **fresh cooldown** (failure counter reset to 1), and the second
+  caller is rejected until the next cooldown;
+* a healthy one-attempt probe closes the circuit; a pre-provider failure
+  (missing key, budget store down, ceiling) settles the lease exactly as
+  in CORRECTION-2 (zero provider calls, no permanent `HALF-OPEN`);
+* CLOSED-circuit calls keep their configured bounded retry budget
+  unchanged (transient failure then success = two attempts).
+
+The reservation is sized from the same explicit count (see 6.9.3/6.9.4).
+Mutation **M25** (loop re-infers `self.max_retries` — the probe makes 3
+transport calls instead of 1) is detected by the
+`gemini-resilience-contract` guard.
+
+#### 6.9.2 Finding B — non-finite floats are rejected on every construction path
+
+Before: `from_env` parsed `float(raw)` and checked only `< 0` — `float("inf")`
+passed (and `committed + reserved + amount > inf` is `False` for every
+finite amount, silently **disabling the ceiling**), and `float("nan")`
+passed both because `nan < 0` is `False` and because NaN comparisons
+defeat every accounting check. Direct `GeminiRuntimeConfig(...)`
+construction had no validation at all.
+
+Now:
+
+* `GeminiRuntimeConfig.__post_init__` runs for **both** `from_env`
+  (which constructs `cls(...)`) and direct construction: every float field
+  (`monthly_budget_usd`, `input_cost_per_million`,
+  `output_cost_per_million`, `timeout_seconds`,
+  `backoff_base_seconds`) must be `math.isfinite`;
+* the `from_env` float parser rejects non-finite values with the same
+  message before the dataclass is built;
+* both ledger constructors validate their accounting parameters at
+  construction through the shared `_require_finite_non_negative` helper
+  (defense in depth below the config — even a directly-built ledger fails
+  closed identically on local and Redis stores).
+
+Documented range semantics (all fail closed, no permissive fallback):
+
+| field | legal range | meaning at the edge |
+|---|---|---|
+| `monthly_budget_usd` | finite, ≥ 0 | **0 = "no calls this period"** — every reservation is rejected immediately; it never means "unlimited" |
+| `input_cost_per_million` / `output_cost_per_million` | finite, **> 0** | a zero rate would silently disable cost accounting while calls still happen |
+| `timeout_seconds` | finite, > 0 | a provider call needs a positive timeout |
+| `backoff_base_seconds` | finite, ≥ 0 | 0 = no wait between attempts (test use, documented) |
+| `max_output_tokens` / `estimated_prompt_tokens` / `max_retries` | int ≥ 1 | — |
+
+Invalid configuration is rejected at construction — **before any provider
+contact**. Mutation **M26** (finiteness removal in all three layers: an
+`inf` budget is accepted and any reservation passes the now-disabled
+ceiling check) is detected by the `gemini-resilience-contract` guard.
+
+#### 6.9.3 Finding C — hard input bounds at the single generation choke point
+
+Before: `generate_remediation`/`generate_iac_blueprint`/`_generate_text`
+accepted unbounded input (the agent-task path takes an unbounded
+`cmd.raw_prompt`; the IaC path stringified arbitrary metadata with no
+bound), while the reservation used only the configured
+`GEMINI_ESTIMATED_PROMPT_TOKENS` (default 220) — an operator could set it
+to 1 and reserve ~zero for a multibyte prompt, so concurrent callers could
+drive committed spend past the ceiling the estimate was supposed to bound.
+
+Now (call-surface audit: the only production caller is
+`analyze_repository.py:60` with gateway-validated fields — name ≤ 120, URL
+≤ 2048, framework ≤ 200, technology ≤ 200 — plus a fixed template; the
+agent-task path is wired only through unwired AMQP scaffolding;
+`generate_iac_blueprint` has zero production callers, but is bounded too):
+
+* **`_generate_text` is the single choke point.** Every path through it
+  first calls `_validate_input_bounds(prompt, system_instruction)`:
+  `prompt ≤ MAX_PROMPT_CHARS (16 000)` and
+  `system_instruction ≤ MAX_SYSTEM_INSTRUCTION_CHARS (4 000)`. Oversized
+  input raises `GeminiInputBoundException` **before** circuit state is
+  read, **before** any reservation, and **before** any provider contact —
+  budget state stays untouched.
+* **Per-request input allowance.** The reservation uses
+  `_estimated_input_tokens(prompt, system_instruction)` =
+  `len((prompt + system).encode("utf-8")) + 64` framing overhead.
+  Justified bound: the Gemini tokenizer is BPE over UTF-8 bytes and every
+  token encodes ≥ 1 input byte, so the byte count is an **upper bound** on
+  input tokens. This is a **reservation allowance, NOT a provider billing
+  guarantee** (see §7).
+* **`GEMINI_ESTIMATED_PROMPT_TOKENS` is a FLOOR only.** The effective
+  allowance is `max(per-request byte bound, configured estimate)` — an
+  operator can never lower the per-request safe bound by setting it small
+  (the setting is retained for compatibility, not removed, so all existing
+  references stay valid).
+* **`generate_iac_blueprint` metadata** is bounded before serialization:
+  accepted value types are exactly the scalars `str` / `int` / finite
+  `float` / `bool` (no implicit `str()` of arbitrary objects), keys ≤ 128
+  chars, and the sorted JSON serialization must fit
+  `MAX_TECH_METADATA_SERIALIZED_CHARS (8 000)` — the resulting prompt is
+  then inside `MAX_PROMPT_CHARS` by construction and re-validated at the
+  choke point.
+* `countTokens` is **not** used: the documented byte bound + framing
+  already over-estimates, and a fail-closed countTokens round-trip would
+  add an unbounded provider dependency for no safety gain.
+
+Mutation **M27** (bound check removed — an oversized prompt reaches the
+provider; estimate floor dropped — a tiny estimate under-reserves
+multibyte input by an order of magnitude) is detected by the
+`gemini-resilience-contract` guard.
+
+#### 6.9.4 Finding D — retry-chain cost reconciliation (no undercount)
+
+Before: the reservation was finalized with **only the final attempt's**
+`usageMetadata` cost — every preceding timeout/5xx attempt was silently
+**free**, so the committed spend under-counted real provider work
+(a timed-out request can still consume billable upstream work), letting
+concurrent callers push committed spend past the ceiling.
+
+Now the attempt loop keeps an **explicit per-attempt billing-evidence
+list** (`attempts: List[Optional[float]]`, no hidden globals): every
+failed attempt appends `None` (unknown cost), a successful attempt appends
+its actual cost from `_cost_from_usage`. On success the reservation
+finalizes with
+
+```
+committed = sum(known usage) + (unknown attempts) × worst-case per-attempt
+committed = min(committed, reservation)
+```
+
+— i.e. known usage where reliable, and a conservative **worst-case
+allowance for every attempt whose cost is unknown** (timeouts, 5xx,
+missing metadata — never free). Total failure keeps the **full
+reservation** (the previous fallback). Invariant: a reservation never
+commits more than it held, and committed ≥ known billable + allowances.
+
+`_cost_from_usage` now inspects the official `usageMetadata` beyond
+prompt/candidates: `cachedContentTokenCount` (billed at the **full** input
+rate — conservative, real cache reads price lower),
+`thoughtsTokenCount`/`thoughtSummariesTokenCount` (output rate), and a
+`totalTokenCount`-only fallback billed at the **higher** configured rate.
+
+Regression coverage: (a) success with usage → actual cost committed;
+(b) timeout→success; (c) 503→success (both commit worst-case + actual);
+(d) 200 with **missing** metadata → worst-case allowance; (e) total
+failure → full reservation; (f) cached/thoughts dimensions aggregated;
+(g) duplicate finalize remains exactly-once on local **and** real Redis
+(existing integration tests). Mutation **M28** (finalization reverts to
+the final attempt's usage only — the timeout is silently free) is detected
+by the `gemini-resilience-contract` guard.
+
+#### 6.9.5 Finding E — one compatible, hash-pinned dependency set
+
+Before: CI installed `requirements-test.txt` (pinned fastapi 0.128.8 /
+starlette 0.52.1 / anyio 4.12.1 for the test-client stack) while the
+containers installed broad `>=` ranges from `requirements.txt` — live CI
+proved the container resolved fastapi **0.143.0** / starlette **1.7.0** /
+anyio **4.15.1**: security was tested on one dependency set and shipped on
+another.
+
+Now:
+
+* **`requirements-runtime.in` / `requirements-test.in`** are the declared
+  sources; the **full transitive locks** `requirements-runtime.txt` /
+  `requirements-test.txt` are generated with `pip-compile
+  --generate-hashes` on Python 3.11 (documented update procedure in the
+  `.in` headers — no ad-hoc `pip freeze`).
+* The deliberately chosen set is the **last verified generation**:
+  fastapi 0.128.8 / starlette 0.52.1 (starlette 1.x deprecates the
+  httpx-based TestClient the security suite is built on) and anyio 4.12.1
+  (4.15+ deprecates the `BlockingPortal` alias starlette 0.52's
+  testclient imports), with pydantic 2.14.1 / redis 8.1.0 / requests
+  2.34.2 / PyJWT 2.15.1 shared exactly. The **container is deliberately
+  held on the verified generation** — one compatible set, not two drifting
+  worlds; the container never runs an untested framework version.
+* **Every runtime dependency is kept** (13 direct deps; no silent
+  slimming); the lock resolves the full closure with sha256 hashes.
+* Both service **Dockerfiles** install ONLY `requirements-runtime.txt`
+  with `pip install --no-cache-dir --require-hashes` (a missing hash or a
+  drifted pin is a hard build failure).
+* **All five CI Python jobs** install ONLY `requirements-test.txt` with
+  `pip install --require-hashes` (cache-dependency-path stays
+  `requirements-test.txt`); the retired broad `requirements.txt` is
+  deleted.
+* The **`dependency-parity-contract` guard** fails CI on any version
+  disagreement between the two locks for the shared packages, a
+  non-pip-compiled/unhashed lock, a missing direct dependency, a
+  Dockerfile without `--require-hashes`, or a CI install without
+  `--require-hashes`.
+
+Verification (local, pre-push): a **fresh** clean venv installs
+`requirements-runtime.txt` with `--require-hashes` (all 13 direct deps
+import; `pip check` clean) and a **second fresh** venv installs
+`requirements-test.txt` with `--require-hashes` (full security suite +
+real Redis + all guards green). The CI `compose-runtime` job builds both
+images from the exact locks and boots them. Mutation **M29** (runtime
+lock re-pinned to starlette 1.7.0 ≠ test lock; Dockerfile drops
+`--require-hashes`) is detected by the `dependency-parity-contract`
+guard.
+
+#### 6.9.6 Finding F — Android: no redirect-following, no unconfirmed-origin token transfer
+
+Before: the single shared `OkHttpClient` used OkHttp's **default**
+`followRedirects(true)`, so a 3xx on the JWT-bearing analysis call would
+have moved the bearer token to whatever `Location` header the gateway
+sent (host/scheme/port/endpoint). `validateAnalysisUrl` also accepted
+`user:pass@host`, query strings, and fragments, making the "exact URL
+used" ambiguous. There was no operator confirmation of the exact
+destination.
+
+Now, in `app/src/main/java/com/example/data/BackendGatewayClient.kt`
+(+ `DevOpsViewModel` / `MainActivity`):
+
+* **Dedicated authenticated client.** The JWT-bearing call runs on
+  `authenticatedHttpClient` — a separate `OkHttpClient` built with
+  `.followRedirects(false)` **and** `.followSslRedirects(false)` (even
+  http→https "safe" redirects are off). The credential-free diagnostics
+  client (`testConnection`) is a separate instance whose default behavior
+  can never carry a token.
+* **3xx = safe explicit failure.** The authenticated path answers any
+  300–399 with a typed failure ("…redirects are never followed…"); the
+  `Location` header is never followed, logged, or surfaced — same-origin
+  or cross-origin alike.
+* **URL canonicalization before token handling.** `validateAnalysisUrl`
+  additionally rejects userinfo, query strings, and fragments; the
+  destination is exactly `scheme://host[:port][/base-path]` + the fixed
+  analysis route (legitimate base paths preserved).
+* **Explicit origin trust, bound to the normalized origin.**
+  `GatewayOrigin(scheme, host, port)` (host lower-cased, effective port)
+  is parsed with the pure `parseGatewayOrigin`. `TrustedGatewayOrigin`
+  (in-memory only, like the JWT — never persisted; fresh process =
+  untrusted) requires an explicit Settings confirmation
+  ("Confirm & trust this gateway origin") **before** any
+  `Authorization: Bearer` request is constructed; an untrusted origin
+  yields a typed failure with **zero network calls**. Changing any part
+  of the (scheme, host, port) triple invalidates the approval
+  automatically (`updateApiUrl` re-checks; the UI shows the trusted
+  canonical origin with a revoke control). `isLiveAnalysisEnabled`
+  requires the trust, so live analysis stays OFF until confirmed.
+* **Honest scope.** The confirmation protects against a wrong or
+  accidental endpoint choice — it is **NOT cryptographic server
+  identity**; TLS certificate validation still governs the connection
+  (no permissive trust managers, no disabled checks anywhere).
+
+Kotlin coverage (`GatewayOriginTrustTest` + extended
+`AnalysisUrlPolicyTest`, offline seam, no real network): client
+isolation + redirect policy, 302/307 explicit failures (Location never
+surfaced), userinfo/query/fragment rejection, origin normalization and
+binding, untrusted origin = zero calls, trusted origin = exactly one call
+with the bearer header, approval cleared on origin change, transport
+exception detail contract (now on the authenticated seam). The
+`android-gemini-secret` guard enforces the structural contract. Mutation
+**M30** (redirect following restored on the JWT-bearing client; trust gate
+bypassed) is detected by the guard.
 
 ---
 

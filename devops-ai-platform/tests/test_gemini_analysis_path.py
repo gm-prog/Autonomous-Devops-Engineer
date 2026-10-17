@@ -1102,3 +1102,536 @@ class TestProbeLeaseSettlesOnPreProviderFailure(_HalfOpenProbeBase):
         adapter._transport = _SuccessProviderTransport()
         assert json.loads(adapter.generate_remediation("p", "s")) == GOOD_ASSETS
         assert adapter.cb_state == "CLOSED"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-3 — Finding A: half-open probe = exactly ONE
+# provider attempt (no retry after a transient failure)
+# ---------------------------------------------------------------------------
+
+
+class _QueueTransport:
+    """Transport that replays a scripted queue of outcomes (responses or
+    exceptions) and counts every call — the attempts under test."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def __call__(self, payload):
+        self.calls += 1
+        item = self.outcomes.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _probe_adapter_with_retries(transport, clock, **config_kwargs):
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    kwargs = dict(max_retries=3, backoff_base_seconds=0.001)
+    kwargs.update(config_kwargs)
+    return gc.GeminiCallerAdapter(
+        api_key="c3-a-test-key-not-a-real-credential",
+        config=gc.GeminiRuntimeConfig(**kwargs),
+        transport=transport,
+        time_fn=lambda: clock["now"],
+    )
+
+
+class TestHalfOpenProbeNeverRetries:
+    """The half-open probe lease gets EXACTLY ONE provider attempt.
+
+    A probe's purpose is to test the provider: a timeout, connection
+    error, 429, 5xx, or malformed response re-opens the circuit with a
+    fresh cooldown.  Retrying inside the probe would (1) multiply the
+    blast radius of a flapping upstream and (2) let the "single probe"
+    contract quietly become a retry storm.  Closed-circuit calls keep
+    their configured bounded retry budget unchanged.
+    """
+
+    def test_probe_transient_503_makes_exactly_one_transport_call(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        transport = _QueueTransport(
+            [_gemini_http(503, None)] * 6 + [_gemini_http(503, None)]
+        )
+        clock = {"now": 9_000_000.0}
+        adapter = _probe_adapter_with_retries(transport, clock)
+
+        # Trip the circuit OPEN (3 attempts x 2 calls = 6 failures >= 5).
+        for _ in range(2):
+            with pytest.raises(
+                (gc.GeminiUpstreamException, gc.GeminiTimeoutException)
+            ):
+                adapter.generate_remediation("p", "s")
+        assert adapter.cb_state == "OPEN"
+        assert transport.calls == 6
+
+        # Cooldown elapsed: this caller takes the half-open lease.  The
+        # probe fails on a transient 503 — and must make EXACTLY ONE
+        # provider attempt despite max_retries=3.
+        clock["now"] += 61
+        before = transport.calls
+        with pytest.raises(gc.GeminiUpstreamException):
+            adapter.generate_remediation("p", "s")
+        assert transport.calls - before == 1, (
+            f"the half-open probe made {transport.calls - before} provider "
+            "attempts; it must make exactly ONE"
+        )
+        # Fresh cooldown with a fresh failure count.
+        assert adapter.cb_state == "OPEN"
+        assert adapter.cb_failures == 1
+
+        # A second caller while the circuit is open again is rejected
+        # fast with ZERO provider contact.
+        before = transport.calls
+        with pytest.raises(gc.GeminiServiceUnavailableException):
+            adapter.generate_remediation("p", "s")
+        assert transport.calls == before
+
+        # The next cooldown: a healthy one-attempt probe closes it.
+        clock["now"] += 61
+        transport.outcomes = [_http_200_ok()]
+        before = transport.calls
+        adapter.generate_remediation("p", "s")
+        assert transport.calls - before == 1
+        assert adapter.cb_state == "CLOSED"
+        assert adapter.cb_failures == 0
+
+    def test_probe_timeout_and_connection_error_also_single_attempt(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        for exc_cls in (requests.Timeout, requests.ConnectionError):
+            transport = _QueueTransport(
+                [exc_cls("failing")] * 6 + [exc_cls("failing")]
+            )
+            clock = {"now": 9_100_000.0}
+            adapter = _probe_adapter_with_retries(transport, clock)
+            for _ in range(2):
+                with pytest.raises(
+                    (gc.GeminiUpstreamException, gc.GeminiTimeoutException)
+                ):
+                    adapter.generate_remediation("p", "s")
+            clock["now"] += 61
+            before = transport.calls
+            with pytest.raises(
+                gc.GeminiTimeoutException
+                if exc_cls is requests.Timeout
+                else gc.GeminiUpstreamException
+            ):
+                adapter.generate_remediation("p", "s")
+            assert transport.calls - before == 1, (
+                f"a probe that failed with {exc_cls.__name__} must make "
+                "exactly ONE provider attempt"
+            )
+            assert adapter.cb_state == "OPEN"
+
+    def test_closed_circuit_call_keeps_configured_retry_budget(self):
+        # The bounded retry policy for CLOSED-circuit calls is untouched:
+        # transient 503 then 200 => two attempts, success.
+        transport = _QueueTransport([_gemini_http(503, None), _http_200_ok()])
+        clock = {"now": 9_200_000.0}
+        adapter = _probe_adapter_with_retries(transport, clock)
+        assert json.loads(adapter.generate_remediation("p", "s")) == GOOD_ASSETS
+        assert transport.calls == 2
+        assert adapter.cb_state == "CLOSED"
+
+
+def _http_200_ok():
+    return _gemini_http(200, {
+        "candidates": [{
+            "content": {"parts": [{"text": json.dumps(GOOD_ASSETS)}]}
+        }],
+        "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 50},
+    })
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-3 — Finding B: non-finite floats are rejected
+# on EVERY construction path and fail closed before provider contact
+# ---------------------------------------------------------------------------
+
+
+class TestFiniteConfigValidation:
+    @pytest.mark.parametrize("raw", ["nan", "NaN", "NAN", "inf", "Infinity",
+                                     "-inf", "+inf", "inf ", "  inf", "1e999"])
+    @pytest.mark.parametrize("field", [
+        "GEMINI_MONTHLY_BUDGET_USD",
+        "GEMINI_INPUT_COST_PER_MILLION_USD",
+        "GEMINI_OUTPUT_COST_PER_MILLION_USD",
+        "GEMINI_TIMEOUT_SECONDS",
+        "GEMINI_BACKOFF_BASE_SECONDS",
+    ])
+    def test_env_parsing_rejects_non_finite(self, raw, field):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        env = {"GEMINI_API_KEY": "b1-test-key-not-a-real-credential",
+               "APP_ENV": "test", field: raw}
+        with pytest.raises(ValueError, match="finite"):
+            gc.GeminiRuntimeConfig.from_env(env)
+
+    @pytest.mark.parametrize("field,value", [
+        ("monthly_budget_usd", float("nan")),
+        ("monthly_budget_usd", float("inf")),
+        ("monthly_budget_usd", float("-inf")),
+        ("input_cost_per_million", float("nan")),
+        ("input_cost_per_million", float("inf")),
+        ("output_cost_per_million", float("nan")),
+        ("output_cost_per_million", float("inf")),
+        ("timeout_seconds", float("nan")),
+        ("timeout_seconds", float("-inf")),
+        ("backoff_base_seconds", float("nan")),
+        ("backoff_base_seconds", float("inf")),
+    ])
+    def test_direct_constructor_rejects_non_finite(self, field, value):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        with pytest.raises(ValueError, match="finite"):
+            gc.GeminiRuntimeConfig(**{field: value})
+
+    def test_documented_range_semantics(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        # Zero budget is LEGAL: it means "no calls this period" — every
+        # reservation is rejected immediately (fail closed), never
+        # "unlimited".
+        cfg = gc.GeminiRuntimeConfig(monthly_budget_usd=0.0)
+        assert cfg.monthly_budget_usd == 0.0
+        # Zero backoff is legal (deliberately used by tests).
+        assert gc.GeminiRuntimeConfig(backoff_base_seconds=0.0).backoff_base_seconds == 0.0
+        # Zero RATES are NOT legal: they would silently disable cost
+        # accounting while calls still happen.
+        for field in ("input_cost_per_million", "output_cost_per_million"):
+            with pytest.raises(ValueError):
+                gc.GeminiRuntimeConfig(**{field: 0.0})
+        with pytest.raises(ValueError):
+            gc.GeminiRuntimeConfig(timeout_seconds=0.0)
+        for field in ("max_output_tokens", "estimated_prompt_tokens", "max_retries"):
+            with pytest.raises(ValueError):
+                gc.GeminiRuntimeConfig(**{field: 0})
+
+    def test_invalid_config_fails_closed_before_any_provider_contact(self):
+        # The defect: float("inf") budget parsed fine, and
+        # "committed + reserved + amount > inf" is False for finite
+        # amounts — the ceiling silently disabled.  Now construction
+        # itself refuses the value, so no adapter, no transport, no
+        # reservation can ever exist with it.
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        with pytest.raises(ValueError):
+            gc.GeminiRuntimeConfig.from_env({
+                "GEMINI_API_KEY": "b2-test-key-not-a-real-credential",
+                "APP_ENV": "test",
+                "GEMINI_MONTHLY_BUDGET_USD": "inf",
+            })
+        # The finite default config still works end-to-end.
+        cfg = gc.GeminiRuntimeConfig.from_env({
+            "GEMINI_API_KEY": "b3-test-key-not-a-real-credential",
+            "APP_ENV": "test",
+        })
+        assert cfg.monthly_budget_usd == 150.0
+
+    def test_ledger_constructors_reject_non_finite_identically(self):
+        """Local and real-Redis-backed ledgers fail closed the same way —
+        even when built directly (defense in depth below the config)."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="finite"):
+                gc.InProcessBudgetLedger(bad, 1.5, 7.5)
+            with pytest.raises(ValueError, match="finite"):
+                gc.InProcessBudgetLedger(100.0, bad, 7.5)
+            with pytest.raises(ValueError, match="finite"):
+                gc.InProcessBudgetLedger(100.0, 1.5, bad)
+        with pytest.raises(ValueError, match="finite"):
+            gc.RedisBudgetLedger(float("nan"), "redis://localhost:6399/0")
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-3 — Finding C: hard input bounds at the single
+# _generate_text choke point, before reservation and provider contact
+# ---------------------------------------------------------------------------
+
+
+class TestInputBounds:
+    def _bounded_adapter(self, **config_kwargs):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        kwargs = dict(max_retries=3, backoff_base_seconds=0.001)
+        kwargs.update(config_kwargs)
+        cfg = gc.GeminiRuntimeConfig(**kwargs)
+        ledger = gc.InProcessBudgetLedger(
+            cfg.monthly_budget_usd, cfg.input_cost_per_million, cfg.output_cost_per_million
+        )
+        transport = _QueueTransport([])
+        adapter = gc.GeminiCallerAdapter(
+            api_key="c-test-key-not-a-real-credential",
+            config=cfg, budget_ledger=ledger, transport=transport,
+        )
+        return adapter, ledger, transport
+
+    def test_oversized_prompt_rejected_before_reservation_and_transport(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter()
+        oversized = "x" * (gc.MAX_PROMPT_CHARS + 1)
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_remediation(oversized, "system")
+        assert transport.calls == 0, "no provider contact for oversized input"
+        assert ledger.accumulated_spend == 0.0
+        assert ledger._reserved == 0.0, "no reservation may be created"
+
+    def test_oversized_system_instruction_rejected_before_transport(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter()
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_remediation("prompt", "s" * (gc.MAX_SYSTEM_INSTRUCTION_CHARS + 1))
+        assert transport.calls == 0
+        assert ledger._reserved == 0.0
+
+    def test_max_legal_repository_analysis_fields_fit_within_bounds(self):
+        """The authenticated analysis contract's maximum legal fields
+        (name 120 / URL 2048 / framework 200 / technology 200, built by the
+        gateway-validated handler prompt) must fit under the hard bound —
+        the bound protects the budget, not the product."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        prompt = (
+            "Analyze repository:\n"
+            f"- name: {'n' * 120}\n"
+            f"- url: {'u' * 2048}\n"
+            f"- framework: {'f' * 200}\n"
+            f"- technology: {'t' * 200}\n"
+            "Produce the strict five-field JSON payload."
+        )
+        assert len(prompt) < gc.MAX_PROMPT_CHARS
+        adapter, ledger, transport = self._bounded_adapter()
+        transport.outcomes = [_http_200_ok()]
+        assert json.loads(adapter.generate_remediation(prompt, "s")) == GOOD_ASSETS
+        assert transport.calls == 1
+
+    def test_unicode_input_reserved_by_utf8_byte_bound(self):
+        """Adversarial multibyte input: the reservation must use the UTF-8
+        BYTE bound (an upper bound on BPE input tokens), not the char
+        count.  A failing call commits the full reservation, so the
+        committed spend proves which bound was used."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter(
+            estimated_prompt_tokens=1  # the legacy estimate must NOT lower it
+        )
+        prompt = "é" * 3000  # 3000 chars, 6000 UTF-8 bytes
+        transport.outcomes = [_gemini_http(503, None)] * 3
+        with pytest.raises(gc.GeminiUpstreamException):
+            adapter.generate_remediation(prompt, "s")
+        expected_input_tokens = adapter._estimated_input_tokens(prompt, "s")
+        assert expected_input_tokens == (
+            len(prompt.encode("utf-8")) + len("s".encode("utf-8"))
+            + gc._INPUT_FRAMING_OVERHEAD_TOKENS
+        ), "the allowance must be the UTF-8 byte bound + framing"
+        worst = (
+            expected_input_tokens * adapter.config.input_cost_per_million
+            + adapter.config.max_output_tokens * adapter.config.output_cost_per_million
+        ) / 1_000_000
+        assert abs(ledger.accumulated_spend - 3 * worst) < 1e-9, (
+            "the reservation must be the UTF-8 byte bound, not the char "
+            f"count nor the tiny legacy estimate (got {ledger.accumulated_spend})"
+        )
+
+    def test_too_small_legacy_estimate_cannot_lower_the_safe_bound(self):
+        """GEMINI_ESTIMATED_PROMPT_TOKENS is a FLOOR only: setting it to 1
+        must not shrink the per-request allowance below the documented
+        byte bound."""
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, _, _ = self._bounded_adapter(estimated_prompt_tokens=1)
+        est = adapter._estimated_input_tokens("hello", "")
+        assert est >= len("hello".encode("utf-8")) + gc._INPUT_FRAMING_OVERHEAD_TOKENS
+        # And a large configured value still acts as a floor upward.
+        adapter_hi, _, _ = self._bounded_adapter(estimated_prompt_tokens=999_999)
+        assert adapter_hi._estimated_input_tokens("hello", "") == 999_999
+
+    def test_oversized_tech_metadata_rejected_before_transport(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = self._bounded_adapter()
+        metadata = {"big": "y" * (gc.MAX_TECH_METADATA_SERIALIZED_CHARS + 100)}
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_iac_blueprint(metadata)
+        assert transport.calls == 0
+        assert ledger._reserved == 0.0
+
+    def test_non_scalar_tech_metadata_values_rejected(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, _, transport = self._bounded_adapter()
+        for bad_value in (["a", "b"], {"nested": 1}, object()):
+            with pytest.raises(gc.GeminiInputBoundException):
+                adapter.generate_iac_blueprint({"k": bad_value})
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_iac_blueprint({"k": float("nan")})
+        with pytest.raises(gc.GeminiInputBoundException):
+            adapter.generate_iac_blueprint({})
+        assert transport.calls == 0
+
+    def test_legal_scalar_metadata_accepted_and_bounded(self):
+        adapter, _, transport = self._bounded_adapter()
+        transport.outcomes = [_http_200_ok()]
+        result = adapter.generate_iac_blueprint({"python": "3.12", "workers": 4,
+                                                 "ratio": 1.5, "ha": True})
+        assert result == GOOD_ASSETS
+        assert transport.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-3 — Finding D: retry-chain cost reconciliation —
+# committed = sum(known usage) + worst-case allowance per attempt with
+# unknown cost.  Never undercount; capped at the reservation.
+# ---------------------------------------------------------------------------
+
+
+def _reconcile_adapter(outcomes, **config_kwargs):
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+    kwargs = dict(max_retries=3, backoff_base_seconds=0.001)
+    kwargs.update(config_kwargs)
+    cfg = gc.GeminiRuntimeConfig(**kwargs)
+    ledger = gc.InProcessBudgetLedger(
+        cfg.monthly_budget_usd, cfg.input_cost_per_million, cfg.output_cost_per_million
+    )
+    transport = _QueueTransport(outcomes)
+    adapter = gc.GeminiCallerAdapter(
+        api_key="d-test-key-not-a-real-credential",
+        config=cfg, budget_ledger=ledger, transport=transport,
+    )
+    return adapter, ledger, transport
+
+
+def _per_attempt_usd(adapter, input_tokens):
+    return (
+        input_tokens * adapter.config.input_cost_per_million
+        + adapter.config.max_output_tokens * adapter.config.output_cost_per_million
+    ) / 1_000_000
+
+
+def _usage_usd(usage, cfg):
+    prompt = usage.get("promptTokenCount", 0)
+    cached = usage.get("cachedContentTokenCount", 0)
+    cand = usage.get("candidatesTokenCount", 0)
+    thoughts = usage.get("thoughtsTokenCount", 0)
+    return ((prompt + cached) * cfg.input_cost_per_million
+            + (cand + thoughts) * cfg.output_cost_per_million) / 1_000_000
+
+
+def _gemini_http_usage(usage):
+    return _gemini_http(200, {
+        "candidates": [{
+            "content": {"parts": [{"text": json.dumps(GOOD_ASSETS)}]}
+        }],
+        "usageMetadata": usage,
+    })
+
+
+class TestRetryChainCostReconciliation:
+    PROMPT, SYSTEM = "p", "s"
+
+    def _input_tokens(self, adapter):
+        return adapter._estimated_input_tokens(self.PROMPT, self.SYSTEM)
+
+    def test_a_success_with_usage_commits_the_actual_cost(self):
+        adapter, ledger, transport = _reconcile_adapter(
+            [_gemini_http_usage({"promptTokenCount": 100, "candidatesTokenCount": 50})]
+        )
+        assert json.loads(adapter.generate_remediation(self.PROMPT, self.SYSTEM)) == GOOD_ASSETS
+        assert transport.calls == 1
+        expected = _usage_usd({"promptTokenCount": 100, "candidatesTokenCount": 50},
+                              adapter.config)
+        assert abs(ledger.accumulated_spend - expected) < 1e-12
+        assert ledger._reserved == 0.0
+
+    def test_b_timeout_then_success_commits_worst_case_plus_actual(self):
+        adapter, ledger, transport = _reconcile_adapter(
+            [requests.Timeout("slow"),
+             _gemini_http_usage({"promptTokenCount": 100, "candidatesTokenCount": 50})]
+        )
+        adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        assert transport.calls == 2
+        worst = _per_attempt_usd(adapter, self._input_tokens(adapter))
+        known = _usage_usd({"promptTokenCount": 100, "candidatesTokenCount": 50},
+                           adapter.config)
+        # committed = 1x unknown-attempt allowance + actual usage — the
+        # timed-out attempt is NOT free.
+        assert abs(ledger.accumulated_spend - (worst + known)) < 1e-12
+        # And it is within the reservation (3x worst).
+        assert ledger.accumulated_spend <= 3 * worst + 1e-12
+
+    def test_c_503_then_success_commits_worst_case_plus_actual(self):
+        adapter, ledger, transport = _reconcile_adapter(
+            [_gemini_http(503, None),
+             _gemini_http_usage({"promptTokenCount": 200, "candidatesTokenCount": 10})]
+        )
+        adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        assert transport.calls == 2
+        worst = _per_attempt_usd(adapter, self._input_tokens(adapter))
+        known = _usage_usd({"promptTokenCount": 200, "candidatesTokenCount": 10},
+                           adapter.config)
+        assert abs(ledger.accumulated_spend - (worst + known)) < 1e-12
+
+    def test_d_success_with_missing_usage_metadata_counts_worst_case(self):
+        # A 200 whose body has NO usageMetadata at all.
+        no_usage = _gemini_http(200, {
+            "candidates": [{"content": {"parts": [{"text": json.dumps(GOOD_ASSETS)}]}}],
+        })
+        adapter, ledger, transport = _reconcile_adapter([no_usage])
+        adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        worst = _per_attempt_usd(adapter, self._input_tokens(adapter))
+        # Missing metadata => the (single) attempt's cost is unknown =>
+        # the full worst-case allowance is committed.
+        assert abs(ledger.accumulated_spend - worst) < 1e-12
+
+    def test_e_total_failure_commits_the_full_reservation(self):
+        from platform_pkg.agent.infrastructure.llm import gemini_caller as gc
+
+        adapter, ledger, transport = _reconcile_adapter(
+            [_gemini_http(503, None)] * 3
+        )
+        with pytest.raises(gc.GeminiUpstreamException):
+            adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        assert transport.calls == 3
+        worst = _per_attempt_usd(adapter, self._input_tokens(adapter))
+        assert abs(ledger.accumulated_spend - 3 * worst) < 1e-12
+        assert ledger._reserved == 0.0
+
+    def test_f_known_usage_dimensions_aggregated(self):
+        """cachedContentTokenCount and thoughtsTokenCount are billed (at
+        the input / output rates respectively) — reliable usage is
+        aggregated, not ignored."""
+        usage = {"promptTokenCount": 100, "cachedContentTokenCount": 40,
+                 "candidatesTokenCount": 50, "thoughtsTokenCount": 10}
+        adapter, ledger, transport = _reconcile_adapter([_gemini_http_usage(usage)])
+        adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        assert abs(ledger.accumulated_spend - _usage_usd(usage, adapter.config)) < 1e-12
+
+    def test_total_token_only_metadata_billed_at_higher_rate(self):
+        adapter, ledger, _ = _reconcile_adapter(
+            [_gemini_http_usage({"totalTokenCount": 1000})]
+        )
+        adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        higher = max(adapter.config.input_cost_per_million,
+                     adapter.config.output_cost_per_million)
+        assert abs(ledger.accumulated_spend - 1000 * higher / 1_000_000) < 1e-12
+
+    def test_committed_never_exceeds_the_reservation(self):
+        """Invariant: even if the provider reports usage far above the
+        allowance, this reservation commits at most what it reserved."""
+        usage = {"promptTokenCount": 10_000_000, "candidatesTokenCount": 10_000_000}
+        adapter, ledger, _ = _reconcile_adapter([_gemini_http_usage(usage)])
+        adapter.generate_remediation(self.PROMPT, self.SYSTEM)
+        worst = _per_attempt_usd(adapter, self._input_tokens(adapter))
+        expected = min(_usage_usd(usage, adapter.config), 3 * worst)
+        assert abs(ledger.accumulated_spend - expected) < 1e-9
+        assert expected < _usage_usd(usage, adapter.config), (
+            "the oversized usage must actually exercise the reservation cap"
+        )

@@ -55,6 +55,31 @@ M17. Runtime:  remove the canonical agent-service build from the D1
                compose stack (runtime verification must turn red).
 M18. Caller:   revert the model to the deprecated gemini-3.5-flash and
                drop the maxOutputTokens bound from the provider payload.
+
+Phase 8.7-D.1-CORRECTION-3 mutations:
+
+M25. Caller:   the half-open probe inherits the retry budget (the attempt
+               loop re-infers self.max_retries) — a flapping upstream gets
+               a retry storm during circuit recovery.
+M26. Caller:   non-finite floats (NaN/+-inf) are accepted by the config
+               parser, the dataclass validation, and the ledger validation
+               — an "inf" monthly budget silently disables the ceiling.
+M27. Caller:   the hard input bounds are bypassed at the generation choke
+               point (unbounded prompts reach the provider) and the
+               per-request estimate floor is dropped (a tiny operator-set
+               estimate under-reserves multibyte input).
+M29. Caller:   the reservation finalizes with only the FINAL attempt's
+               usage — every preceding timeout/5xx attempt is silently
+               free (retry-chain cost undercount).
+
+M29. Runtime:  dependency drift — the runtime lock re-pins a shared
+               package (starlette) to a different version than the test
+               lock, and/or the Dockerfile drops --require-hashes
+               (the Finding E container/test divergence).
+
+M30. Android:  the JWT-bearing client follows redirects again (a 3xx
+               moves the bearer token), and/or the explicit
+               gateway-origin trust gate is bypassed (Finding F).
 """
 
 from __future__ import annotations
@@ -742,11 +767,17 @@ def test_mutation_m10_missing_secret_fail_open_detected(mutated_repo):
 def _apply_swallow_auth_failure(repo: Path) -> None:
     caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
     src = caller_path.read_text(encoding="utf-8")
-    old = "            if status in _AUTH_STATUS_CODES:\n                self._register_failure()\n                raise GeminiAuthException("
+    # Target re-pointed in Phase 8.7-D.1-CORRECTION-3 (Finding D): the
+    # auth branch now records per-attempt billing evidence
+    # (attempts.append(None)) before registering the failure — the
+    # security property under test (the branch must RAISE, never return a
+    # fabricated success) is unchanged.
+    old = "            if status in _AUTH_STATUS_CODES:\n                attempts.append(None)\n                self._register_failure()\n                raise GeminiAuthException("
     assert old in src, "M11 target not found in gemini_caller"
     src = src.replace(
         old,
         "            if status in _AUTH_STATUS_CODES:\n"
+        "                attempts.append(None)\n"
         "                self._register_failure()\n"
         '                return "SIMULATED GEMINI RESPONSE (provider error swallowed)"  # MUTATION\n'
         "                raise GeminiAuthException(",
@@ -1947,3 +1978,578 @@ def test_mutation_m24_redis_ci_flag_removal_detected(mutated_repo, monkeypatch):
     monkeypatch.setenv("REDIS_INTEGRATION_REQUIRED", "true")
     with pytest.raises(pytest.fail.Exception):
         mod.resolve_live_redis_url()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8.7-D.1-CORRECTION-3 mutations (M25–M28)
+# ---------------------------------------------------------------------------
+
+
+def _intact_gemini_contract_holds() -> None:
+    """The permanent structural guard must hold on the unmutated repo."""
+    from security_guards import gemini_guard
+
+    violations = gemini_guard.check_gemini_contract(REPO_ROOT)
+    assert violations == [], (
+        f"unmutated repo violates the Gemini resilience contract: {violations}"
+    )
+
+
+def _mutated_gemini_contract_broken(mutated_repo: Path, expected_prefix: str) -> None:
+    from security_guards import gemini_guard
+
+    violations = gemini_guard.check_gemini_contract(mutated_repo)
+    assert any(v.startswith(expected_prefix) for v in violations), (
+        f"guard stayed green after the {expected_prefix} mutation "
+        f"(got {violations})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M25 — the half-open probe RETRIES: the attempt loop re-inferences
+#       self.max_retries instead of the explicit allowed_attempts
+# ---------------------------------------------------------------------------
+
+
+def _apply_probe_retry_storm(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    old = "        for attempt in range(1, allowed_attempts + 1):\n"
+    assert old in src, "M25 target (loop range) not found in _generate_text_with_reservation"
+    src = src.replace(
+        old,
+        "        for attempt in range(1, self.max_retries + 1):  # MUTATION: probe inherits the retry budget\n",
+        1,
+    )
+    old_stop = "                if attempt == allowed_attempts:\n"
+    assert src.count(old_stop) == 4, "M25 expected 4 final-attempt checks"
+    src = src.replace(
+        old_stop,
+        "                if attempt == self.max_retries:  # MUTATION\n",
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m25_half_open_probe_retry_storm_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _intact_gemini_contract_holds()
+    _apply_probe_retry_storm(mutated_repo)
+    _mutated_gemini_contract_broken(mutated_repo, "A:")
+
+    # (2) Behavioral: with the weakened control, the single half-open probe
+    #     expands into a full retry storm against a flapping upstream —
+    #     the audit defect (a probe that "tests" the provider three times,
+    #     multiplying blast radius during recovery).
+    top = _register_mutated_tree(mutated_repo, "mut_m25")
+    gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+
+    class _Always503:
+        status_code = 503
+
+        def json(self):
+            raise ValueError("no body")
+
+    transport_calls = {"n": 0}
+
+    def _t503(_payload):
+        transport_calls["n"] += 1
+        return _Always503()
+
+    clock = {"now": 55_000_000.0}
+    adapter = gc.GeminiCallerAdapter(
+        api_key="m25-test-key-not-a-real-credential",
+        config=gc.GeminiRuntimeConfig(max_retries=3, backoff_base_seconds=0.001),
+        transport=_t503,
+        time_fn=lambda: clock["now"],
+    )
+    # Trip the circuit OPEN (6 attempts >= 5 failures).
+    for _ in range(2):
+        try:
+            adapter.generate_remediation("p", "s")
+        except (gc.GeminiUpstreamException, gc.GeminiTimeoutException):
+            pass
+    assert adapter.cb_state == "OPEN"
+
+    # Cooldown elapsed: this call acquires the half-open lease.
+    clock["now"] += 61
+    # The half-open probe: EXACTLY ONE provider attempt is the contract.
+    before = transport_calls["n"]
+    try:
+        adapter.generate_remediation("p", "s")
+    except (gc.GeminiUpstreamException, gc.GeminiTimeoutException):
+        pass
+    assert transport_calls["n"] - before == 3, (
+        "expected the weakened probe to retry inside the half-open lease "
+        f"(made {transport_calls['n'] - before} provider attempts; the intact "
+        "contract makes exactly 1)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M26 — non-finite floats accepted: the math.isfinite rejection is removed
+#       from the config parser, the dataclass validation, and the shared
+#       ledger validation (the one control family, three layers)
+# ---------------------------------------------------------------------------
+
+
+def _apply_non_finite_acceptance(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+
+    old_float = (
+        "            if not math.isfinite(value):\n"
+        '                raise ValueError(f"{name} must be a finite number (got {raw!r}).")\n'
+    )
+    assert old_float in src, "M26 target (from_env _float) not found"
+    src = src.replace(
+        old_float,
+        "            if False:  # MUTATION: non-finite env values accepted\n"
+        '                raise ValueError(f"{name} must be a finite number (got {raw!r}).")\n',
+        1,
+    )
+
+    old_post = (
+        "            if not math.isfinite(v):\n"
+        '                raise ValueError(f"{name} must be a finite number (got {value!r}).")\n'
+    )
+    assert old_post in src, "M26 target (__post_init__) not found"
+    src = src.replace(
+        old_post,
+        "            if False:  # MUTATION: non-finite config values accepted\n"
+        '                raise ValueError(f"{name} must be a finite number (got {value!r}).")\n',
+        1,
+    )
+
+    old_ledger = (
+        "    if not math.isfinite(v) or v < 0:\n"
+        '        raise ValueError(f"{name} must be a finite number >= 0 (got {value!r}).")\n'
+    )
+    assert old_ledger in src, "M26 target (_require_finite_non_negative) not found"
+    src = src.replace(
+        old_ledger,
+        "    if v < 0:  # MUTATION: non-finite ledger parameters accepted\n"
+        '        raise ValueError(f"{name} must be a finite number >= 0 (got {value!r}).")\n',
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m26_non_finite_budget_accepted_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _intact_gemini_contract_holds()
+    _apply_non_finite_acceptance(mutated_repo)
+    _mutated_gemini_contract_broken(mutated_repo, "B:")
+
+    # (2) Behavioral: the INTACT config rejects +inf budget at construction
+    #     (fail closed, before any provider contact).
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as intact_gc
+
+    with pytest.raises(ValueError, match="finite"):
+        intact_gc.GeminiRuntimeConfig.from_env({
+            "GEMINI_API_KEY": "m26-test-key-not-a-real-credential",
+            "APP_ENV": "test",
+            "GEMINI_MONTHLY_BUDGET_USD": "inf",
+        })
+
+    # WEAKENED: the same +inf budget is accepted — and, once it reaches
+    # the (equally weakened) ledger, the ceiling is mathematically
+    # DISABLED: "committed + reserved + amount > inf" is False for every
+    # finite amount, so ANY reservation succeeds (unbounded provider
+    # spend).
+    top = _register_mutated_tree(mutated_repo, "mut_m26")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    cfg = m_gc.GeminiRuntimeConfig.from_env({
+        "GEMINI_API_KEY": "m26-test-key-not-a-real-credential",
+        "APP_ENV": "test",
+        "GEMINI_MONTHLY_BUDGET_USD": "inf",
+    })
+    assert cfg.monthly_budget_usd == float("inf"), (
+        "expected the weakened config to silently accept an infinite budget"
+    )
+    # The original accounting hazard, made concrete: the ceiling test
+    # that every reservation must pass is satisfied by ANY amount.
+    amount = 1_000_000_000.0
+    assert not (0.0 + 0.0 + amount > cfg.monthly_budget_usd), (
+        "the weakened ceiling check must let an arbitrary reservation through"
+    )
+    ledger = m_gc.build_budget_ledger(cfg)
+    reservation = ledger.reserve(amount)
+    assert reservation is not None and reservation.reserved_usd == amount, (
+        "expected the weakened ledger to grant an unbounded reservation"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M27 — input bounds bypassed: the choke-point validation is removed and
+#       the per-request estimate floor is dropped (an operator-set tiny
+#       GEMINI_ESTIMATED_PROMPT_TOKENS lowers the reservation bound)
+# ---------------------------------------------------------------------------
+
+
+def _apply_input_bound_bypass(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+
+    old_check = (
+        "        self._validate_input_bounds(prompt, system_instruction)\n"
+    )
+    assert old_check in src, "M27 target (bound check) not found"
+    src = src.replace(
+        old_check,
+        "        pass  # MUTATION: input bounds bypassed\n",
+        1,
+    )
+
+    old_floor = (
+        "        return max(byte_bound, int(self.config.estimated_prompt_tokens))\n"
+    )
+    assert old_floor in src, "M27 target (estimate floor) not found"
+    src = src.replace(
+        old_floor,
+        "        return int(self.config.estimated_prompt_tokens)  # MUTATION: tiny estimate lowers the bound\n",
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m27_input_bound_bypass_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _intact_gemini_contract_holds()
+    _apply_input_bound_bypass(mutated_repo)
+    _mutated_gemini_contract_broken(mutated_repo, "C:")
+
+    # (2) Behavioral part 1 — oversized input REACHED: the INTACT caller
+    #     rejects a >16k-char prompt before reservation/transport; the
+    #     WEAKENED caller accepts it and contacts the provider.
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as intact_gc
+
+    oversized = "x" * (intact_gc.MAX_PROMPT_CHARS + 1)
+    intact_transport = {"n": 0}
+
+    def _intact_t(_p):
+        intact_transport["n"] += 1
+        raise AssertionError("intact caller must not reach the provider")
+
+    intact = intact_gc.GeminiCallerAdapter(
+        api_key="m27-test-key-not-a-real-credential",
+        config=intact_gc.GeminiRuntimeConfig(),
+        transport=_intact_t,
+    )
+    with pytest.raises(intact_gc.GeminiInputBoundException):
+        intact.generate_remediation(oversized, "s")
+    assert intact_transport["n"] == 0
+
+    top = _register_mutated_tree(mutated_repo, "mut_m27")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+
+    class _Ok200:
+        status_code = 200
+
+        def json(self):
+            return {
+                "candidates": [{"content": {"parts": [{"text": "provider-text"}]}}],
+                "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+            }
+
+    weak_transport = {"n": 0}
+
+    def _weak_t(_p):
+        weak_transport["n"] += 1
+        return _Ok200()
+
+    weak = m_gc.GeminiCallerAdapter(
+        api_key="m27-test-key-not-a-real-credential",
+        config=m_gc.GeminiRuntimeConfig(),
+        transport=_weak_t,
+    )
+    weak.generate_remediation(oversized, "s")  # no exception: the defect
+    assert weak_transport["n"] == 1, (
+        "expected the weakened caller to forward the unbounded prompt to "
+        "the provider"
+    )
+
+    # (3) Behavioral part 2 — under-reservation: with the floor dropped, a
+    #     tiny operator-set GEMINI_ESTIMATED_PROMPT_TOKENS (1) shrinks the
+    #     worst-case reservation for a multibyte prompt far below the
+    #     documented byte bound, so concurrent callers can commit past
+    #     the ceiling the bound was supposed to guarantee.
+    prompt = "é" * 3000  # 6000 UTF-8 bytes
+    weak2 = m_gc.GeminiCallerAdapter(
+        api_key="m27b-test-key-not-a-real-credential",
+        config=m_gc.GeminiRuntimeConfig(
+            estimated_prompt_tokens=1,
+            max_retries=3,
+            backoff_base_seconds=0.001,
+            monthly_budget_usd=1e9,
+            # Input-dominated rates so the INPUT allowance (the mutated
+            # term) dominates the per-attempt worst case.
+            output_cost_per_million=0.0001,
+        ),
+        transport=lambda _p: _gemini_http_weak503(),
+    )
+    try:
+        weak2.generate_remediation(prompt, "s")
+    except Exception:
+        pass
+    weak_committed = weak2.budget_service.accumulated_spend
+
+    weak_intact = intact_gc.GeminiCallerAdapter(
+        api_key="m27c-test-key-not-a-real-credential",
+        config=intact_gc.GeminiRuntimeConfig(
+            estimated_prompt_tokens=1,
+            max_retries=3,
+            backoff_base_seconds=0.001,
+            monthly_budget_usd=1e9,
+            output_cost_per_million=0.0001,
+        ),
+        transport=lambda _p: _gemini_http_weak503(),
+    )
+    try:
+        weak_intact.generate_remediation(prompt, "s")
+    except Exception:
+        pass
+    intact_committed = weak_intact.budget_service.accumulated_spend
+
+    assert weak_committed < intact_committed / 10, (
+        "expected the weakened reservation to be an order of magnitude "
+        f"smaller than the byte-bound reservation "
+        f"(weak {weak_committed} vs intact {intact_committed})"
+    )
+
+
+def _gemini_http_weak503():
+    import requests
+
+    class _Resp503:
+        status_code = 503
+
+        def json(self):
+            raise ValueError("no body")
+
+    return _Resp503()
+
+
+# ---------------------------------------------------------------------------
+# M28 — retry-chain cost undercount: the reservation finalizes with ONLY
+#       the final attempt's usage (timeouts/5xx preceding the success are
+#       silently free)
+# ---------------------------------------------------------------------------
+
+
+def _apply_retry_chain_undercount(repo: Path) -> None:
+    caller_path = repo / "devops-ai-platform/agent-service/infrastructure/llm/gemini_caller.py"
+    src = caller_path.read_text(encoding="utf-8")
+    old = (
+        "            attempt_cost = self._cost_from_usage(data, self.config)\n"
+        "            attempts.append(attempt_cost)\n"
+        "            known_cost = sum(c for c in attempts if c is not None)\n"
+        "            unknown_attempts = sum(1 for c in attempts if c is None)\n"
+        "            total_cost = known_cost + unknown_attempts * self._per_attempt_cost_usd(input_tokens)\n"
+        "            total_cost = min(total_cost, reservation.reserved_usd)\n"
+        "            self.budget_service.finalize(reservation, total_cost)\n"
+    )
+    assert old in src, "M28 target (retry-chain finalization) not found"
+    src = src.replace(
+        old,
+        "            self.budget_service.finalize(\n"
+        "                reservation, self._cost_from_usage(data, self.config)\n"
+        "            )  # MUTATION: only the final attempt's usage is counted\n",
+        1,
+    )
+    caller_path.write_text(src, encoding="utf-8")
+
+
+def test_mutation_m28_retry_chain_undercount_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    _intact_gemini_contract_holds()
+    _apply_retry_chain_undercount(mutated_repo)
+    _mutated_gemini_contract_broken(mutated_repo, "D:")
+
+    # (2) Behavioral: a timeout followed by a success.  The INTACT caller
+    #     commits worst-case allowance (unknown attempt) + actual usage;
+    #     the WEAKENED caller commits only the final attempt's usage —
+    #     the timed-out attempt is silently free (under-billed budget,
+    #     ceiling reachable by concurrent callers).
+    import requests as rq
+
+    from platform_pkg.agent.infrastructure.llm import gemini_caller as intact_gc
+
+    def _ok_with_usage():
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {
+                    "candidates": [{"content": {"parts": [{"text": "provider-text"}]}}],
+                    "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 50},
+                }
+
+        return _Resp()
+
+    def _build(module, top=None):
+        seq = [rq.Timeout("slow"), _ok_with_usage()]
+        ledger = module.InProcessBudgetLedger(
+            100.0, 1.5, 7.5
+        )
+        adapter = module.GeminiCallerAdapter(
+            api_key="m28-test-key-not-a-real-credential",
+            config=module.GeminiRuntimeConfig(
+                max_retries=3, backoff_base_seconds=0.001
+            ),
+            budget_ledger=ledger,
+            transport=_make_transport(seq),
+        )
+        return adapter, ledger
+
+
+def _make_transport(seq):
+    def t(_payload):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    return t
+
+    intact, intact_ledger = _build(intact_gc)
+    intact.generate_remediation("p", "s")
+
+    top = _register_mutated_tree(mutated_repo, "mut_m28")
+    m_gc = importlib.import_module(f"{top}.agent.infrastructure.llm.gemini_caller")
+    weak, weak_ledger = _build(m_gc)
+    weak.generate_remediation("p", "s")
+
+    worst = intact._per_attempt_cost_usd(intact._estimated_input_tokens("p", "s"))
+    known = intact._cost_from_usage(
+        {"usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 50}},
+        intact.config,
+    )
+    assert abs(intact_ledger.accumulated_spend - (worst + known)) < 1e-12
+    assert abs(weak_ledger.accumulated_spend - known) < 1e-12, (
+        "expected the weakened finalization to count only the final "
+        "attempt's usage"
+    )
+    assert weak_ledger.accumulated_spend < intact_ledger.accumulated_spend, (
+        "the weakened accounting must undercount the retry chain "
+        "(the timed-out attempt must not be free in the intact code)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M29 — dependency drift: the runtime lock is re-pinned to a DIFFERENT
+#       starlette generation than the test lock (container/test divergence,
+#       the Finding E defect) — and the Dockerfile drops --require-hashes
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_m29_dependency_drift_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    from security_guards import dependency_guard
+
+    assert dependency_guard.check_dependency_contract(REPO_ROOT) == [], (
+        "unmutated repo violates the dependency parity contract"
+    )
+
+    # (2) Mutation A — version drift: the runtime lock silently moves to a
+    #     different starlette generation than the test lock (the exact
+    #     class of defect the audit found: 0.52.1 in CI vs 1.7.0 in the
+    #     container).
+    runtime_lock = mutated_repo / "devops-ai-platform/requirements-runtime.txt"
+    src = runtime_lock.read_text(encoding="utf-8")
+    old = "starlette==0.52.1 \\"
+    assert old in src, "M29 target (runtime lock starlette pin) not found"
+    src = src.replace(old, "starlette==1.7.0 \\", 1)
+    runtime_lock.write_text(src, encoding="utf-8")
+
+    violations = dependency_guard.check_dependency_contract(mutated_repo)
+    assert any("starlette" in v and "drift" in v for v in violations), (
+        f"guard stayed green after the runtime/test starlette drift "
+        f"(got {violations})"
+    )
+
+    # The INTACT locks agree on the shared set (the property under test):
+    runtime_v = dependency_guard._parse_lock(REPO_ROOT / "devops-ai-platform/requirements-runtime.txt")
+    test_v = dependency_guard._parse_lock(REPO_ROOT / "devops-ai-platform/requirements-test.txt")
+    assert runtime_v["starlette"] == test_v["starlette"] == "0.52.1"
+
+    # (3) Mutation B — the Dockerfile installs WITHOUT --require-hashes
+    #     (unpinned fallback: any build-time resolution drift goes
+    #     undetected).
+    df = mutated_repo / "devops-ai-platform/agent-service/Dockerfile"
+    dsrc = df.read_text(encoding="utf-8")
+    old_df = "RUN pip install --no-cache-dir --require-hashes -r /app/requirements-runtime.txt"
+    assert old_df in dsrc, "M29 target (Dockerfile hash-verified install) not found"
+    dsrc = dsrc.replace(
+        old_df,
+        "RUN pip install --no-cache-dir -r /app/requirements-runtime.txt",
+        1,
+    )
+    df.write_text(dsrc, encoding="utf-8")
+
+    violations_b = dependency_guard.check_dependency_contract(mutated_repo)
+    assert any("--require-hashes" in v and "Dockerfile" in v for v in violations_b), (
+        f"guard stayed green after --require-hashes was dropped from the "
+        f"Dockerfile (got {violations_b})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# M30 — Android: the JWT-bearing client follows redirects again / the
+#       explicit origin trust gate is bypassed (Finding F)
+# ---------------------------------------------------------------------------
+
+
+def test_mutation_m30_android_redirect_trust_detected(mutated_repo):
+    # (1) Structural guard holds on the unmutated repo.
+    from security_guards import android_guard
+
+    assert android_guard.check_android(REPO_ROOT) == [], (
+        "unmutated repo violates the Android secret/transport contract"
+    )
+
+    client_rel = "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+
+    # (2) Mutation A — the dedicated authenticated client re-enables
+    #     redirect following (the Finding F defect: a 3xx moves the bearer
+    #     token to another host/scheme/port/endpoint).
+    client = mutated_repo / client_rel
+    src = client.read_text(encoding="utf-8")
+    old = (
+        "        .followRedirects(false)\n"
+        "        .followSslRedirects(false)\n"
+        "        .build()\n"
+    )
+    assert old in src, "M30 target (authenticated client builder) not found"
+    src = src.replace(
+        old,
+        "        .build()  // MUTATION: redirect following restored on the JWT-bearing client\n",
+        1,
+    )
+    client.write_text(src, encoding="utf-8")
+
+    violations = android_guard.check_redirect_trust_policy(mutated_repo)
+    assert any("followRedirects(false)" in v for v in violations), (
+        f"guard stayed green after redirect following was restored on the "
+        f"authenticated client (got {violations})"
+    )
+    violations2 = android_guard.check_redirect_trust_policy(mutated_repo)
+    assert any("followSslRedirects" in v for v in violations2), (
+        "the followSslRedirects(false) removal must also be detected"
+    )
+
+    # (3) Mutation B — the explicit trust gate is bypassed: an untrusted
+    #     origin no longer blocks the bearer request.
+    src = client.read_text(encoding="utf-8")
+    old_gate = "        if (!TrustedGatewayOrigin.isApproved(origin)) {\n"
+    assert old_gate in src, "M30 target (trust gate) not found"
+    src = src.replace(
+        old_gate,
+        "        if (false) {  // MUTATION: trust gate bypassed\n",
+        1,
+    )
+    client.write_text(src, encoding="utf-8")
+
+    violations3 = android_guard.check_redirect_trust_policy(mutated_repo)
+    assert any("trust gate" in v for v in violations3), (
+        f"guard stayed green after the trust gate was bypassed (got {violations3})"
+    )

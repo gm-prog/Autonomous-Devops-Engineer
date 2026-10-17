@@ -97,18 +97,33 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
     var gatewayJwtToken by mutableStateOf("")
         private set
 
+    // Phase 8.7-D.1-CORRECTION-3 (Finding F): explicit gateway-origin
+    // trust. The platform JWT is only ever sent to a gateway origin the
+    // operator explicitly confirmed in Settings. The approval is bound to
+    // the normalized (scheme, host, port): any URL change that alters the
+    // origin invalidates it automatically. Memory-only, like the JWT — a
+    // fresh process starts untrusted.
+    var isGatewayOriginTrusted by mutableStateOf(false)
+        private set
+
+    /** The normalized origin of the configured gateway URL, or null. */
+    val gatewayOrigin: com.example.data.BackendGatewayClient.GatewayOrigin?
+        get() = com.example.data.BackendGatewayClient.parseGatewayOrigin(apiUrlGateway)
+
     // Last analysis source, surfaced honestly in the header badge:
     // OFFLINE_SIM (default) | LIVE_BACKEND (server analysis succeeded) |
     // LIVE_FAILED (server attempt failed — never presented as a success) |
     // OFFLINE_FAILED (on-device engine failed — never labeled as a live failure).
     var analysisSource by mutableStateOf("OFFLINE_SIM")
 
-    /** Live analysis is enabled only when the backend is configured AND
-     *  verified reachable (explicit operator choice + working probe). */
+    /** Live analysis is enabled only when the backend is configured, the
+     *  exact origin is explicitly trusted, AND verified reachable
+     *  (explicit operator choices + working probe). */
     val isLiveAnalysisEnabled: Boolean
         get() = isRemoteGatewayEnabled &&
             apiUrlGateway.isNotBlank() &&
             gatewayJwtToken.isNotBlank() &&
+            isGatewayOriginTrusted &&
             connectionStatus == "ONLINE"
 
     fun setRemoteGateway(enabled: Boolean) {
@@ -121,6 +136,27 @@ class DevOpsViewModel(application: Application) : AndroidViewModel(application) 
         apiUrlGateway = newUrl
         prefs.edit().putString("api_url_gateway", newUrl).apply()
         connectionStatus = "UNCHECKED"
+        // Finding F: an origin change (or an unparseable URL) invalidates
+        // any previous trust approval — the approval is bound to the
+        // normalized (scheme, host, port), never to the URL string.
+        val origin = com.example.data.BackendGatewayClient.parseGatewayOrigin(newUrl)
+        isGatewayOriginTrusted = origin != null &&
+            com.example.data.BackendGatewayClient.TrustedGatewayOrigin.isApproved(origin)
+    }
+
+    /** Explicit operator confirmation of the gateway origin (Finding F).
+     *  No-op unless the configured URL is policy-parseable; the approval
+     *  is memory-only and bound to the normalized origin. */
+    fun confirmGatewayOrigin() {
+        val origin = gatewayOrigin ?: return
+        com.example.data.BackendGatewayClient.TrustedGatewayOrigin.approve(origin)
+        isGatewayOriginTrusted = true
+    }
+
+    /** Explicit revocation of the gateway-origin trust (Finding F). */
+    fun revokeGatewayOrigin() {
+        com.example.data.BackendGatewayClient.TrustedGatewayOrigin.clear()
+        isGatewayOriginTrusted = false
     }
 
     fun updateGatewayJwtToken(newToken: String) {

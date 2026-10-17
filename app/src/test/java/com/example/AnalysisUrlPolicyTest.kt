@@ -88,9 +88,23 @@ class AnalysisUrlPolicyTest {
    * The failure reason is a stable message; only a safe technical
    * identifier (the exception class simple name) is logged, never returned.
    */
+  /**
+   * Phase 8.7-D.1-CORRECTION (#9): a transport exception must NOT leak raw
+   * network/exception detail (URL, host, socket, DNS, connection string)
+   * into the user-facing [BackendGatewayClient.AnalysisOutcome.Failure].
+   * The failure reason is a stable message; only a safe technical
+   * identifier (the exception class simple name) is logged, never returned.
+   *
+   * CORRECTION-3: the authenticated call now runs on the dedicated
+   * `authenticatedHttpClient` seam, and the origin must be explicitly
+   * trusted first (Finding F) — both are honored here.
+   */
   @Test
   fun transport_exception_detail_never_reaches_the_failure_reason() = runBlocking {
-    val previous = BackendGatewayClient.httpClient
+    val previous = BackendGatewayClient.authenticatedHttpClient
+    val origin =
+      BackendGatewayClient.parseGatewayOrigin("https://gw.internal.corp:8443")!!
+    BackendGatewayClient.TrustedGatewayOrigin.approve(origin)
     // A hostile transport whose exception message is FULL of the kind of
     // detail the audit forbids from reaching the UI layer.
     val sensitive =
@@ -99,9 +113,11 @@ class AnalysisUrlPolicyTest {
           "dns: gw.internal.corp -> 10.20.30.40)"
     val hostile =
       OkHttpClient.Builder()
+        .followRedirects(false)
+        .followSslRedirects(false)
         .addInterceptor { chain -> throw java.io.IOException(sensitive) }
         .build()
-    BackendGatewayClient.httpClient = hostile
+    BackendGatewayClient.authenticatedHttpClient = hostile
     try {
       val outcome =
         BackendGatewayClient.requestRepositoryAnalysis(
@@ -124,7 +140,8 @@ class AnalysisUrlPolicyTest {
         )
       }
     } finally {
-      BackendGatewayClient.httpClient = previous
+      BackendGatewayClient.authenticatedHttpClient = previous
+      BackendGatewayClient.TrustedGatewayOrigin.clear()
     }
   }
 }

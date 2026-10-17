@@ -36,7 +36,7 @@ jobs:
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install security test dependencies
-        run: pip install -r requirements-test.txt
+        run: pip install --require-hashes -r requirements-test.txt
 
       - name: JWT fail-closed contract (Defect C)
         run: python -m pytest tests/test_jwt_secret_policy.py -v
@@ -190,7 +190,7 @@ jobs:
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install security test dependencies
-        run: pip install -r requirements-test.txt
+        run: pip install --require-hashes -r requirements-test.txt
 
       - name: Android secret guards over the actual repository source (Defect B)
         run: python -m pytest tests/test_android_secret_guards.py -v
@@ -214,7 +214,7 @@ jobs:
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install security test dependencies
-        run: pip install -r requirements-test.txt
+        run: pip install --require-hashes -r requirements-test.txt
 
       - name: All structural guards over the actual repository source
         # Exits non-zero on any violation: a failed security invariant fails CI.
@@ -233,7 +233,7 @@ jobs:
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install test dependencies (authoritative contract incl. redis client)
-        run: pip install -r devops-ai-platform/requirements-test.txt
+        run: pip install --require-hashes -r devops-ai-platform/requirements-test.txt
       - name: Start a real Redis (digest-pinned)
         run: |
           set -euo pipefail
@@ -294,7 +294,7 @@ jobs:
           cache: pip
           cache-dependency-path: devops-ai-platform/requirements-test.txt
       - name: Install test dependencies (authoritative contract incl. pyyaml)
-        run: pip install -r devops-ai-platform/requirements-test.txt
+        run: pip install --require-hashes -r devops-ai-platform/requirements-test.txt
 
       - name: Canonical compose config (structure + required variables)
         working-directory: devops-ai-platform

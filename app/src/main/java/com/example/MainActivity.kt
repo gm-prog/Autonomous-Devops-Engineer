@@ -1947,6 +1947,76 @@ fun ConnectivitySettingsDialog(
                         modifier = Modifier.fillMaxWidth()
                     )
 
+                    // Phase 8.7-D.1-CORRECTION-3 (Finding F): explicit
+                    // gateway-origin trust. The access token is only ever
+                    // sent to the exact origin the operator confirmed
+                    // (scheme, host, port). Changing the URL's host, port,
+                    // or scheme invalidates the confirmation automatically.
+                    val trustedOrigin = viewModel.gatewayOrigin
+                    if (viewModel.isGatewayOriginTrusted && trustedOrigin != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = "Origin trusted: ${trustedOrigin.canonical}",
+                                color = ColorNeonGreen,
+                                fontSize = 10.sp,
+                                fontFamily = FontFamily.Monospace,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = "Revoke",
+                                color = ColorMutedGray,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier
+                                    .clickable { viewModel.revokeGatewayOrigin() }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(Color.White.copy(alpha = 0.03f), RoundedCornerShape(8.dp))
+                                .padding(10.dp)
+                        ) {
+                            Text(
+                                "Gateway origin confirmation required",
+                                color = ColorNeonBlue,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                if (trustedOrigin != null)
+                                    "The access token will only be sent to ${trustedOrigin.canonical}. " +
+                                        "Confirming is an explicit endpoint choice — it is not " +
+                                        "cryptographic identity: TLS certificate validation still " +
+                                        "governs the connection. Changing the URL's scheme, host, " +
+                                        "or port invalidates this confirmation."
+                                else
+                                    "The configured gateway URL could not be parsed. Configure " +
+                                        "scheme://host[:port] (optional base path; no user info, " +
+                                        "query, or fragment) to confirm the origin.",
+                                color = ColorMutedGray,
+                                fontSize = 10.sp
+                            )
+                            Button(
+                                onClick = { viewModel.confirmGatewayOrigin() },
+                                enabled = trustedOrigin != null,
+                                colors = ButtonDefaults.buttonColors(containerColor = ColorNeonBlue.copy(alpha = 0.15f)),
+                                border = BorderStroke(1.dp, ColorNeonBlue.copy(alpha = 0.6f)),
+                                shape = RoundedCornerShape(6.dp),
+                                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                            ) {
+                                Text("Confirm & trust this gateway origin", color = ColorNeonBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
                     // Connection Testing Dashboard
                     Row(
                         modifier = Modifier.fillMaxWidth(),

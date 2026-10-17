@@ -320,6 +320,105 @@ def check_analysis_transport_policy(repo_root: Path) -> List[str]:
     return violations
 
 
+def check_redirect_trust_policy(repo_root: Path) -> List[str]:
+    """F (Phase 8.7-D.1-CORRECTION-3): the JWT-bearing gateway client must
+    never follow redirects, must canonicalize the gateway URL before token
+    handling, and must gate the authenticated call on an explicit,
+    in-memory operator trust confirmation bound to the normalized origin."""
+    violations: List[str] = []
+    client_path = repo_root / "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+    rel = "app/src/main/java/com/example/data/BackendGatewayClient.kt"
+    if not client_path.is_file():
+        violations.append(
+            "android guard: BackendGatewayClient.kt not found — the "
+            "redirect/trust policy cannot be verified"
+        )
+        return violations
+    code = _strip_kotlin_comments(client_path.read_text(encoding="utf-8"))
+
+    # 1) The dedicated authenticated client disables BOTH redirect
+    #    followings (a 3xx must be a safe explicit failure, never a token
+    #    transfer to another host/scheme/port/endpoint).
+    if ".followRedirects(false)" not in code:
+        violations.append(
+            f"{rel}: the authenticated client must set "
+            ".followRedirects(false) — OkHttp's default would follow a 3xx "
+            "and move the bearer token"
+        )
+    if ".followSslRedirects(false)" not in code:
+        violations.append(
+            f"{rel}: the authenticated client must set "
+            ".followSslRedirects(false) — even http->https 'safe' redirects "
+            "must not carry the token"
+        )
+    if ".followRedirects(true)" in code or ".followSslRedirects(true)" in code:
+        violations.append(
+            f"{rel}: an explicit followRedirects(true)/followSslRedirects(true) "
+            "reappeared — the JWT must never be moved by a redirect"
+        )
+    # 2) The 3xx must be answered as a safe explicit failure, and the
+    #    Location header must never be read/logged/surfaced.
+    if "response.code in 300..399" not in code:
+        violations.append(
+            f"{rel}: the 3xx redirect branch is missing — redirects on the "
+            "authenticated path must be a safe explicit failure"
+        )
+    if 'header("Location")' in code or '.header("Location"' in code.replace("addHeader", ""):
+        violations.append(
+            f"{rel}: the Location header must never be read, logged, or "
+            "surfaced on the authenticated path"
+        )
+    # 3) The authenticated call must go through the dedicated client (the
+    #    credential-free diagnostics client must never carry the token).
+    analysis_fn = code[code.find("fun requestRepositoryAnalysis"):]
+    if "authenticatedHttpClient.newCall" not in analysis_fn:
+        violations.append(
+            f"{rel}: the authenticated analysis call must use the dedicated "
+            "authenticatedHttpClient (redirects never followed), not the "
+            "diagnostics client"
+        )
+    # 4) The explicit trust gate: the exact normalized origin must be
+    #    approved before any bearer request is constructed.
+    if "TrustedGatewayOrigin.isApproved" not in analysis_fn:
+        violations.append(
+            f"{rel}: the trust gate is missing — the exact gateway origin "
+            "must be explicitly confirmed before the JWT is attached"
+        )
+    # 5) URL canonicalization: userinfo / query / fragment rejected.
+    validate_fn = code[code.find("fun validateAnalysisUrl"):]
+    for marker in ("url.username", "encodedQuery", "encodedFragment"):
+        if marker not in validate_fn:
+            violations.append(
+                f"{rel}: the URL policy must reject {marker!r} — the "
+                "analysis destination must be exactly "
+                "scheme://host[:port][/base-path]"
+            )
+
+    # 6) ViewModel wiring: live analysis requires the origin trust, and the
+    #    trust is memory-only (never persisted in SharedPreferences).
+    vm_path = repo_root / "app/src/main/java/com/example/ui/DevOpsViewModel.kt"
+    if vm_path.is_file():
+        vm = _strip_kotlin_comments(vm_path.read_text(encoding="utf-8"))
+        enabled = vm[vm.find("val isLiveAnalysisEnabled"):]
+        if "isGatewayOriginTrusted" not in enabled:
+            violations.append(
+                "android guard: isLiveAnalysisEnabled must require the "
+                "explicit gateway-origin trust (isGatewayOriginTrusted)"
+            )
+        if "confirmGatewayOrigin" not in vm:
+            violations.append(
+                "android guard: the explicit origin confirmation control "
+                "(confirmGatewayOrigin) is missing from the ViewModel"
+            )
+        for jwt_pref_key in ('"gateway_jwt_token"', '"gatewayJwtToken"', '"gateway_jwt"'):
+            if f"putString({jwt_pref_key}" in vm:
+                violations.append(
+                    "android guard: the gateway JWT must never be persisted "
+                    f"in SharedPreferences (found putString({jwt_pref_key}...)"
+                )
+    return violations
+
+
 def check_android(repo_root: Union[str, Path]) -> List[str]:
     """Run the Android secret guard over the actual repository."""
     repo_root = Path(repo_root)
@@ -331,6 +430,10 @@ def check_android(repo_root: Union[str, Path]) -> List[str]:
 
     # A8 — authenticated analysis transport is HTTPS-only (Phase 8.7-D.1).
     violations.extend(check_analysis_transport_policy(repo_root))
+
+    # F — no redirect-following, no unconfirmed-origin token transfer
+    #    (Phase 8.7-D.1-CORRECTION-3).
+    violations.extend(check_redirect_trust_policy(repo_root))
 
     # A1/A2/A3/A6 — production Kotlin sources.
     for py in _iter_app_kotlin_files(app_dir):

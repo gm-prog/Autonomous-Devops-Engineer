@@ -33,10 +33,23 @@ import java.util.concurrent.TimeUnit
  *    the JWT, enforces role authorization, and calls Gemini with its own
  *    SERVER-SIDE GEMINI_API_KEY.
  *
- * TRANSPORT POLICY (Phase 8.7-D.1): the JWT is only ever sent to HTTPS
- * destinations; cleartext HTTP is permitted exclusively for the local
- * emulator endpoint and only in debug builds. Unsafe URLs are rejected
- * before the request is constructed (see [validateAnalysisUrl]).
+ * TRANSPORT POLICY (Phase 8.7-D.1, hardened in 8.7-D.1-CORRECTION-3):
+ * the JWT is only ever sent to HTTPS destinations; cleartext HTTP is
+ * permitted exclusively for the local emulator endpoint and only in debug
+ * builds. Unsafe URLs are rejected before the request is constructed (see
+ * [validateAnalysisUrl]).
+ *
+ * REDIRECT + TRUST POLICY (Phase 8.7-D.1-CORRECTION-3, Finding F): the
+ * JWT-bearing call runs on a dedicated client with followRedirects(false)
+ * and followSslRedirects(false) — a 3xx is a safe explicit failure and a
+ * redirect can NEVER move the token to another host/scheme/port/endpoint.
+ * The gateway URL is canonicalized before any token handling (no userinfo,
+ * query, or fragment). The exact origin used is bound to an explicit,
+ * in-memory operator trust confirmation ([TrustedGatewayOrigin]),
+ * invalidated whenever any part of the (scheme, host, port) changes and
+ * never persisted. The confirmation is endpoint-choice protection, NOT
+ * cryptographic server identity — TLS certificate validation still
+ * governs the connection.
  *
  * HONEST FAILURE: every non-success outcome is surfaced as a typed
  * [AnalysisFailure] with a truthful reason. This client NEVER fabricates an
@@ -52,13 +65,38 @@ object BackendGatewayClient {
         .build()
 
     /**
-     * The HTTP client used for gateway calls. Production code always uses
-     * the default instance; the setter is a documented TEST seam
-     * (@VisibleForTesting) so the transport-failure contract (stable,
-     * detail-free failure messages) can be verified offline.
+     * The DIAGNOSTICS client — credential-free only ([testConnection]).
+     * Production code always uses the default instance; the setter is a
+     * documented TEST seam (@VisibleForTesting) so the transport-failure
+     * contract (stable, detail-free failure messages) can be verified
+     * offline.
      */
     @androidx.annotation.VisibleForTesting
     var httpClient: OkHttpClient = defaultClient
+
+    // Phase 8.7-D.1-CORRECTION-3 (Finding F): the JWT-BEARING client is a
+    // SEPARATE, dedicated OkHttp instance whose redirect policy is
+    // explicitly off — including the "safe" http->https SSL redirects.
+    // OkHttp's default is followRedirects(true), which would let a
+    // misconfigured or hostile gateway move the bearer token to another
+    // host/scheme/port/endpoint via a 3xx.  With the policy off, a 3xx is
+    // answered as a safe explicit failure (see requestRepositoryAnalysis);
+    // the Location header is never followed, logged, or surfaced.
+    private val defaultAuthenticatedClient = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
+    /**
+     * The HTTP client used EXCLUSIVELY for the authenticated analysis call
+     * ([requestRepositoryAnalysis]) — never for diagnostics.  Documented
+     * TEST seam (@VisibleForTesting) for the redirect/trust contract.
+     */
+    @androidx.annotation.VisibleForTesting
+    var authenticatedHttpClient: OkHttpClient = defaultAuthenticatedClient
 
     /**
      * Analysis URL policy (Phase 8.7-D.1).
@@ -101,6 +139,21 @@ object BackendGatewayClient {
             Log.w(TAG, "Gateway URL parse failure: ${e.javaClass.simpleName}")
             return "Gateway URL is malformed."
         }
+        // Phase 8.7-D.1-CORRECTION-3 (Finding F): canonicalize the gateway
+        // URL BEFORE any token handling.  The analysis destination is
+        // exactly scheme://host[:port][/base-path] + the fixed analysis
+        // route — userinfo (user:pass@host), a query string, and a fragment
+        // are all rejected: they make the "exact URL used" ambiguous and
+        // can smuggle credentials or alter the destination the operator
+        // approved.  Legitimate base paths are preserved.
+        if (url.username.isNotEmpty() || url.encodedPassword().isNotEmpty()) {
+            return "Gateway URLs must not contain user info (user:pass@host) — " +
+                "configure scheme://host[:port] with an optional base path only."
+        }
+        if (url.encodedQuery != null || url.encodedFragment != null) {
+            return "Gateway URLs must not contain a query string or fragment — " +
+                "configure scheme://host[:port] with an optional base path only."
+        }
         return when (url.scheme) {
             "https" -> null
             "http" -> when {
@@ -117,6 +170,75 @@ object BackendGatewayClient {
                 "Only HTTPS is permitted for authenticated analysis (the local " +
                     "emulator endpoint is allowed over HTTP in debug builds only)."
         }
+    }
+
+    /**
+     * The normalized gateway origin: exactly (scheme, host, port) — the
+     * unit an explicit operator trust confirmation is bound to (Finding F).
+     *
+     * The host is lower-cased and the port is OkHttp's EFFECTIVE port
+     * (443 for https, 80 for http when omitted), so
+     * `https://GW.example.com:443/base/` and `https://gw.example.com`
+     * normalize to the SAME origin.  Any change to any part of the
+     * (scheme, host, port) triple is a different origin.
+     */
+    data class GatewayOrigin(val scheme: String, val host: String, val port: Int) {
+        val canonical: String get() = "$scheme://${host.lowercase()}:$port"
+    }
+
+    /**
+     * Parses the normalized origin of a gateway URL, or null when the URL
+     * cannot be parsed.  Pure function — no network, no state.
+     */
+    fun parseGatewayOrigin(rawUrl: String): GatewayOrigin? {
+        val clean = rawUrl.trim().removeSuffix("/")
+        if (clean.isEmpty()) return null
+        val url: HttpUrl = try {
+            clean.toHttpUrl() ?: return null
+        } catch (e: Exception) {
+            return null
+        }
+        return GatewayOrigin(url.scheme, url.host.lowercase(), url.port)
+    }
+
+    /**
+     * In-memory trusted-origin registry (Phase 8.7-D.1-CORRECTION-3,
+     * Finding F).
+     *
+     * An EXPLICIT operator confirmation (the trust control in Settings) is
+     * required before the platform JWT is ever attached to a request for a
+     * gateway origin.  The approval is bound to the NORMALIZED
+     * (scheme, host, port): changing ANY part of the origin invalidates it
+     * (isApproved returns false again), and the approval is NEVER
+     * persisted — a fresh process starts untrusted, exactly like the
+     * memory-only gateway JWT (which is likewise cleared on restart).
+     *
+     * SCOPE, STATED HONESTLY: this confirmation protects against a wrong
+     * or accidental endpoint choice (operator confirms exactly where the
+     * token will be sent). It is NOT cryptographic server identity: TLS
+     * certificate validation still governs the connection — this client
+     * installs no permissive trust managers and never disables
+     * certificate checks.
+     */
+    object TrustedGatewayOrigin {
+        @Volatile
+        private var approvedCanonical: String? = null
+
+        fun approve(origin: GatewayOrigin) {
+            approvedCanonical = origin.canonical
+        }
+
+        fun isApproved(origin: GatewayOrigin): Boolean = origin.canonical == approvedCanonical
+
+        fun clear() {
+            approvedCanonical = null
+        }
+
+        val hasApproval: Boolean
+            get() = approvedCanonical != null
+
+        @androidx.annotation.VisibleForTesting
+        fun approvedCanonicalForTests(): String? = approvedCanonical
     }
 
     /** Outcome of a typed, authenticated remote analysis request. */
@@ -195,6 +317,24 @@ object BackendGatewayClient {
             return@withContext AnalysisOutcome.Failure(urlPolicyError)
         }
 
+        // Phase 8.7-D.1-CORRECTION-3 (Finding F): the EXACT origin used by
+        // the request must be explicitly trusted by the operator BEFORE
+        // any bearer token is attached.  Untrusted origin => typed failure
+        // with ZERO network calls.  The approval is bound to the
+        // normalized (scheme, host, port), so a URL change that alters any
+        // part of the origin automatically invalidates it.
+        val origin = parseGatewayOrigin(cleanUrl)
+        if (origin == null) {
+            return@withContext AnalysisOutcome.Failure("Gateway URL is malformed.")
+        }
+        if (!TrustedGatewayOrigin.isApproved(origin)) {
+            Log.w(TAG, "Analysis origin not explicitly trusted; no request constructed")
+            return@withContext AnalysisOutcome.Failure(
+                "Gateway origin is not trusted. Confirm the gateway origin in " +
+                    "Settings before the access token can be sent."
+            )
+        }
+
         val endpoint = "$cleanUrl/api/v1/repository/analyze"
         val payload = JSONObject().apply {
             put("repo_name", repoName)
@@ -210,7 +350,24 @@ object BackendGatewayClient {
             .build()
 
         try {
-            httpClient.newCall(request).execute().use { response ->
+            // The JWT-bearing request goes ONLY through the dedicated
+            // authenticated client (redirects never followed).
+            authenticatedHttpClient.newCall(request).execute().use { response ->
+                // Finding F: the authenticated client never follows
+                // redirects.  A 3xx means the configured gateway URL is not
+                // the analysis endpoint (misconfiguration, or a hostile
+                // redirector trying to move the bearer token): fail
+                // explicitly and safely.  The Location header is NEVER
+                // followed, logged, or surfaced — it must not steer the
+                // operator or the token anywhere.
+                if (response.code in 300..399) {
+                    Log.w(TAG, "Live analysis redirected: HTTP ${response.code} (redirects are never followed)")
+                    return@withContext AnalysisOutcome.Failure(
+                        "Gateway redirected the authenticated analysis request; " +
+                            "redirects are never followed. Check the configured gateway URL.",
+                        response.code
+                    )
+                }
                 val body = response.body?.string().orEmpty()
                 if (!response.isSuccessful) {
                     Log.w(TAG, "Live analysis failed: HTTP ${response.code}")

@@ -15,6 +15,18 @@ weaknesses:
 * ``runtime_guard``  — the canonical D1 compose stack must declare, and CI
   must build/boot, the full authenticated analysis path (gateway + agent +
   pinned redis, no unneeded host ports).
+* ``dependency_guard`` — ONE compatible, hash-pinned dependency set:
+  the container (runtime lock) and every CI test job (test lock) must
+  share identical pinned versions for every shared package, install
+  exclusively via ``pip install --require-hashes`` against
+  pip-compile-generated locks (Finding E, mutation M29).
+* ``gemini_guard``   — the Gemini caller resilience contract
+  (Phase 8.7-D.1-CORRECTION-3, Findings A–D): half-open probe = exactly
+  one provider attempt; NaN/+-inf rejected for every float config field;
+  hard input bounds at the single generation choke point with the
+  configured estimate as a floor only; retry-chain cost reconciliation
+  from explicit per-attempt billing evidence (failed/timed-out attempts
+  are never free).
 
 Run standalone (CI job ``structural-guards``):
 
@@ -25,7 +37,9 @@ source-level ``check_*`` helpers used directly by the pytest mutation tests.
 """
 
 from .android_guard import check_android as android_check
+from .dependency_guard import check_dependency as dependency_check
 from .gateway_guard import check_gateway as gateway_check
+from .gemini_guard import check_gemini as gemini_check
 from .jwt_guard import check_jwt as jwt_check
 from .runtime_guard import check_runtime_contract_repo as runtime_check
 
@@ -34,12 +48,16 @@ ALL_GUARDS = {
     "android-gemini-secret": android_check,
     "jwt-fail-closed": jwt_check,
     "d1-runtime-contract": runtime_check,
+    "gemini-resilience-contract": gemini_check,
+    "dependency-parity-contract": dependency_check,
 }
 
 __all__ = [
     "ALL_GUARDS",
     "android_check",
+    "dependency_check",
     "gateway_check",
+    "gemini_check",
     "jwt_check",
     "runtime_check",
 ]

@@ -166,9 +166,12 @@ The `devops-ai-platform` services follow the contract in
 
 ```bash
 cd devops-ai-platform
-pip install -r requirements-test.txt
+pip install --require-hashes -r requirements-test.txt   # hash-pinned test lock (Python 3.11)
 python -m pytest tests/ -v                 # focused security suites
 PYTHONPATH=. python -m security_guards     # structural guards
 ```
 
-Both are mandatory in CI (see `.github/workflows/ci.yml`).
+The service containers install the hash-pinned runtime lock
+(`requirements-runtime.txt`, same pinned runtime set — enforced by the
+`dependency-parity-contract` guard). Both are mandatory in CI (see
+`.github/workflows/ci.yml`).

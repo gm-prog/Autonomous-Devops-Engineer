@@ -2,6 +2,106 @@
 
 All notable changes to this project are documented in this file.
 
+## [8.7-D.1-CORRECTION-3] — Correction of Six Audit Findings (2026-10-17)
+
+Narrow correction pass for the six findings (A–F) of the independent
+audit of `7b8e050` (CI 37843637151, 6/6 green). No feature expansion, no
+architectural rewrite. Every new control has positive + negative
+behavioral tests, a permanent structural guard, and an adversarial
+mutation (M25–M30, isolated repository copies) proving CI turns red when
+the control is removed or weakened. M1–M24 remain in place.
+
+### Finding A — half-open probe = exactly ONE provider attempt
+
+The half-open probe previously inherited the full retry budget (the
+attempt loop re-inferred `self.max_retries` per iteration). The allowed
+attempt count is now computed once per call
+(`allowed_attempts = 1 if probing else self.max_retries`) and passed
+explicitly into the attempt loop; a probe that fails re-opens the circuit
+with a fresh cooldown and a second caller is rejected; CLOSED-circuit
+calls keep their bounded retry budget. The reservation is sized from the
+same explicit count. Mutation **M25**.
+
+### Finding B — non-finite floats rejected on every construction path
+
+NaN/±inf now fail closed for every float config field in
+`GeminiRuntimeConfig.__post_init__` (covers `from_env` AND direct
+construction), the `from_env` float parser, and the shared ledger
+validation used by both ledgers. Documented ranges: zero budget =
+"no calls this period" (never "unlimited"); zero cost rates rejected
+(they would disable accounting); zero backoff legal (test use). Invalid
+config is rejected before any provider contact. Mutation **M26**.
+
+### Finding C — hard input bounds at the single generation choke point
+
+Every path through `_generate_text` is bounded before reservation and
+provider contact: prompt ≤ 16 000 chars, system instruction ≤ 4 000
+(`GeminiInputBoundException`, budget state untouched); `generate_iac_blueprint`
+metadata is bounded by accepted scalar types + serialized size (no
+implicit `str()`). The per-request input allowance is the documented
+UTF-8 byte bound + framing (an upper bound on BPE input tokens);
+`GEMINI_ESTIMATED_PROMPT_TOKENS` is retained as a **floor only**
+(`max(byte bound, configured)` — it can never lower the safe bound).
+The allowance is a reservation estimate, not a billing guarantee
+(SECURITY.md §6.9.3/§7). Mutation **M27**.
+
+### Finding D — retry-chain cost reconciliation (no undercount)
+
+The reservation now finalizes from an explicit per-attempt billing-evidence
+list: known usage → real cost; every attempt with unknown/missing usage
+(timeout, 5xx, absent metadata) → the worst-case per-attempt allowance
+(never free); total failure → full reservation; committed for a
+reservation never exceeds what it held. `_cost_from_usage` now also bills
+`cachedContentTokenCount` (full input rate),
+`thoughtsTokenCount`/`thoughtSummariesTokenCount` (output rate), and a
+`totalTokenCount`-only fallback (higher rate). Mutation **M28**.
+
+### Finding E — one compatible, hash-pinned dependency set
+
+CI (fastapi 0.128.8 / starlette 0.52.1 / anyio 4.12.1) and the container
+(fastapi 0.143.0 / starlette 1.7.0 / anyio 4.15.1) no longer drift:
+`requirements-runtime.in` / `requirements-test.in` declare the deliberate
+set (the verified last pre-starlette-1.0 generation; all 13 runtime deps
+kept), the full transitive locks are `pip-compile --generate-hashes`
+generated on Python 3.11, both service Dockerfiles install
+`requirements-runtime.txt` with `--require-hashes`, all five CI Python
+jobs install `requirements-test.txt` with `--require-hashes`, and the
+retired broad `requirements.txt` is deleted. New
+`dependency-parity-contract` structural guard. Mutation **M29**.
+
+### Finding F — Android: no redirect-following, no unconfirmed-origin token transfer
+
+The JWT-bearing analysis call now runs on a dedicated `OkHttpClient` with
+`followRedirects(false)` + `followSslRedirects(false)` (the
+credential-free diagnostics client stays separate); a 3xx is a safe
+explicit failure and the `Location` header is never followed, logged, or
+surfaced. `validateAnalysisUrl` additionally rejects userinfo, query, and
+fragment (base paths preserved). The exact normalized origin
+(scheme, host, port) requires an explicit, in-memory Settings
+confirmation before any `Authorization: Bearer` request (untrusted origin
+= typed failure, zero network calls); any change to the origin
+invalidates the approval; the JWT is never persisted (existing contract,
+unchanged). The confirmation is endpoint-choice protection, NOT
+cryptographic server identity (TLS validation still governs). New Kotlin
+suite `GatewayOriginTrustTest` + extended `AnalysisUrlPolicyTest`;
+`android-gemini-secret` guard extended. Mutation **M30**.
+
+### Documentation
+
+SECURITY.md §6.2 updated (reservation math) + new §6.9 (Findings A–F),
+guard list extended (§4); `.env.example` now documents the COMPLETE
+validated `GEMINI_*` surface (previously absent) including the finite-
+value contract. No stale counts: this entry's numbers are the final
+verified local + CI state.
+
+### Verification (local, pre-push)
+
+Full security suite + real Redis (7.2.5) + all structural guards + all 30
+mutations; fresh clean venvs install both locks with `--require-hashes`
+(`pip check` clean, full suite green on the test lock); Compose images
+built from the exact locks in CI. Android verified via Gradle in CI
+(no local JDK). See the phase report for exact commands and counts.
+
 ## [8.7-D.1-CORRECTION-2] — Final Hardening After Independent Adversarial Audit (2026-10-08)
 
 Final hardening pass for Phase 8.7-D.1, driven by an independent

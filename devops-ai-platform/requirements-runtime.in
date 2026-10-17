@@ -1,0 +1,54 @@
+# Runtime dependency contract — Phase 8.7-D.1-CORRECTION-3 (Finding E).
+#
+# SOURCE OF TRUTH for what the service containers install.  The compiled,
+# fully-transitive, hash-pinned lock is `requirements-runtime.txt`
+# (generated — do not edit by hand):
+#
+#   pip-compile --generate-hashes --strip-extras \
+#       -o requirements-runtime.txt requirements-runtime.in
+#
+# Both service Dockerfiles install ONLY `requirements-runtime.txt` with
+# `pip install --require-hashes` — no broad `>=` ranges, no unpinned
+# transitive resolution at build time, no divergence between the test and
+# container environments for the shared packages (enforced structurally by
+# the dependency-parity guard; mutation M29).
+#
+# WHY THESE EXACT PINS (the deliberately chosen compatible set — the
+# "last verified generation" the security test suite runs warning-free):
+#
+# * fastapi 0.128.8 / starlette 0.52.1 — the last pre-starlette-1.0
+#   generation.  starlette 1.x deprecates the httpx-based TestClient the
+#   whole security suite is built on ("install httpx2"); the gateway and
+#   agent apps run identically on either generation, so the CONTAINER is
+#   deliberately held on the verified generation too — one compatible set,
+#   not two drifting worlds.
+# * anyio 4.12.1 — anyio 4.15+ deprecates the `anyio.abc.BlockingPortal`
+#   alias that starlette 0.52's TestClient imports (verified: 4.13/4.14
+#   clean, 4.15 emits a deprecation warning).
+# * pydantic 2.14.1 / redis 8.1.0 / requests 2.34.2 / PyJWT 2.15.1 — the
+#   versions the resolved test lock carries; pinned so the runtime and
+#   test locks share identical versions for every shared package.
+#
+# The remaining runtime dependencies keep their documented minimums; the
+# lock resolves their full transitive closure with hashes.
+#
+# UPDATE PROCEDURE (documented, not ad-hoc): change a pin here, re-run the
+# pip-compile command above on Python 3.11, regenerate requirements-test.txt
+# the same way, and let the dependency-parity guard + the fresh-venv CI
+# verification prove the two locks still share the pinned runtime set.
+
+fastapi==0.128.8
+starlette==0.52.1
+anyio==4.12.1
+pydantic==2.14.1
+redis==8.1.0
+requests==2.34.2
+PyJWT==2.15.1
+uvicorn>=0.22.0
+sqlalchemy>=2.0.19
+celery>=5.3.1
+grpcio>=1.54.2
+prometheus_client>=0.17.1
+websockets>=11.0.3
+structlog>=23.1.0
+python-dotenv>=1.0.0
