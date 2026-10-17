@@ -73,6 +73,16 @@ jobs:
             tail -5 security-tests.txt 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          # Phase 8.8A Correction-1: on a red suite the artifact CDN is
+          # not reachable from every review environment, so mirror the
+          # FAILED/ERROR node ids into annotations — the durable record
+          # of exactly which tests failed. Bounded to the first 25.
+          if [ -f security-tests.txt ]; then
+            grep -E '^(FAILED|ERROR) ' security-tests.txt | head -25 \
+              | while IFS= read -r LINE; do
+                printf '::error file=security-tests.txt,title=security suite::%s\n' "${LINE//$'\r'/}"
+              done
+          fi
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -703,13 +713,31 @@ jobs:
             --build-arg "BASE_IMAGE=$E2E_PYTHON_BASE_IMAGE" \
             -t ares-e2e-workload:local e2e/workload
           export E2E_BASE_COMMIT="${GITHUB_SHA:0:7}"
+          set +e
           PYTHONPATH=. python e2e/kubernetes_sandbox_kind_e2e.py \
             --node-image "$NODE_IMAGE" \
             --base-image "$E2E_PYTHON_BASE_IMAGE" \
             --workload-image ares-e2e-workload:local \
             --registry localhost:5001 \
             --kubectl-version "$ARES_KUBECTL_VERSION" \
-            --evidence kubernetes-kind-e2e-evidence.json
+            --evidence kubernetes-kind-e2e-evidence.json 2>&1 | tee /tmp/k8s-kind-e2e.log
+          CODE=${PIPESTATUS[0]}
+          set -e
+          if [ "$CODE" != "0" ]; then
+            {
+              echo '### Phase 8.6-A Kind E2E output (tail)'
+              echo '```'
+              tail -c 8000 /tmp/k8s-kind-e2e.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Mirror the failure into annotations: the raw log blob and
+            # the step summary are not reachable from every review
+            # environment, so the driver's own tail is the durable record.
+            tail -n 12 /tmp/k8s-kind-e2e.log | while IFS= read -r LINE; do
+              echo "::error file=.github,${RANDOM}::kind-e2e: ${LINE}"
+            done
+            exit "$CODE"
+          fi
       - name: Publish live evidence
         if: always()
         run: |
@@ -816,9 +844,34 @@ jobs:
               tail -n 8 /tmp/8.8-a.log | while IFS= read -r LINE; do
                 printf '::error title=8.8-A crash::%s\n' "${LINE//$'\r'/}"
               done
+            else
+              tail -n 10 /tmp/8.8-a.log | while IFS= read -r LINE; do
+                printf '::warning title=8.8-A log tail::%s\n' "${LINE//$'\r'/}"
+              done
             fi
           fi
           exit "$CODE"
+      # Phase 8.8A Correction-1: the driver's compact evidence annotation
+      # is base64-chunked and truncated by the 1KB annotation limit, so
+      # the ACTUAL failed checks are unreadable there. On a red driver,
+      # annotate the failed check names in plain text (one line each,
+      # comfortably under the limit) — the durable, readable record.
+      - name: Annotate failed E2E checks (readable record)
+        if: failure()
+        run: |
+          set -euo pipefail
+          [ -f kubernetes-http-e2e-evidence.json ] || exit 0
+          python3 -c "
+          import json
+          with open('kubernetes-http-e2e-evidence.json', encoding='utf-8') as fh:
+              evidence = json.load(fh)
+          failed = [c for c in evidence.get('checks', [])
+                    if isinstance(c, dict) and c.get('status') != 'PASS']
+          for check in failed[:8]:
+              name = str(check.get('check', 'unknown'))[:110]
+              observed = str(check.get('observed', ''))[:160]
+              print('::error title=8.6-B check::' + name + ' FAIL — ' + observed)
+          "
       - name: Publish live evidence
         if: always()
         run: |

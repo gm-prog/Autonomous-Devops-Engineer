@@ -352,11 +352,11 @@ class ContainerKubectlSandbox:
                 runtime=self._runtime,
             )
 
-            return self._run_container(plan, namespace, cancel_event)
+            return self._run_container(plan, step, namespace, cancel_event)
         finally:
             self._safe_remove_tree(staging)
 
-    def _run_container(self, plan, namespace: str, cancel_event) -> KubectlSandboxResult:
+    def _run_container(self, plan, step, namespace: str, cancel_event) -> KubectlSandboxResult:
         timed_out = False
         cancelled = False
         try:
@@ -367,7 +367,7 @@ class ContainerKubectlSandbox:
                 shell=False,
                 env=self._runtime_env(),
             )
-            deadline = _monotonic() + plan.timeout_seconds
+            deadline = time.monotonic() + plan.timeout_seconds
             poll_interval = 0.25
             while process.poll() is None:
                 if cancel_event is not None and cancel_event.is_set():

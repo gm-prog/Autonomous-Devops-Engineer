@@ -23,6 +23,7 @@ import os
 import stat
 import tempfile
 import sys
+import unittest
 
 import pytest
 
@@ -149,7 +150,7 @@ def _run_staged(sandbox, capture, monkeypatch):
     """Patch the launch seam: a bound function receives the sandbox
     instance as its first argument, then (plan, namespace, cancel)."""
 
-    def _launch(self_sandbox, plan, namespace, cancel_event=None):
+    def _launch(self_sandbox, plan, step, namespace, cancel_event=None):
         return capture.record(plan)
 
     monkeypatch.setattr(ContainerKubectlSandbox, "_run_container", _launch)
@@ -274,7 +275,7 @@ def test_pre_planted_symlink_at_staged_path_is_refused(sandbox, monkeypatch, tmp
     # force the per-run staging dir to be the pre-planted one
     monkeypatch.setattr(sandbox_mod, "_make_run_dir", lambda base_: staging)
 
-    def _no_launch(sandbox_self, plan, namespace, cancel_event=None):
+    def _no_launch(sandbox_self, plan, step, namespace, cancel_event=None):
         raise AssertionError("launch must not happen")
 
     monkeypatch.setattr(ContainerKubectlSandbox, "_run_container", _no_launch)
@@ -297,7 +298,7 @@ def test_cleanup_removes_staging_without_following_symlinks(sandbox, monkeypatch
     victim.write_text("must survive")
     real_capture = _Capture()
 
-    def _capture(sandbox_self, plan, namespace, cancel_event=None):
+    def _capture(sandbox_self, plan, step, namespace, cancel_event=None):
         kubeconfig = _Capture._host_path_for(plan, KUBECONFIG_PATH)
         staging = os.path.dirname(kubeconfig)
         os.symlink(str(victim), os.path.join(staging, "intruder-link"))
@@ -322,7 +323,7 @@ def test_cleanup_removes_staging_without_following_symlinks(sandbox, monkeypatch
 def test_no_secret_content_in_result_or_plan(sandbox, monkeypatch):
     captured = {}
 
-    def _capture(sandbox_self, plan, namespace, cancel_event=None):
+    def _capture(sandbox_self, plan, step, namespace, cancel_event=None):
         captured["plan"] = plan
         return _dummy_result()
 

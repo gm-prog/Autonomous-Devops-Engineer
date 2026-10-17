@@ -458,7 +458,11 @@ class DeploymentEngine:
             return run
         except Exception as exc:
             run.move(DeploymentState.DRY_RUN_FAILED, error=type(exc).__name__)
-            run.add_log(f"DRY_RUN_FAILED: {type(exc).__name__}.")
+            # Phase 8.8A Correction-1: record the exception MESSAGE, not
+            # only its type. A bare type (e.g. "NameError") is not a
+            # diagnosable record; the message names the failing symbol
+            # and contains no secret material for this code path.
+            run.add_log(f"DRY_RUN_FAILED: {type(exc).__name__}: {exc}")
             self.store.save(run)
             return run
         finally:
