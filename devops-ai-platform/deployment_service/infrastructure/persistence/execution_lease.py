@@ -86,12 +86,23 @@ end
 return 0
 """
 
-#: commit: KEYS[1]=run key, KEYS[2]=active fence; ARGV[1]=run payload,
-#: ARGV[2]=my fence, ARGV[3]=ttl (seconds). The run is rewritten only
-#: while THIS owner's fence is the active one.
+#: commit: KEYS[1]=run key, KEYS[2]=active fence, KEYS[3]=revision
+#: counter; ARGV[1]=run payload, ARGV[2]=my fence, ARGV[3]=ttl
+#: (seconds). The run is rewritten only while THIS owner's fence is the
+#: active one.
+#:
+#: Independent audit (P1-2 follow-up): the fenced commit is a
+#: whole-document write, so it must ALSO bump the run document's
+#: monotonic revision counter (INCR of KEYS[3] inside the same atomic
+#: script). Without this, a worker state-advance would be invisible to
+#: the API's optimistic-concurrency claims (dispatch claim / re-dispatch
+#: / revert), and a stale API write could clobber a worker-advanced run.
+#: The payload bytes are stored AS-IS — never decoded/re-encoded.
 COMMIT_SCRIPT = """
 if redis.call('GET', KEYS[2]) == ARGV[2] then
-  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+  redis.call('INCR', KEYS[3])
+  redis.call('EXPIRE', KEYS[3], tonumber(ARGV[3]))
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[3]))
   return 1
 end
 return 0
@@ -233,12 +244,13 @@ class ExecutionLeaseGuard:
         lease-lost, not as "saved"."""
         try:
             ok = self._client.eval(
-                COMMIT_SCRIPT, 2,
+                COMMIT_SCRIPT, 3,
                 f"deployment_run:{self._run_id}",
                 active_fence_key(self._run_id),
+                f"deployment_run:{self._run_id}:rev",
                 run_payload,
                 str(self._fence),
-                int(ttl_seconds),
+                str(int(ttl_seconds)),
             )
             return bool(ok)
         except Exception:  # noqa: BLE001

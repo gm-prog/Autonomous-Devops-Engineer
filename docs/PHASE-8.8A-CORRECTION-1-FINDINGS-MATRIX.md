@@ -220,14 +220,56 @@ triggered an UNGUARDED read-check-write revert and a 503 claiming
 "nothing was executed" — false whenever the timed-out publish had in
 fact queued the task.
 
+**Independent audit (2026-10-20) of the first P1-2 fix (f2edf91): NOT
+CLOSED — four blockers, all corrected in the follow-up:**
+
+* **Blocker A** — the initial APPROVED -> EXECUTION_REQUESTED
+  preparation was still an unguarded read/check/write: two concurrent
+  /execute requests could both claim and both publish.
+* **Blocker B** — redeliver_dispatch wrote a stale whole document with a
+  plain save (a worker could advance between read and save).
+* **Blocker C** — the CAS guard checked state + dispatch id + fence but
+  no document version, so same-state concurrent writers could reset
+  each other's bookkeeping.
+* **Blocker D** — a broker reachability ping was used as the revert
+  gate; a ping cannot prove that a FAILED publish was never accepted
+  (the broker may accept and then die), so reverting an ambiguous send
+  to APPROVED was unsafe.
+
+**Follow-up fixes (all in the same focused set of files):**
+
+1. **Monotonic document revision (A/B/C).** The run document's revision
+   lives in a separate counter key (`deployment_run:<id>:rev`) bumped
+   inside the SAME Lua script that performs every durable write:
+   `store.save`, the new `store.save_cas`, `store.cas_run_document`,
+   and the lease's fenced `COMMIT_SCRIPT` (a worker state-advance is
+   therefore visible to every API-side claim). The document bytes are
+   stored AS-IS — never decoded/re-encoded (an earlier draft re-encoded
+   through Lua cjson, which corrupts empty arrays to `{}`; rejected and
+   replaced). A writer that read revision N cannot overwrite a document
+   written after its read, whoever wrote it: the dispatch claim,
+   re-dispatch, revert and outcome bookkeeping are all
+   compare-and-set on the revision, and the losing concurrent request
+   publishes nothing.
+2. **Conservative failure classification (D).** A failed publish is
+   AMBIGUOUS by default — a timeout, a mid-command disconnect, an
+   unknown error, or any exception chain with a timeout anywhere in it
+   proves nothing about acceptance. The ONLY revertible class is
+   provably PRE-SEND: every attempt failed with a clean TCP-level
+   connection REFUSAL (no publish bytes could have reached the broker).
+   No reachability probe gates any revert: an ambiguous send is NEVER
+   reverted to APPROVED, even if the broker is unreachable right now;
+   it stays EXECUTION_REQUESTED (durable, flagged `ambiguous`) for
+   idempotent re-dispatch.
+
 Files (focused, no architectural change):
 
 * `deployment_service/infrastructure/persistence/redis_pipeline_store.py`
-  — new `cas_run_document` (Lua compare-and-set, same pattern as the
-  lease guard's COMMIT_SCRIPT): a run document is only replaced if it is
-  still in the expected state, still carries the expected dispatch
-  identity, and no worker fence (`deployment_fence_active:<run_id>`) is
-  active. Returns False (never raises) when the run moved on.
+  — revision counter + `save_cas` (claim) + `cas_run_document` (Lua
+  compare-and-set guarded on state + dispatch identity + revision
+  counter + absence of a worker fence `deployment_fence_active:<run_id>`;
+  document bytes stored as-is). Returns False (never raises) when the
+  run moved on or the claim was lost.
 * `deployment_service/application/services/deployment_engine.py`
   — `prepare_dispatch` now persists a DURE DISPATCH record
   (`execution.dispatch = {dispatch_id, task_id, attempts,
@@ -255,7 +297,7 @@ Files (focused, no architectural change):
 
 Regression tests (`deployment_service/tests/
 test_deployment_api_dispatch_contract.py`, all against the live store;
-15 total, +7 new):
+21 total, 13 added across the two rounds):
 
 * ambiguous publish → 200 `"unknown"`, run kept EXECUTION_REQUESTED,
   `ambiguous` persisted, 3 bounded retries all with the same task id;
@@ -267,9 +309,28 @@ test_deployment_api_dispatch_contract.py`, all against the live store;
 * revert-CAS is a NO-OP (never a clobber) when the run already advanced
   (DEPLOYING), when a worker fence is active, or when the dispatch
   identity differs;
-* existing contract tests preserved (fresh duplicate 409, broker-down
-  503 + APPROVED revert, worker terminal redelivery replay, concurrent
-  ALREADY_EXECUTING).
+* existing contract tests preserved (fresh duplicate 409, pre-send
+  broker refusal 503 + APPROVED revert, worker terminal redelivery
+  replay, concurrent ALREADY_EXECUTING);
+* audit acceptance tests (all live-Redis, deterministic):
+  1. two concurrent /execute HTTP requests from the same APPROVED
+     document, barrier-synchronized at the claim phase: exactly one
+     claim wins (200), the loser is refused (409) and publishes
+     nothing; the winning dispatch identity is the one published;
+  2. redelivery read at revision R, a worker advances the run to
+     DEPLOYING in the window, the stale write is refused — the worker's
+     state and the dispatch record stand; the method itself then
+     refuses too;
+  3. broker accepts the message, producer then times out (broker now
+     unreachable): 200 "unknown", run NOT reverted, ambiguous flag
+     set — no "nothing was executed" claim;
+  4. publish accepted, broker outage before any probe: no unsafe
+     revert (the probe no longer gates a revert at all);
+  5. mixed attempts (pre-send refusal + mid-command reset): any
+     ambiguous attempt makes the whole outcome ambiguous;
+  6. two writers reading the same revision (a redelivery vs a stale
+     outcome): exactly one applies; the stale one cannot reset the
+     attempt count/timestamp/ambiguity fields (retried, refused again).
 
 Documented residual limitation (cannot be eliminated without a broker
 delivery-ack, which Redis does not provide): an ambiguous-but-lost
@@ -279,7 +340,11 @@ re-POST) or ages past 2x the visibility timeout (7200 s). There is no
 autonomous relay process: the caller (pipeline runner) re-POSTs. Because
 redelivery reuses the stable task id and the worker's fenced lease +
 terminal-state check absorb duplicates, at-least-once delivery never
-becomes double execution.
+becomes double execution. The pre-send classification is
+transport-signature based (connection-refused at connect time); any
+failure that cannot be proven pre-send is treated as ambiguous — the
+safe side: the run is never reverted, at most an extra idempotent
+re-dispatch happens.
 
 ### P1-3 — lease-loss safety (stale worker after re-grant)
 

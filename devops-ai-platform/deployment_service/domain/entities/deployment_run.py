@@ -44,6 +44,16 @@ class DeploymentRun:
     execution: Dict[str, Any] = field(default_factory=dict)
     health_check: Dict[str, Any] = field(default_factory=dict)
     rollback: Dict[str, Any] = field(default_factory=dict)
+    #: Independent audit (P1-2 follow-up): monotonic document revision —
+    #: the optimistic-concurrency version of this run document. Every
+    #: durable write (store.save, the fenced lease commit, the CAS
+    #: claim/revert/outcome writes) bumps it exactly once, and a CAS
+    #: write applies only when the stored revision still matches the
+    #: writer's read. This makes stale whole-document writes impossible:
+    #: a writer that read revision N cannot overwrite a document that
+    #: has since been written (now revision > N), regardless of which
+    #: process wrote it.
+    revision: int = 0
     logs: List[str] = field(default_factory=list)
     error: Optional[str] = None
 
@@ -78,6 +88,7 @@ class DeploymentRun:
             "execution": self.execution,
             "health_check": self.health_check,
             "rollback": self.rollback,
+            "revision": self.revision,
             "logs": self.logs,
             "error": self.error,
             # Provenance is DERIVED on every serialization from this run's own
@@ -135,6 +146,7 @@ class DeploymentRun:
             execution=payload.get("execution") or {},
             health_check=payload.get("health_check") or {},
             rollback=payload.get("rollback") or {},
+            revision=int(payload.get("revision") or 0),
             logs=list(payload.get("logs") or []),
             error=payload.get("error"),
         )

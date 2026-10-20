@@ -60,7 +60,34 @@ class FakeSourceVerifier:
 class FakeStore:
     def __init__(self):
         self.data, self.locks = {}, set()
-    def save(self, run): self.data[run.id] = run.to_dict()
+    def save(self, run):
+        # Audit P1-2 follow-up: mirror the real store — every durable
+        # write bumps the document revision.
+        stored = self.data.get(run.id)
+        run.revision = (int(stored.get("revision") or 0) if stored else run.revision) + 1
+        self.data[run.id] = run.to_dict()
+    def save_cas(self, run_id, expected_revision, run):
+        stored = self.data.get(run_id)
+        if stored is None or int(stored.get("revision") or 0) != expected_revision:
+            return False
+        run.revision = expected_revision + 1
+        self.data[run_id] = run.to_dict()
+        return True
+    def cas_run_document(self, run_id, expected_state, expected_dispatch_id,
+                         expected_revision, new_run):
+        stored = self.data.get(run_id)
+        if not stored:
+            return False
+        if stored.get("state") != expected_state:
+            return False
+        if int(stored.get("revision") or 0) != expected_revision:
+            return False
+        dispatch = (stored.get("execution") or {}).get("dispatch") or {}
+        if dispatch.get("dispatch_id") != expected_dispatch_id:
+            return False
+        new_run.revision = expected_revision + 1
+        self.data[run_id] = new_run.to_dict()
+        return True
     def get(self, run_id): return self.data.get(run_id)
     def ping(self): return True
     def acquire_lock(self, run_id, ttl_seconds=900):

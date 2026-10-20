@@ -731,7 +731,18 @@ class DeploymentEngine:
             "durable run is persisted before the task is enqueued "
             "(at-least-once delivery; the worker is idempotent)."
         )
-        self.store.save(run)
+        # Audit P1-2 follow-up (Blocker A): the APPROVED ->
+        # EXECUTION_REQUESTED claim is an ATOMIC compare-and-set on the
+        # document revision (read above). Two concurrent /execute
+        # requests that both read APPROVED at revision N: exactly one
+        # claim applies (the first bumps to N+1); the loser's write is
+        # refused and it must NOT publish. A worker that advanced the run
+        # in the window did too — the claim is refused the same way.
+        if not self.store.save_cas(run.id, expected_revision=run.revision, run=run):
+            raise DeploymentActionError(
+                "Dispatch claim lost to a concurrent request or a worker "
+                "transition; nothing was enqueued. Re-POST to retry."
+            )
         return run
 
     # A dispatch is eligible for idempotent redelivery when it is (a)
@@ -798,7 +809,18 @@ class DeploymentEngine:
             f"stable task (reason: {'ambiguous publish' if ambiguous else 'stale dispatch'}); "
             "any duplicate is absorbed by the worker."
         )
-        self.store.save(run)
+        # Audit P1-2 follow-up (Blocker B): the re-dispatch update is an
+        # ATOMIC compare-and-set on the revision read above. If a worker
+        # advanced the run between the read and the write, the stored
+        # revision no longer matches and the update is refused — the
+        # worker's state stands, this redelivery is reported as lost, and
+        # the caller must re-read (a fresh redelivery is always possible
+        # while the run is still EXECUTION_REQUESTED + eligible).
+        if not self.store.save_cas(run_id, expected_revision=run.revision, run=run):
+            raise DeploymentActionError(
+                "Re-dispatch lost to a concurrent state transition; poll "
+                "the run and re-POST if it is still eligible."
+            )
         return run
 
     def revert_dispatch(self, run_id: str, dispatch_id: str) -> bool:
@@ -834,6 +856,7 @@ class DeploymentEngine:
             run_id,
             expected_state="EXECUTION_REQUESTED",
             expected_dispatch_id=dispatch_id,
+            expected_revision=run.revision,
             new_run=run,
         )
 
@@ -860,10 +883,16 @@ class DeploymentEngine:
             return
         dispatch["ambiguous"] = ambiguous
         run.execution["dispatch"] = dispatch
+        # Audit P1-2 follow-up (Blocker C): the write is guarded on the
+        # revision read above as well as state + dispatch identity, so a
+        # stale outcome (e.g. from a superseded publish attempt) can
+        # never reset bookkeeping that a concurrent redelivery already
+        # advanced — the CAS simply declines and the newer state stands.
         self.store.cas_run_document(
             run_id,
             expected_state="EXECUTION_REQUESTED",
             expected_dispatch_id=dispatch_id,
+            expected_revision=run.revision,
             new_run=run,
         )
 

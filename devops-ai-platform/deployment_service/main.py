@@ -13,33 +13,37 @@ holds no Docker daemon access. The worker owns execution under a
 fenced, renewable Redis lease; delivery is at-least-once and the worker
 is idempotent, so a redelivered or duplicate task never double-applies.
 
-Execution contract (F7, audit P1-2)
-===================================
+Execution contract (F7, audit P1-2 + follow-up Blockers A–D)
+============================================================
 POST .../execute is a DISPATCH, not an execution. The API never
 conflates "the broker accepted the task", "the broker never received
 it", and "we do not know which":
 
 * 200 ``dispatched: true`` — the durable run moved to
-  EXECUTION_REQUESTED AND the publish completed.
-* 200 ``dispatched: "unknown"`` — the publish failed while the broker
-  was reachable (ambiguous timeout): the task MAY be queued and
-  executing, so the run is NOT reverted; it stays EXECUTION_REQUESTED
-  and the caller may poll or idempotently re-POST the same request
-  (same stable task id; the worker absorbs duplicates).
-* 503 — the publish failed AND the broker was confirmed unreachable:
-  the run is atomically reverted to APPROVED and nothing was executed.
+  EXECUTION_REQUESTED (atomic revision-claim) AND the publish
+  completed.
+* 200 ``dispatched: "unknown"`` — the publish failed in a way that
+  CANNOT be proven pre-send (timeout, mid-command disconnect, broker
+  that accepted and then died): the task MAY be queued and executing,
+  so the run is NEVER reverted; it stays EXECUTION_REQUESTED and the
+  caller may poll or idempotently re-POST the same request (same
+  stable task id; the worker absorbs duplicates).
+* 503 — EVERY publish attempt provably failed pre-send (the broker
+  refused the connection before any publish bytes were sent): the run
+  is atomically reverted to APPROVED and nothing was executed.
 
-The dispatch identity (task_id) is persisted in the run document
-BEFORE the publish, and a broker-failure revert is a Lua
-compare-and-set guarded on state + dispatch identity + absence of a
-worker fence, so a revert can never clobber a run a worker already
-took. Delivery is at-least-once; the worker is idempotent.
+Concurrency: the run document carries a monotonic ``revision``; the
+APPROVED -> EXECUTION_REQUESTED claim, re-dispatch updates, reverts and
+outcome bookkeeping are all Lua compare-and-set on it, so a losing
+concurrent request publishes nothing and no writer can clobber a
+document another process has advanced. Delivery is at-least-once; the
+worker is idempotent.
 """
 
 import logging
 import re
 import time
-from typing import List
+from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -182,34 +186,55 @@ class ExecuteRequest(BaseModel):
         return _validate_components(value)
 
 
-# Independent audit (P1-2): bounded publish retries and a bounded
-# broker reachability probe. A failed publish is NOT automatically a
-# "nothing executed" answer — the message may be queued — so the API
-# retries a few times, then PROBES the broker: only a confirmed-down
-# broker justifies a revert + 503; a reachable broker makes the outcome
-# ambiguous, and the truthful answer is "unknown" with the run left in
-# EXECUTION_REQUESTED for idempotent re-dispatch.
+# Independent audit (P1-2, follow-up Blocker D): bounded publish
+# retries and a CONSERVATIVE failure classification. A failed publish is
+# AMBIGUOUS by default — the broker may have accepted the message and
+# the producer lost the reply (a timeout after send, a mid-command
+# disconnect, a broker that accepts and then dies). The ONLY failure
+# class that proves the message was never accepted is a clean TCP-level
+# REFUSAL of the connection itself: no publish bytes could have reached
+# the broker. A later reachability ping can NEVER prove historical
+# non-acceptance, so no probe gates a revert: only all-attempts-pre-send
+# justifies reverting to APPROVED; any ambiguous attempt keeps the run
+# in EXECUTION_REQUESTED for idempotent re-dispatch.
 _PUBLISH_ATTEMPTS = 3
 _PUBLISH_RETRY_DELAY_SECONDS = 0.5
-_BROKER_PROBE_ATTEMPTS = 3
-_BROKER_PROBE_RETRY_DELAY_SECONDS = 0.5
+
+#: Exception-chain signatures of a clean connection REFUSAL (pre-send).
+#: Anything not matching — timeouts, mid-command resets, protocol errors,
+#: unknown errors — is ambiguous by default.
+_PRE_SEND_REFUSED_RE = re.compile(
+    r"connection refused|failed to establish a connection|error \d+ connecting",
+    re.IGNORECASE,
+)
 
 
-def _broker_reachable(engine: "DeploymentEngine") -> bool:
-    """Bounded reachability probe for the post-publish decision (P1-2).
-
-    True = the broker answered at least one probe (the failed publish is
-    AMBIGUOUS — the task may be queued). False = every probe failed or
-    raised (the broker is down — the task cannot be queued, so a revert
-    is truthful)."""
-    for _attempt in range(_BROKER_PROBE_ATTEMPTS):
-        try:
-            if engine.store.ping():
-                return True
-        except Exception:  # noqa: BLE001 — probe failure == unreachable
-            pass
-        if _attempt + 1 < _BROKER_PROBE_ATTEMPTS:
-            time.sleep(_BROKER_PROBE_RETRY_DELAY_SECONDS)
+def _publish_failure_is_pre_send(exc: BaseException) -> bool:
+    """True only if the exception chain PROVES the publish was never
+    sent (Blocker D): no timeout anywhere in the cause/context chain,
+    and a connection-refused signature (a ConnectionRefusedError, or an
+    OSError naming a refused connection at connect time). Any doubt —
+    an unexplainable error type or message — returns False (ambiguous),
+    because an ambiguous send must never be reverted to APPROVED."""
+    nodes: "List[BaseException]" = []
+    current: "Optional[BaseException]" = exc
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        nodes.append(current)
+        current = current.__cause__ or current.__context__
+    for node in nodes:
+        if isinstance(node, TimeoutError):
+            return False
+        if "timeout" in f"{type(node).__name__}: {node}".lower():
+            return False
+    for node in nodes:
+        if isinstance(node, ConnectionRefusedError):
+            return True
+        if isinstance(node, OSError) and _PRE_SEND_REFUSED_RE.search(
+            f"{type(node).__name__}: {node}"
+        ):
+            return True
     return False
 
 
@@ -311,31 +336,34 @@ def create_app() -> FastAPI:
         request: ExecuteRequest,
         identity: Identity = Depends(require_dispatch_caller),
     ):
-        """DISPATCH an approved run to the worker (F7; audit P1-2).
+        """DISPATCH an approved run to the worker (F7; audit P1-2 +
+        follow-up Blockers A–D).
 
         Tri-state truthful contract — the API never conflates "the
         broker accepted the task", "the broker never received it", and
         "we do not know which":
 
-        * 200 ``dispatched: true`` — the run is durably
-          EXECUTION_REQUESTED and the publish to the broker completed.
-        * 200 ``dispatched: "unknown"`` — the publish FAILED while the
-          broker was reachable (a timeout after the connection was
-          established). The task MAY already be queued and executing, so
-          the run is NOT reverted; it stays EXECUTION_REQUESTED and is
-          eligible for idempotent re-dispatch. Re-POSTing the SAME
-          request is safe: it re-publishes the SAME stable task id and
-          the worker's lease + terminal-state check absorb any
-          duplicate.
-        * 503 — the publish failed AND a reachability probe confirmed
-          the broker is down: the run is atomically reverted to
-          APPROVED and the API truthfully reports that nothing was
-          executed.
+        * 200 ``dispatched: true`` — the run claimed EXECUTION_REQUESTED
+          (atomic revision-claim) and the publish completed.
+        * 200 ``dispatched: "unknown"`` — the publish failed in a way
+          that CANNOT be proven pre-send (timeout, mid-command
+          disconnect, a broker that accepted and then died). The task
+          MAY already be queued and executing, so the run is NEVER
+          reverted (a later ping cannot prove historical non-acceptance);
+          it stays EXECUTION_REQUESTED and re-POSTing the SAME request
+          idempotently re-publishes the SAME stable task id, which the
+          worker's lease + terminal-state check absorb.
+        * 503 — EVERY attempt provably failed pre-send (the broker
+          refused the connection before any publish bytes were sent):
+          the run is atomically reverted to APPROVED and the API
+          truthfully reports that nothing was executed.
 
         Duplicate handling: a FRESH (non-ambiguous, non-stale) run
         already in EXECUTION_REQUESTED is refused with 409 — exactly-once
         dispatch is preserved for the normal path; only ambiguous or
-        stale dispatches are re-delivered.
+        stale dispatches are re-delivered. Concurrent initial dispatches
+        race an atomic revision-claim: exactly one wins and publishes;
+        the loser's claim is refused and it publishes nothing.
         """
         engine: DeploymentEngine = application.state.engine
         try:
@@ -374,13 +402,13 @@ def create_app() -> FastAPI:
                        "dispatch identity; no task was enqueued.",
             )
 
-        publish_error: Exception = None
+        publish_errors: "List[Exception]" = []
         for _attempt in range(_PUBLISH_ATTEMPTS):
             try:
                 from deployment_service.infrastructure.celery import tasks as deployment_tasks
 
                 # The SAME stable task_id on every attempt: a retry after
-                # an ambiguous timeout publishes a duplicate message that
+                # an ambiguous failure publishes a duplicate message that
                 # the worker's idempotency absorbs — at-least-once, never
                 # double-executed.
                 deployment_tasks.execute_iac_deployment.apply_async(
@@ -399,14 +427,13 @@ def create_app() -> FastAPI:
                     },
                     task_id=task_id,
                 )
-                publish_error = None
                 break
-            except Exception as exc:  # broker down / serialization refused
-                publish_error = exc
+            except Exception as exc:  # broker down / mid-command loss / timeout
+                publish_errors.append(exc)
                 if _attempt + 1 < _PUBLISH_ATTEMPTS:
                     time.sleep(_PUBLISH_RETRY_DELAY_SECONDS)
 
-        if publish_error is None:
+        if not publish_errors:
             engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=False)
             return {
                 "dispatched": True,
@@ -417,56 +444,71 @@ def create_app() -> FastAPI:
                         "terminal state; a dispatched run is not yet complete",
             }
 
-        # The publish failed on every attempt. Decide the truth:
-        # (a) broker down → the task cannot be queued → atomic revert;
-        # (b) broker reachable → the message may be queued → ambiguous.
-        if _broker_reachable(engine):
-            # AMBIGUOUS: never revert. The task may already be running.
-            engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=True)
+        # The publish failed on every attempt. Audit P1-2 follow-up
+        # (Blocker D): the outcome is revertible ONLY if EVERY attempt
+        # provably failed pre-send (connection refused: no publish bytes
+        # could have reached the broker). ANY ambiguous attempt — a
+        # timeout, a mid-command disconnect, a broker that accepted and
+        # then died — means the task MAY be queued and executing, and
+        # the run is NEVER reverted: a later ping cannot prove historical
+        # non-acceptance.
+        if all(_publish_failure_is_pre_send(e) for e in publish_errors):
+            reverted = engine.revert_dispatch(run_id, dispatch_id)
+            if not reverted:
+                stored = engine.store.get(run_id)
+                state = (stored or {}).get("state", "UNKNOWN")
+                logger.error(
+                    "deployment dispatch failed pre-send for %s (%s) but the "
+                    "run already advanced to %s; reporting current state",
+                    run_id, type(publish_errors[0]).__name__, state,
+                )
+                return {
+                    "dispatched": "unknown",
+                    "run_id": run_id,
+                    "state": state,
+                    "delivery": "at-least-once",
+                    "note": "the publish failed before reaching the broker "
+                            "but the run had already moved on; poll for the "
+                            "terminal state.",
+                }
             logger.error(
-                "deployment dispatch AMBIGUOUS for %s: %s; run kept in "
-                "EXECUTION_REQUESTED, re-dispatch is idempotent",
-                run_id, type(publish_error).__name__,
+                "deployment dispatch failed PRE-SEND for %s: %s; broker "
+                "refused the connection on every attempt, nothing was "
+                "enqueued, run reverted to APPROVED",
+                run_id, type(publish_errors[0]).__name__,
             )
-            return {
-                "dispatched": "unknown",
-                "run_id": run_id,
-                "state": "EXECUTION_REQUESTED",
-                "delivery": "at-least-once",
-                "note": "the broker publish timed out after the connection "
-                        "was established, so the task MAY already be queued "
-                        "and executing. Poll the run, or re-POST this same "
-                        "request: the re-dispatch is idempotent (same stable "
-                        "task id; the worker absorbs duplicates).",
-            }
+            raise HTTPException(
+                status_code=503,
+                detail="Execution dispatch is unavailable: the broker "
+                       "refused the connection before any publish was sent "
+                       "(on every attempt); the run remains APPROVED and "
+                       "nothing was executed.",
+            ) from publish_errors[0]
 
-        # Broker confirmed down: the task cannot have been queued. Revert
-        # atomically; if the run moved on in the meantime, report its
-        # actual state instead of "nothing was executed".
-        reverted = engine.revert_dispatch(run_id, dispatch_id)
-        if not reverted:
-            stored = engine.store.get(run_id)
-            state = (stored or {}).get("state", "UNKNOWN")
-            logger.error(
-                "deployment dispatch failed for %s (%s) and the run already "
-                "advanced to %s; reporting current state",
-                run_id, type(publish_error).__name__, state,
-            )
-            return {
-                "dispatched": "unknown",
-                "run_id": run_id,
-                "state": state,
-                "delivery": "at-least-once",
-                "note": "the publish failed but the run had already moved on; "
-                        "poll for the terminal state.",
-            }
-        logger.error("deployment dispatch failed for %s: %s", run_id, type(publish_error).__name__)
-        raise HTTPException(
-            status_code=503,
-            detail="Execution dispatch is unavailable (broker confirmed "
-                   "unreachable); the run remains APPROVED and nothing was "
-                   "executed.",
-        ) from publish_error
+        # AMBIGUOUS: at least one attempt could not be proven pre-send.
+        # Never revert — the task may already be queued and executing,
+        # even if the broker is unreachable right now.
+        engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=True)
+        logger.error(
+            "deployment dispatch AMBIGUOUS for %s: %s; outcome cannot be "
+            "proven pre-send, run kept in EXECUTION_REQUESTED, re-dispatch "
+            "is idempotent",
+            run_id, type(publish_errors[0]).__name__,
+        )
+        return {
+            "dispatched": "unknown",
+            "run_id": run_id,
+            "state": "EXECUTION_REQUESTED",
+            "delivery": "at-least-once",
+            "note": "the publish failed and the outcome CANNOT be proven to "
+                    "have stayed off the broker (timeout or mid-command "
+                    "failure), so the task MAY already be queued and "
+                    "executing — the run is not reverted, even if the "
+                    "broker is currently unreachable. Poll the run, or "
+                    "re-POST this same request: the re-dispatch is "
+                    "idempotent (same stable task id; the worker absorbs "
+                    "duplicates).",
+        }
 
     return application
 

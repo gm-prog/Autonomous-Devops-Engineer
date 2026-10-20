@@ -1,39 +1,54 @@
-"""Phase 8.8A Correction-1 (F7, independent audit P1-2) — single
-execution contract, truthful dispatch, safe ambiguity.
+"""Phase 8.8A Correction-1 (F7, independent audit P1-2 + follow-up
+Blockers A–D) — single execution contract, truthful dispatch, safe
+ambiguity, optimistic concurrency.
 
 The API's ``/execute`` is a DISPATCH, not an execution, and it never
 conflates "the broker accepted the task", "the broker never received
 it", and "we do not know which":
 
-* 200/``dispatched: true`` only after the durable run moved to
-  EXECUTION_REQUESTED AND the publish completed, with the REAL
-  persisted run id;
+* 200/``dispatched: true`` only after the durable run CLAIMED
+  EXECUTION_REQUESTED (atomic revision-claim) AND the publish
+  completed, with the REAL persisted run id;
 * a duplicate dispatch of a FRESH (non-ambiguous, non-stale)
   EXECUTION_REQUESTED run is refused (409) and enqueues NOTHING extra;
-* a publish that fails while the broker is CONFIRMED DOWN reverts the
-  run to APPROVED (atomic CAS) and reports 503 — nothing was executed;
-* a publish that fails while the broker is REACHABLE is AMBIGUOUS: the
-  run is NOT reverted (the task may be queued and executing), the API
-  reports ``dispatched: "unknown"``, and re-POSTing the same request
-  idempotently re-publishes the SAME stable task id (the worker's lease
-  + terminal-state check absorb duplicates);
-* a stale dispatch (no worker progress for > 2x the visibility timeout)
-  is idempotently re-deliverable;
-* a broker-failure revert is a no-op — never a clobber — when the run
-  already advanced, a worker fence is active, or the dispatch identity
-  changed;
+* TWO CONCURRENT initial dispatches from the same APPROVED document
+  race the atomic claim: exactly one wins and publishes; the loser's
+  claim is refused and it publishes nothing (Blocker A);
+* a publish that provably failed PRE-SEND on every attempt (the broker
+  refused the connection before any publish bytes were sent) reverts
+  the run to APPROVED (atomic CAS) and reports 503 — nothing was
+  executed;
+* ANY publish failure that cannot be proven pre-send — a timeout after
+  send, a mid-command disconnect, a broker that accepted and then
+  died — is AMBIGUOUS: the run is NEVER reverted (a later ping cannot
+  prove historical non-acceptance, Blocker D), the API reports
+  ``dispatched: "unknown"``, and re-POSTing the same request
+  idempotently re-publishes the SAME stable task id (the worker's
+  lease + terminal-state check absorb duplicates);
+* a stale dispatch (no worker progress for > 2x the visibility
+  timeout) is idempotently re-deliverable; the re-dispatch update is a
+  revision-CAS that cannot overwrite a worker-advanced run (Blocker B);
+* a revert / outcome bookkeeping write is a no-op — never a clobber —
+  when the run already advanced, a worker fence is active, the dispatch
+  identity changed, or the document revision moved (Blocker C): a
+  stale writer at the same revision cannot reset bookkeeping a
+  concurrent redelivery already advanced;
 * the worker task is idempotent under at-least-once delivery: a
   redelivery for a terminal run returns the persisted outcome and
   starts nothing; a concurrent duplicate finds the lease held and
   reports ALREADY_EXECUTING without touching the run.
 """
 import os
+import threading
 import time
 import unittest
 from unittest import mock
 
 from fastapi.testclient import TestClient
 
+from deployment_service.application.services.deployment_engine import (
+    DeploymentActionError,
+)
 from deployment_service.tests.test_deployment_auth import (
     TEST_INTERNAL,
     TEST_SECRET,
@@ -202,19 +217,21 @@ class DispatchTruthTests(_ContractAppBase):
                       "a FRESH duplicate is refused, not re-delivered")
         self.assertEqual(len(calls), 1, "a duplicate must NOT enqueue again")
 
-    def test_broker_failure_reverts_and_reports_unavailable(self):
-        # Broker CONFIRMED DOWN: the publish failed on every attempt AND
-        # the reachability probe also failed, so the task cannot have
-        # been enqueued — the atomic revert to APPROVED is truthful.
+    def test_pre_send_refusal_reverts_and_reports_unavailable(self):
+        # EVERY attempt provably failed PRE-SEND: a clean TCP refusal of
+        # the connection means no publish bytes could have reached the
+        # broker, so the atomic revert to APPROVED is truthful. (A
+        # generic/timeout failure is NOT treated this way — see the
+        # ambiguity tests below.)
         run = self._create_and_approve()
 
-        def _down(kwargs=None, **_):
-            raise ConnectionError("broker unreachable")
+        def _refused(kwargs=None, **_):
+            raise ConnectionError(
+                "Error 111 connecting to 127.0.0.1:6379. Connection refused."
+            )
 
-        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task, \
-             mock.patch("deployment_service.main._broker_reachable",
-                        return_value=False):
-            task.apply_async.side_effect = _down
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _refused
             resp = self._post_execute(run)
         self.assertEqual(resp.status_code, 503, resp.text)
         self.assertNotIn("dispatched\": true", resp.text)
@@ -317,6 +334,208 @@ class DispatchSafetyTests(_ContractAppBase):
         self.assertEqual(dispatch["attempts"], 2)
         self.assertFalse(dispatch["ambiguous"],
                          "a successful publish clears the ambiguity")
+
+    # -- Blocker D: an ambiguous send is NEVER reverted ---------------------
+
+    def test_accepted_then_timeout_never_reverts(self):
+        # The broker ACCEPTED the message, then the producer lost its
+        # reply (timeout). Even with the broker now unreachable, the run
+        # must NOT be reverted and must not claim "nothing was executed"
+        # — a ping cannot prove historical non-acceptance.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        attempts = []
+
+        def _timeout_after_accept(kwargs=None, **apply_kwargs):
+            attempts.append(apply_kwargs.get("task_id"))
+            raise TimeoutError("timeout reading from broker after publish")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task, \
+             mock.patch.object(engine.store, "ping",
+                               side_effect=OSError("broker outage")):
+            task.apply_async.side_effect = _timeout_after_accept
+            resp = self._post_execute(run)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["dispatched"], "unknown")
+        stored = engine.store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED",
+                         "an ambiguous send is never reverted, even if the "
+                         "broker is down now")
+        self.assertTrue(stored["execution"]["dispatch"]["ambiguous"])
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(set(attempts)), 1)
+
+    def test_accepted_then_outage_never_reverts(self):
+        # A mid-command disconnect (the message MAY have been accepted)
+        # followed by a broker outage: the failure signature is not a
+        # clean pre-send refusal, so the run must NOT be reverted.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+
+        def _mid_command_reset(kwargs=None, **_):
+            raise OSError("Connection reset by peer during publish")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task, \
+             mock.patch.object(engine.store, "ping",
+                               side_effect=OSError("broker outage")):
+            task.apply_async.side_effect = _mid_command_reset
+            resp = self._post_execute(run)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["dispatched"], "unknown")
+        stored = engine.store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED")
+        self.assertTrue(stored["execution"]["dispatch"]["ambiguous"])
+
+    def test_mixed_pre_send_and_ambiguous_attempts_is_ambiguous(self):
+        # Attempt 1: clean refusal (pre-send). Attempt 2: mid-command
+        # reset (ambiguous). ANY ambiguous attempt makes the whole
+        # outcome ambiguous: no revert.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        sequence = [
+            ConnectionError(
+                "Error 111 connecting to 127.0.0.1:6379. Connection refused."
+            ),
+            OSError("Connection reset by peer during publish"),
+            TimeoutError("timeout"),
+        ]
+        it = iter(sequence)
+
+        def _mixed(kwargs=None, **_):
+            raise next(it)
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _mixed
+            resp = self._post_execute(run)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["dispatched"], "unknown")
+        self.assertEqual(engine.store.get(run.id)["state"],
+                         "EXECUTION_REQUESTED")
+
+    # -- Blocker A: concurrent initial dispatches ---------------------------
+
+    def test_concurrent_execute_from_approved_exactly_one_claim_wins(self):
+        # Two concurrent /execute requests from the SAME APPROVED
+        # document, synchronized so both reach the claim phase: exactly
+        # one dispatch claim wins; the loser publishes nothing.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        store = engine.store
+        real_save_cas = store.save_cas
+        barrier = threading.Barrier(2, timeout=20)
+        calls, task_ids = [], []
+
+        def _guarded_save_cas(run_id, expected_revision, run):
+            barrier.wait()  # both requests reach the claim phase
+            return real_save_cas(run_id, expected_revision, run)
+
+        def _apply_async(kwargs=None, **apply_kwargs):
+            calls.append(kwargs)
+            task_ids.append(apply_kwargs.get("task_id"))
+            result = mock.MagicMock()
+            result.id = "task-fake-1"
+            return result
+
+        results, errors = [], []
+
+        def _post(client):
+            try:
+                with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+                    task.apply_async.side_effect = _apply_async
+                    results.append(client.post(
+                        f"/api/internal/deployments/{run.id}/execute",
+                        json=self._execute_body(run),
+                        headers=self.auth,
+                    ))
+            except Exception as exc:  # noqa: BLE001 - surfaced as failure
+                errors.append(exc)
+
+        with mock.patch.object(store, "save_cas", _guarded_save_cas):
+            t1 = threading.Thread(target=_post, args=(TestClient(self.app),))
+            t2 = threading.Thread(target=_post, args=(TestClient(self.app),))
+            t1.start(); t2.start(); t1.join(30); t2.join(30)
+        self.assertEqual(errors, [], f"unexpected client error: {errors}")
+        self.assertEqual(len(results), 2)
+        codes = sorted(r.status_code for r in results)
+        self.assertEqual(codes, [200, 409],
+                         "exactly one claim wins; the loser is refused")
+        self.assertEqual(len(calls), 1,
+                         "the losing request must NOT publish")
+        stored = store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED")
+        # the winning claim's dispatch identity is the one that was
+        # published — stable, single, durable
+        self.assertEqual(stored["execution"]["dispatch"]["task_id"],
+                         task_ids[0])
+
+    # -- Blocker B: redelivery cannot overwrite an advanced run -------------
+
+    def test_redelivery_cannot_overwrite_advanced_run(self):
+        run, dispatch = self._dispatched_run()
+        engine = self.app.state.engine
+        store = engine.store
+        # the re-dispatch writer's read: EXECUTION_REQUESTED at rev R
+        read = store.get(run.id)
+        writer = DeploymentRun.from_dict(read)
+        self.assertEqual(writer.state, DeploymentState.EXECUTION_REQUESTED)
+        # between its read and its write, a worker advances the run
+        # (the same revision-bumping write the fenced commit performs)
+        advanced = DeploymentRun.from_dict(store.get(run.id))
+        advanced.move(DeploymentState.DEPLOYING)
+        store.save(advanced)
+        # the writer's STALE claim must be refused
+        writer.execution["dispatch"]["attempts"] += 1
+        ok = store.save_cas(run.id, expected_revision=writer.revision,
+                            run=writer)
+        self.assertFalse(ok, "a stale redelivery write must be refused")
+        # the worker's state stands — no clobber
+        stored = store.get(run.id)
+        self.assertEqual(stored["state"], "DEPLOYING")
+        self.assertEqual(stored["execution"]["dispatch"]["attempts"], 1)
+        # and the method itself, called after the advance, refuses
+        with self.assertRaises(DeploymentActionError):
+            engine.redeliver_dispatch(
+                run.id, run.artifact_hash, run.plan_hash)
+        self.assertEqual(store.get(run.id)["state"], "DEPLOYING")
+        self.assertEqual(store.get(run.id)["execution"]["dispatch"]
+                         ["attempts"], 1)
+
+    # -- Blocker C: stale bookkeeping cannot reset newer state --------------
+
+    def test_stale_outcome_cannot_reset_redelivery_bookkeeping(self):
+        run, dispatch = self._dispatched_run()
+        engine = self.app.state.engine
+        store = engine.store
+        read = store.get(run.id)
+        rev = int(read.get("revision") or 0)
+        dispatch_id = dispatch["dispatch_id"]
+        # writer 1: a redelivery (attempts -> 2) reading at revision R
+        w1 = DeploymentRun.from_dict(read)
+        w1.execution["dispatch"]["attempts"] = 2
+        w1.execution["dispatch"]["last_attempt_at"] = time.time()
+        # writer 2: a STALE outcome from the original publish (attempts
+        # still 1) reading at the SAME revision R
+        w2 = DeploymentRun.from_dict(read)
+        w2.execution["dispatch"]["ambiguous"] = False
+        # both CAS on the same read: exactly one applies
+        r1 = store.save_cas(run.id, expected_revision=rev, run=w1)
+        r2 = store.cas_run_document(
+            run.id, "EXECUTION_REQUESTED", dispatch_id, rev, w2)
+        self.assertTrue(r1)
+        self.assertFalse(r2,
+                         "a stale writer at the same revision cannot apply "
+                         "after the first write")
+        final = store.get(run.id)
+        self.assertEqual(final["execution"]["dispatch"]["attempts"], 2)
+        self.assertEqual(final.get("revision"), rev + 1)
+        # a stale outcome retrying the same old read is refused again —
+        # the bookkeeping cannot be reset
+        w3 = DeploymentRun.from_dict(read)
+        w3.execution["dispatch"]["ambiguous"] = False
+        self.assertFalse(store.cas_run_document(
+            run.id, "EXECUTION_REQUESTED", dispatch_id, rev, w3))
+        self.assertEqual(store.get(run.id)["execution"]["dispatch"]
+                         ["attempts"], 2)
 
     # -- stale redelivery --------------------------------------------------
 
