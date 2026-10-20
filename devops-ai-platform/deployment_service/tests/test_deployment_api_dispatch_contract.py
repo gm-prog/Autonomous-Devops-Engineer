@@ -440,17 +440,20 @@ class DispatchSafetyTests(_ContractAppBase):
 
         def _post(client):
             try:
-                with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
-                    task.apply_async.side_effect = _apply_async
-                    results.append(client.post(
-                        f"/api/internal/deployments/{run.id}/execute",
-                        json=self._execute_body(run),
-                        headers=self.auth,
-                    ))
+                results.append(client.post(
+                    f"/api/internal/deployments/{run.id}/execute",
+                    json=self._execute_body(run),
+                    headers=self.auth,
+                ))
             except Exception as exc:  # noqa: BLE001 - surfaced as failure
                 errors.append(exc)
 
-        with mock.patch.object(store, "save_cas", _guarded_save_cas):
+        # ONE patch for the whole concurrent window (overlapping per-thread
+        # patches could restore out of order and leak the mock into the
+        # rest of the suite); both threads share it.
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task, \
+             mock.patch.object(store, "save_cas", _guarded_save_cas):
+            task.apply_async.side_effect = _apply_async
             t1 = threading.Thread(target=_post, args=(TestClient(self.app),))
             t2 = threading.Thread(target=_post, args=(TestClient(self.app),))
             t1.start(); t2.start(); t1.join(30); t2.join(30)
