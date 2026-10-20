@@ -348,7 +348,33 @@ re-dispatch happens.
 
 ### P1-3 — lease-loss safety (stale worker after re-grant)
 
-NOT STARTED: pending after P1-2 review. Planned: a stale worker must not
-initiate another external side effect after losing its lease;
-deterministic race test (expire old lease → grant new fencing token →
-resume old worker).
+Implementation added on branch
+`dev/phase-8-8a-p1-3-lease-loss-safety`; CI and review pending.
+
+* `execution_lease.py`: new Redis Lua ownership assertion atomically
+  compares both the unique owner token and active fencing token. Failure
+  or inability to reach Redis raises `LeaseLostError`, marks the guard
+  lost, and requests cancellation. A stale worker cannot rely on the
+  watchdog's local transient-outage grace window to begin another step.
+* `deployment_engine.py`: `_require_lease` invokes that authoritative
+  assertion immediately before each side effect and translates rejection
+  into `LeaseLostDuringExecutionError`; the existing lease-loss path
+  performs no further side effects or rollback.
+* Regression coverage added:
+  * live-Redis test: old owner acquires, lease/fence is removed to model
+    expiry, a new owner acquires a higher fence, and the old owner's
+    assertion is rejected while the new owner's assertion succeeds;
+  * engine test: ownership is lost during Terraform initialization, and
+    the worker is prevented from starting Terraform apply or Kubernetes
+    apply afterward.
+
+**Status: implementation pending CI and review; do not mark closed yet.**
+The assertion closes the deterministic stale-resume gap, but it cannot
+make an external cloud/Kubernetes API atomically participate in Redis's
+fencing transaction. There remains a check/use window if ownership is
+lost immediately after a successful assertion and before the external
+system accepts the operation. The watchdog's cancellation signal and
+sandbox cancellation are the in-flight mitigation; end-to-end prevention
+of a concurrent already-started remote operation requires downstream
+fencing or a provider-specific operation/serialization contract. That
+residual must remain explicit rather than claiming absolute fencing.
