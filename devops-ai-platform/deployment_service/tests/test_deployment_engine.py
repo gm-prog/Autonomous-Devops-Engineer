@@ -8,6 +8,7 @@ import pytest
 from deployment_service.application.services.deployment_engine import DeploymentActionError, DeploymentEngine
 from deployment_service.application.services.source_verification import SourceVerificationError
 from deployment_service.domain.value_objects.deployment_state import DeploymentState
+from deployment_service.infrastructure.persistence.execution_lease import LeaseLostError
 from shared_kernel.domain.provenance import verify_provenance_record
 
 
@@ -122,6 +123,12 @@ class FakeLeaseGuard:
 
     def alive(self):
         return not self._lost.is_set()
+
+    def assert_owned(self):
+        # Mirror the production guard's authoritative ownership assertion.
+        if self._lost.is_set() or FakeLeaseGuard.holders.get(self.run_id) is not self:
+            self.lose()
+            raise LeaseLostError("fake lease no longer owned")
 
     def request_cancel(self):
         self._cancel.set()
@@ -459,3 +466,35 @@ def test_execute_rejects_tampered_plan_hash(monkeypatch):
     monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
     with pytest.raises(DeploymentActionError, match="approval record"):
         engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, "0" * 64)
+
+
+def test_execution_rechecks_lease_before_each_external_side_effect(monkeypatch):
+    """A worker that loses its lease during one step must not start the next."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+
+    factory = FakeLeaseFactory(engine.store)
+    engine.lease_factory = factory
+
+    class LoseLeaseDuringTerraformInit(FakeTerraform):
+        def initialize(self, iac_dir, cancel_event=None):
+            result = super().initialize(iac_dir, cancel_event=cancel_event)
+            # Deterministically model expiry + another worker taking over
+            # between the init operation and the subsequent Terraform apply.
+            factory.created[0].lose()
+            return result
+
+    terraform = LoseLeaseDuringTerraformInit()
+    engine.terraform = terraform
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+
+    result = engine.execute(
+        run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash
+    )
+
+    assert result.state == DeploymentState.LEASE_LOST
+    assert terraform.init_calls == 1
+    assert terraform.applied_from is None, "stale worker must not start Terraform apply"
+    assert engine.kubectl.applied_calls == [], "stale worker must not start Kubernetes apply"
+
