@@ -526,11 +526,32 @@ already started; it is not proof that a provider did not accept a request.
 | `test_lease_callback_runs_before_each_terraform_subprocess` and `test_mutating_kubernetes_operations_fail_closed_at_the_sandbox_boundary` | Runner-level gates precede every Terraform plan subprocess, Terraform apply, Kubernetes apply and rollout undo; a refusing callback results in no sandbox launch. | An external provider's enforcement of an owner token/fence. |
 | `test_13_malformed_or_nonexpiring_lease_state_fails_closed` (two parameter cases) | Real Redis rejects malformed active-fence data and a lease key with no expiry; the guard cancels and marks loss without exposing its owner token. | Arbitrary Redis corruption outside the asserted key set. |
 
-Local live-Redis result: `14 passed` with `REDIS_INTEGRATION_REQUIRED=true`
-against a private standalone Redis 7.2.6 instance. Focused engine and trust
-boundary suites also pass. Exact final commit SHA and the complete 11-job CI
-run must be recorded here after commit/push; until then this section is
-not CI-verified.
+**Verification evidence for the P1-3 implementation commit**
+`b75cc3072bc969cf24af02d68fa2027a0685ec96` (parent
+`e1d0040c111417d7921ee376422b9b3df1e60d41`):
+
+* Live Redis lease suite: `14 passed` with
+  `REDIS_INTEGRATION_REQUIRED=true` against an isolated standalone Redis
+  7.2.6 instance.
+* Canonical local `python -m pytest tests/ deployment_service/tests -q`:
+  `973 passed, 1 skipped, 34 subtests passed`; the sole skip is the existing
+  foreign-owned staging-root case, which requires root to create a directory
+  owned by another UID.
+* Focused dispatch contract: `27 passed`; security mutation tests: `37
+  passed`; Celery crash recovery: `2 passed`; `python -m security_guards`:
+  PASS.
+* Exact GitHub Actions run:
+  [39437175670](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/39437175670)
+  for the implementation SHA above — completed success, all 11 of 11 jobs
+  successful (including real Redis, full deployment/platform tests, Compose,
+  container E2E, both Kind E2Es, Terraform/Kubernetes trust boundaries,
+  security mutation/guards, and Android unit/build).
+
+The run was obtained after pushing the implementation commit and its job
+results were inspected individually. This paragraph is a documentation-only
+follow-up; the final report also identifies the resulting branch HEAD and
+its own CI run. The P1-3 implementation status is **CI-verified, for
+independent review only**.
 
 **Guarantee boundary / topology.** The proved scenario is precise: once B
 has acquired the higher fence before A resumes its pre-operation check, A's
