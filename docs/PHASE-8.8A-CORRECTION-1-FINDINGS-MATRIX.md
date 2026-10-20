@@ -380,6 +380,67 @@ failure that cannot be proven pre-send is treated as ambiguous — the
 safe side: the run is never reverted, at most an extra idempotent
 re-dispatch happens.
 
+**Third independent audit (2026-10-20) of the second-round fix: one
+remaining P1 — the FENCE RACE on the history fact — corrected with a
+durable attempt journal:**
+
+* **Residual hole** — `record_dispatch_outcome` (the write that sets
+  `may_have_been_published`) is a run-document CAS that REFUSES every
+  write while a worker's active fence exists. A fast worker can
+  consume the just-published message, take the lease and create the
+  fence BEFORE that write lands: the history fact is silently lost,
+  `may_have_been_published` stays false, and a later stale re-POST
+  whose attempts all fail pre-send reverts a POSSIBLY-PUBLISHED
+  dispatch to APPROVED ("nothing was executed" — false).
+* **Fix — the durable per-dispatch ATTEMPT JOURNAL.** A separate
+  hash key per run (`deployment_run:<id>:dispatch_journal`, field =
+  attempt id, value = `{dispatch_id, state, at}`; NOT the run
+  document, NOT fenced, no whole-document replacement) with atomic
+  state transitions: `PUBLISHING` is journaled durably BEFORE
+  `apply_async` (if that write fails, the attempt is NOT sent — an
+  untracked publish must not be made); on success `PUBLISHED` (so
+  `dispatched:true` is never reported without durable publication
+  evidence); on a clean pre-send refusal `PRE_SEND_FAILED`; on
+  timeout / mid-command loss / unknown `AMBIGUOUS`; a crashed API
+  leaves `PUBLISHING`, which is never interpreted as
+  non-publication. The revert decision now consults the journal,
+  checked ATOMICALLY server-side: `REVERT_DISPATCH_CAS` takes the
+  journal hash as a fourth key and, on the revert path, requires at
+  least one journaled attempt for this dispatch and EVERY one to be
+  terminal `PRE_SEND_FAILED` — an empty journal, a `PUBLISHING`
+  (in flight / crashed mid-flight) entry, an `AMBIGUOUS` entry, or a
+  `PUBLISHED` entry all refuse the revert, no matter what the
+  current call's errors show and no matter which fence blocked an
+  earlier run-document write. The engine's `revert_dispatch`
+  pre-checks the same condition; `redeliver_dispatch` treats any
+  unresolved (`PUBLISHING`/`AMBIGUOUS`) journal attempt as
+  redelivery-eligible too (same stable task id; the worker absorbs
+  duplicates). `may_have_been_published` is retained as a
+  run-document convenience flag (monotonic, best-effort); the
+  journal is authoritative.
+* **Deterministic regression tests (suite now 27, all live-Redis):**
+  1. **The fence race, step by step** — initial run (no history
+     fact, empty journal); the publish is accepted and the worker
+     consumes the message, acquiring a REAL lease/fence before the
+     API's post-publish write; the run-document outcome write is
+     refused (MHB stays false in the document) while the journal
+     records the `PUBLISHED` attempt; the fence is released, the run
+     aged stale, and a forced re-POST with all-pre-send refusals is
+     NOT reverted (stays EXECUTION_REQUESTED, no "nothing was
+     executed", no revert log line; the earlier `PUBLISHED` entry
+     survives the retry);
+  2. **Crashed API** — a lone `PUBLISHING` entry with no document
+     flag: a later all-pre-send re-POST is accepted as an idempotent
+     redelivery (unresolved journal attempt) and does NOT revert — a
+     `PUBLISHING` entry is evidence of possible publication, never
+     of non-publication;
+  3. **dispatched:true evidence** — when the `PUBLISHING` journal
+     write cannot persist, nothing is sent and the API does NOT
+     report `dispatched:true` (fail closed: the run stays
+     non-revertible until the outcome is durable); the success path
+     asserts a durable `PUBLISHED` journal entry accompanies
+     `dispatched:true`.
+
 ### P1-3 — lease-loss safety (stale worker after re-grant)
 
 NOT STARTED: pending after P1-2 review. Planned: a stale worker must not

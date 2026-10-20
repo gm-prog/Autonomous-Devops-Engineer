@@ -1,6 +1,7 @@
 import json
 import os
-from typing import Optional
+import time
+from typing import Any, Dict, List, Optional
 
 import redis
 
@@ -48,6 +49,10 @@ def _rev_key(run_id: str) -> str:
     return f"deployment_run:{run_id}:rev"
 
 
+def _journal_key(run_id: str) -> str:
+    return f"deployment_run:{run_id}:dispatch_journal"
+
+
 class RedisPipelineStore:
     def __init__(self):
         self.client = redis.Redis(
@@ -84,15 +89,20 @@ return 1
 """
 
     # Dispatch-scoped atomic revert / outcome bookkeeping (audit P1-2,
-    # second round): the document is replaced only if it is still in the
+    # third round): the document is replaced only if it is still in the
     # expected state, still carries the expected dispatch identity, the
     # revision counter still equals the caller's read, and NO worker
     # fence is active. With ARGV[6]=="1" (revert path) it ADDITIONALLY
-    # requires that the dispatch history says NO publish may have
-    # reached the broker (may_have_been_published false): an earlier
-    # ambiguous or successful attempt can never be erased by a later
-    # pre-send refusal on a retry. The document bytes are stored
-    # unchanged. Returns 1 or 0.
+    # requires:
+    #  * the run-document history flag may_have_been_published is false,
+    #  * the DURABLE ATTEMPT JOURNAL (KEYS[4], written before every
+    #    send) records at least one attempt for this dispatch and EVERY
+    #    such attempt is terminal PRE_SEND_FAILED. A missing journal, a
+    #    pending PUBLISHING entry, an AMBIGUOUS entry, or a PUBLISHED
+    #    entry all refuse the revert — including when a worker's active
+    #    fence made the run-document history write impossible earlier
+    #    (the journal is a separate key the fence cannot block).
+    # The document bytes are stored unchanged. Returns 1 or 0.
     REVERT_DISPATCH_CAS = """
 local doc = redis.call('GET', KEYS[1])
 if not doc then return 0 end
@@ -104,7 +114,19 @@ local execution = run.execution or {}
 local dispatch = execution.dispatch or {}
 if dispatch.dispatch_id ~= ARGV[4] then return 0 end
 if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end
-if ARGV[6] == '1' and dispatch.may_have_been_published then return 0 end
+if ARGV[6] == '1' then
+  if dispatch.may_have_been_published then return 0 end
+  local entries = redis.call('HGETALL', KEYS[4])
+  local saw_attempt = false
+  for i = 1, #entries, 2 do
+    local entry = cjson.decode(entries[i+1])
+    if entry.dispatch_id == ARGV[4] then
+      saw_attempt = true
+      if entry.state ~= 'PRE_SEND_FAILED' then return 0 end
+    end
+  end
+  if not saw_attempt then return 0 end
+end
 redis.call('INCR', KEYS[3])
 redis.call('EXPIRE', KEYS[3], tonumber(ARGV[5]))
 redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[5]))
@@ -197,10 +219,11 @@ return 1
         try:
             ok = self.client.eval(
                 self.REVERT_DISPATCH_CAS,
-                3,
+                4,
                 _run_key(run_id),
                 active_fence_key(run_id),
                 _rev_key(run_id),
+                _journal_key(run_id),
                 json.dumps(new_run.to_dict()),
                 expected_state,
                 str(int(expected_revision)),
@@ -213,3 +236,87 @@ return 1
             return bool(ok)
         except Exception:  # noqa: BLE001 - store blip: report, don't raise
             return False
+
+    # ------------------------------------------------------------ journal
+    # Independent audit (P1-2, third round): the DURABLE ATTEMPT JOURNAL.
+    # A separate hash key per run (NOT the run document, NOT fenced):
+    # each publish attempt is journaled PUBLISHING BEFORE the send, then
+    # transitioned to PUBLISHED / PRE_SEND_FAILED / AMBIGUOUS. The fence
+    # an active worker creates cannot block it, so a fast worker cannot
+    # make the audit trail disappear; a crashed API leaves a PUBLISHING
+    # entry, which the server-side revert treats as "may have been
+    # published" (never as "nothing was executed"). Revert is possible
+    # only when every journaled attempt for the dispatch is terminal
+    # PRE_SEND_FAILED (checked atomically in REVERT_DISPATCH_CAS).
+    #: Attempt states (terminal states are marked with ``_`` here).
+    ATTEMPT_PUBLISHING = "PUBLISHING"      # in flight (or crashed mid-flight)
+    ATTEMPT_PUBLISHED = "PUBLISHED"        # the broker accepted the message
+    ATTEMPT_PRE_SEND_FAILED = "PRE_SEND_FAILED"  # provably never sent
+    ATTEMPT_AMBIGUOUS = "AMBIGUOUS"        # failed, cannot be proven pre-send
+
+    def journal_dispatch_attempt(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        attempt_id: str,
+        state: str,
+    ) -> bool:
+        """Durably record one publish attempt transition. Returns False
+        (never raises) on a store failure — callers must then fail
+        closed (do not publish an untracked attempt; treat the attempt
+        as pending)."""
+        payload = json.dumps({
+            "dispatch_id": dispatch_id,
+            "state": state,
+            "at": time.time(),
+        })
+        try:
+            key = _journal_key(run_id)
+            with self.client.pipeline() as pipe:
+                pipe.hset(key, attempt_id, payload)
+                pipe.expire(key, _RUN_TTL_SECONDS)
+                pipe.execute()
+            return True
+        except Exception:  # noqa: BLE001 - store blip: report, don't raise
+            return False
+
+    def read_dispatch_journal(
+        self, run_id: str, dispatch_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """The journal entries (optionally filtered to one dispatch).
+        Returns [] on a store failure — callers decide the
+        fail-closed interpretation."""
+        try:
+            raw = self.client.hgetall(_journal_key(run_id)) or {}
+        except Exception:  # noqa: BLE001
+            return []
+        entries: List[Dict[str, Any]] = []
+        for value in raw.values():
+            try:
+                entry = json.loads(value)
+            except (TypeError, ValueError):
+                continue
+            if dispatch_id is None or entry.get("dispatch_id") == dispatch_id:
+                entries.append(entry)
+        return entries
+
+    def all_attempts_pre_send_failed(self, run_id: str, dispatch_id: str) -> bool:
+        """True only when the journal records at least one attempt for
+        this dispatch and EVERY one is terminal PRE_SEND_FAILED.
+        An empty journal (or a store failure) is NOT proof of
+        non-publication — it returns False (fail closed)."""
+        entries = self.read_dispatch_journal(run_id, dispatch_id)
+        return bool(entries) and all(
+            e.get("state") == self.ATTEMPT_PRE_SEND_FAILED for e in entries
+        )
+
+    def has_unresolved_attempt(self, run_id: str, dispatch_id: str) -> bool:
+        """True when the journal holds a PUBLISHING (in flight / crashed
+        mid-flight) or AMBIGUOUS attempt for this dispatch — the
+        dispatch outcome is unconfirmed and idempotent re-dispatch is
+        safe (same stable task id; the worker absorbs duplicates)."""
+        entries = self.read_dispatch_journal(run_id, dispatch_id)
+        return any(
+            e.get("state") in (self.ATTEMPT_PUBLISHING, self.ATTEMPT_AMBIGUOUS)
+            for e in entries
+        )

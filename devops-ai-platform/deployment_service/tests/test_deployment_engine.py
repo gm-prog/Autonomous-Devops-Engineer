@@ -58,8 +58,17 @@ class FakeSourceVerifier:
 
 
 class FakeStore:
+    #: Attempt-journal states (mirror of RedisPipelineStore).
+    ATTEMPT_PUBLISHING = "PUBLISHING"
+    ATTEMPT_PUBLISHED = "PUBLISHED"
+    ATTEMPT_PRE_SEND_FAILED = "PRE_SEND_FAILED"
+    ATTEMPT_AMBIGUOUS = "AMBIGUOUS"
+
     def __init__(self):
         self.data, self.locks = {}, set()
+        # Independent audit (P1-2, third round): the durable attempt
+        # journal, mirrored per-run as {dispatch_id: {attempt_id: state}}.
+        self.journal = {}
     def save(self, run):
         # Audit P1-2 follow-up: mirror the real store — every durable
         # write bumps the document revision.
@@ -74,7 +83,8 @@ class FakeStore:
         self.data[run_id] = run.to_dict()
         return True
     def cas_run_document(self, run_id, expected_state, expected_dispatch_id,
-                         expected_revision, new_run):
+                         expected_revision, new_run,
+                         require_not_maybe_published=False):
         stored = self.data.get(run_id)
         if not stored:
             return False
@@ -85,6 +95,11 @@ class FakeStore:
         dispatch = (stored.get("execution") or {}).get("dispatch") or {}
         if dispatch.get("dispatch_id") != expected_dispatch_id:
             return False
+        if require_not_maybe_published:
+            if dispatch.get("may_have_been_published"):
+                return False
+            if not self.all_attempts_pre_send_failed(run_id, expected_dispatch_id):
+                return False
         new_run.revision = expected_revision + 1
         self.data[run_id] = new_run.to_dict()
         return True
@@ -94,6 +109,28 @@ class FakeStore:
         if run_id in self.locks: return False
         self.locks.add(run_id); return True
     def release_lock(self, run_id): self.locks.discard(run_id)
+
+    def journal_dispatch_attempt(self, run_id, dispatch_id, attempt_id, state):
+        self.journal.setdefault(run_id, {}).setdefault(dispatch_id, {})[attempt_id] = state
+        return True
+    def read_dispatch_journal(self, run_id, dispatch_id=None):
+        dispatches = self.journal.get(run_id, {})
+        if dispatch_id is not None:
+            dispatches = {dispatch_id: dispatches.get(dispatch_id, {})}
+        entries = []
+        for did, attempts in dispatches.items():
+            for attempt_id, state in attempts.items():
+                entries.append({"dispatch_id": did,
+                                "attempt_id": attempt_id, "state": state})
+        return entries
+    def all_attempts_pre_send_failed(self, run_id, dispatch_id):
+        entries = self.read_dispatch_journal(run_id, dispatch_id)
+        return bool(entries) and all(
+            e["state"] == self.ATTEMPT_PRE_SEND_FAILED for e in entries)
+    def has_unresolved_attempt(self, run_id, dispatch_id):
+        return any(
+            e["state"] in (self.ATTEMPT_PUBLISHING, self.ATTEMPT_AMBIGUOUS)
+            for e in self.read_dispatch_journal(run_id, dispatch_id))
 
 
 class FakeLeaseGuard:

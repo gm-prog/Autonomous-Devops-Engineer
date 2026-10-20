@@ -204,6 +204,14 @@ class DispatchTruthTests(_ContractAppBase):
         dispatch = stored["execution"]["dispatch"]
         self.assertTrue(dispatch["dispatch_id"])
         self.assertEqual(dispatch["task_id"], task_ids[0])
+        # audit P1-2 third round: dispatched:true requires DURABLE
+        # publication evidence in the attempt journal
+        journal = self.app.state.engine.store.read_dispatch_journal(
+            run.id, dispatch["dispatch_id"])
+        self.assertTrue(
+            any(e["state"] == "PUBLISHED" for e in journal),
+            "dispatched:true must never be reported without a durable "
+            "PUBLISHED (or pending) journal entry")
         # exactly one enqueue, carrying the same immutable artifact
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["run_id"], run.id)
@@ -868,6 +876,198 @@ class DispatchSafetyTests(_ContractAppBase):
         self.assertEqual(stored["state"], "EXECUTION_REQUESTED")
         self.assertEqual(stored["execution"]["dispatch"]["dispatch_id"],
                          dispatch["dispatch_id"])
+
+
+class DispatchJournalRaceTests(_ContractAppBase):
+    """Independent audit (P1-2, third round): the durable attempt
+    journal makes the revert decision immune to the fence race — a
+    worker whose active fence blocks the run-document history write
+    can no longer make the dispatch's publication evidence disappear.
+    """
+    TASK = "deployment_service.infrastructure.celery.tasks"
+
+    def _age_dispatch(self, run, engine):
+        stored = engine.store.get(run.id)
+        stored["execution"]["dispatch"]["last_attempt_at"] = (
+            time.time() - engine.RE_DISPATCH_STALE_AFTER_SECONDS - 800
+        )
+        engine.store.save(DeploymentRun.from_dict(stored))
+
+    def test_fence_race_refused_outcome_write_journal_blocks_reversion(self):
+        # Deterministic reproduction of the audit's fence race:
+        #  (a) the run starts with may_have_been_published False and an
+        #      empty journal;
+        #  (b) the publish is accepted and the (fast) worker consumes
+        #      the message, acquiring its fence BEFORE the API's
+        #      post-publish run-document write;
+        #  (c) that outcome write is REFUSED (fence active);
+        #  (d) the journal — a separate key the fence cannot block —
+        #      still records the possibly-published attempt;
+        #  (e) the fence is released and the run aged stale;
+        #  (f) a forced re-POST whose attempts ALL fail pre-send must
+        #      NOT revert the run to APPROVED.
+        from deployment_service.infrastructure.persistence.execution_lease import (
+            ExecutionLeaseGuard,
+        )
+
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        store = engine.store
+
+        # (a) initial: no dispatch history fact (the dispatch record is
+        # created at claim time), empty journal
+        stored = store.get(run.id)
+        dispatch_record = (stored.get("execution") or {}).get("dispatch") or {}
+        self.assertFalse(dispatch_record.get("may_have_been_published", False))
+        self.assertEqual(store.read_dispatch_journal(run.id), [])
+
+        # (b) the broker accepts; the worker consumes the message and
+        # acquires its fence before the API's post-publish write.
+        guards = []
+
+        def _accept_and_consume(kwargs=None, **apply_kwargs):
+            result = mock.MagicMock()
+            result.id = "task-fake-1"
+            guard = ExecutionLeaseGuard(store.client, run.id, ttl_seconds=120)
+            self.assertTrue(guard.acquire())
+            guards.append(guard)
+            return result
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _accept_and_consume
+            first = self._post_execute(run)
+        for guard in guards:
+            self.addCleanup(guard.release)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertTrue(first.json()["dispatched"])
+        dispatch_id = store.get(run.id)["execution"]["dispatch"]["dispatch_id"]
+
+        # (c) the run-document outcome write was refused by the fence:
+        # the history fact never landed in the document.
+        stored = store.get(run.id)
+        self.assertFalse(
+            stored["execution"]["dispatch"]["may_have_been_published"],
+            "the fence must block the run-document history write")
+
+        # (d) the journal still records the possibly-published attempt.
+        entries = store.read_dispatch_journal(run.id, dispatch_id)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["state"], store.ATTEMPT_PUBLISHED,
+                         "the journal is the fence-proof audit trail")
+
+        # (e) the worker finishes and releases the fence; age the run.
+        for guard in guards:
+            guard.release()
+        self._age_dispatch(run, engine)
+
+        # (f) forced re-POST, every attempt a clean pre-send refusal.
+        def _refused(kwargs=None, **_):
+            raise ConnectionRefusedError("connection refused")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _refused
+            second = self._post_execute(run)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["dispatched"], "unknown")
+        self.assertNotIn("nothing was executed", second.text)
+
+        stored = store.get(run.id)
+        self.assertEqual(
+            stored["state"], "EXECUTION_REQUESTED",
+            "the journaled PUBLISHED attempt forbids the revert even "
+            "though the document history fact was refused")
+        self.assertNotEqual(stored["state"], "APPROVED")
+        self.assertFalse(any("reverted" in line for line in stored["logs"]))
+        journal = store.read_dispatch_journal(run.id, dispatch_id)
+        self.assertEqual(
+            [e["state"] for e in journal].count(store.ATTEMPT_PUBLISHED), 1,
+            "the earlier PUBLISHED entry survives the retry")
+        self.assertGreaterEqual(
+            [e["state"] for e in journal].count(store.ATTEMPT_PRE_SEND_FAILED),
+            1)
+        # the run is redeliverable again (stale + ambiguous) and the
+        # document bookkeeping caught up once the fence was gone
+        self.assertTrue(stored["execution"]["dispatch"]["ambiguous"])
+        self.assertTrue(
+            stored["execution"]["dispatch"]["may_have_been_published"])
+
+    def test_crashed_api_leaves_publishing_entry_never_reverts(self):
+        # The API journaled PUBLISHING, the broker accepted the send,
+        # and the API CRASHED before recording the outcome: the journal
+        # is left with a lone PUBLISHING entry and NO document flag
+        # (no ambiguous, no may_have_been_published). A later re-POST
+        # whose attempts all fail pre-send must (a) be accepted as an
+        # idempotent redelivery (unresolved journal attempt) and (b)
+        # NOT revert — a PUBLISHING entry means "may have been
+        # published", never "nothing was executed".
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        store = engine.store
+
+        claimed = engine.prepare_dispatch(
+            run.id, self._execute_body(run),
+            run.artifact_hash, run.plan_hash)
+        dispatch_id = claimed.execution["dispatch"]["dispatch_id"]
+        self.assertTrue(
+            store.journal_dispatch_attempt(
+                run.id, dispatch_id, "attempt-crash-1",
+                store.ATTEMPT_PUBLISHING))
+        stored = store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED")
+        self.assertFalse(
+            stored["execution"]["dispatch"]["may_have_been_published"])
+        self.assertFalse(stored["execution"]["dispatch"]["ambiguous"])
+
+        def _refused(kwargs=None, **_):
+            raise ConnectionRefusedError("connection refused")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _refused
+            resp = self._post_execute(run)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["dispatched"], "unknown")
+        self.assertNotIn("nothing was executed", resp.text)
+
+        stored = store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED",
+                         "a lone PUBLISHING entry is evidence of "
+                         "possible publication, never of non-publication")
+        self.assertNotEqual(stored["state"], "APPROVED")
+        self.assertFalse(any("reverted" in line for line in stored["logs"]))
+        journal = store.read_dispatch_journal(run.id, dispatch_id)
+        states = [e["state"] for e in journal]
+        self.assertEqual(states.count(store.ATTEMPT_PUBLISHING), 1,
+                         "the crashed attempt stays unresolved")
+        self.assertGreaterEqual(
+            states.count(store.ATTEMPT_PRE_SEND_FAILED), 1)
+        # redelivery happened (attempts advanced) — the unresolved
+        # journal entry made the dispatch eligible
+        self.assertEqual(stored["execution"]["dispatch"]["attempts"], 2)
+
+    def test_dispatch_true_requires_durable_journal_entry(self):
+        # Fail closed: if the PUBLISHING journal write cannot persist,
+        # the attempt must NOT be sent and the API must NOT report
+        # dispatched:true — an untracked publish must never be made.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        store = engine.store
+        calls, _task_ids, apply_async = self._captured_task()
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = apply_async
+            with mock.patch.object(
+                    store, "journal_dispatch_attempt", return_value=False):
+                resp = self._post_execute(run)
+        self.assertEqual(len(calls), 0,
+                         "a publish that cannot be journaled must not "
+                         "be sent")
+        self.assertNotIsInstance(resp.json().get("dispatched"), bool)
+        self.assertNotIn("nothing was executed", resp.text)
+        stored = store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED",
+                         "no durable evidence in either direction: the "
+                         "run stays non-revertible (fail closed)")
+        self.assertNotEqual(stored["state"], "APPROVED")
+        self.assertFalse(any("reverted" in line for line in stored["logs"]))
 
 
 class WorkerIdempotencyTests(_ContractAppBase):

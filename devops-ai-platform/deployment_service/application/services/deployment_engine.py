@@ -804,17 +804,26 @@ class DeploymentEngine:
         age = now - float(dispatch.get("last_attempt_at") or 0)
         ambiguous = bool(dispatch.get("ambiguous"))
         stale = age > self.RE_DISPATCH_STALE_AFTER_SECONDS
-        if not (ambiguous or stale):
+        # Independent audit (P1-2, third round): the durable attempt
+        # journal is authoritative for eligibility too — a PUBLISHING
+        # (crashed mid-flight) or AMBIGUOUS entry means the outcome is
+        # unconfirmed even if the run-document flag was never written
+        # (e.g. a worker fence blocked that write).
+        unresolved = self.store.has_unresolved_attempt(run_id, dispatch_id)
+        if not (ambiguous or stale or unresolved):
             raise DeploymentActionError(
-                "Re-dispatch rejected: this dispatch is fresh (not ambiguous "
-                "and not stale); poll the run state instead of re-dispatching."
+                "Re-dispatch rejected: this dispatch is fresh (not ambiguous, "
+                "not stale, and no unresolved attempt in the durable "
+                "journal); poll the run state instead of re-dispatching."
             )
+        reason = ("unresolved journal attempt" if unresolved
+                  else "ambiguous publish" if ambiguous else "stale dispatch")
         dispatch["attempts"] = int(dispatch.get("attempts") or 1) + 1
         dispatch["last_attempt_at"] = now
         run.execution["dispatch"] = dispatch
         run.add_log(
             f"DISPATCH RE-DELIVERED: attempt {dispatch['attempts']} of the same "
-            f"stable task (reason: {'ambiguous publish' if ambiguous else 'stale dispatch'}); "
+            f"stable task (reason: {reason}); "
             "any duplicate is absorbed by the worker."
         )
         # Audit P1-2 follow-up (Blocker B): the re-dispatch update is an
@@ -848,7 +857,13 @@ class DeploymentEngine:
           succeeded or was ambiguous, a later pre-send refusal on a
           RETRY does not erase that history — the earlier task may still
           be queued, so the dispatch can never be reverted, no matter
-          what the current call's errors show.
+          what the current call's errors show;
+        * the DURABLE ATTEMPT JOURNAL proves the same: at least one
+          journaled attempt for this dispatch exists and EVERY one is
+          terminal ``PRE_SEND_FAILED``. An empty journal, a ``PUBLISHING``
+          (crashed mid-flight) entry, an ``AMBIGUOUS`` or a ``PUBLISHED``
+          entry all refuse the revert — the journal is a separate key a
+          worker fence cannot block, so it is the authoritative trail.
 
         Returns True when the revert was applied and False when the run
         moved on or the history forbids it; on False the caller must
@@ -869,6 +884,14 @@ class DeploymentEngine:
             # revert would claim "nothing was executed" for a task that
             # may be queued — refuse; the run stays eligible for
             # idempotent re-dispatch/reconciliation instead.
+            return False
+        # Independent audit (P1-2, third round): the DURABLE ATTEMPT
+        # JOURNAL is authoritative — a worker's active fence can block
+        # the run-document history write, but never the journal. Revert
+        # requires that every journaled attempt for this dispatch is
+        # terminal PRE_SEND_FAILED (an empty journal is NOT proof —
+        # fail closed). The Lua CAS re-checks this atomically.
+        if not self.store.all_attempts_pre_send_failed(run_id, dispatch_id):
             return False
         run.move(DeploymentState.APPROVED)
         run.add_log(
