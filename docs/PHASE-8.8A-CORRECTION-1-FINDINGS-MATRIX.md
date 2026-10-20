@@ -262,6 +262,40 @@ CLOSED — four blockers, all corrected in the follow-up:**
    it stays EXECUTION_REQUESTED (durable, flagged `ambiguous`) for
    idempotent re-dispatch.
 
+**Second independent audit (2026-10-20) of the follow-up: one P1
+failure-path gap remained in Blocker D — corrected:**
+
+* **Residual hole** — the revert decision inspected only the CURRENT
+  HTTP call's publish errors. A dispatch whose EARLIER attempt was
+  ambiguous (or even successful) could be reverted to APPROVED by a
+  later re-POST whose retries all failed pre-send — erasing the history
+  that the earlier task may still be queued.
+* **Fix** — a durable, MONOTONIC dispatch-history fact
+  `may_have_been_published`, persisted with the dispatch record: set by
+  any successful or ambiguous publish, never cleared. The revert is
+  refused both at the route decision (the persisted history is
+  consulted) and in the Lua CAS (`require_not_maybe_published`),
+  no matter what later retries show; the run then stays
+  EXECUTION_REQUESTED, explicitly ambiguous, and remains eligible for
+  idempotent same-id re-dispatch. A fresh run whose ENTIRE history is
+  pre-send still reverts truthfully (503, "nothing was executed").
+* **Tests (suite now 24, all live-Redis)** — ambiguous initial publish
+  then a re-POST with all-pre-send refusals: NOT reverted, history
+  preserved, no false "nothing was executed" claim; successful publish
+  then stale then all-pre-send refusals: NOT reverted (the original
+  task may still be queued); broker-backed acceptance: the message is
+  real-published to the live broker and independently verified in the
+  queue (the BRPOPped envelope carries the stable task id + run id a
+  real worker would execute), with producer-side confirmation loss
+  injected AFTER the real publish; the accepted-then-error unit tests
+  are labeled as simulations.
+* **Wording correction (audit accuracy note)** — every durable write
+  ADVANCES the revision; the concurrency-sensitive dispatch writes
+  (claim, re-dispatch, revert, outcome bookkeeping) are CAS-guarded on
+  it. Unconditional saves (single-writer phases, worker state
+  advances) advance the counter too, invalidating dispatch claims
+  based on earlier reads — but they do not check it.
+
 Files (focused, no architectural change):
 
 * `deployment_service/infrastructure/persistence/redis_pipeline_store.py`

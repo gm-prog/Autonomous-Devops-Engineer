@@ -724,6 +724,14 @@ class DeploymentEngine:
             "attempts": 1,
             "last_attempt_at": time.time(),
             "ambiguous": False,
+            # Independent audit (P1-2 follow-up, second round): monotonic
+            # HISTORY fact — once any publish attempt succeeded or had an
+            # ambiguous outcome, this is True forever. A dispatch with
+            # may_have_been_published=True can NEVER be reverted to
+            # APPROVED ("nothing was executed"), no matter what later
+            # retry attempts show: the task from the earlier attempt may
+            # still be queued.
+            "may_have_been_published": False,
         }
         run.move(DeploymentState.EXECUTION_REQUESTED)
         run.add_log(
@@ -824,18 +832,27 @@ class DeploymentEngine:
         return run
 
     def revert_dispatch(self, run_id: str, dispatch_id: str) -> bool:
-        """Atomically revert a dispatch (independent audit, P1-2).
+        """Atomically revert a dispatch (independent audit, P1-2, second
+        round).
 
         The run returns to APPROVED — nothing was executed — but ONLY if,
-        atomically, it is still EXECUTION_REQUESTED, still carries THIS
-        dispatch, and no worker fence is active (the store executes the
-        check-and-write as one Lua script). A plain read-check-write could
-        clobber a run that the failed publish had in fact handed to a
-        worker between the publish and the revert.
+        atomically, ALL of these hold (the store executes the
+        check-and-write as one Lua script):
+
+        * it is still EXECUTION_REQUESTED;
+        * it still carries THIS dispatch;
+        * the document revision still matches this read;
+        * no worker fence is active;
+        * the dispatch HISTORY proves no publish could have reached the
+          broker: ``may_have_been_published`` is False. Once ANY attempt
+          succeeded or was ambiguous, a later pre-send refusal on a
+          RETRY does not erase that history — the earlier task may still
+          be queued, so the dispatch can never be reverted, no matter
+          what the current call's errors show.
 
         Returns True when the revert was applied and False when the run
-        moved on; on False the caller must report the run's CURRENT state,
-        never "nothing was executed".
+        moved on or the history forbids it; on False the caller must
+        report the run's CURRENT state, never "nothing was executed".
         """
         stored = self.store.get(run_id)
         if not stored:
@@ -846,11 +863,19 @@ class DeploymentEngine:
         dispatch = (run.execution or {}).get("dispatch") or {}
         if dispatch.get("dispatch_id") != dispatch_id:
             return False
+        if dispatch.get("may_have_been_published"):
+            # The dispatch history says a publish may have reached the
+            # broker (an earlier ambiguous or successful attempt). A
+            # revert would claim "nothing was executed" for a task that
+            # may be queued — refuse; the run stays eligible for
+            # idempotent re-dispatch/reconciliation instead.
+            return False
         run.move(DeploymentState.APPROVED)
         run.add_log(
-            f"Dispatch {dispatch_id[:12]} reverted: the broker was confirmed "
-            "down, so the publish never landed; nothing was executed. The "
-            "run remains approved and may be executed again."
+            f"Dispatch {dispatch_id[:12]} reverted: EVERY publish attempt in "
+            "this dispatch's history provably failed before reaching the "
+            "broker; nothing was executed. The run remains approved and "
+            "may be executed again."
         )
         return self.store.cas_run_document(
             run_id,
@@ -858,6 +883,7 @@ class DeploymentEngine:
             expected_dispatch_id=dispatch_id,
             expected_revision=run.revision,
             new_run=run,
+            require_not_maybe_published=True,
         )
 
     def record_dispatch_outcome(
@@ -865,13 +891,20 @@ class DeploymentEngine:
         run_id: str,
         dispatch_id: str,
         ambiguous: bool,
+        may_have_been_published: bool = False,
     ) -> None:
         """Best-effort, race-safe bookkeeping after a publish attempt
-        (audit P1-2): record whether the publish was ambiguous. The write
-        is CAS-guarded on state + dispatch identity, so it can never
-        clobber a run a worker has already advanced; when the guard
-        declines the bookkeeping is simply skipped (the run state is the
-        truth, the flag is only for redelivery eligibility)."""
+        (audit P1-2): record whether the publish was ambiguous, and
+        whether this attempt proves the dispatch may have reached the
+        broker (a successful or an ambiguous publish).
+        ``may_have_been_published`` is MONOTONIC — once True it is never
+        reset: it is the dispatch-history fact that forbids any later
+        revert to APPROVED, no matter what subsequent retries show.
+        The write is CAS-guarded on state + dispatch identity +
+        revision, so it can never clobber a run a worker has already
+        advanced; when the guard declines the bookkeeping is simply
+        skipped (the run state is the truth, the flag is only for
+        redelivery eligibility and revert safety)."""
         stored = self.store.get(run_id)
         if not stored:
             return
@@ -882,6 +915,9 @@ class DeploymentEngine:
         if dispatch.get("dispatch_id") != dispatch_id:
             return
         dispatch["ambiguous"] = ambiguous
+        dispatch["may_have_been_published"] = bool(
+            dispatch.get("may_have_been_published") or may_have_been_published
+        )
         run.execution["dispatch"] = dispatch
         # Audit P1-2 follow-up (Blocker C): the write is guarded on the
         # revision read above as well as state + dispatch identity, so a

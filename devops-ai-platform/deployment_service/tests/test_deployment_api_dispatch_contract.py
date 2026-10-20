@@ -14,10 +14,16 @@ it", and "we do not know which":
 * TWO CONCURRENT initial dispatches from the same APPROVED document
   race the atomic claim: exactly one wins and publishes; the loser's
   claim is refused and it publishes nothing (Blocker A);
-* a publish that provably failed PRE-SEND on every attempt (the broker
-  refused the connection before any publish bytes were sent) reverts
-  the run to APPROVED (atomic CAS) and reports 503 — nothing was
-  executed;
+* a dispatch whose ENTIRE history provably failed PRE-SEND (the broker
+  refused the connection before any publish bytes were sent, and no
+  earlier attempt succeeded or was ambiguous) reverts the run to
+  APPROVED (atomic CAS) and reports 503 — nothing was executed;
+* the dispatch history is a DURABLE, MONOTONIC fact
+  (may_have_been_published): once any attempt succeeded or was
+  ambiguous, a LATER re-POST whose attempts all fail pre-send does NOT
+  revert the run and does not claim "nothing was executed" — the
+  earlier task may still be queued; a broker-backed test real-publishes
+  to the live broker and verifies the accepted message in the queue;
 * ANY publish failure that cannot be proven pre-send — a timeout after
   send, a mid-command disconnect, a broker that accepted and then
   died — is AMBIGUOUS: the run is NEVER reverted (a later ping cannot
@@ -334,14 +340,194 @@ class DispatchSafetyTests(_ContractAppBase):
         self.assertEqual(dispatch["attempts"], 2)
         self.assertFalse(dispatch["ambiguous"],
                          "a successful publish clears the ambiguity")
+        # the monotonic history fact survives the successful re-publish
+        # (the earlier attempt MAY have reached the broker)
+        self.assertTrue(dispatch["may_have_been_published"])
+
+    # -- dispatch history: a later pre-send refusal NEVER erases an
+    #    earlier ambiguous or successful publish (audit second round) --
+
+    def test_ambiguous_then_presend_retries_never_revert(self):
+        # The FIRST call's publish is ambiguous (may have been accepted).
+        # A re-POST whose attempts ALL fail pre-send (clean refusal)
+        # must NOT revert the run: the persisted history fact
+        # (may_have_been_published) survives across HTTP calls and
+        # forbids the "nothing was executed" claim.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+
+        def _ambiguous(kwargs=None, **_):
+            raise TimeoutError("socket timeout while publishing")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _ambiguous
+            first = self._post_execute(run)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json()["dispatched"], "unknown")
+        stored = engine.store.get(run.id)
+        self.assertTrue(stored["execution"]["dispatch"]
+                        ["may_have_been_published"])
+
+        def _refused(kwargs=None, **_):
+            raise ConnectionRefusedError("connection refused")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _refused
+            second = self._post_execute(run)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["dispatched"], "unknown")
+        self.assertNotIn("nothing was executed", second.text)
+        stored = engine.store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED",
+                         "a later pre-send refusal must NOT erase an "
+                         "earlier ambiguous publish")
+        dispatch = stored["execution"]["dispatch"]
+        self.assertTrue(dispatch["may_have_been_published"])
+        self.assertTrue(dispatch["ambiguous"],
+                        "kept explicitly ambiguous for re-dispatch")
+        self.assertEqual(dispatch["attempts"], 2)
+        self.assertFalse(any("reverted" in line for line in stored["logs"]))
+
+    def test_published_then_stale_presend_retries_never_revert(self):
+        # The FIRST publish SUCCEEDED (the task is definitely queued).
+        # The dispatch goes stale, a re-POST's attempts all fail
+        # pre-send: still NO revert — the original message may still be
+        # queued or eligible for delivery.
+        run = self._create_and_approve()
+        engine = self.app.state.engine
+        _, _, apply_async = self._captured_task()
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = apply_async
+            first = self._post_execute(run)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertTrue(first.json()["dispatched"])
+        stored = engine.store.get(run.id)
+        self.assertTrue(stored["execution"]["dispatch"]
+                        ["may_have_been_published"],
+                        "a SUCCESSFUL publish is history too")
+        self.assertFalse(stored["execution"]["dispatch"]["ambiguous"])
+
+        # age the dispatch past the staleness window
+        stored = engine.store.get(run.id)
+        stored["execution"]["dispatch"]["last_attempt_at"] = (
+            time.time() - engine.RE_DISPATCH_STALE_AFTER_SECONDS - 800
+        )
+        engine.store.save(DeploymentRun.from_dict(stored))
+
+        def _refused(kwargs=None, **_):
+            raise ConnectionRefusedError("connection refused")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _refused
+            second = self._post_execute(run)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["dispatched"], "unknown")
+        self.assertNotIn("nothing was executed", second.text)
+        stored = engine.store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED",
+                         "the originally-published task may still be "
+                         "queued; a stale pre-send refusal must not "
+                         "revert")
+        dispatch = stored["execution"]["dispatch"]
+        self.assertTrue(dispatch["may_have_been_published"])
+        self.assertTrue(dispatch["ambiguous"])
+        self.assertEqual(dispatch["attempts"], 2)
+        self.assertFalse(any("reverted" in line for line in stored["logs"]))
+
+    # -- broker-backed: real acceptance, then producer-side loss -----------
+
+    def test_real_broker_acceptance_then_producer_loss(self):
+        # Broker-backed (audit item 5): the message is REAL-published to
+        # the REAL broker (independently verifiable in the queue); the
+        # producer-side loss is injected as an exception AFTER the
+        # publish call returned (the confirmation is lost). The run must
+        # not be reverted, the history fact must be persisted, and the
+        # queued message must be the real, well-formed task (a real
+        # worker would consume exactly this).
+        import redis as redis_lib
+        from urllib.parse import urlparse
+        from deployment_service.infrastructure.celery import tasks as task_mod
+
+        # The broker-backed test needs a REAL reachable Celery broker
+        # (in CI: the digest-pinned Redis on 127.0.0.1:6379). The broker
+        # URL is fixed at celery-app import time, so probe THAT url;
+        # when it is not reachable (e.g. a bare environment where the
+        # app default host does not exist) this is a live-broker
+        # precondition failure, not a code failure — skip, as the other
+        # live-integration tests do.
+        broker_url = task_mod.celery_app.conf.broker_url
+        try:
+            u = urlparse(broker_url)
+            probe = redis_lib.Redis(
+                host=u.hostname, port=u.port or 6379,
+                db=(u.path.lstrip("/") or 0),
+                socket_connect_timeout=2,
+            )
+            if not probe.ping():
+                raise OSError("no pong from the Celery broker")
+        except Exception:  # noqa: BLE001
+            self.skipTest(
+                "no reachable Celery broker for the broker-backed "
+                "acceptance test; it runs in CI where the digest-pinned "
+                "Redis is up")
+
+        real_task = task_mod.execute_iac_deployment
+        run = self._create_and_approve()
+        broker = redis_lib.Redis(
+            host=os.environ.get("REDIS_HOST", "127.0.0.1"),
+            port=int(os.environ.get("REDIS_PORT", "6399")),
+            db=0,
+            decode_responses=True,
+        )
+
+        def _publish_then_lose_confirmation(kwargs=None, **apply_kwargs):
+            # REAL publish to the REAL broker (the server accepts the
+            # message)...
+            real_task.apply_async(
+                kwargs=kwargs, task_id=apply_kwargs.get("task_id"))
+            # ...then the producer loses the publish confirmation.
+            raise TimeoutError(
+                "producer lost the publish confirmation")
+
+        with mock.patch(f"{self.TASK}.execute_iac_deployment") as task:
+            task.apply_async.side_effect = _publish_then_lose_confirmation
+            resp = self._post_execute(run)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["dispatched"], "unknown")
+        self.assertNotIn("nothing was executed", resp.text)
+        stored = self.app.state.engine.store.get(run.id)
+        self.assertEqual(stored["state"], "EXECUTION_REQUESTED")
+        dispatch = stored["execution"]["dispatch"]
+        self.assertTrue(dispatch["may_have_been_published"],
+                        "the real acceptance must be persisted as history")
+        self.assertTrue(dispatch["ambiguous"])
+
+        # INDEPENDENT broker-side verification: the message is really
+        # queued (consumed here so nothing lingers), and it carries the
+        # stable task id + run id a real worker would execute.
+        task_id = dispatch["task_id"]
+        found, deadline = [], time.time() + 5
+        while time.time() < deadline:
+            item = broker.brpop("celery", timeout=1)
+            if item is None:
+                break
+            found.append(item[1])
+        self.assertTrue(
+            any(task_id in m and run.id in m for m in found),
+            "the REAL broker accepted the message; a real worker would "
+            "consume exactly this task")
 
     # -- Blocker D: an ambiguous send is NEVER reverted ---------------------
 
     def test_accepted_then_timeout_never_reverts(self):
-        # The broker ACCEPTED the message, then the producer lost its
-        # reply (timeout). Even with the broker now unreachable, the run
-        # must NOT be reverted and must not claim "nothing was executed"
-        # — a ping cannot prove historical non-acceptance.
+        # SIMULATED post-send ambiguity (audit item 5): the side effect
+        # raises a TimeoutError to MODEL "the broker accepted the message
+        # and the producer lost the reply"; no real message is enqueued
+        # here — the broker-backed variant is
+        # test_real_broker_acceptance_then_producer_loss. Even with the
+        # broker now unreachable, the run must NOT be reverted and must
+        # not claim "nothing was executed" — a ping cannot prove
+        # historical non-acceptance.
         run = self._create_and_approve()
         engine = self.app.state.engine
         attempts = []
@@ -366,9 +552,12 @@ class DispatchSafetyTests(_ContractAppBase):
         self.assertEqual(len(set(attempts)), 1)
 
     def test_accepted_then_outage_never_reverts(self):
-        # A mid-command disconnect (the message MAY have been accepted)
-        # followed by a broker outage: the failure signature is not a
-        # clean pre-send refusal, so the run must NOT be reverted.
+        # SIMULATED post-send ambiguity (audit item 5): a mocked OSError
+        # models a mid-command disconnect (the message MAY have been
+        # accepted) followed by a broker outage; no real message is
+        # enqueued here (see the broker-backed variant below). The
+        # failure signature is not a clean pre-send refusal, so the run
+        # must NOT be reverted.
         run = self._create_and_approve()
         engine = self.app.state.engine
 

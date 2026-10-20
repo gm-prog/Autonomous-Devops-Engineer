@@ -22,22 +22,32 @@ it", and "we do not know which":
 * 200 ``dispatched: true`` — the durable run moved to
   EXECUTION_REQUESTED (atomic revision-claim) AND the publish
   completed.
-* 200 ``dispatched: "unknown"`` — the publish failed in a way that
-  CANNOT be proven pre-send (timeout, mid-command disconnect, broker
-  that accepted and then died): the task MAY be queued and executing,
-  so the run is NEVER reverted; it stays EXECUTION_REQUESTED and the
-  caller may poll or idempotently re-POST the same request (same
-  stable task id; the worker absorbs duplicates).
-* 503 — EVERY publish attempt provably failed pre-send (the broker
-  refused the connection before any publish bytes were sent): the run
-  is atomically reverted to APPROVED and nothing was executed.
+* 200 ``dispatched: "unknown"`` — the dispatch CANNOT be proven to
+  have stayed off the broker: either this call's publish failed in a
+  way that cannot be proven pre-send (timeout, mid-command disconnect,
+  a broker that accepted and then died), or this call's attempts all
+  failed pre-send but an EARLIER attempt of this same dispatch
+  succeeded or was ambiguous (the monotonic, durable
+  ``may_have_been_published`` history fact): the task MAY be queued
+  and executing, so the run is NEVER reverted; it stays
+  EXECUTION_REQUESTED, explicitly ambiguous, and the caller may poll
+  or idempotently re-POST the same request (same stable task id; the
+  worker absorbs duplicates).
+* 503 — EVERY publish attempt in the dispatch's ENTIRE history
+  provably failed pre-send (the broker refused the connection before
+  any publish bytes were sent, and no earlier attempt succeeded or was
+  ambiguous): the run is atomically reverted to APPROVED and nothing
+  was executed.
 
-Concurrency: the run document carries a monotonic ``revision``; the
-APPROVED -> EXECUTION_REQUESTED claim, re-dispatch updates, reverts and
-outcome bookkeeping are all Lua compare-and-set on it, so a losing
-concurrent request publishes nothing and no writer can clobber a
-document another process has advanced. Delivery is at-least-once; the
-worker is idempotent.
+Concurrency: every durable write to the run document atomically
+ADVANCES a monotonic ``revision`` counter; the concurrency-sensitive
+dispatch writes (the APPROVED -> EXECUTION_REQUESTED claim, re-dispatch
+updates, reverts, outcome bookkeeping) are Lua compare-and-set on it,
+so a losing concurrent request publishes nothing and a stale dispatch
+write is refused. Unconditional saves (single-writer phases, worker
+state advances) also advance the counter, invalidating any dispatch
+claim based on an earlier read. Delivery is at-least-once; the worker
+is idempotent.
 """
 
 import logging
@@ -345,18 +355,25 @@ def create_app() -> FastAPI:
 
         * 200 ``dispatched: true`` — the run claimed EXECUTION_REQUESTED
           (atomic revision-claim) and the publish completed.
-        * 200 ``dispatched: "unknown"`` — the publish failed in a way
-          that CANNOT be proven pre-send (timeout, mid-command
-          disconnect, a broker that accepted and then died). The task
+        * 200 ``dispatched: "unknown"`` — the dispatch cannot be proven
+          to have stayed off the broker: either this call's publish
+          failed in a way that cannot be proven pre-send (timeout,
+          mid-command disconnect, a broker that accepted and then
+          died), or this call's attempts all failed pre-send but the
+          DURABLE dispatch history (monotonic may_have_been_published)
+          shows an earlier attempt succeeded or was ambiguous. The task
           MAY already be queued and executing, so the run is NEVER
-          reverted (a later ping cannot prove historical non-acceptance);
-          it stays EXECUTION_REQUESTED and re-POSTing the SAME request
-          idempotently re-publishes the SAME stable task id, which the
-          worker's lease + terminal-state check absorb.
-        * 503 — EVERY attempt provably failed pre-send (the broker
-          refused the connection before any publish bytes were sent):
-          the run is atomically reverted to APPROVED and the API
-          truthfully reports that nothing was executed.
+          reverted (a later ping — and even a later clean refusal —
+          cannot prove historical non-acceptance); it stays
+          EXECUTION_REQUESTED, explicitly ambiguous, and re-POSTing the
+          SAME request idempotently re-publishes the SAME stable task
+          id, which the worker's lease + terminal-state check absorb.
+        * 503 — EVERY publish attempt in the dispatch's ENTIRE history
+          provably failed pre-send (the broker refused the connection
+          before any publish bytes were sent; no earlier attempt
+          succeeded or was ambiguous): the run is atomically reverted
+          to APPROVED and the API truthfully reports that nothing was
+          executed.
 
         Duplicate handling: a FRESH (non-ambiguous, non-stale) run
         already in EXECUTION_REQUESTED is refused with 409 — exactly-once
@@ -434,7 +451,15 @@ def create_app() -> FastAPI:
                     time.sleep(_PUBLISH_RETRY_DELAY_SECONDS)
 
         if not publish_errors:
-            engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=False)
+            # A successful publish is itself history: the task reached
+            # the broker, so this dispatch can never later be reverted
+            # to APPROVED ("nothing was executed") — not even after a
+            # retry whose attempts all fail pre-send (the original
+            # message may still be queued or redelivered).
+            engine.record_dispatch_outcome(
+                run_id, dispatch_id, ambiguous=False,
+                may_have_been_published=True,
+            )
             return {
                 "dispatched": True,
                 "run_id": run_id,
@@ -444,19 +469,32 @@ def create_app() -> FastAPI:
                         "terminal state; a dispatched run is not yet complete",
             }
 
-        # The publish failed on every attempt. Audit P1-2 follow-up
-        # (Blocker D): the outcome is revertible ONLY if EVERY attempt
-        # provably failed pre-send (connection refused: no publish bytes
-        # could have reached the broker). ANY ambiguous attempt — a
-        # timeout, a mid-command disconnect, a broker that accepted and
-        # then died — means the task MAY be queued and executing, and
-        # the run is NEVER reverted: a later ping cannot prove historical
-        # non-acceptance.
-        if all(_publish_failure_is_pre_send(e) for e in publish_errors):
+        # The publish failed on every attempt of THIS call. Audit P1-2
+        # follow-up (Blocker D, second round): the outcome is revertible
+        # ONLY if the ENTIRE dispatch history provably failed pre-send:
+        # (a) every attempt of THIS call was a clean connection refusal
+        # (no publish bytes could have reached the broker), AND
+        # (b) the persisted dispatch history says no EARLIER attempt
+        # succeeded or was ambiguous (may_have_been_published is
+        # monotonic and durable: an earlier ambiguous or successful
+        # publish is never erased by a later pre-send refusal on a
+        # retry — the earlier task may still be queued and executing).
+        # ANY ambiguous attempt — a timeout, a mid-command disconnect, a
+        # broker that accepted and then died — means the run is NEVER
+        # reverted: a later ping cannot prove historical non-acceptance.
+        stored = engine.store.get(run_id) or {}
+        stored_dispatch = (stored.get("execution") or {}).get("dispatch") or {}
+        ever_maybe_published = bool(
+            stored_dispatch.get("may_have_been_published")
+        )
+        all_current_pre_send = all(
+            _publish_failure_is_pre_send(e) for e in publish_errors
+        )
+        if all_current_pre_send and not ever_maybe_published:
             reverted = engine.revert_dispatch(run_id, dispatch_id)
             if not reverted:
-                stored = engine.store.get(run_id)
-                state = (stored or {}).get("state", "UNKNOWN")
+                current = engine.store.get(run_id)
+                state = (current or {}).get("state", "UNKNOWN")
                 logger.error(
                     "deployment dispatch failed pre-send for %s (%s) but the "
                     "run already advanced to %s; reporting current state",
@@ -472,42 +510,59 @@ def create_app() -> FastAPI:
                             "terminal state.",
                 }
             logger.error(
-                "deployment dispatch failed PRE-SEND for %s: %s; broker "
-                "refused the connection on every attempt, nothing was "
-                "enqueued, run reverted to APPROVED",
+                "deployment dispatch failed PRE-SEND for %s: %s; every "
+                "attempt in the dispatch history provably stayed off the "
+                "broker, run reverted to APPROVED",
                 run_id, type(publish_errors[0]).__name__,
             )
             raise HTTPException(
                 status_code=503,
-                detail="Execution dispatch is unavailable: the broker "
-                       "refused the connection before any publish was sent "
-                       "(on every attempt); the run remains APPROVED and "
-                       "nothing was executed.",
+                detail="Execution dispatch is unavailable: every publish "
+                       "attempt in this dispatch's history provably failed "
+                       "before reaching the broker (connection refused); "
+                       "the run remains APPROVED and nothing was executed.",
             ) from publish_errors[0]
 
-        # AMBIGUOUS: at least one attempt could not be proven pre-send.
-        # Never revert — the task may already be queued and executing,
-        # even if the broker is unreachable right now.
-        engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=True)
+        # NOT REVERTIBLE: either at least one attempt of this call could
+        # not be proven pre-send (timeout / mid-command loss — the task
+        # may be queued and executing), or this call's attempts all
+        # failed pre-send BUT the persisted dispatch history shows an
+        # EARLIER attempt succeeded or was ambiguous (may_have_been_
+        # published is monotonic: the earlier task may still be queued).
+        # The run stays in EXECUTION_REQUESTED, explicitly ambiguous, and
+        # remains eligible for idempotent same-id re-dispatch.
+        engine.record_dispatch_outcome(
+            run_id, dispatch_id, ambiguous=True,
+            may_have_been_published=True,
+        )
         logger.error(
-            "deployment dispatch AMBIGUOUS for %s: %s; outcome cannot be "
-            "proven pre-send, run kept in EXECUTION_REQUESTED, re-dispatch "
-            "is idempotent",
-            run_id, type(publish_errors[0]).__name__,
+            "deployment dispatch NOT REVERTIBLE for %s: %s; this call's "
+            "attempts all pre-send=%s but dispatch history may_have_been_"
+            "published=%s — run kept in EXECUTION_REQUESTED (ambiguous), "
+            "re-dispatch is idempotent",
+            run_id, type(publish_errors[0]).__name__, all_current_pre_send,
+            ever_maybe_published,
         )
         return {
             "dispatched": "unknown",
             "run_id": run_id,
             "state": "EXECUTION_REQUESTED",
             "delivery": "at-least-once",
-            "note": "the publish failed and the outcome CANNOT be proven to "
-                    "have stayed off the broker (timeout or mid-command "
-                    "failure), so the task MAY already be queued and "
-                    "executing — the run is not reverted, even if the "
-                    "broker is currently unreachable. Poll the run, or "
-                    "re-POST this same request: the re-dispatch is "
-                    "idempotent (same stable task id; the worker absorbs "
-                    "duplicates).",
+            "note": "the dispatch cannot be reverted: "
+                    + ("every attempt of this call failed before reaching "
+                       "the broker, but an EARLIER attempt of this dispatch "
+                       "succeeded or was ambiguous, so that task may still "
+                       "be queued and executing"
+                      if all_current_pre_send else
+                      "the outcome of this call CANNOT be proven to have "
+                      "stayed off the broker (timeout or mid-command "
+                      "failure), so the task may already be queued and "
+                      "executing")
+                    + " — the run stays EXECUTION_REQUESTED: reverting "
+                      "would falsely claim that no work was enqueued for "
+                      "this dispatch. Poll the run, or re-POST this same "
+                      "request: the re-dispatch is idempotent (same "
+                      "stable task id; the worker absorbs duplicates).",
         }
 
     return application

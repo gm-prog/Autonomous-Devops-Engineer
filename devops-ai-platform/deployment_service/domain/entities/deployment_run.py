@@ -46,13 +46,17 @@ class DeploymentRun:
     rollback: Dict[str, Any] = field(default_factory=dict)
     #: Independent audit (P1-2 follow-up): monotonic document revision —
     #: the optimistic-concurrency version of this run document. Every
-    #: durable write (store.save, the fenced lease commit, the CAS
-    #: claim/revert/outcome writes) bumps it exactly once, and a CAS
-    #: write applies only when the stored revision still matches the
-    #: writer's read. This makes stale whole-document writes impossible:
-    #: a writer that read revision N cannot overwrite a document that
-    #: has since been written (now revision > N), regardless of which
-    #: process wrote it.
+    #: durable write (store.save, the fenced lease commit, the
+    #: claim/revert/outcome writes) advances it exactly once. The
+    #: concurrency-sensitive dispatch writes (claim, re-dispatch,
+    #: revert, outcome bookkeeping) additionally CHECK it: they apply
+    #: only when the stored revision still matches the writer's read, so
+    #: a stale dispatch write is refused. An unconditional save (a
+    #: single-writer phase) does not check, but it still advances the
+    #: counter, so every later dispatch CAS sees the newer revision and
+    #: any dispatch writer that read before the save goes stale.
+    #: (Authoritative value: the store's revision counter key; this
+    #: field is informational and merged from that key on read.)
     revision: int = 0
     logs: List[str] = field(default_factory=list)
     error: Optional[str] = None
