@@ -711,29 +711,161 @@ class DeploymentEngine:
         # an approval with no bound identity cannot authorize execution.
         if not (run.terraform_plan or {}).get("credential_profile_id", ""):
             pass  # terraform may legitimately be undeclared
+        # Independent audit (P1-2): persist a DURABLE DISPATCH record before
+        # the broker publish so the dispatch identity is stable across
+        # retries and redeliveries: dispatch_id is the celery task_id, so
+        # a re-publish of the SAME logical task is a duplicate that the
+        # worker's lease + terminal-state check absorb — never a second
+        # execution.
+        dispatch_id = uuid.uuid4().hex
+        run.execution["dispatch"] = {
+            "dispatch_id": dispatch_id,
+            "task_id": f"deploy-{dispatch_id}",
+            "attempts": 1,
+            "last_attempt_at": time.time(),
+            "ambiguous": False,
+        }
         run.move(DeploymentState.EXECUTION_REQUESTED)
-        run.add_log("EXECUTION_REQUESTED: dispatch validated; the durable run "
-                    "is persisted before the task is enqueued.")
+        run.add_log(
+            f"EXECUTION_REQUESTED: dispatch {dispatch_id[:12]} validated; the "
+            "durable run is persisted before the task is enqueued "
+            "(at-least-once delivery; the worker is idempotent)."
+        )
         self.store.save(run)
         return run
 
-    def revert_dispatch(self, run_id: str) -> None:
-        """Undo a dispatch whose broker publish failed.
+    # A dispatch is eligible for idempotent redelivery when it is (a)
+    # AMBIGUOUS — the publish timed out while the broker was reachable, so
+    # the message may already be queued — or (b) STALE: no worker has moved
+    # the run past EXECUTION_REQUESTED for longer than 2x the broker
+    # visibility timeout, so any message is either gone or long since
+    # re-delivery-eligible. The redelivered task reuses the SAME stable
+    # task_id, so duplicates are absorbed by the worker, never doubled.
+    RE_DISPATCH_STALE_AFTER_SECONDS = 7200
 
-        Only EXECUTION_REQUESTED reverts to APPROVED: if the worker has
-        already taken the run (DEPLOYING/...) nothing is touched, and a
-        terminal run can never be resurrected.
+    def redeliver_dispatch(
+        self,
+        run_id: str,
+        artifact_hash: str,
+        plan_hash: str,
+    ) -> "DeploymentRun":
+        """Re-publish the SAME dispatch for a run stuck in
+        EXECUTION_REQUESTED (independent audit, P1-2).
+
+        Idempotent by construction: the task_id is stable, and the worker's
+        terminal-state check plus fenced lease absorb any duplicate message.
+        Raises DeploymentActionError when the run is not in
+        EXECUTION_REQUESTED, the hashes no longer match the approval record,
+        the run has no durable dispatch record, or the dispatch is neither
+        ambiguous nor stale.
         """
+        stored = self.store.get(run_id)
+        if not stored:
+            raise DeploymentActionError("Deployment run not found.")
+        run = DeploymentRun.from_dict(stored)
+        if run.state != DeploymentState.EXECUTION_REQUESTED:
+            raise DeploymentActionError(
+                f"Only an EXECUTION_REQUESTED run can be re-dispatched "
+                f"(current state: {run.state.value})."
+            )
+        approval = run.approval or {}
+        if approval.get("artifact_hash") != artifact_hash or approval.get("plan_hash") != plan_hash:
+            raise DeploymentActionError(
+                "Re-dispatch rejected: hashes no longer match the approval "
+                "record (a newer pipeline generation is in flight)."
+            )
+        dispatch = (run.execution or {}).get("dispatch") or {}
+        dispatch_id = dispatch.get("dispatch_id")
+        if not dispatch_id:
+            raise DeploymentActionError(
+                "Re-dispatch rejected: run has no durable dispatch record; "
+                "approve the pipeline afresh."
+            )
+        now = time.time()
+        age = now - float(dispatch.get("last_attempt_at") or 0)
+        ambiguous = bool(dispatch.get("ambiguous"))
+        stale = age > self.RE_DISPATCH_STALE_AFTER_SECONDS
+        if not (ambiguous or stale):
+            raise DeploymentActionError(
+                "Re-dispatch rejected: this dispatch is fresh (not ambiguous "
+                "and not stale); poll the run state instead of re-dispatching."
+            )
+        dispatch["attempts"] = int(dispatch.get("attempts") or 1) + 1
+        dispatch["last_attempt_at"] = now
+        run.execution["dispatch"] = dispatch
+        run.add_log(
+            f"DISPATCH RE-DELIVERED: attempt {dispatch['attempts']} of the same "
+            f"stable task (reason: {'ambiguous publish' if ambiguous else 'stale dispatch'}); "
+            "any duplicate is absorbed by the worker."
+        )
+        self.store.save(run)
+        return run
+
+    def revert_dispatch(self, run_id: str, dispatch_id: str) -> bool:
+        """Atomically revert a dispatch (independent audit, P1-2).
+
+        The run returns to APPROVED — nothing was executed — but ONLY if,
+        atomically, it is still EXECUTION_REQUESTED, still carries THIS
+        dispatch, and no worker fence is active (the store executes the
+        check-and-write as one Lua script). A plain read-check-write could
+        clobber a run that the failed publish had in fact handed to a
+        worker between the publish and the revert.
+
+        Returns True when the revert was applied and False when the run
+        moved on; on False the caller must report the run's CURRENT state,
+        never "nothing was executed".
+        """
+        stored = self.store.get(run_id)
+        if not stored:
+            return False
+        run = DeploymentRun.from_dict(stored)
+        if run.state != DeploymentState.EXECUTION_REQUESTED:
+            return False
+        dispatch = (run.execution or {}).get("dispatch") or {}
+        if dispatch.get("dispatch_id") != dispatch_id:
+            return False
+        run.move(DeploymentState.APPROVED)
+        run.add_log(
+            f"Dispatch {dispatch_id[:12]} reverted: the broker was confirmed "
+            "down, so the publish never landed; nothing was executed. The "
+            "run remains approved and may be executed again."
+        )
+        return self.store.cas_run_document(
+            run_id,
+            expected_state="EXECUTION_REQUESTED",
+            expected_dispatch_id=dispatch_id,
+            new_run=run,
+        )
+
+    def record_dispatch_outcome(
+        self,
+        run_id: str,
+        dispatch_id: str,
+        ambiguous: bool,
+    ) -> None:
+        """Best-effort, race-safe bookkeeping after a publish attempt
+        (audit P1-2): record whether the publish was ambiguous. The write
+        is CAS-guarded on state + dispatch identity, so it can never
+        clobber a run a worker has already advanced; when the guard
+        declines the bookkeeping is simply skipped (the run state is the
+        truth, the flag is only for redelivery eligibility)."""
         stored = self.store.get(run_id)
         if not stored:
             return
         run = DeploymentRun.from_dict(stored)
         if run.state != DeploymentState.EXECUTION_REQUESTED:
             return
-        run.move(DeploymentState.APPROVED)
-        run.add_log("Dispatch reverted: the task never reached the broker; "
-                    "the run remains approved and nothing was executed.")
-        self.store.save(run)
+        dispatch = (run.execution or {}).get("dispatch") or {}
+        if dispatch.get("dispatch_id") != dispatch_id:
+            return
+        dispatch["ambiguous"] = ambiguous
+        run.execution["dispatch"] = dispatch
+        self.store.cas_run_document(
+            run_id,
+            expected_state="EXECUTION_REQUESTED",
+            expected_dispatch_id=dispatch_id,
+            new_run=run,
+        )
 
     def execute(self, run_id: str, payload: Dict[str, Any], artifact_hash: str, plan_hash: str, namespace="devops-production-namespace", healthcheck_url="", previous_good_terraform_tf=""):
         """Worker-owned execution under a fenced, renewable lease (F5/F7).

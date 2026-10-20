@@ -187,3 +187,103 @@ exact SHA, including live Compose boot/readiness, real-Redis integration
 kubernetes E2E (driver-level staging proof, non-root sandbox identity) and the
 service→HTTP→Kind E2E at **36/36 PASS** (real dispatch, worker-owned
 execution, terminal DEPLOYED on Kind, deterministic health verification).
+
+## Independent audit follow-up (2026-10-20, three P1 issues)
+
+Fixed one at a time on the session branch, each with regression tests and
+CI green at the exact SHA.
+
+### P1-1 — Celery crash recovery (commit 2cf0f53; CI 39377033703, 11/11 at SHA)
+
+* `infrastructure/celery/tasks.py` — explicit broker semantics
+  (`acks_late`, `acks_on_failure_or_timeout=False`,
+  `reject_on_worker_lost`, prefetch 1, `retry_on_startup`, visibility
+  3600 s > the 2790 s bounded worst case); explicit `-P prefork
+  --concurrency=1` at every worker launch site (Dockerfile.e2e CMD,
+  canonical compose).
+* `tests/crash_recovery_worker_target.py` + `tests/test_celery_crash_recovery.py`
+  — real worker subprocesses on the live broker, SIGKILL mid-execution,
+  restart, redelivery of the unacked message, idempotent resume
+  (SUCCEEDED) and terminal duplicate REPLAY with zero work. CI step
+  "Celery crash recovery — worker kill/restart on the live broker (audit
+  P1)", evidence artifact `celery-crash-recovery.txt`.
+* Structural guard `_check_redis_integration_contract` now covers the 4th
+  live-store step; mutation M24 updated to count it (extends, does not
+  reduce).
+
+### P1-2 — safe dispatch semantics (ambiguous broker publish, duplicate
+requests, concurrent transitions, retries, worker/API races)
+
+The old contract conflated "the broker accepted the task", "the broker
+never received it" and "we do not know which": any publish exception
+triggered an UNGUARDED read-check-write revert and a 503 claiming
+"nothing was executed" — false whenever the timed-out publish had in
+fact queued the task.
+
+Files (focused, no architectural change):
+
+* `deployment_service/infrastructure/persistence/redis_pipeline_store.py`
+  — new `cas_run_document` (Lua compare-and-set, same pattern as the
+  lease guard's COMMIT_SCRIPT): a run document is only replaced if it is
+  still in the expected state, still carries the expected dispatch
+  identity, and no worker fence (`deployment_fence_active:<run_id>`) is
+  active. Returns False (never raises) when the run moved on.
+* `deployment_service/application/services/deployment_engine.py`
+  — `prepare_dispatch` now persists a DURE DISPATCH record
+  (`execution.dispatch = {dispatch_id, task_id, attempts,
+  last_attempt_at, ambiguous}`) BEFORE the publish; `dispatch_id` is the
+  stable celery `task_id`. New `redeliver_dispatch` (idempotent re-publish
+  of the SAME task id, allowed only when the dispatch is AMBIGUOUS or
+  STALE — > 2x the broker visibility timeout — with re-verified hashes)
+  and `revert_dispatch(run_id, dispatch_id)` (atomic via
+  `cas_run_document`; returns whether the revert applied) plus
+  `record_dispatch_outcome` (CAS-guarded ambiguity bookkeeping that can
+  never clobber an advanced run).
+* `deployment_service/main.py` — `/execute` is tri-state:
+  * 200 `dispatched: true` — publish completed (bounded 3 attempts, same
+    task id);
+  * 200 `dispatched: "unknown"` — publish failed while a bounded
+    reachability probe found the broker REACHABLE (ambiguous timeout):
+    the run is NOT reverted, stays EXECUTION_REQUESTED, and re-POSTing
+    the same request idempotently re-publishes the SAME stable task id;
+  * 503 — publish failed AND the probe confirmed the broker DOWN: atomic
+    CAS revert to APPROVED, truthfully "nothing was executed"; if the CAS
+    declines (the run moved on), the API reports the run's CURRENT state
+    instead.
+  A fresh (non-ambiguous, non-stale) EXECUTION_REQUESTED duplicate stays
+  409 — exactly-once dispatch on the normal path is preserved.
+
+Regression tests (`deployment_service/tests/
+test_deployment_api_dispatch_contract.py`, all against the live store;
+15 total, +7 new):
+
+* ambiguous publish → 200 `"unknown"`, run kept EXECUTION_REQUESTED,
+  `ambiguous` persisted, 3 bounded retries all with the same task id;
+  re-POST → 200 true, SAME task id, attempts=2, ambiguity cleared;
+* stale dispatch (last attempt > 2x visibility) → idempotent
+  redelivery with the same task id;
+* re-dispatch with a mismatched artifact hash → 409, nothing enqueued;
+* terminal run + execute → 409, run not resurrected;
+* revert-CAS is a NO-OP (never a clobber) when the run already advanced
+  (DEPLOYING), when a worker fence is active, or when the dispatch
+  identity differs;
+* existing contract tests preserved (fresh duplicate 409, broker-down
+  503 + APPROVED revert, worker terminal redelivery replay, concurrent
+  ALREADY_EXECUTING).
+
+Documented residual limitation (cannot be eliminated without a broker
+delivery-ack, which Redis does not provide): an ambiguous-but-lost
+message is recovered by idempotent re-dispatch, which becomes eligible
+automatically as soon as the dispatch is marked ambiguous (immediate
+re-POST) or ages past 2x the visibility timeout (7200 s). There is no
+autonomous relay process: the caller (pipeline runner) re-POSTs. Because
+redelivery reuses the stable task id and the worker's fenced lease +
+terminal-state check absorb duplicates, at-least-once delivery never
+becomes double execution.
+
+### P1-3 — lease-loss safety (stale worker after re-grant)
+
+NOT STARTED: pending after P1-2 review. Planned: a stale worker must not
+initiate another external side effect after losing its lease;
+deterministic race test (expire old lease → grant new fencing token →
+resume old worker).

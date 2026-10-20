@@ -13,18 +13,32 @@ holds no Docker daemon access. The worker owns execution under a
 fenced, renewable Redis lease; delivery is at-least-once and the worker
 is idempotent, so a redelivered or duplicate task never double-applies.
 
-Execution contract (F7)
-=======================
-POST .../execute is a DISPATCH, not an execution: it returns a
-truthful ``queued`` result with the real persisted run id once the
-durable run has been moved to EXECUTION_REQUESTED AND the task was
-enqueued. If persistence or broker dispatch fails, the run is reverted
-to APPROVED and the API returns a typed failure — it never returns
-accepted/queued/success for work that was not actually dispatched.
+Execution contract (F7, audit P1-2)
+===================================
+POST .../execute is a DISPATCH, not an execution. The API never
+conflates "the broker accepted the task", "the broker never received
+it", and "we do not know which":
+
+* 200 ``dispatched: true`` — the durable run moved to
+  EXECUTION_REQUESTED AND the publish completed.
+* 200 ``dispatched: "unknown"`` — the publish failed while the broker
+  was reachable (ambiguous timeout): the task MAY be queued and
+  executing, so the run is NOT reverted; it stays EXECUTION_REQUESTED
+  and the caller may poll or idempotently re-POST the same request
+  (same stable task id; the worker absorbs duplicates).
+* 503 — the publish failed AND the broker was confirmed unreachable:
+  the run is atomically reverted to APPROVED and nothing was executed.
+
+The dispatch identity (task_id) is persisted in the run document
+BEFORE the publish, and a broker-failure revert is a Lua
+compare-and-set guarded on state + dispatch identity + absence of a
+worker fence, so a revert can never clobber a run a worker already
+took. Delivery is at-least-once; the worker is idempotent.
 """
 
 import logging
 import re
+import time
 from typing import List
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -168,6 +182,37 @@ class ExecuteRequest(BaseModel):
         return _validate_components(value)
 
 
+# Independent audit (P1-2): bounded publish retries and a bounded
+# broker reachability probe. A failed publish is NOT automatically a
+# "nothing executed" answer — the message may be queued — so the API
+# retries a few times, then PROBES the broker: only a confirmed-down
+# broker justifies a revert + 503; a reachable broker makes the outcome
+# ambiguous, and the truthful answer is "unknown" with the run left in
+# EXECUTION_REQUESTED for idempotent re-dispatch.
+_PUBLISH_ATTEMPTS = 3
+_PUBLISH_RETRY_DELAY_SECONDS = 0.5
+_BROKER_PROBE_ATTEMPTS = 3
+_BROKER_PROBE_RETRY_DELAY_SECONDS = 0.5
+
+
+def _broker_reachable(engine: "DeploymentEngine") -> bool:
+    """Bounded reachability probe for the post-publish decision (P1-2).
+
+    True = the broker answered at least one probe (the failed publish is
+    AMBIGUOUS — the task may be queued). False = every probe failed or
+    raised (the broker is down — the task cannot be queued, so a revert
+    is truthful)."""
+    for _attempt in range(_BROKER_PROBE_ATTEMPTS):
+        try:
+            if engine.store.ping():
+                return True
+        except Exception:  # noqa: BLE001 — probe failure == unreachable
+            pass
+        if _attempt + 1 < _BROKER_PROBE_ATTEMPTS:
+            time.sleep(_BROKER_PROBE_RETRY_DELAY_SECONDS)
+    return False
+
+
 def create_app() -> FastAPI:
     """Application factory.
 
@@ -266,17 +311,35 @@ def create_app() -> FastAPI:
         request: ExecuteRequest,
         identity: Identity = Depends(require_dispatch_caller),
     ):
-        """DISPATCH an approved run to the worker (F7).
+        """DISPATCH an approved run to the worker (F7; audit P1-2).
 
-        Truthful contract: a 200 with ``dispatched: true`` is returned
-        only after the durable run moved to EXECUTION_REQUESTED AND the
-        task reached the broker. Any failure reverts the run to
-        APPROVED and returns a typed error — never an accepted/queued
-        state for work that was not actually dispatched.
+        Tri-state truthful contract — the API never conflates "the
+        broker accepted the task", "the broker never received it", and
+        "we do not know which":
+
+        * 200 ``dispatched: true`` — the run is durably
+          EXECUTION_REQUESTED and the publish to the broker completed.
+        * 200 ``dispatched: "unknown"`` — the publish FAILED while the
+          broker was reachable (a timeout after the connection was
+          established). The task MAY already be queued and executing, so
+          the run is NOT reverted; it stays EXECUTION_REQUESTED and is
+          eligible for idempotent re-dispatch. Re-POSTing the SAME
+          request is safe: it re-publishes the SAME stable task id and
+          the worker's lease + terminal-state check absorb any
+          duplicate.
+        * 503 — the publish failed AND a reachability probe confirmed
+          the broker is down: the run is atomically reverted to
+          APPROVED and the API truthfully reports that nothing was
+          executed.
+
+        Duplicate handling: a FRESH (non-ambiguous, non-stale) run
+        already in EXECUTION_REQUESTED is refused with 409 — exactly-once
+        dispatch is preserved for the normal path; only ambiguous or
+        stale dispatches are re-delivered.
         """
         engine: DeploymentEngine = application.state.engine
         try:
-            engine.prepare_dispatch(
+            run = engine.prepare_dispatch(
                 run_id,
                 request.model_dump(),
                 request.artifact_hash,
@@ -286,45 +349,124 @@ def create_app() -> FastAPI:
                 previous_good_terraform_tf=request.previous_good_terraform_tf,
             )
         except DeploymentActionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # A run already in EXECUTION_REQUESTED may be a re-dispatch
+            # request for an ambiguous/stale dispatch — let the engine
+            # decide (it refuses when the dispatch is fresh).
+            if "EXECUTION_REQUESTED" in str(exc):
+                try:
+                    run = engine.redeliver_dispatch(
+                        run_id, request.artifact_hash, request.plan_hash
+                    )
+                except DeploymentActionError as re_exc:
+                    raise HTTPException(status_code=409, detail=str(re_exc)) from re_exc
+            else:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-        try:
-            from deployment_service.infrastructure.celery import tasks as deployment_tasks
-
-            deployment_tasks.execute_iac_deployment.apply_async(
-                kwargs={
-                    "run_id": run_id,
-                    "artifact_hash": request.artifact_hash,
-                    "plan_hash": request.plan_hash,
-                    "namespace": request.namespace,
-                    "healthcheck_url": request.healthcheck_url,
-                    "previous_good_terraform_tf": request.previous_good_terraform_tf,
-                    "dockerfile": request.dockerfile,
-                    "k8s_yaml": request.k8s_yaml,
-                    "terraform_tf": request.terraform_tf,
-                    "pipeline_yaml": request.pipeline_yaml,
-                    "components": request.components,
-                },
-            )
-        except Exception as exc:  # broker down / serialization refused
-            # The run is not executing anything: put it back where it
-            # came from and report the truth.
-            engine.revert_dispatch(run_id)
-            logger.error("deployment dispatch failed for %s: %s", run_id, type(exc).__name__)
+        dispatch = (run.execution or {}).get("dispatch") or {}
+        task_id = dispatch.get("task_id")
+        dispatch_id = dispatch.get("dispatch_id")
+        if not task_id or not dispatch_id:
+            # Cannot happen for a run prepared by this API; refuse to
+            # publish a task whose durable identity we cannot prove.
             raise HTTPException(
-                status_code=503,
-                detail="Execution dispatch is unavailable (broker failure); "
-                       "the run remains APPROVED and nothing was executed.",
-            ) from exc
+                status_code=500,
+                detail="Internal dispatch error: the run has no durable "
+                       "dispatch identity; no task was enqueued.",
+            )
 
-        return {
-            "dispatched": True,
-            "run_id": run_id,
-            "state": "EXECUTION_REQUESTED",
-            "delivery": "at-least-once",
-            "note": "poll GET /api/internal/deployments/{run_id} for the "
-                    "terminal state; a dispatched run is not yet complete",
-        }
+        publish_error: Exception = None
+        for _attempt in range(_PUBLISH_ATTEMPTS):
+            try:
+                from deployment_service.infrastructure.celery import tasks as deployment_tasks
+
+                # The SAME stable task_id on every attempt: a retry after
+                # an ambiguous timeout publishes a duplicate message that
+                # the worker's idempotency absorbs — at-least-once, never
+                # double-executed.
+                deployment_tasks.execute_iac_deployment.apply_async(
+                    kwargs={
+                        "run_id": run_id,
+                        "artifact_hash": request.artifact_hash,
+                        "plan_hash": request.plan_hash,
+                        "namespace": request.namespace,
+                        "healthcheck_url": request.healthcheck_url,
+                        "previous_good_terraform_tf": request.previous_good_terraform_tf,
+                        "dockerfile": request.dockerfile,
+                        "k8s_yaml": request.k8s_yaml,
+                        "terraform_tf": request.terraform_tf,
+                        "pipeline_yaml": request.pipeline_yaml,
+                        "components": request.components,
+                    },
+                    task_id=task_id,
+                )
+                publish_error = None
+                break
+            except Exception as exc:  # broker down / serialization refused
+                publish_error = exc
+                if _attempt + 1 < _PUBLISH_ATTEMPTS:
+                    time.sleep(_PUBLISH_RETRY_DELAY_SECONDS)
+
+        if publish_error is None:
+            engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=False)
+            return {
+                "dispatched": True,
+                "run_id": run_id,
+                "state": "EXECUTION_REQUESTED",
+                "delivery": "at-least-once",
+                "note": "poll GET /api/internal/deployments/{run_id} for the "
+                        "terminal state; a dispatched run is not yet complete",
+            }
+
+        # The publish failed on every attempt. Decide the truth:
+        # (a) broker down → the task cannot be queued → atomic revert;
+        # (b) broker reachable → the message may be queued → ambiguous.
+        if _broker_reachable(engine):
+            # AMBIGUOUS: never revert. The task may already be running.
+            engine.record_dispatch_outcome(run_id, dispatch_id, ambiguous=True)
+            logger.error(
+                "deployment dispatch AMBIGUOUS for %s: %s; run kept in "
+                "EXECUTION_REQUESTED, re-dispatch is idempotent",
+                run_id, type(publish_error).__name__,
+            )
+            return {
+                "dispatched": "unknown",
+                "run_id": run_id,
+                "state": "EXECUTION_REQUESTED",
+                "delivery": "at-least-once",
+                "note": "the broker publish timed out after the connection "
+                        "was established, so the task MAY already be queued "
+                        "and executing. Poll the run, or re-POST this same "
+                        "request: the re-dispatch is idempotent (same stable "
+                        "task id; the worker absorbs duplicates).",
+            }
+
+        # Broker confirmed down: the task cannot have been queued. Revert
+        # atomically; if the run moved on in the meantime, report its
+        # actual state instead of "nothing was executed".
+        reverted = engine.revert_dispatch(run_id, dispatch_id)
+        if not reverted:
+            stored = engine.store.get(run_id)
+            state = (stored or {}).get("state", "UNKNOWN")
+            logger.error(
+                "deployment dispatch failed for %s (%s) and the run already "
+                "advanced to %s; reporting current state",
+                run_id, type(publish_error).__name__, state,
+            )
+            return {
+                "dispatched": "unknown",
+                "run_id": run_id,
+                "state": state,
+                "delivery": "at-least-once",
+                "note": "the publish failed but the run had already moved on; "
+                        "poll for the terminal state.",
+            }
+        logger.error("deployment dispatch failed for %s: %s", run_id, type(publish_error).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail="Execution dispatch is unavailable (broker confirmed "
+                   "unreachable); the run remains APPROVED and nothing was "
+                   "executed.",
+        ) from publish_error
 
     return application
 
