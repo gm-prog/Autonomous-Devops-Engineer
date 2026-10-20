@@ -43,6 +43,7 @@ import redis as redis_lib
 
 from deployment_service.infrastructure.persistence.execution_lease import (
     ExecutionLeaseGuard,
+    LeaseLostError,
     active_fence_key,
     fence_key,
     lease_key,
@@ -405,6 +406,34 @@ class _patch_engine:
         self.module.DeploymentEngine = self.original
         return False
 
+
+
+# 10 --------------------------------------------------------------------
+def test_10_authoritative_ownership_check_rejects_superseded_worker(live_client):
+    """A stale local watchdog state cannot authorize another side effect."""
+    run_id = _run_id("assert-owned")
+    old_owner = ExecutionLeaseGuard(live_client, run_id, ttl_seconds=TTL)
+    new_owner = ExecutionLeaseGuard(live_client, run_id, ttl_seconds=TTL)
+    try:
+        assert old_owner.acquire()
+        assert old_owner.assert_owned() is None
+
+        # Deterministically model the old lease expiring and a new owner
+        # acquiring a higher fence before the old worker resumes.
+        live_client.delete(lease_key(run_id), active_fence_key(run_id))
+        assert new_owner.acquire()
+        assert new_owner.fence > old_owner.fence
+
+        # The old watchdog may not have ticked yet, but the Redis-backed
+        # assertion must still refuse ownership and request cancellation.
+        with pytest.raises(LeaseLostError, match="superseded"):
+            old_owner.assert_owned()
+        assert old_owner.cancel_event.is_set()
+        assert new_owner.assert_owned() is None
+    finally:
+        old_owner.release()
+        new_owner.release()
+        _cleanup(live_client, run_id)
 
 if __name__ == "__main__":
     import sys
