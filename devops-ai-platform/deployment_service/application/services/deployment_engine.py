@@ -642,13 +642,27 @@ class DeploymentEngine:
         )
 
     def _require_lease(self, guard) -> None:
-        """Before every side effect: prove we still own the lease."""
-        if not guard.alive():
+        """Prove live lease ownership immediately before each side effect.
+
+        The local watchdog deliberately tolerates a transient Redis outage
+        while an operation is already in flight. Its local state is not
+        authoritative enough to start another external operation: another
+        worker may have acquired a higher fence since the last watchdog tick.
+        The Redis-backed assertion fails closed if ownership is lost OR
+        cannot be confirmed.
+        """
+        try:
+            assert_owned = getattr(guard, "assert_owned", None)
+            if callable(assert_owned):
+                assert_owned()
+            elif not guard.alive():
+                raise LeaseLostError("local lease watchdog reports ownership loss")
+        except LeaseLostError as exc:
             guard.request_cancel()
             raise LeaseLostDuringExecutionError(
-                "execution lease lost before this step; refusing to start "
-                "a further side effect"
-            )
+                "execution lease lost or unverifiable before this step; "
+                "refusing to start a further side effect"
+            ) from exc
 
     def _mark_lease_lost(self, run, guard) -> None:
         """Best-effort terminal LEASE_LOST mark. The commit is fenced, so
