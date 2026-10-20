@@ -86,6 +86,18 @@ end
 return 0
 """
 
+#: ownership proof: KEYS[1]=lease, KEYS[2]=active fence;
+#: ARGV[1]=owner token, ARGV[2]=my fence.
+#: Unlike the watchdog's local grace-window state, this is an authoritative
+#: Redis check used immediately before starting each new external operation.
+OWNERSHIP_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] and
+   redis.call('GET', KEYS[2]) == ARGV[2] then
+  return 1
+end
+return 0
+"""
+
 #: commit: KEYS[1]=run key, KEYS[2]=active fence, KEYS[3]=revision
 #: counter; ARGV[1]=run payload, ARGV[2]=my fence, ARGV[3]=ttl
 #: (seconds). The run is rewritten only while THIS owner's fence is the
@@ -228,6 +240,36 @@ class ExecutionLeaseGuard:
         """True while the worker still owns the lease (or is inside
         the post-blip grace window)."""
         return not self._lost.is_set()
+
+    def assert_owned(self) -> None:
+        """Prove current Redis ownership before starting another side effect.
+
+        The watchdog's local grace window is useful while an operation is
+        already running through a transient Redis outage, but it is not
+        sufficient authority to START a new operation: the lease may have
+        expired and been granted to a worker with a newer fencing token.
+        Any failed or inconclusive ownership check fails closed.
+        """
+        try:
+            owned = self._client.eval(
+                OWNERSHIP_SCRIPT, 2,
+                lease_key(self._run_id),
+                active_fence_key(self._run_id),
+                self._owner,
+                str(self._fence),
+            )
+        except Exception as exc:  # noqa: BLE001 — inability to prove ownership
+            self._lost.set()
+            self._cancel.set()
+            raise LeaseLostError(
+                "cannot verify execution lease ownership; refusing a new side effect"
+            ) from exc
+        if not owned:
+            self._lost.set()
+            self._cancel.set()
+            raise LeaseLostError(
+                "execution lease was superseded; refusing a new side effect"
+            )
 
     def request_cancel(self) -> None:
         """Signal the running sandbox to terminate (bounded cancel)."""
