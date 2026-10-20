@@ -8,6 +8,7 @@ import pytest
 from deployment_service.application.services.deployment_engine import DeploymentActionError, DeploymentEngine
 from deployment_service.application.services.source_verification import SourceVerificationError
 from deployment_service.domain.value_objects.deployment_state import DeploymentState
+from deployment_service.infrastructure.persistence.execution_lease import LeaseLostError
 from shared_kernel.domain.provenance import verify_provenance_record
 
 
@@ -160,6 +161,12 @@ class FakeLeaseGuard:
     def alive(self):
         return not self._lost.is_set()
 
+    def assert_owned(self):
+        if self._lost.is_set() or FakeLeaseGuard.holders.get(self.run_id) is not self:
+            self.lose()
+            raise LeaseLostError("fake lease ownership is not current")
+        return True
+
     def request_cancel(self):
         self._cancel.set()
 
@@ -239,7 +246,10 @@ class FakeTerraform:
         self.applied_with_hash = None
         self.applied_from = None
 
-    def run_plan(self, iac_dir, execution=False, plan_output_path=None, cancel_event=None):
+    def run_plan(self, iac_dir, execution=False, plan_output_path=None, cancel_event=None,
+                 before_operation=None):
+        if before_operation is not None:
+            before_operation()
         self.plan_calls += 1
         plan_file_hash = ""
         if plan_output_path:
@@ -254,15 +264,16 @@ class FakeTerraform:
             "sandbox": {"sandbox_policy_identity": "fake-sandbox-v1"},
         }
 
-    def initialize(self, iac_dir, cancel_event=None):
+    def initialize(self, iac_dir, cancel_event=None, before_operation=None):
+        if before_operation is not None:
+            before_operation()
         self.init_calls += 1
         return {"status": "PASS", "operation": "init", "stdout": "init-ok"}
 
-    def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash="", cancel_event=None):
+    def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash="",
+                   cancel_event=None, before_operation=None):
         # The engine re-verifies the saved plan's hash at the apply
         # boundary; mirror that so a mismatch cannot pass unnoticed.
-        self.applied_with_hash = expected_plan_file_hash
-        self.applied_from = plan_output_path
         actual = hashlib.sha256(Path(plan_output_path).read_bytes()).hexdigest()
         if not expected_plan_file_hash or actual != expected_plan_file_hash:
             return {
@@ -270,6 +281,10 @@ class FakeTerraform:
                 "error_code": "PLAN_ARTIFACT_MISMATCH",
                 "plan_file_hash": actual,
             }
+        if before_operation is not None:
+            before_operation()
+        self.applied_with_hash = expected_plan_file_hash
+        self.applied_from = plan_output_path
         return {"status": "PASS", "stdout": "apply-ok", "plan_file_hash": actual}
 
 
@@ -277,16 +292,25 @@ class FakeKubectl:
     def __init__(self):
         self.dry_run_calls = []
         self.applied_calls = []
+        self.undo_calls = []
 
     def namespace(self): return "devops-production-namespace"
     def dry_run(self, manifest_path, namespace=None, cancel_event=None):
         self.dry_run_calls.append((manifest_path, namespace))
         return {"status": "PASS", "stdout": "dry-run-ok", "cluster_access": False}
-    def apply(self, manifest_path, namespace=None, approved_identity=None, cancel_event=None):
+    def apply(self, manifest_path, namespace=None, approved_identity=None,
+              cancel_event=None, before_operation=None):
+        if before_operation is not None:
+            before_operation()
         self.applied_calls.append((manifest_path, namespace, approved_identity))
         return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
     def rollout_status(self, deployment_name, namespace=None, timeout_seconds=300, cancel_event=None): return {"status": "PASS", "stdout": "rollout-ok", "cluster_access": True}
-    def rollout_undo(self, deployment_name, namespace=None, approved_identity=None, cancel_event=None): return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
+    def rollout_undo(self, deployment_name, namespace=None, approved_identity=None,
+                     cancel_event=None, before_operation=None):
+        if before_operation is not None:
+            before_operation()
+        self.undo_calls.append((deployment_name, namespace, approved_identity))
+        return {"status": "PASS", "stdout": "undo-ok", "cluster_access": True}
 
 
 class FakeHealth:
@@ -496,3 +520,153 @@ def test_execute_rejects_tampered_plan_hash(monkeypatch):
     monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
     with pytest.raises(DeploymentActionError, match="approval record"):
         engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, "0" * 64)
+
+
+def test_execution_refuses_alive_only_guard_without_assert_owned(monkeypatch):
+    """Missing assertion capability must not fall back to alive()."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    terraform = engine.terraform
+
+    class AliveOnlyGuard:
+        def __init__(self):
+            self.cancel_event = _threading.Event()
+            self.cancel_requested = False
+
+        def acquire(self):
+            return True
+
+        def alive(self):
+            return True
+
+        def request_cancel(self):
+            self.cancel_requested = True
+            self.cancel_event.set()
+
+        def commit(self, payload, ttl_seconds=86400):
+            return False
+
+        def release(self):
+            pass
+
+    guard = AliveOnlyGuard()
+    engine.lease_factory = lambda _run_id: guard
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    result = engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash)
+    assert result.state == DeploymentState.LEASE_LOST
+    assert guard.alive() is True
+    assert guard.cancel_requested is True
+    assert terraform.init_calls == 0
+    assert terraform.applied_from is None
+
+
+def test_lease_loss_before_kubernetes_apply_does_not_enter_generic_rollback(monkeypatch):
+    """A failure at the Kubernetes apply gate is lease loss, not a reason
+    for the generic handler to roll back a completed Terraform apply."""
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    terraform, kubectl = engine.terraform, engine.kubectl
+
+    class LoseAtKubernetesApply(FakeLeaseGuard):
+        def __init__(self, run_id, store=None):
+            super().__init__(run_id, store)
+            self.assertions = 0
+
+        def assert_owned(self):
+            self.assertions += 1
+            if self.assertions == 5:
+                self.lose()
+            return super().assert_owned()
+
+    guard = LoseAtKubernetesApply(run.id, engine.store)
+    engine.lease_factory = lambda _run_id: guard
+    result = engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash)
+    assert result.state == DeploymentState.LEASE_LOST
+    assert terraform.applied_from is not None
+    assert kubectl.applied_calls == []
+    assert kubectl.undo_calls == [], "lease-loss path must bypass generic rollback"
+    assert guard.cancel_event.is_set()
+
+
+def test_rollback_mutations_each_receive_a_fresh_authoritative_check(monkeypatch):
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+
+    class FailedKubernetesApply(FakeKubectl):
+        def apply(self, *args, **kwargs):
+            result = super().apply(*args, **kwargs)
+            result["status"] = "FAIL"
+            return result
+
+    kubectl = FailedKubernetesApply()
+    engine.kubectl = kubectl
+
+    class CountingGuard(FakeLeaseGuard):
+        def __init__(self, run_id, store=None):
+            super().__init__(run_id, store)
+            self.assertions = 0
+
+        def assert_owned(self):
+            self.assertions += 1
+            return super().assert_owned()
+
+    guard = CountingGuard(run.id, engine.store)
+    engine.lease_factory = lambda _run_id: guard
+    result = engine.execute(
+        run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash,
+        previous_good_terraform_tf='terraform { required_version = ">= 1.5.0" }\\n',
+    )
+    assert result.state == DeploymentState.ROLLED_BACK
+    assert len(kubectl.applied_calls) == 1
+    assert len(kubectl.undo_calls) == 1
+    assert engine.terraform.plan_calls == 2, "rollback Terraform plan did not run"
+    assert "/rollback/" in engine.terraform.applied_from
+    # Two state-transition gates, init, apply, Kubernetes apply, rollback
+    # entry, rollout undo, rollback plan, and rollback apply.
+    assert guard.assertions == 9
+
+
+def test_lease_loss_at_rollback_entry_prevents_undo_and_terraform_rollback(monkeypatch):
+    engine = build_engine()
+    run = engine.create_dry_run(VALID_PAYLOAD)
+    engine.approve(run.id, "human", run.artifact_hash, run.plan_hash)
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    terraform = engine.terraform
+
+    class FailedKubernetesApply(FakeKubectl):
+        def apply(self, *args, **kwargs):
+            result = super().apply(*args, **kwargs)
+            result["status"] = "FAIL"
+            return result
+
+    kubectl = FailedKubernetesApply()
+    engine.kubectl = kubectl
+
+    class LoseAtRollbackEntry(FakeLeaseGuard):
+        def __init__(self, run_id, store=None):
+            super().__init__(run_id, store)
+            self.assertions = 0
+
+        def assert_owned(self):
+            self.assertions += 1
+            # 1-2 transition gates; 3 init; 4 Terraform apply; 5
+            # Kubernetes apply; 6 is _rollback's preflight.
+            if self.assertions == 6:
+                self.lose()
+            return super().assert_owned()
+
+    guard = LoseAtRollbackEntry(run.id, engine.store)
+    engine.lease_factory = lambda _run_id: guard
+    result = engine.execute(
+        run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash,
+        previous_good_terraform_tf="terraform { required_version = \">= 1.5.0\" }\\n",
+    )
+    assert result.state == DeploymentState.LEASE_LOST
+    assert len(kubectl.applied_calls) == 1
+    assert kubectl.undo_calls == [], "no rollback mutation after lease loss"
+    assert terraform.plan_calls == 1, "Terraform rollback plan must not start"

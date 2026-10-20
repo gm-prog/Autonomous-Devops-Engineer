@@ -443,7 +443,113 @@ durable attempt journal:**
 
 ### P1-3 — lease-loss safety (stale worker after re-grant)
 
-NOT STARTED: pending after P1-2 review. Planned: a stale worker must not
-initiate another external side effect after losing its lease;
-deterministic race test (expire old lease → grant new fencing token →
-resume old worker).
+**Status: implemented on the Arena working branch; independent review and
+integration are still required.** The local checkout at task start was
+`arena/9d77a550-autonomous-devops-engineer` at `7b30a56` (a clean checkout
+of main, without the P1-2 source). To preserve rather than recreate or
+weaken P1-2, that same working branch was fast-forwarded to the existing
+P1-2 round-3 descendant `e1d0040c111417d7921ee376422b9b3df1e60d41`; no
+branch switch or merge of the unapproved candidate was performed. The
+candidate `dev/phase-8-8a-p1-3-lease-loss-safety` was reviewed as reference
+only: its P1-3 changes are not imported because its delta removes P1-2
+journal code and tests.
+
+**Defect and exact boundary.** `ExecutionLeaseGuard.alive()` represents
+local watchdog health and deliberately remains true during its Redis
+renewal grace period. A worker A could pause after its last successful
+renewal, have its lease and active-fence keys expire/revoked, and resume
+before that watchdog grace state changed. The former
+`DeploymentEngine._require_lease()` consulted only `alive()`, so it could
+start its next Terraform/Kubernetes operation despite worker B already
+holding a higher fence. Fenced state commits did not stop that external
+call from starting.
+
+**Implementation.** `execution_lease.py` adds one atomic Redis Lua
+assertion over the existing lease, monotonic fence-counter and active-fence
+keys. It requires the unique owner token to match, both Redis fence values
+to be canonical positive decimal strings equal to this acquisition's exact
+fence, and both expiring lease keys to have positive TTLs. Missing,
+expired, malformed or mismatched values return refusal. The Python guard
+accepts only the Lua success result; mismatch marks ownership lost, and
+mismatch or Redis/network/unverifiable response latches cancellation and
+raises `LeaseLostError`. A separate assertion-failed latch prevents a later
+watchdog renewal from clearing cancellation, while `alive()` retains its
+original watchdog/grace meaning. Owner tokens are not put into errors,
+logs, or evidence.
+
+`DeploymentEngine._require_lease()` now requires a callable
+`assert_owned()` returning exactly `True`; there is no `alive()` fallback.
+Missing capability and all assertion errors become the specific
+`LeaseLostDuringExecutionError` path. That branch makes no rollback call;
+any lease-lost state write uses only the existing fenced commit. Terraform
+and Kubernetes runners accept a per-operation gate that is invoked after
+local policy/artifact validation and immediately before sandbox launch.
+
+**Side-effect inventory and boundaries audited.**
+
+* Terraform execution `initialize` and exact approved-plan `apply`: checked
+  at the runner's individual sandbox launch boundary (including after
+  approved plan hash verification).
+* Rollback Kubernetes `rollout undo`: checked after local target/config
+  preparation and before sandbox launch.
+* Rollback Terraform `run_plan`: the gate runs before each CLI subprocess
+  (`fmt`, `init`, `validate`, `plan`), not merely once before the compound
+  helper; rollback `apply_plan` is checked after plan-artifact verification
+  and before the apply subprocess.
+* Kubernetes `apply`: checked after manifest, kubeconfig, execution-identity
+  and sandbox-policy preparation, immediately before launch.
+* Health/rollout status work is read-only; execution checks ownership before
+  starting that remote health-check phase and propagates the existing
+  cancellation event. Local payload transforms, YAML parsing, hashes and
+  state/log construction do not independently mutate an external system.
+* Pre-approval dry-run Terraform planning and Kubernetes server-side
+  dry-run occur before an execution lease exists; they are planning/validation
+  rather than deployment mutations and are outside the stale execution
+  worker path. The execution and rollback Terraform operations above are
+  lease-gated.
+
+The production runner cancellation event continues into the Terraform and
+Kubernetes sandboxes, which terminate/request termination of in-flight
+subprocesses where supported. Cancellation is best-effort for an operation
+already started; it is not proof that a provider did not accept a request.
+
+**Deterministic tests and evidence (live Redis, isolated run IDs):**
+
+| Test | Proves | Does not prove |
+|---|---|---|
+| `test_10_authoritative_assertion_positive_and_superseded_owner` | Against real Redis, A passes while current; B cannot acquire while A holds; after the test revokes A's lease/fence and B acquires a strictly higher fence, A's assertion fails, B's passes, and stale release/commit cannot delete or overwrite B. | Provider-level enforcement of fencing. |
+| `test_11_real_engine_rejects_paused_superseded_worker_before_apply` | Real `DeploymentEngine`, real Redis store and real guard: A completes Terraform init, pauses at the injected pre-apply boundary, B acquires and commits under a higher fence, then A resumes; its production ownership assertion raises before Terraform apply. No A Kubernetes apply or rollback occurs; cancellation is set; B's stored marker/state and lease remain intact. | Atomicity between Redis assertion and a separate external provider call. |
+| `test_12_real_engine_redis_unavailable_fails_closed_inside_watchdog_grace` | An actual Redis lease is acquired, while the assertion client reports a connection outage; local `alive()` stays true, cancellation is requested, the engine marks/returns lease loss through its fenced path, and Terraform/Kubernetes side-effect spies remain untouched. | Behavior of a real network partition on an external provider or cancellation of an already-running provider request. |
+| `test_execution_refuses_alive_only_guard_without_assert_owned` | Missing ownership capability refuses execution despite `alive() == True`. | Redis behavior; covered by the live-Redis tests above. |
+| `test_lease_loss_before_kubernetes_apply_does_not_enter_generic_rollback` and `test_lease_loss_at_rollback_entry_prevents_undo_and_terraform_rollback` | A lease-loss exception after an earlier operation takes precedence over generic recovery; no next Kubernetes apply, rollout undo, or Terraform rollback plan starts. | Provider-side fencing after a call was already launched. |
+| `test_rollback_mutations_each_receive_a_fresh_authoritative_check` | Engine passes gates to rollback rollout-undo, each rollback plan operation, and rollback apply; positive assertions precede their corresponding calls. | Downstream receiver enforcement. |
+| `test_lease_callback_runs_before_each_terraform_subprocess` and `test_mutating_kubernetes_operations_fail_closed_at_the_sandbox_boundary` | Runner-level gates precede every Terraform plan subprocess, Terraform apply, Kubernetes apply and rollout undo; a refusing callback results in no sandbox launch. | An external provider's enforcement of an owner token/fence. |
+| `test_13_malformed_or_nonexpiring_lease_state_fails_closed` (two parameter cases) | Real Redis rejects malformed active-fence data and a lease key with no expiry; the guard cancels and marks loss without exposing its owner token. | Arbitrary Redis corruption outside the asserted key set. |
+
+Local live-Redis result: `14 passed` with `REDIS_INTEGRATION_REQUIRED=true`
+against a private standalone Redis 7.2.6 instance. Focused engine and trust
+boundary suites also pass. Exact final commit SHA and the complete 11-job CI
+run must be recorded here after commit/push; until then this section is
+not CI-verified.
+
+**Guarantee boundary / topology.** The proved scenario is precise: once B
+has acquired the higher fence before A resumes its pre-operation check, A's
+atomic assertion fails and A does not invoke that next engine operation.
+This is not an absolute provider guarantee. A successful Redis assertion
+and a separate Terraform/Kubernetes/provider call are not one transaction;
+B can supersede A in the check/use interval after a successful assertion.
+The runner callback narrows that interval to the operation-launch boundary,
+but cannot make a non-cooperating receiver reject an old fence. Strict
+end-to-end fencing requires the downstream receiver to enforce monotonic
+fencing/idempotency or an architecture that serializes and authorizes
+operation start with the receiver. No such provider enforcement is claimed
+here. The repository's Compose and CI use standalone Redis; current keys
+have no common Cluster hash tag, so Redis Cluster is not supported for this
+multi-key Lua layout and would require a separately reviewed migration.
+
+**P1-2 preservation.** The round-3 journal implementation in
+`redis_pipeline_store.py`, dispatch route in `main.py`, and its durable
+publication-attempt contract tests were not changed. The focused dispatch
+contract suite remains 27 tests; the full local `tests/` plus
+`deployment_service/tests/` gate and CI evidence are recorded with the final
+SHA below.

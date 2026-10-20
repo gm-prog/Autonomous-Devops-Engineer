@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Callable, Dict, Optional, Protocol
 
 from deployment_service.application.services.kubeconfig_policy import (
     KubeconfigPolicyError,
@@ -209,6 +209,7 @@ class KubectlRunnerService:
         extra: Optional[Dict[str, Any]] = None,
         approved_identity: Optional[KubernetesExecutionIdentity] = None,
         cancel_event: Optional[threading.Event] = None,
+        before_operation: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         namespace = self.namespace()
         try:
@@ -249,6 +250,12 @@ class KubectlRunnerService:
             return self._blocked(f"sandbox is not configured: {exc}")
 
         try:
+            # Authorization is checked after local policy/configuration work
+            # and immediately before handing a mutating command to the
+            # sandbox. This narrows (but cannot eliminate) the Redis/provider
+            # check/use interval.
+            if before_operation is not None:
+                before_operation()
             result = sandbox.execute(
                 step,
                 manifest_yaml=manifest_yaml,
@@ -313,7 +320,8 @@ class KubectlRunnerService:
 
     def apply(self, manifest_path: str, namespace: Optional[str] = None,
               approved_identity: Optional[KubernetesExecutionIdentity] = None,
-              cancel_event: Optional[threading.Event] = None) -> Dict[str, Any]:
+              cancel_event: Optional[threading.Event] = None,
+              before_operation: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
             return blocked
@@ -330,6 +338,7 @@ class KubectlRunnerService:
                 "applied_resources": approved.resources,
             },
             cancel_event=cancel_event,
+            before_operation=before_operation,
         )
 
     def rollout_status(
@@ -356,6 +365,7 @@ class KubectlRunnerService:
         namespace: Optional[str] = None,
         approved_identity: Optional[KubernetesExecutionIdentity] = None,
         cancel_event: Optional[threading.Event] = None,
+        before_operation: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
@@ -366,4 +376,5 @@ class KubectlRunnerService:
             manifest_yaml="",
             deployment_name=deployment_name,
             cancel_event=cancel_event,
+            before_operation=before_operation,
         )

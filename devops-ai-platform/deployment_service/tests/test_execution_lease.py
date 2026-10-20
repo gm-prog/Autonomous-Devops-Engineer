@@ -20,7 +20,7 @@ These scenarios run against a live Redis (``REDIS_URL`` /
 ``tests/test_redis_integration.py``: in CI (``REDIS_INTEGRATION_REQUIRED
 = true``) a missing URL is a HARD failure — never a silent skip.
 
-The nine named scenarios:
+The original nine lease scenarios remain intact; P1-3 cases extend them:
 
   1. acquire is mutually exclusive (NX);
   2. release is compare-and-delete (stale release is a no-op);
@@ -31,18 +31,29 @@ The nine named scenarios:
   7. a single renewal failure inside the TTL is not lease-lost;
   8. 20+ concurrent duplicate dispatches yield exactly ONE owner;
   9. crash + redelivery never double-applies (engine-level, real
-     store, real lease).
+     store, real lease);
+ 10. authoritative ownership assertion: current owner succeeds; stale
+     owner after higher-fence grant fails and cannot commit/release;
+ 11. deterministic engine pause: superseded worker cannot start its next
+     Terraform operation and cannot roll back;
+ 12. Redis unavailability inside the watchdog grace window blocks the
+     engine's next external operation while local alive() stays true;
+ 13. malformed fence data and a non-expiring lease are refused (two
+     parameter cases).
 """
+import hashlib
 import os
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 import redis as redis_lib
 
 from deployment_service.infrastructure.persistence.execution_lease import (
     ExecutionLeaseGuard,
+    LeaseLostError,
     active_fence_key,
     fence_key,
     lease_key,
@@ -82,7 +93,8 @@ def _run_id(tag):
 def _cleanup(client, run_id):
     client.delete(
         lease_key(run_id), fence_key(run_id), active_fence_key(run_id),
-        f"deployment_run:{run_id}",
+        f"deployment_run:{run_id}", f"deployment_run:{run_id}:rev",
+        f"deployment_run:{run_id}:dispatch_journal",
     )
 
 
@@ -293,11 +305,13 @@ def test_9_crash_redelivery_never_double_applies(live_client):
 
     class _SlowKubectl(FakeKubectl):
         def apply(self, manifest_path, namespace=None,
-                  approved_identity=None, cancel_event=None):
+                  approved_identity=None, cancel_event=None,
+                  before_operation=None):
             time.sleep(0.75)  # hold the lease across the redelivery
             return super().apply(manifest_path, namespace,
                                  approved_identity=approved_identity,
-                                 cancel_event=cancel_event)
+                                 cancel_event=cancel_event,
+                                 before_operation=before_operation)
 
     kubectl_slow = _SlowKubectl()
     engine = DeploymentEngine(
@@ -404,6 +418,221 @@ class _patch_engine:
     def __exit__(self, *exc):
         self.module.DeploymentEngine = self.original
         return False
+
+
+# 10 --------------------------------------------------------------------
+def test_10_authoritative_assertion_positive_and_superseded_owner(live_client):
+    """Current owner passes; after B's higher fence, A fails and cannot
+    release or commit over B. This is a live Redis proof, not a fake."""
+    run_id = _run_id("assert-owned")
+    old_owner = ExecutionLeaseGuard(live_client, run_id, ttl_seconds=TTL)
+    new_owner = ExecutionLeaseGuard(live_client, run_id, ttl_seconds=TTL)
+    try:
+        assert old_owner.acquire()
+        assert old_owner.assert_owned() is True
+        assert new_owner.acquire() is False
+
+        # Deterministically model lease expiry/revocation before B acquires.
+        live_client.delete(lease_key(run_id), active_fence_key(run_id))
+        assert new_owner.acquire()
+        assert new_owner.fence > old_owner.fence
+        assert new_owner.assert_owned() is True
+
+        with pytest.raises(LeaseLostError):
+            old_owner.assert_owned()
+        assert old_owner.cancel_event.is_set()
+        assert new_owner.assert_owned() is True
+
+        assert old_owner.commit('{"owner": "stale"}', ttl_seconds=60) is False
+        old_owner.release()
+        assert live_client.get(lease_key(run_id)) is not None
+        assert new_owner.assert_owned() is True
+        payload = '{"owner": "current"}'
+        assert new_owner.commit(payload, ttl_seconds=60) is True
+        assert live_client.get(f"deployment_run:{run_id}") == payload.encode()
+    finally:
+        old_owner.release()
+        new_owner.release()
+        _cleanup(live_client, run_id)
+
+
+# 11 --------------------------------------------------------------------
+def test_11_real_engine_rejects_paused_superseded_worker_before_apply(live_client, monkeypatch):
+    """A real engine + real Redis guard refuses A's next Terraform call
+    after B acquires a higher fence while A is paused at the apply boundary."""
+    import json
+    from deployment_service.application.services.deployment_engine import DeploymentEngine
+    from deployment_service.domain.entities.deployment_run import DeploymentRun
+    from deployment_service.infrastructure.persistence.execution_lease import (
+        ExecutionLeaseGuard,
+    )
+    from deployment_service.infrastructure.persistence.redis_pipeline_store import RedisPipelineStore
+    from deployment_service.tests.test_deployment_engine import (
+        FakeHealth, FakeKubectl, FakeSourceVerifier, FakeTerraform, FakeValidator,
+        VALID_PAYLOAD,
+    )
+
+    store = RedisPipelineStore()
+    store.client = live_client
+    at_apply_boundary = threading.Event()
+    resume_old_worker = threading.Event()
+
+    class PausingTerraform(FakeTerraform):
+        def apply_plan(self, iac_dir, plan_output_path, expected_plan_file_hash="",
+                       cancel_event=None, before_operation=None):
+            actual = hashlib.sha256(Path(plan_output_path).read_bytes()).hexdigest()
+            if not expected_plan_file_hash or actual != expected_plan_file_hash:
+                return {"status": "BLOCKED", "error_code": "PLAN_ARTIFACT_MISMATCH"}
+            # This is the deterministic hook immediately before the injected
+            # production lease assertion; no apply side effect has begun.
+            at_apply_boundary.set()
+            if not resume_old_worker.wait(timeout=15):
+                raise AssertionError("test did not resume the paused worker")
+            if before_operation is not None:
+                before_operation()
+            self.applied_with_hash = expected_plan_file_hash
+            self.applied_from = plan_output_path
+            return {"status": "PASS", "stdout": "apply-ok", "plan_file_hash": actual}
+
+    terraform = PausingTerraform()
+    kubectl = FakeKubectl()
+    created_guards = []
+
+    def real_guard_factory(rid):
+        guard = ExecutionLeaseGuard(live_client, rid, ttl_seconds=TTL)
+        created_guards.append(guard)
+        return guard
+
+    engine = DeploymentEngine(
+        store=store, validator=FakeValidator(), terraform=terraform, kubectl=kubectl,
+        health_checker=FakeHealth(), source_verifier=FakeSourceVerifier(),
+        lease_factory=real_guard_factory,
+    )
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    run = engine.create_dry_run(dict(VALID_PAYLOAD))
+    engine.approve(run.id, "lease-regression", run.artifact_hash, run.plan_hash)
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault(
+        "run", engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash)))
+    new_owner = ExecutionLeaseGuard(live_client, run.id, ttl_seconds=TTL)
+    try:
+        worker.start()
+        assert at_apply_boundary.wait(timeout=15), "worker never reached apply boundary"
+        old_owner = created_guards[0]
+        assert old_owner.alive() is True
+
+        # Supersede A atomically from the test's real-Redis fixture, then
+        # establish that B—not a stale local watchdog snapshot—is current.
+        live_client.delete(lease_key(run.id), active_fence_key(run.id))
+        assert new_owner.acquire()
+        assert new_owner.fence > old_owner.fence
+        assert new_owner.assert_owned() is True
+        b_state = DeploymentRun.from_dict(store.get(run.id))
+        b_state.add_log("new-owner-state-marker")
+        assert new_owner.commit(json.dumps(b_state.to_dict())) is True
+
+        resume_old_worker.set()
+        worker.join(timeout=20)
+        assert not worker.is_alive(), "old worker did not terminate after lease loss"
+
+        assert outcome["run"].state.value == "LEASE_LOST"
+        assert old_owner.cancel_event.is_set()
+        assert terraform.init_calls == 1
+        assert terraform.applied_from is None, "A must not begin Terraform apply"
+        assert kubectl.applied_calls == [], "A must not begin Kubernetes apply"
+        assert kubectl.undo_calls == [], "A must not begin stale rollback"
+        assert new_owner.assert_owned() is True
+        assert live_client.get(lease_key(run.id)) is not None
+        final = store.get(run.id)
+        assert final["state"] == b_state.state.value
+        assert any("new-owner-state-marker" in line for line in final["logs"])
+        assert not any("LEASE_LOST" in line for line in final["logs"])
+    finally:
+        resume_old_worker.set()
+        if worker.ident is not None:
+            worker.join(timeout=20)
+        new_owner.release()
+        for guard in created_guards:
+            guard.release()
+        _cleanup(live_client, run.id)
+
+
+# 12 --------------------------------------------------------------------
+def test_12_real_engine_redis_unavailable_fails_closed_inside_watchdog_grace(
+    live_client, monkeypatch,
+):
+    """A still-alive local watchdog cannot authorize init when the atomic
+    Redis ownership query is unavailable."""
+    from deployment_service.application.services.deployment_engine import DeploymentEngine
+    from deployment_service.infrastructure.persistence.execution_lease import (
+        ExecutionLeaseGuard, OWNERSHIP_ASSERTION_SCRIPT,
+    )
+    from deployment_service.infrastructure.persistence.redis_pipeline_store import RedisPipelineStore
+    from deployment_service.tests.test_deployment_engine import (
+        FakeHealth, FakeKubectl, FakeSourceVerifier, FakeTerraform, FakeValidator,
+        VALID_PAYLOAD,
+    )
+
+    class UnavailableOwnershipClient:
+        def eval(self, script, *args, **kwargs):
+            if script == OWNERSHIP_ASSERTION_SCRIPT:
+                raise redis_lib.ConnectionError("synthetic Redis outage")
+            return live_client.eval(script, *args, **kwargs)
+
+    store = RedisPipelineStore()
+    store.client = live_client
+    terraform = FakeTerraform()
+    kubectl = FakeKubectl()
+    guards = []
+
+    def guard_factory(run_id):
+        guard = ExecutionLeaseGuard(
+            UnavailableOwnershipClient(), run_id, ttl_seconds=TTL)
+        guards.append(guard)
+        return guard
+
+    engine = DeploymentEngine(
+        store=store, validator=FakeValidator(), terraform=terraform, kubectl=kubectl,
+        health_checker=FakeHealth(), source_verifier=FakeSourceVerifier(),
+        lease_factory=guard_factory,
+    )
+    monkeypatch.setenv("DEPLOYMENT_EXECUTION_ENABLED", "true")
+    run = engine.create_dry_run(dict(VALID_PAYLOAD))
+    try:
+        engine.approve(run.id, "lease-regression", run.artifact_hash, run.plan_hash)
+        result = engine.execute(run.id, VALID_PAYLOAD, run.artifact_hash, run.plan_hash)
+        assert result.state.value == "LEASE_LOST"
+        assert guards[0].alive() is True, "local watchdog grace must retain its meaning"
+        assert guards[0].cancel_event.is_set()
+        assert terraform.init_calls == 0
+        assert terraform.applied_from is None
+        assert kubectl.applied_calls == []
+        assert kubectl.undo_calls == []
+    finally:
+        for guard in guards:
+            guard.release()
+        _cleanup(live_client, run.id)
+
+
+# 13 --------------------------------------------------------------------
+@pytest.mark.parametrize("corruption", ["malformed-active-fence", "lease-without-ttl"])
+def test_13_malformed_or_nonexpiring_lease_state_fails_closed(live_client, corruption):
+    run_id = _run_id("malformed")
+    guard = ExecutionLeaseGuard(live_client, run_id, ttl_seconds=TTL)
+    try:
+        assert guard.acquire()
+        if corruption == "malformed-active-fence":
+            live_client.set(active_fence_key(run_id), "not-a-fence", px=TTL * 1000)
+        else:
+            live_client.persist(lease_key(run_id))
+        with pytest.raises(LeaseLostError) as exc_info:
+            guard.assert_owned()
+        assert guard.cancel_event.is_set()
+        assert guard.alive() is False
+        assert guard._owner not in str(exc_info.value)
+    finally:
+        guard.release()
+        _cleanup(live_client, run_id)
 
 
 if __name__ == "__main__":

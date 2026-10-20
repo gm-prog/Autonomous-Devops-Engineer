@@ -695,6 +695,34 @@ def test_rollback_uses_the_same_sandbox_and_namespace(wired):
     assert sandbox.calls[0]["step"].argv[:3] == ("kubectl", "rollout", "undo")
 
 
+def test_mutating_kubernetes_operations_fail_closed_at_the_sandbox_boundary(wired):
+    runner, sandbox, manifest = wired
+    approved = runner.execution_identity()
+    checks = []
+
+    def refuse(operation):
+        def _refuse():
+            checks.append(operation)
+            raise RuntimeError("lease authorization refused")
+        return _refuse
+
+    with pytest.raises(RuntimeError, match="lease authorization refused"):
+        runner.apply(
+            str(manifest), approved_identity=approved,
+            before_operation=refuse("apply"),
+        )
+    assert checks == ["apply"]
+    assert sandbox.calls == [], "Kubernetes apply must not reach the sandbox"
+
+    with pytest.raises(RuntimeError, match="lease authorization refused"):
+        runner.rollout_undo(
+            "checkout-service", approved_identity=approved,
+            before_operation=refuse("undo"),
+        )
+    assert checks == ["apply", "undo"]
+    assert sandbox.calls == [], "rollout undo must not reach the sandbox"
+
+
 def test_runner_evidence_never_leaks_credentials(wired):
     runner, _, manifest = wired
     blob = repr(runner.apply(str(manifest),

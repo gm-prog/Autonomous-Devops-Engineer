@@ -176,13 +176,14 @@ class RecordingKubectl(FakeKubectl):
         return super().dry_run(manifest_path, namespace, cancel_event=cancel_event)
 
     def apply(self, manifest_path, namespace=None, approved_identity=None,
-              cancel_event=None):
+              cancel_event=None, before_operation=None):
         self.applied_manifests.append(
             Path(manifest_path).read_text(encoding="utf-8")
         )
         return super().apply(manifest_path, namespace,
                              approved_identity=approved_identity,
-                             cancel_event=cancel_event)
+                             cancel_event=cancel_event,
+                             before_operation=before_operation)
 
 
 def _execute_approved(kubectl, payload):

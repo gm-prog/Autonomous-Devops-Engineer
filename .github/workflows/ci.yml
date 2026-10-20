@@ -308,11 +308,12 @@ jobs:
       # proven against THIS live Redis — mutual-exclusion acquire,
       # compare-and-delete release, compare-and-expire renewal,
       # monotonic fencing, stale-worker commit rejection, watchdog
-      # renewal, blip grace, 24 concurrent duplicate dispatches and the
-      # crash-redelivery no-double-apply engine proof. Fail-closed:
+      # renewal, blip grace, authoritative ownership assertion, stale
+      # engine-boundary refusal, Redis-outage fail-closed behavior, 24
+      # concurrent duplicate dispatches and crash-redelivery proof. Fail-closed:
       # REDIS_INTEGRATION_REQUIRED=true makes a missing Redis a hard
       # failure, never a silent skip.
-      - name: Execution lease safety against the live store (F5, 9 scenarios)
+      - name: Execution lease safety against the live store (F5/P1-3, 14 scenarios)
         working-directory: devops-ai-platform
         env:
           REDIS_URL: redis://127.0.0.1:6379/0

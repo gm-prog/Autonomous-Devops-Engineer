@@ -573,26 +573,29 @@ class DeploymentEngine:
             self._commit(run, guard)
         results = []
         for name in deployment_names:
-            if guard is not None:
-                self._require_lease(guard)
             results.append({"component": f"kubernetes:{name}", "result": self.kubectl.rollout_undo(
                 name, namespace,
                 approved_identity=self._approved_kubernetes_identity(run),
-                cancel_event=guard.cancel_event if guard is not None else None)})
+                cancel_event=guard.cancel_event if guard is not None else None,
+                before_operation=(lambda: self._require_lease(guard))
+                if guard is not None else None)})
 
         if run.execution.get("terraform_applied"):
             if not previous_good_terraform_tf.strip():
                 results.append({"component": "terraform", "result": {"status": "BLOCKED", "error": "No previous known-good Terraform configuration was supplied."}})
             else:
-                if guard is not None:
-                    self._require_lease(guard)
                 rollback_dir = Path(temp_dir, "rollback")
                 rollback_dir.mkdir(parents=True, exist_ok=True)
                 previous_path = rollback_dir / "main.tf"
                 previous_path.write_text(previous_good_terraform_tf, encoding="utf-8")
                 plan_path = rollback_dir / "rollback.tfplan"
-                plan = self.terraform.run_plan(str(rollback_dir), execution=True, plan_output_path=str(plan_path),
-                                               cancel_event=guard.cancel_event if guard is not None else None)
+                plan = self.terraform.run_plan(
+                    str(rollback_dir), execution=True,
+                    plan_output_path=str(plan_path),
+                    cancel_event=guard.cancel_event if guard is not None else None,
+                    before_operation=(lambda: self._require_lease(guard))
+                    if guard is not None else None,
+                )
                 results.append({
                     "component": "terraform",
                     "result": plan if plan.get("status") != "PASS" else self.terraform.apply_plan(
@@ -600,6 +603,8 @@ class DeploymentEngine:
                         str(plan_path),
                         expected_plan_file_hash=plan.get("plan_file_hash", ""),
                         cancel_event=guard.cancel_event if guard is not None else None,
+                        before_operation=(lambda: self._require_lease(guard))
+                        if guard is not None else None,
                     ),
                 })
 
@@ -642,13 +647,47 @@ class DeploymentEngine:
         )
 
     def _require_lease(self, guard) -> None:
-        """Before every side effect: prove we still own the lease."""
-        if not guard.alive():
-            guard.request_cancel()
+        """Require an authoritative Redis proof before another operation.
+
+        ``alive()`` is only local watchdog health and cannot authorize an
+        external operation during its renewal grace window. Missing
+        assertion capability, a Redis outage, malformed response, or a
+        proven owner/fence mismatch all take the lease-loss path. There is
+        deliberately no alive()-only compatibility fallback.
+        """
+        def _cancel_if_supported():
+            try:
+                cancel = getattr(guard, "request_cancel", None)
+                if callable(cancel):
+                    cancel()
+            except Exception:  # cancellation must not authorize a start
+                pass
+
+        try:
+            assert_owned = getattr(guard, "assert_owned", None)
+        except Exception:
+            _cancel_if_supported()
             raise LeaseLostDuringExecutionError(
-                "execution lease lost before this step; refusing to start "
-                "a further side effect"
+                "execution lease ownership cannot be verified; refusing a new operation"
+            ) from None
+        if not callable(assert_owned):
+            _cancel_if_supported()
+            raise LeaseLostDuringExecutionError(
+                "execution lease ownership cannot be verified; refusing a new operation"
             )
+        try:
+            verified = assert_owned()
+            if verified is not True:
+                raise LeaseLostDuringExecutionError(
+                    "execution lease ownership could not be verified; refusing a new operation"
+                )
+        except Exception:
+            _cancel_if_supported()
+            # Do not preserve provider/client exception text: it is not
+            # authorization evidence and could contain sensitive data.
+            raise LeaseLostDuringExecutionError(
+                "execution lease ownership is lost or unverifiable; refusing a new operation"
+            ) from None
 
     def _mark_lease_lost(self, run, guard) -> None:
         """Best-effort terminal LEASE_LOST mark. The commit is fenced, so
@@ -1068,8 +1107,11 @@ class DeploymentEngine:
                 )
             )
             if blocked is None and terraform_declared:
-                self._require_lease(guard)
-                init = self.terraform.initialize(tf_workspace, cancel_event=guard.cancel_event)
+                init = self.terraform.initialize(
+                    tf_workspace,
+                    cancel_event=guard.cancel_event,
+                    before_operation=lambda: self._require_lease(guard),
+                )
                 run.execution["terraform_init"] = init
                 blocked = (
                     None
@@ -1099,13 +1141,13 @@ class DeploymentEngine:
             run.execution["terraform_plan"] = terraform_plan
             run.execution["approved_plan_hash"] = approved_plan_hash
 
-            self._require_lease(guard)
             terraform_apply = (
                 self.terraform.apply_plan(
                     tf_workspace,
                     str(Path(tf_workspace, PLAN_FILENAME)),
                     expected_plan_file_hash=approved_plan_hash,
                     cancel_event=guard.cancel_event,
+                    before_operation=lambda: self._require_lease(guard),
                 )
                 if terraform_declared
                 else self._terraform_not_applicable()
@@ -1129,11 +1171,11 @@ class DeploymentEngine:
             # create_dry_run); apply it byte-for-byte with no further
             # mutation after the hash check.
             approved_k8s_identity = self._approved_kubernetes_identity(run)
-            self._require_lease(guard)
             kubernetes_apply = (
                 self.kubectl.apply(paths["kubernetes"], namespace,
                                    approved_identity=approved_k8s_identity,
-                                   cancel_event=guard.cancel_event)
+                                   cancel_event=guard.cancel_event,
+                                   before_operation=lambda: self._require_lease(guard))
                 if self._kubernetes_is_declared(effective_payload)
                 else self._kubernetes_not_applicable()
             )

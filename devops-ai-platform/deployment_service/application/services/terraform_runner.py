@@ -12,7 +12,7 @@ mounts, limits, environment or credentials.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from deployment_service.application.services.plan_artifact import (
     PLAN_FILENAME,
@@ -61,6 +61,7 @@ class TerraformRunnerService:
         execution: bool,
         plan_file: Optional[str] = None,
         cancel_event=None,
+        before_operation: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Run exactly one policy-owned Terraform operation."""
         sandbox = self._sandbox if self._sandbox is not None else _default_sandbox()
@@ -77,6 +78,11 @@ class TerraformRunnerService:
                     resolve_credential_env_keys() if execution else ()
                 ),
             )
+            # The callback is the lease authorization boundary for a new
+            # Terraform subprocess. Keep it after local argv/policy work and
+            # immediately before handing the operation to the sandbox.
+            if before_operation is not None:
+                before_operation()
             outcome = sandbox.execute(step, Path(iac_dir), cancel_event=cancel_event)
         except TerraformSandboxError as exc:
             # Sandbox configuration / policy / availability / result
@@ -133,6 +139,7 @@ class TerraformRunnerService:
         execution: bool = False,
         plan_output_path: Optional[str] = None,
         cancel_event=None,
+        before_operation: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """fmt -> init -> validate -> plan, all inside the sandbox.
 
@@ -176,6 +183,7 @@ class TerraformRunnerService:
                 execution=execution,
                 plan_file=plan_file if uses_plan_file else None,
                 cancel_event=cancel_event,
+                before_operation=before_operation,
             )
             steps.append(result)
             if result["status"] != STATUS_PASS:
@@ -231,6 +239,7 @@ class TerraformRunnerService:
         plan_output_path: str,
         expected_plan_file_hash: str = "",
         cancel_event=None,
+        before_operation: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Apply EXACTLY the saved plan, after re-verifying its bytes.
 
@@ -294,6 +303,7 @@ class TerraformRunnerService:
             execution=True,
             plan_file=plan_file,
             cancel_event=cancel_event,
+            before_operation=before_operation,
         )
         result["plan_file_hash"] = actual_hash
         result["sandbox"] = self.describe_sandbox()
@@ -301,7 +311,12 @@ class TerraformRunnerService:
 
     # --- post-approval preparation ---------------------------------------
 
-    def initialize(self, iac_dir: str, cancel_event=None) -> Dict[str, Any]:
+    def initialize(
+        self,
+        iac_dir: str,
+        cancel_event=None,
+        before_operation: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         """Run ONLY ``terraform init`` (no plan) in an existing workspace.
 
         Phase 8.5-A corrective, Workstream D: the execution path must be
@@ -312,6 +327,7 @@ class TerraformRunnerService:
         result = self._execute(
             TerraformOperation.INIT, iac_dir, execution=True,
             cancel_event=cancel_event,
+            before_operation=before_operation,
         )
         result["sandbox"] = self.describe_sandbox()
         return result

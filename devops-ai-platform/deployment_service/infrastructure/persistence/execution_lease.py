@@ -22,10 +22,9 @@ Design (proved against real Redis — see
 * **renew** — Lua compare-and-expire: only the current owner extends.
 * **fence** — every durable state commit of the run is a
   compare-and-set against the fence the worker captured at
-  acquisition (``commit_fenced``). A worker whose lease expired and
-  was re-acquired (higher fence) cannot commit state or start a
-  subsequent side effect: its commits are silently rejected and the
-  new owner's state wins.
+  acquisition. A worker whose lease expired and was re-acquired
+  (higher fence) cannot commit state; the authoritative assertion below
+  also refuses its next operation before the worker calls the runner.
 * **watchdog** — a daemon thread renews at a bounded interval
   (``ttl / 3``). A renewal failure is tolerated only while the time
   since the last successful renewal is inside the TTL (the server-side
@@ -33,8 +32,15 @@ Design (proved against real Redis — see
   lease-lost, which the engine converts into a bounded cancellation of
   the running sandbox and a ``LEASE_LOST`` terminal mark.
 
-Redis outages are never treated as "lease lost" before the TTL
-elapses, and never treated as "lease kept" after it does.
+The watchdog's ``alive()`` remains a local grace-window signal: a Redis
+outage alone does not make it false before the TTL elapses. In contrast,
+``assert_owned()`` refuses to authorize any new operation when Redis is
+unavailable, even inside that grace window.
+
+The current key helpers intentionally have no Redis Cluster hash tags.
+The repository's Compose/CI topology is a single standalone Redis server;
+Redis Cluster is not a supported deployment contract for this key layout
+(multi-key scripts would otherwise fail with CROSSSLOT).
 """
 from __future__ import annotations
 
@@ -84,6 +90,31 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
   return 1
 end
 return 0
+"""
+
+#: assert-owned: KEYS[1]=lease, KEYS[2]=fence counter,
+#: KEYS[3]=active fence; ARGV[1]=owner token, ARGV[2]=my fence.
+#: All ownership facts are checked atomically. The lease and active fence
+#: must still have positive TTLs; the active fence and monotonic counter
+#: must both equal this acquisition's canonical positive fencing token.
+OWNERSHIP_ASSERTION_SCRIPT = """
+local expected = ARGV[2]
+if not expected or not string.match(expected, '^[1-9][0-9]*$') then
+  return 0
+end
+local owner = redis.call('GET', KEYS[1])
+local counter = redis.call('GET', KEYS[2])
+local active = redis.call('GET', KEYS[3])
+if owner ~= ARGV[1] or not counter or not active then return 0 end
+if not string.match(counter, '^[1-9][0-9]*$') or
+   not string.match(active, '^[1-9][0-9]*$') then
+  return 0
+end
+if counter ~= expected or active ~= expected then return 0 end
+if redis.call('PTTL', KEYS[1]) <= 0 or redis.call('PTTL', KEYS[3]) <= 0 then
+  return 0
+end
+return 1
 """
 
 #: commit: KEYS[1]=run key, KEYS[2]=active fence, KEYS[3]=revision
@@ -150,6 +181,11 @@ class ExecutionLeaseGuard:
         self._owner = secrets.token_urlsafe(24)
         self._fence = 0
         self._lost = threading.Event()
+        # A failed side-effect preflight is terminal for this guard. Keep it
+        # separate from _lost so alive() retains its watchdog/grace meaning
+        # when Redis is merely unavailable, while a later renewal cannot
+        # clear cancellation and accidentally re-authorize this worker.
+        self._assertion_failed = threading.Event()
         self._cancel = threading.Event()
         self._stop = threading.Event()
         self._last_success = 0.0
@@ -204,9 +240,11 @@ class ExecutionLeaseGuard:
         while not self._stop.wait(interval):
             if self.renew_once():
                 self._last_success = time.monotonic()
-                if self._lost.is_set():
-                    # Redis came back and we still own the lease: the
-                    # run may continue (the TTL clock was honest).
+                if self._lost.is_set() and not self._assertion_failed.is_set():
+                    # Redis came back and we still own the lease after a
+                    # watchdog-only grace lapse: preserve the existing
+                    # recovery behavior. A failed side-effect assertion is
+                    # terminal and must never be cleared by this path.
                     self._lost.clear()
                     self._cancel.clear()
             else:
@@ -228,6 +266,45 @@ class ExecutionLeaseGuard:
         """True while the worker still owns the lease (or is inside
         the post-blip grace window)."""
         return not self._lost.is_set()
+
+    def assert_owned(self) -> bool:
+        """Atomically prove this exact owner+fence is current in Redis.
+
+        ``alive()`` deliberately remains a local watchdog/grace signal. It
+        cannot authorize a new operation: only a successful one-script
+        read of lease, counter, and active fence can do that. A mismatch or
+        any unavailable/malformed response latches cancellation and fails
+        closed. A transport error does not change ``alive()``'s watchdog
+        meaning, but this guard can never pass another assertion afterward.
+        """
+        if self._assertion_failed.is_set():
+            raise LeaseLostError(
+                "execution lease ownership is unavailable; refusing a new side effect"
+            )
+        try:
+            result = self._client.eval(
+                OWNERSHIP_ASSERTION_SCRIPT,
+                3,
+                lease_key(self._run_id),
+                fence_key(self._run_id),
+                active_fence_key(self._run_id),
+                self._owner,
+                str(self._fence),
+            )
+        except Exception:  # noqa: BLE001 — fail closed on Redis/network errors
+            self._assertion_failed.set()
+            self._cancel.set()
+            raise LeaseLostError(
+                "execution lease ownership could not be verified; refusing a new side effect"
+            ) from None
+        if result != 1:
+            self._assertion_failed.set()
+            self._lost.set()
+            self._cancel.set()
+            raise LeaseLostError(
+                "execution lease ownership is no longer current; refusing a new side effect"
+            )
+        return True
 
     def request_cancel(self) -> None:
         """Signal the running sandbox to terminate (bounded cancel)."""

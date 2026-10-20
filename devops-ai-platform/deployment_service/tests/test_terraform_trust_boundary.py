@@ -784,6 +784,45 @@ class TestEnvironmentAndCredentialPolicy:
 # =====================================================================
 
 
+def test_lease_callback_runs_before_each_terraform_subprocess(tmp_path):
+    """Execution/rollback Terraform stages get one fresh gate per CLI call."""
+    events = []
+
+    class TracedSandbox(FakeTerraformSandbox):
+        def execute(self, step, workspace_path, cancel_event=None):
+            events.append(f"launch:{step.operation.value}")
+            return super().execute(step, workspace_path, cancel_event)
+
+    sandbox = TracedSandbox()
+    runner = TerraformRunnerService(sandbox=sandbox)
+
+    def gate():
+        events.append("lease-check")
+
+    result = runner.run_plan(
+        str(tmp_path), execution=True, before_operation=gate)
+    assert result["status"] == "PASS"
+    assert len(events) == 8
+    assert all(events[index] == "lease-check" for index in range(0, 8, 2))
+    assert all(events[index].startswith("launch:") for index in range(1, 8, 2))
+
+    plan_path = tmp_path / "terraform.tfplan"
+    plan_path.write_bytes(b"approved-plan")
+    import hashlib
+    plan_hash = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    before = len(sandbox.calls)
+
+    def refuse_apply():
+        raise RuntimeError("lease authorization refused")
+
+    with pytest.raises(RuntimeError, match="lease authorization refused"):
+        runner.apply_plan(
+            str(tmp_path), str(plan_path), expected_plan_file_hash=plan_hash,
+            before_operation=refuse_apply,
+        )
+    assert len(sandbox.calls) == before, "apply subprocess must not launch"
+
+
 class TestPlanArtifactBinding:
     def _runner(self):
         return TerraformRunnerService(sandbox=FakeTerraformSandbox())

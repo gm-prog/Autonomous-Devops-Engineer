@@ -49,8 +49,16 @@ _ALLOWED = {
     # dispatch reverts it (APPROVED is the only legitimate outcome when
     # nothing was enqueued). DEPLOYING stays reachable directly for the
     # worker's defensive re-validation path.
-    DeploymentState.APPROVED: {DeploymentState.EXECUTION_REQUESTED, DeploymentState.DEPLOYING},
-    DeploymentState.EXECUTION_REQUESTED: {DeploymentState.DEPLOYING, DeploymentState.APPROVED},
+    DeploymentState.APPROVED: {
+        DeploymentState.EXECUTION_REQUESTED,
+        DeploymentState.DEPLOYING,
+        DeploymentState.LEASE_LOST,
+    },
+    DeploymentState.EXECUTION_REQUESTED: {
+        DeploymentState.DEPLOYING,
+        DeploymentState.APPROVED,
+        DeploymentState.LEASE_LOST,
+    },
     DeploymentState.DEPLOYING: {
         DeploymentState.HEALTH_CHECKING,
         DeploymentState.DEPLOYMENT_FAILED,
@@ -61,7 +69,10 @@ _ALLOWED = {
         DeploymentState.DEPLOYMENT_FAILED,
         DeploymentState.LEASE_LOST,
     },
-    DeploymentState.DEPLOYMENT_FAILED: {DeploymentState.ROLLBACK_PENDING},
+    DeploymentState.DEPLOYMENT_FAILED: {
+        DeploymentState.ROLLBACK_PENDING,
+        DeploymentState.LEASE_LOST,
+    },
     DeploymentState.ROLLBACK_PENDING: {
         DeploymentState.ROLLED_BACK,
         DeploymentState.ROLLBACK_FAILED,
