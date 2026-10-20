@@ -19,6 +19,16 @@ Delivery semantics (honest, documented):
   * Celery provides AT-LEAST-ONCE delivery here. Exactly-once is NOT
     claimed; idempotency comes from the durable run state + the
     fenced lease, not from the broker.
+  * Worker-loss behavior is EXPLICIT (audit P1): the message is acked
+    only after the task completes (task_acks_late), a lost pool child
+    rejects+requeues its in-flight task (task_reject_on_worker_lost),
+    and a whole-worker crash leaves the message unacked, so the next
+    running consumer restores it after the visibility timeout
+    (3600s > the ~2790s worst-case bounded run, so healthy slow runs
+    are never spuriously redelivered). Crash recovery therefore takes
+    at most one visibility timeout; a stuck owner is overtaken sooner
+    via the 120s lease TTL. Proven by tests/test_celery_crash_recovery.py
+    (real Redis broker, real worker kill/restart).
   * a successful call returns a typed result reflecting the run's REAL
     final state (SUCCEEDED / ROLLED_BACK / FAILED / LEASE_LOST /
     BLOCKED / ALREADY_EXECUTING);
@@ -52,7 +62,83 @@ sys.path.insert(0, _PLATFORM_ROOT)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+
+# ---------------------------------------------------------------------
+# Explicit broker / worker-loss semantics (independent audit, P1).
+#
+# Celery provides AT-LEAST-ONCE delivery here. Exactly-once is NOT
+# claimed and cannot be: on a Redis broker a publish/ack can be lost
+# or redelivered. Safety comes from the durable run record + the fenced
+# execution lease:
+#
+#   * a duplicate redelivery while the lease is HELD is refused
+#     without touching the run (ALREADY_EXECUTING);
+#   * a redelivery after a worker CRASH resumes the orphaned in-flight
+#     run idempotently — its side effects are convergent (the exact
+#     approved plan, declarative kubectl apply); see
+#     DeploymentEngine.execute's F5 crash-redelivery contract;
+#   * a redelivery of a TERMINAL run returns the persisted outcome.
+#
+# For any of that to work the message must stay UNACKED while the task
+# executes; with the Celery default (ack on receipt) a killed worker's
+# message is already acknowledged and is LOST — the run then sits in
+# EXECUTION_REQUESTED/DEPLOYING forever while the API already reported
+# "dispatched". These settings close that gap.
+# ---------------------------------------------------------------------
+
+#: Worst-case bounded single execution, every leg at its budget plus a
+#: full rollback: terraform init 180 + validate 120 + plan 240 +
+#: apply 600; k8s apply 300 + rollout 330; rollback rollout-undo 180 +
+#: re-plan 240 + re-apply 600. ≈ 2790 seconds.
+_MAX_BOUNDED_EXECUTION_SECONDS = 2790
+
+#: A dead worker's in-flight message is restored to the queue by any
+#: running consumer once it is older than this (kombu redis transport,
+#: QoS.restore_visible). It MUST exceed the worst-case bounded run so a
+#: healthy slow run is never spuriously redelivered; crash recovery
+#: therefore takes at most one visibility timeout, while a STUCK owner
+# is overtaken much sooner through the 120s lease TTL (fencing).
+_BROKER_VISIBILITY_TIMEOUT_SECONDS = 3600
+
+
+def broker_semantics(
+    visibility_timeout: int = _BROKER_VISIBILITY_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """The explicit at-least-once delivery contract (audit P1).
+
+    Shared by the production task app and the crash-recovery
+    integration test (which shortens the visibility timeout so a kill
+    is recoverable within test wall-clock).
+    """
+    return {
+        # Ack AFTER the task completes, never on receipt: a worker that
+        # dies mid-execution leaves the message unacked, so it can be
+        # redelivered (see module comment).
+        "task_acks_late": True,
+        # A task that raises (never expected — every outcome is a typed
+        # return) is NOT acked: it may be redelivered, and the
+        # terminal-state + lease checks make that safe.
+        "task_acks_on_failure_or_timeout": False,
+        # Prefork fast path: if a pool child is lost but the worker
+        # survives, its in-flight task is rejected+requeued immediately
+        # (whole-process loss is covered by the visibility timeout).
+        "task_reject_on_worker_lost": True,
+        # One in-flight task per worker child: a dying worker takes at
+        # most one message into the grave; bursts queue, never prefetch.
+        "worker_prefetch_multiplier": 1,
+        # The truth lives in the durable run record, not a result
+        # backend; nothing reads AsyncResult.
+        "task_ignore_result": True,
+        # Explicit startup broker-retry behavior (no implicit default).
+        "broker_connection_retry_on_startup": True,
+        "broker_transport_options": {
+            "visibility_timeout": visibility_timeout,
+        },
+    }
+
+
 celery_app = Celery("deployment_tasks", broker=f"redis://{REDIS_HOST}:{REDIS_PORT}/0")
+celery_app.conf.update(broker_semantics())
 
 logger = logging.getLogger("DeploymentCeleryTasks")
 

@@ -92,4 +92,8 @@ RUN pip install --no-cache-dir --require-hashes -r requirements-runtime.txt
 COPY . /app
 
 EXPOSE 8030
-CMD ["sh", "-c", "celery -A deployment_service.infrastructure.celery.tasks.celery_app worker --loglevel=info & exec uvicorn deployment_service.main:app --host 0.0.0.0 --port 8030"]
+# Audit P1: explicit worker-loss semantics at the launch site — the
+# same pool/concurrency the canonical compose deployment-worker uses,
+# so a lost worker takes at most one in-flight message (prefetch 1,
+# acks late, reject-on-worker-lost; see tasks.py broker_semantics).
+CMD ["sh", "-c", "celery -A deployment_service.infrastructure.celery.tasks.celery_app worker -P prefork --concurrency=1 --loglevel=info & exec uvicorn deployment_service.main:app --host 0.0.0.0 --port 8030"]

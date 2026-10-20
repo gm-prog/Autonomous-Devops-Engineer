@@ -1939,22 +1939,24 @@ def test_mutation_m24_redis_ci_flag_removal_detected(mutated_repo, monkeypatch):
     runtime_guard._check_redis_integration_contract(REPO_ROOT, violations)
     assert violations == [], f"unmutated repo violates the CI Redis contract: {violations}"
 
-    # (2) Mutation: remove the flag from the CI copy. Three live-store
+    # (2) Mutation: remove the flag from the CI copy. Four live-store
     #     steps carry it: the integration suite, the M19/M22 mutation
-    #     suite, and (Phase 8.8A Correction-1, F5) the execution-lease
-    #     safety scenarios.
+    #     suite, (Phase 8.8A Correction-1, F5) the execution-lease
+    #     safety scenarios, and (independent audit, P1) the Celery
+    #     crash-recovery proof on the live broker.
     ci = mutated_repo / ".github/workflows/ci.yml"
     src = ci.read_text(encoding="utf-8")
     flag_line = '          REDIS_INTEGRATION_REQUIRED: "true"\n'
-    assert src.count(flag_line) == 3, (
-        "expected exactly three live-store steps carrying the "
-        "fail-closed flag (integration + mutation + execution-lease)"
+    assert src.count(flag_line) == 4, (
+        "expected exactly four live-store steps carrying the "
+        "fail-closed flag (integration + mutation + execution-lease "
+        "+ celery crash recovery)"
     )
     ci.write_text(src.replace(flag_line, ""), encoding="utf-8")
 
     violations2: list = []
     runtime_guard._check_redis_integration_contract(mutated_repo, violations2)
-    assert sum("REDIS_INTEGRATION_REQUIRED" in v for v in violations2) == 3, (
+    assert sum("REDIS_INTEGRATION_REQUIRED" in v for v in violations2) == 4, (
         "guard stayed green after REDIS_INTEGRATION_REQUIRED=true was "
         f"removed from the CI workflow (got {violations2})"
     )

@@ -69,7 +69,10 @@ def _check_redis_integration_contract(repo_root: Path, violations: List[str]) ->
         run = str(step.get("run") or "")
         if ("tests/test_redis_integration.py" in run
                 or "tests/test_security_mutations.py" in run
-                or "tests/test_execution_lease.py" in run):
+                or "tests/test_execution_lease.py" in run
+                # Independent audit (P1): the Celery crash-recovery
+                # proof also runs against the live broker.
+                or "tests/test_celery_crash_recovery.py" in run):
             live_store_steps.append(step)
     if not live_store_steps:
         violations.append(

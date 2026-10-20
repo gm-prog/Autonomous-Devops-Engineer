@@ -197,7 +197,10 @@ services:
     # Same image as the API — different entrypoint. The worker consumes
     # the deployment queue and owns sandbox execution under a fenced
     # Redis lease (Phase 8.8A Correction-1, F5/F7).
-    command: ["celery", "-A", "deployment_service.infrastructure.celery.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=1"]
+    # Audit P1: explicit pool at the launch site — prefork with one
+    # child, so the acks-late / reject-on-worker-lost broker semantics
+    # (tasks.py broker_semantics) apply deterministically.
+    command: ["celery", "-A", "deployment_service.infrastructure.celery.tasks.celery_app", "worker", "-P", "prefork", "--concurrency=1", "--loglevel=info"]
     # No ports and, in the canonical stack, no volumes: the worker is
     # reachable only over the d1 network and has no daemon, no
     # kubeconfig and no staging root to execute against. Enabling

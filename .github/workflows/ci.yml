@@ -324,6 +324,20 @@ jobs:
           set -euo pipefail
           python -m pytest deployment_service/tests/test_execution_lease.py \
             -v 2>&1 | tee redis-execution-lease.txt
+      # Independent audit (P1): explicit Celery ack / worker-loss
+      # semantics proven end-to-end on THIS live broker — real worker
+      # subprocesses, SIGKILL mid-execution, restart, redelivery of the
+      # unacked message, idempotent resume, terminal replay. Fail-closed
+      # as above (missing Redis = hard failure).
+      - name: Celery crash recovery — worker kill/restart on the live broker (audit P1)
+        working-directory: devops-ai-platform
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          REDIS_INTEGRATION_REQUIRED: "true"
+        run: |
+          set -euo pipefail
+          python -m pytest tests/test_celery_crash_recovery.py \
+            -v 2>&1 | tee celery-crash-recovery.txt
       - name: Mutation suite against the live store (M19/M22 behavioral proofs — weakened finalize script double-counts; pre-provider probe bypass wedges the breaker, both on the real code paths)
         working-directory: devops-ai-platform
         env:
@@ -341,6 +355,7 @@ jobs:
             devops-ai-platform/redis-integration.txt
             devops-ai-platform/redis-mutations.txt
             devops-ai-platform/redis-execution-lease.txt
+            devops-ai-platform/celery-crash-recovery.txt
           if-no-files-found: warn
       - name: Tear down Redis
         if: always()
