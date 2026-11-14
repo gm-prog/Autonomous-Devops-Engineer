@@ -1,11 +1,14 @@
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import tempfile
 import time
 import uuid
+from contextlib import ExitStack
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +17,16 @@ import yaml
 from deployment_service.application.services.health_check_service import HealthCheckService
 from deployment_service.application.services.iac_validator import IaCValidator
 from deployment_service.application.services.kubectl_runner import KubectlRunnerService
+from deployment_service.application.services.kubernetes_operation_evidence import (
+    COMPENSATION_NOT_REQUIRED,
+    EVIDENCE_KEY,
+    KubernetesAttemptCapacityRefused,
+    classify_compensation,
+    ensure_evidence,
+    get_evidence,
+    record_attempt,
+    record_attempt_result,
+)
 from deployment_service.application.services.release_identity_injection import (
     inject_release_identity,
 )
@@ -37,6 +50,9 @@ from deployment_service.infrastructure.persistence.execution_lease import (
     LeaseLostError,
 )
 from deployment_service.infrastructure.persistence.redis_pipeline_store import RedisPipelineStore
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DeploymentActionError(RuntimeError):
@@ -242,6 +258,22 @@ class DeploymentEngine:
         )
 
     @staticmethod
+    def _kubernetes_declared_for_run(run) -> bool:
+        """P2.1: whether Kubernetes is a DECLARED component of this run.
+
+        Derived from the run's own durable dry-run record, never from the
+        caller payload. A missing record cannot prove absence, so it is
+        treated as declared (the rollback classification then fails closed
+        rather than claiming "nothing to compensate").
+        """
+        dry_run = run.kubernetes_dry_run or {}
+        if dry_run.get("kubernetes_applicable") is False:
+            return False
+        if dry_run.get("status") in ("SKIPPED", "NOT_APPLICABLE"):
+            return False
+        return True
+
+    @staticmethod
     def _terraform_is_declared(payload) -> bool:
         """True when the deployment actually has a Terraform component.
 
@@ -365,7 +397,13 @@ class DeploymentEngine:
         """Remove a persisted approval workspace once it can never apply."""
         root = os.getenv("DEPLOYMENT_WORKSPACE_ROOT", "").strip()
         base = Path(root) if root else Path(tempfile.gettempdir())
-        shutil.rmtree(base / f"approved-{run_id}", ignore_errors=True)
+        try:
+            shutil.rmtree(base / f"approved-{run_id}", ignore_errors=True)
+        except OSError:
+            # This is best-effort disposal of a now-unusable local artifact.
+            # It must not overwrite a deployment outcome or hide its primary
+            # exception.  Do not include filesystem/provider exception text.
+            LOGGER.warning("approval workspace cleanup failed for run %s", run_id)
 
     def create_dry_run(self, payload: Dict[str, Any]) -> DeploymentRun:
         source_revision = self._validated_source_revision(payload.get("source_revision"))
@@ -562,27 +600,133 @@ class DeploymentEngine:
         return os.getenv("DEPLOYMENT_EXECUTION_ENABLED", "false").strip().lower() == "true"
 
     def _rollback(self, run, temp_dir, namespace, deployment_names, previous_good_terraform_tf, guard=None):
+        """P2.1: truthful, evidence-gated rollback.
+
+        Automatic Kubernetes compensation does not exist in this phase:
+        ``kubectl rollout undo`` is NEVER invoked. Whether Kubernetes may
+        need compensation is decided from DURABLE operation evidence, and
+        every uncertainty becomes an operator escalation, never a mutation.
+
+        Outcomes (``run.rollback["outcome"]``):
+        * NOT_REQUIRED — durable evidence proves no component needs it;
+          ROLLBACK_PENDING is never entered (a rollback that would run
+          nothing must not claim work).
+        * COMPLETE — every compensable component was provably restored.
+        * PARTIAL — something was restored AND something is blocked
+          (e.g. Terraform restored while Kubernetes is operator-blocked).
+        * BLOCKED — nothing restored and compensation is refused or its
+          provenance is unknown.
+        * FAILED — a compensation was attempted and did not succeed.
+        """
         # Rollback is itself side-effectful: under a lease, every step
         # re-proves ownership first (a stale worker must not roll back
         # the NEW owner's deployment), and every commit is fenced.
         if guard is not None:
             self._require_lease(guard)
+
+        # Classify FIRST, from the durable record. The classification is
+        # provenance, not authorization: it can BLOCK compensation, never
+        # permit an undo.
+        classification = classify_compensation(
+            execution=run.execution,
+            state_value=run.state.value,
+            kubernetes_declared=self._kubernetes_declared_for_run(run),
+        )
+        kubernetes_not_required = (
+            classification["state"] == COMPENSATION_NOT_REQUIRED)
+
+        terraform_apply = run.execution.get("terraform_apply") or {}
+        terraform_status = str(terraform_apply.get("status", ""))
+        # Terraform compensation is only ever attempted after a PROVEN
+        # successful apply (PASS). NOT_APPLICABLE needs nothing; a
+        # FAIL/TIMEOUT/CANCELLED apply leaves provenance uncertainty — a
+        # failed apply may still have mutated part-way — so no restore is
+        # attempted and the outcome can never claim COMPLETE or
+        # NOT_REQUIRED over Terraform.
+        terraform_compensation_required = (
+            bool(run.execution.get("terraform_applied"))
+            and terraform_status == "PASS")
+        terraform_provenance_uncertain = terraform_status in (
+            "FAIL", "TIMEOUT", "CANCELLED")
+
+        # ---- skip: nothing can or must be compensated -------------------
+        if (kubernetes_not_required and not terraform_compensation_required
+                and not terraform_provenance_uncertain):
+            run.rollback = {
+                "status": "PASS",
+                "outcome": "NOT_REQUIRED",
+                "components": [],
+                "kubernetes_compensation": classification,
+            }
+            run.add_log(
+                "DEPLOYMENT_FAILED: rollback is NOT_REQUIRED — durable "
+                "evidence proves no component requires compensation "
+                f"({classification['evidence_state']}).")
+            if guard is not None:
+                self._commit(run, guard)
+            else:
+                self.store.save(run)
+            return run
+
+        # ---- blocked without entering rollback: Terraform provenance ----
+        # A failed or interrupted Terraform apply cannot be truthfully
+        # compensated (the previous-good restore is only defined after a
+        # proven successful apply), so neither leg may act. Record the
+        # operator escalation and stay DEPLOYMENT_FAILED: entering
+        # ROLLBACK_PENDING would claim work that must not be attempted.
+        if terraform_provenance_uncertain:
+            run.rollback = {
+                "status": "FAIL",
+                "outcome": "BLOCKED",
+                "reason_code": "TERRAFORM_PROVENANCE_UNKNOWN",
+                "components": [],
+                "kubernetes_compensation": classification,
+            }
+            run.add_log(
+                "ROLLBACK BLOCKED: the original Terraform apply did not "
+                "prove success, so its provenance is unknown; no "
+                "compensation is attempted and operator intervention is "
+                f"required (kubernetes: {classification['evidence_state']}).")
+            if guard is not None:
+                self._commit(run, guard)
+            else:
+                self.store.save(run)
+            return run
+
+        # ---- enter rollback ----------------------------------------------
         run.move(DeploymentState.ROLLBACK_PENDING)
         run.add_log("ROLLBACK_PENDING: attempting deterministic rollback.")
         if guard is not None:
             self._commit(run, guard)
-        results = []
-        for name in deployment_names:
-            results.append({"component": f"kubernetes:{name}", "result": self.kubectl.rollout_undo(
-                name, namespace,
-                approved_identity=self._approved_kubernetes_identity(run),
-                cancel_event=guard.cancel_event if guard is not None else None,
-                before_operation=(lambda: self._require_lease(guard))
-                if guard is not None else None)})
 
-        if run.execution.get("terraform_applied"):
+        results = []
+        if not kubernetes_not_required:
+            # P2.1: the undo is never invoked. Each affected Kubernetes
+            # surface receives a BLOCKED component that demands operator
+            # action instead of a mutation.
+            components = [
+                f"kubernetes:{name}" for name in deployment_names
+            ] or ["kubernetes"]
+            for component in components:
+                results.append({
+                    "component": component,
+                    "status": "BLOCKED",
+                    "result": {
+                        "status": "BLOCKED",
+                        "error": classification["reason"],
+                        "reason_code": "KUBERNETES_COMPENSATION_BLOCKED",
+                        "evidence_state": classification["evidence_state"],
+                        "may_have_mutated": classification["may_have_mutated"],
+                        "undo_invoked": False,
+                        "operator_action_required": True,
+                    },
+                })
+
+        if terraform_compensation_required:
             if not previous_good_terraform_tf.strip():
-                results.append({"component": "terraform", "result": {"status": "BLOCKED", "error": "No previous known-good Terraform configuration was supplied."}})
+                results.append({
+                    "component": "terraform", "status": "BLOCKED",
+                    "result": {"status": "BLOCKED", "error": "No previous known-good Terraform configuration was supplied."}})
             else:
                 rollback_dir = Path(temp_dir, "rollback")
                 rollback_dir.mkdir(parents=True, exist_ok=True)
@@ -596,26 +740,63 @@ class DeploymentEngine:
                     before_operation=(lambda: self._require_lease(guard))
                     if guard is not None else None,
                 )
-                results.append({
-                    "component": "terraform",
-                    "result": plan if plan.get("status") != "PASS" else self.terraform.apply_plan(
+                result = (
+                    plan if plan.get("status") != "PASS" else self.terraform.apply_plan(
                         str(rollback_dir),
                         str(plan_path),
                         expected_plan_file_hash=plan.get("plan_file_hash", ""),
                         cancel_event=guard.cancel_event if guard is not None else None,
                         before_operation=(lambda: self._require_lease(guard))
                         if guard is not None else None,
-                    ),
+                    )
+                )
+                results.append({
+                    "component": "terraform",
+                    "status": result.get("status", ""),
+                    "result": result,
                 })
 
-        failed = [r for r in results if (r.get("result") or {}).get("status") != "PASS"]
-        run.rollback = {"status": "PASS" if not failed else "FAIL", "components": results}
-        if failed:
-            run.move(DeploymentState.ROLLBACK_FAILED)
-            run.add_log("ROLLBACK_FAILED: one or more components could not be restored.")
+        # Aggregation priority: any uncertainty-or-blocked component
+        # dominates (PARTIAL only if something was provably restored);
+        # then an attempted-but-unsuccessful compensation is FAILED; a
+        # full restore is COMPLETE. An entered-but-empty rollback cannot
+        # occur: the skip branch above already handled that shape.
+        any_restored = any(
+            (r.get("result") or {}).get("status") == "PASS" for r in results)
+        any_blocked = any(
+            (r.get("result") or {}).get("status") == "BLOCKED" for r in results)
+        any_attempted_failure = any(
+            (r.get("result") or {}).get("status") not in ("PASS", "BLOCKED")
+            for r in results)
+        if any_blocked:
+            outcome = "PARTIAL" if any_restored else "BLOCKED"
+        elif any_attempted_failure:
+            outcome = "FAILED"
+        elif any_restored:
+            outcome = "COMPLETE"
         else:
+            outcome = "NOT_REQUIRED"
+
+        run.rollback = {
+            # rollback.status is kept for existing consumers
+            # (PASS == every compensable component reported success).
+            "status": "PASS" if outcome == "COMPLETE" else "FAIL",
+            "outcome": outcome,
+            "components": results,
+            "kubernetes_compensation": classification,
+        }
+        if outcome == "COMPLETE":
             run.move(DeploymentState.ROLLED_BACK)
-            run.add_log("ROLLED_BACK: all rollback components reported success.")
+            run.add_log(
+                "ROLLED_BACK: every compensable component was provably "
+                "restored; Kubernetes required no compensation.")
+        else:
+            run.move(DeploymentState.ROLLBACK_FAILED)
+            detail = (
+                "Kubernetes compensation is operator-blocked and was never "
+                "attempted." if not kubernetes_not_required
+                else "compensation attempts did not fully succeed.")
+            run.add_log(f"ROLLBACK_FAILED: rollback outcome {outcome}; {detail}")
         if guard is not None:
             self._commit(run, guard)
         else:
@@ -689,18 +870,89 @@ class DeploymentEngine:
                 "execution lease ownership is lost or unverifiable; refusing a new operation"
             ) from None
 
-    def _mark_lease_lost(self, run, guard) -> None:
+    def _mark_lease_lost(self, run, guard) -> bool:
         """Best-effort terminal LEASE_LOST mark. The commit is fenced, so
         a stale owner cannot overwrite the new owner's state — if the
-        mark is rejected, the new owner's state simply stands."""
+        mark is rejected, the new owner's state simply stands.
+
+        Returns whether the fenced commit was CONFIRMED: only a confirmed
+        terminal commit authorizes destructive cleanup (P2.1)."""
         try:
             run.move(DeploymentState.LEASE_LOST)
         except Exception:  # noqa: BLE001 - already terminal
-            return
+            return False
         run.add_log("LEASE_LOST: the executing worker lost ownership of its "
                     "lease; no further side effects or rollback are "
                     "performed by the stale worker.")
-        guard.commit(json.dumps(run.to_dict()))
+        return bool(guard.commit(json.dumps(run.to_dict())))
+
+    def _handle_lease_loss(self, run, guard, cleanup_authorization=None):
+        """Finish through the one safe stale-owner path.
+
+        This helper is deliberately usable from an ``except Exception``
+        suite: Python does not re-run a sibling lease-loss handler for an
+        exception raised while that generic recovery suite is executing.
+
+        The shared approval workspace is retained unless THIS worker's
+        LEASE_LOST mark was positively confirmed by the fence: a stale
+        worker whose terminal mark was rejected must never discard the
+        workspace a new owner may still need (P2.1).
+        """
+        run.add_log(
+            "LEASE_LOST: execution lease ownership was lost or could not "
+            "be verified; no further side effects or rollback are performed."
+        )
+        confirmed = self._mark_lease_lost(run, guard)
+        if confirmed and cleanup_authorization is not None:
+            cleanup_authorization["terminal_commit_confirmed"] = True
+        return run
+
+    # ------------------------------------- P2.1: operation evidence seam
+
+    def _record_kubernetes_attempt(self, run, guard, context) -> None:
+        """Persist the sandbox handoff BEFORE the sandbox receives the step.
+
+        Invoked as the runner's ``before_handoff`` seam: every preflight
+        has passed and the very next side effect is the sandboxed apply.
+        The fenced commit IS the authorization — when the record cannot
+        be committed, the exception propagates and the sandbox is never
+        invoked. No separate ``assert_owned`` runs here: the fence check
+        is the commit itself (the caller's ``before_operation`` proof has
+        already re-verified ownership immediately before this seam).
+
+        A host-owned capacity refusal propagates as
+        :class:`KubernetesAttemptCapacityRefused` — deliberately distinct
+        from lease loss: the worker still owns its lease, the run simply
+        refuses the next external mutation.
+        """
+        evidence = ensure_evidence(run.execution)
+        record_attempt(evidence, context)
+        self._commit(run, guard)
+
+    def _record_kubernetes_result(self, run, guard, result_payload) -> None:
+        """Attach the returned runner result to the newest pending attempt.
+
+        Called IMMEDIATELY after ``apply`` returns — before health checks,
+        rollback, or any recovery branch — so the durable record answers
+        "was the handoff finalized?" even if this worker dies next.
+
+        On a rejected commit the evidence snapshot is RESTORED so the
+        durable record stays HANDOFF_PENDING (uncertainty is never
+        downgraded in either direction), then lease loss propagates.
+        """
+        evidence = get_evidence(run.execution)
+        if evidence is None:
+            # Legacy schema-less record: no pending attempt can exist, so
+            # there is nothing to finalize (the result payload itself is
+            # still committed with the run by the caller's next save).
+            return
+        snapshot = deepcopy(evidence)
+        try:
+            record_attempt_result(evidence, result_payload)
+            self._commit(run, guard)
+        except LeaseLostDuringExecutionError:
+            run.execution[EVIDENCE_KEY] = snapshot
+            raise
 
     # ------------------------------------------- F7: dispatch contract
 
@@ -1049,25 +1301,69 @@ class DeploymentEngine:
         if not guard.acquire():
             raise DeploymentExecutionLeaseHeld(
                 "this run is already executing under another worker's lease")
+        # Register cleanup as the very next operation after acquisition.
+        # ``ExitStack.close`` is idempotent, allowing setup failures and the
+        # normal execution finalizer to share one release path.
+        temp_dir = None
+        cleanup = ExitStack()
+        # P2.1: the shared approval workspace may only be discarded after
+        # a POSITIVELY CONFIRMED terminal fenced commit. A rejected or
+        # unknown commit (a stale worker's mark) must retain the
+        # workspace: another worker may still legitimately need the
+        # approved plan it contains.
+        cleanup_authorization = {"terminal_commit_confirmed": False}
+
+        def _release_acquired_guard():
+            try:
+                guard.release()
+            except Exception:
+                # Do not expose client/owner details or mask the primary
+                # setup/execution outcome.  The guard's TTL remains the
+                # crash/outage backstop when release cannot reach Redis.
+                LOGGER.warning("execution lease release failed for run %s", run.id)
+
+        def _remove_execution_workspace():
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+        # ExitStack invokes callbacks LIFO.  Register workspace disposal
+        # first so watchdog shutdown/release happens before local deletion.
+        cleanup.callback(_remove_execution_workspace)
+        cleanup.callback(_release_acquired_guard)
+
         # Re-read UNDER the lease: the state may have advanced between
         # the check above and the acquisition (a concurrent worker
         # finished, or was marked terminal, in that window).
-        fresh = self.store.get(run_id)
-        if not fresh:
-            guard.release()
-            raise DeploymentActionError("Deployment run not found.")
-        run = DeploymentRun.from_dict(fresh)
-        if run.state not in resumable_states:
-            guard.release()
-            raise DeploymentActionError(
-                f"run state advanced to {run.state.value} before this "
-                f"execution could start; refusing a second execution")
+        try:
+            fresh = self.store.get(run_id)
+            if not fresh:
+                # A missing record is an affirmative terminal result of a
+                # successful re-read.  Its saved plan is no longer resumable.
+                self._discard_approval_workspace(run.id)
+                raise DeploymentActionError("Deployment run not found.")
+            run = DeploymentRun.from_dict(fresh)
+            if run.state not in resumable_states:
+                # Only a positively confirmed terminal record consumes its
+                # single-use plan.  An awaiting-approval record, and every
+                # failed/uncertain store read, must retain it.
+                if run.state in _TERMINAL_STATES:
+                    self._discard_approval_workspace(run.id)
+                raise DeploymentActionError(
+                    f"run state advanced to {run.state.value} before this "
+                    f"execution could start; refusing a second execution")
 
-        temp_dir = self._new_workspace(f"devops-exec-{run.id}-")
-        approved = run.terraform_plan or {}
-        approved_plan_hash = approved.get("plan_file_hash", "")
-        tf_workspace = approved.get("approval_workspace", "")
-        deployment_names = self._deployment_names(effective_payload.get("k8s_yaml", ""))
+            temp_dir = self._new_workspace(f"devops-exec-{run.id}-")
+            approved = run.terraform_plan or {}
+            approved_plan_hash = approved.get("plan_file_hash", "")
+            tf_workspace = approved.get("approval_workspace", "")
+            deployment_names = self._deployment_names(
+                effective_payload.get("k8s_yaml", ""))
+            # Writing the local payload is setup, not deployment execution.
+            # Failures must remain visible and never trigger rollback.
+            paths = self._write_iac(effective_payload, temp_dir)
+        except BaseException:
+            cleanup.close()
+            raise
         try:
             resumed_in_flight = run.state in (
                 DeploymentState.DEPLOYING, DeploymentState.HEALTH_CHECKING)
@@ -1090,9 +1386,13 @@ class DeploymentEngine:
                 self._require_lease(guard)
                 run.move(DeploymentState.DEPLOYING)
                 run.add_log("DEPLOYING: starting controlled Terraform and Kubernetes execution.")
+                # P2.1: the operation-evidence protocol is stamped ONLY at
+                # this FRESH transition into DEPLOYING. A resumed legacy
+                # worker must never receive a fabricated NOT_ATTEMPTED
+                # record (its run predates the protocol and can prove
+                # nothing); it records its own real attempts later instead.
+                ensure_evidence(run.execution)
                 self._commit(run, guard)
-            paths = self._write_iac(effective_payload, temp_dir)
-
             # ---- Phase 8.5-A corrective, Workstream D ----------------
             # Execution applies the EXACT artifact that was approved. It
             # does not re-plan: a second plan could legitimately differ
@@ -1130,6 +1430,7 @@ class DeploymentEngine:
                     "be recovered and verified; nothing was applied."
                 )
                 self._commit(run, guard)
+                cleanup_authorization["terminal_commit_confirmed"] = True
                 return run
 
             # Contract-preserving evidence: the plan recorded against the
@@ -1163,30 +1464,77 @@ class DeploymentEngine:
             if not run.execution["terraform_applied"]:
                 run.error = "Terraform apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names,
-                                      previous_good_terraform_tf, guard)
+                result = self._rollback(run, temp_dir, namespace, deployment_names,
+                                        previous_good_terraform_tf, guard)
+                cleanup_authorization["terminal_commit_confirmed"] = True
+                return result
 
             # Phase 6.5.2 corrective — the manifest file written above IS
             # the approved artifact (identity already bound in
             # create_dry_run); apply it byte-for-byte with no further
             # mutation after the hash check.
             approved_k8s_identity = self._approved_kubernetes_identity(run)
-            kubernetes_apply = (
-                self.kubectl.apply(paths["kubernetes"], namespace,
-                                   approved_identity=approved_k8s_identity,
-                                   cancel_event=guard.cancel_event,
-                                   before_operation=lambda: self._require_lease(guard))
-                if self._kubernetes_is_declared(effective_payload)
-                else self._kubernetes_not_applicable()
-            )
+            try:
+                kubernetes_apply = (
+                    self.kubectl.apply(
+                        paths["kubernetes"], namespace,
+                        approved_identity=approved_k8s_identity,
+                        cancel_event=guard.cancel_event,
+                        before_operation=lambda: self._require_lease(guard),
+                        # P2.1: the fenced handoff commit IS the
+                        # authorization for the sandbox invocation. It
+                        # happens inside the runner after every preflight
+                        # and immediately before the sandbox step.
+                        before_handoff=lambda context: self._record_kubernetes_attempt(
+                            run, guard, context),
+                    )
+                    if self._kubernetes_is_declared(effective_payload)
+                    else self._kubernetes_not_applicable()
+                )
+            except KubernetesAttemptCapacityRefused as exc:
+                # A host-owned evidence bound refused the NEXT sandbox
+                # invocation. This is a preflight refusal made by the
+                # still-owning worker — NOT lease loss and NOT an apply
+                # result — and must never be reported as either.
+                evidence = ensure_evidence(run.execution)
+                evidence["blocked_reason"] = (
+                    f"{exc.reason_code}: the Kubernetes sandbox invocation "
+                    "was refused by a host-owned operation-evidence "
+                    "capacity bound"
+                )
+                run.error = (
+                    "Kubernetes apply was refused: the run's bounded "
+                    "operation-evidence capacity is exhausted "
+                    f"({exc.reason_code})."
+                )
+                run.move(DeploymentState.DEPLOYMENT_FAILED)
+                run.add_log(
+                    "DEPLOYMENT_FAILED: Kubernetes apply was refused by a "
+                    f"host-owned evidence capacity bound ({exc.reason_code}); "
+                    "no further external mutation is permitted on this run."
+                )
+                try:
+                    result = self._rollback(
+                        run, temp_dir, namespace, deployment_names,
+                        previous_good_terraform_tf, guard)
+                    cleanup_authorization["terminal_commit_confirmed"] = True
+                    return result
+                except LeaseLostDuringExecutionError:
+                    return self._handle_lease_loss(run, guard, cleanup_authorization)
             run.execution["kubernetes_apply"] = kubernetes_apply
+            # P2.1: the result is committed IMMEDIATELY — before health
+            # checks, rollback, or any recovery branch — so the durable
+            # evidence always answers whether the handoff was finalized.
+            self._record_kubernetes_result(run, guard, kubernetes_apply)
             run.execution["kubernetes_applied"] = kubernetes_apply.get("status") in (
                 "PASS", "SKIPPED", "NOT_APPLICABLE")
             if not run.execution["kubernetes_applied"]:
                 run.error = "Kubernetes apply failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names,
-                                      previous_good_terraform_tf, guard)
+                result = self._rollback(run, temp_dir, namespace, deployment_names,
+                                        previous_good_terraform_tf, guard)
+                cleanup_authorization["terminal_commit_confirmed"] = True
+                return result
 
             self._require_lease(guard)
             if run.state != DeploymentState.HEALTH_CHECKING:
@@ -1199,35 +1547,49 @@ class DeploymentEngine:
             if run.health_check.get("status") != "PASS":
                 run.error = "Post-deployment health verification failed."
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
-                return self._rollback(run, temp_dir, namespace, deployment_names,
-                                      previous_good_terraform_tf, guard)
+                result = self._rollback(run, temp_dir, namespace, deployment_names,
+                                        previous_good_terraform_tf, guard)
+                cleanup_authorization["terminal_commit_confirmed"] = True
+                return result
 
             run.move(DeploymentState.DEPLOYED)
             run.add_log("DEPLOYED: execution and deterministic health verification succeeded.")
             self._commit(run, guard)
+            cleanup_authorization["terminal_commit_confirmed"] = True
             return run
-        except LeaseLostDuringExecutionError as exc:
+        except LeaseLostDuringExecutionError:
             # Ownership is gone. Cancel anything in flight, mark
             # LEASE_LOST (fenced: the new owner's state wins if it is
             # further along), and do NOTHING else — no rollback, no
             # further side effects, no "failure" claim by a stale worker.
-            run.add_log(f"LEASE_LOST: {exc}")
-            self._mark_lease_lost(run, guard)
-            return run
+            return self._handle_lease_loss(run, guard, cleanup_authorization)
         except Exception as exc:
             run.error = type(exc).__name__
             if run.state in {DeploymentState.DEPLOYING, DeploymentState.HEALTH_CHECKING}:
                 run.move(DeploymentState.DEPLOYMENT_FAILED)
             if run.execution.get("terraform_applied") or run.execution.get("kubernetes_applied"):
-                return self._rollback(run, temp_dir, namespace, deployment_names,
-                                      previous_good_terraform_tf, guard)
-            self._commit(run, guard)
+                try:
+                    result = self._rollback(run, temp_dir, namespace, deployment_names,
+                                            previous_good_terraform_tf, guard)
+                    cleanup_authorization["terminal_commit_confirmed"] = True
+                    return result
+                except LeaseLostDuringExecutionError:
+                    return self._handle_lease_loss(run, guard, cleanup_authorization)
+            try:
+                self._commit(run, guard)
+                cleanup_authorization["terminal_commit_confirmed"] = True
+            except LeaseLostDuringExecutionError:
+                return self._handle_lease_loss(run, guard, cleanup_authorization)
             return run
         finally:
-            guard.release()
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            # A saved plan is sensitive and single-use: once the run has
-            # reached a terminal state it can never be applied again, so
-            # the approval workspace is destroyed.
-            if run.state in _TERMINAL_STATES:
+            # P2.1 delete-before-release ordering: the shared approval
+            # workspace is destroyed while this worker still (or last)
+            # provably owned the run — and only after a terminal fenced
+            # commit was CONFIRMED. A stale worker whose terminal mark was
+            # rejected retains the workspace for the new owner, and the
+            # lease is never released while this worker might still be
+            # deleting a workspace another owner could re-create or use.
+            if run.state in _TERMINAL_STATES and \
+                    cleanup_authorization["terminal_commit_confirmed"]:
                 self._discard_approval_workspace(run.id)
+            cleanup.close()

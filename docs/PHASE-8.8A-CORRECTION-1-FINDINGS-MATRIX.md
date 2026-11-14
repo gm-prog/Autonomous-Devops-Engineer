@@ -574,3 +574,69 @@ publication-attempt contract tests were not changed. The focused dispatch
 contract suite remains 27 tests; the full local `tests/` plus
 `deployment_service/tests/` gate and CI evidence are recorded with the final
 SHA below.
+
+## P2 recovery-safety follow-up — lease cleanup and recovery control flow
+
+**Scope and cause.** This follow-up changes only the execution path after a
+successful lease acquisition. Previously, the fresh store read and temporary
+workspace allocation occurred before the execution `try/finally`; either
+ordinary Python exception could leave the local watchdog running and retain
+the owner lease. Separately, a `LeaseLostDuringExecutionError` raised by
+`_rollback()` or a fenced `_commit()` while the generic `except Exception`
+handler was already executing did not re-enter the sibling lease-loss
+handler. It could therefore escape rather than take the stale-worker result
+path.
+
+**Implementation.** `DeploymentEngine.execute()` registers an idempotent
+acquired-lease cleanup stack immediately after `guard.acquire()` succeeds.
+Its LIFO callbacks stop/release the guard before removing an existing local
+execution workspace. The post-acquisition store read, fresh-state validation,
+workspace creation, and local artifact writing are setup: their exceptions
+close that stack, propagate unchanged, and do not fabricate
+`DEPLOYMENT_FAILED` or start rollback. A positively confirmed missing or
+terminal re-read now discards the single-use approval workspace; an
+unavailable/failed read or nonterminal non-resumable state does not. Release
+and approval-workspace disposal errors are sanitized/best effort so they do
+not mask a primary outcome. A small `_handle_lease_loss()` helper is used both
+by the normal lease-loss handler and by narrow nested handlers around rollback
+and generic-recovery commits.
+
+**Regression coverage.** Engine tests
+`test_post_acquisition_store_read_failure_releases_tracking_guard`,
+`test_confirmed_post_acquisition_terminal_result_discards_approval_workspace`,
+`test_uncertain_post_acquisition_read_preserves_approval_workspace`,
+`test_workspace_setup_failure_releases_tracking_guard`, and parameterized
+`test_post_acquisition_early_exit_releases_tracking_guard` verify setup,
+destructive-cleanup, and early-return paths. The real-Redis lease suite adds
+`test_14_post_acquisition_store_failure_releases_real_lease`,
+`test_15_workspace_failure_releases_real_lease`, and parameterized
+`test_16_post_acquisition_early_exit_releases_real_lease`; these assert both
+watchdog stop and removal of the owned lease/active-fence keys while retaining
+the monotonic fence counter. P2-B is covered by
+`test_generic_recovery_lease_loss_at_rollback_entry_is_handled` and
+`test_generic_recovery_commit_lease_loss_is_handled`: no rollout undo or
+rollback Terraform plan starts after the lease assertion refuses ownership,
+and a persisted newer-owner record remains unchanged.
+
+**Verification status at this unpushed recovery checkout.** Python compile
+checks and `git diff --check` passed. Seven focused P2-A engine tests passed
+under a process-local Windows `os.getuid`/`os.getgid` shim (`7 passed, 22
+deselected`) and both required P2-B tests passed (`2 passed`). The full
+shimmed engine suite had `28 passed, 1 failed` only because an existing test
+requires POSIX `/rollback/` in a correct Windows path. The real-Redis lease
+suite was run with `REDIS_INTEGRATION_REQUIRED=true` and correctly failed
+closed with 18 setup errors because no Redis URL/server was available; it was
+not counted as a skip or pass. Docker Desktop's Linux daemon, Redis binaries,
+and Kind were unavailable; the dispatch suite's `127.0.0.1:6399` Redis
+refused connections. The static no-host-Terraform guard and the Kubernetes
+trust-boundary units passed, but the mutation drivers are unverified because
+their isolated Python lacked pytest or did not complete. There is no P2 commit
+SHA, push, hosted CI run, or CI-job conclusion recorded yet; this is not a
+production-readiness claim. P1-2's dispatch journal and P1-3's ownership
+assertion/runner gates remain unchanged by this follow-up.
+
+**Remaining boundary.** Python cleanup covers ordinary returns and exceptions
+after acquisition, not forced process termination. Lease TTL and Celery crash
+recovery remain the hard-kill safeguards. A Redis assertion and a separate
+provider call remain a check/use interval; downstream provider fencing is not
+claimed.

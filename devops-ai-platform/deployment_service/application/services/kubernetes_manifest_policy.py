@@ -36,6 +36,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import yaml
 
+from deployment_service.application.services.kubernetes_operation_evidence import (
+    MAX_CANONICAL_RESOURCES,
+)
+
 # RFC 1123 subdomain, the rule Kubernetes applies to most object names.
 _DNS_1123 = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$")
 
@@ -171,6 +175,11 @@ class KubernetesManifestPolicy:
         allowed_configmap_names: Optional[Sequence[str]] = None,
         allow_service_account_tokens: Optional[bool] = None,
     ) -> None:
+        # P2.1: the canonical-resource bound is a HOST-OWNED constant, not
+        # a caller-controlled value, and it participates in the approved
+        # policy identity so an approval taken under one bound cannot
+        # silently execute under a different one.
+        self.max_canonical_resources = MAX_CANONICAL_RESOURCES
         self.namespace = (
             namespace
             if namespace is not None
@@ -278,6 +287,7 @@ class KubernetesManifestPolicy:
             f"pvcs={';'.join(sorted(self.allowed_pvc_names))}",
             f"configmaps={';'.join(sorted(self.allowed_configmap_names))}",
             f"sa_tokens={self.allow_service_account_tokens}",
+            f"max_resources={self.max_canonical_resources}",
         ])
         return f"{self.POLICY_VERSION}:{hashlib.sha256(material.encode()).hexdigest()[:32]}"
 
@@ -381,6 +391,18 @@ class KubernetesManifestPolicy:
             canonical_metadata["namespace"] = self.namespace
             canonical["metadata"] = canonical_metadata
             canonical_docs.append(canonical)
+
+        # P2.1: the canonical-resource bound is host-owned and enforced
+        # before any dry-run or approval is produced. A manifest that
+        # would exceed the per-run evidence cap is refused outright, so
+        # the durable evidence ledger can never be silently truncated
+        # and every attempted mutation keeps a detailed record.
+        if len(canonical_docs) > MAX_CANONICAL_RESOURCES:
+            errors.append(
+                f"Manifest declares {len(canonical_docs)} canonical Kubernetes "
+                f"resources, which exceeds the host-owned bound of "
+                f"{MAX_CANONICAL_RESOURCES}; split the manifest."
+            )
 
         if not resources and not errors:
             errors.append("No Kubernetes resources found.")

@@ -44,6 +44,9 @@ from deployment_service.application.services.kubernetes_execution_identity impor
 from deployment_service.application.services.kubernetes_manifest_policy import (
     KubernetesManifestPolicy,
 )
+from deployment_service.application.services.kubernetes_operation_evidence import (
+    EVIDENCE_SCHEMA_VERSION,
+)
 
 DEFAULT_NAMESPACE = "devops-production-namespace"
 
@@ -210,6 +213,8 @@ class KubectlRunnerService:
         approved_identity: Optional[KubernetesExecutionIdentity] = None,
         cancel_event: Optional[threading.Event] = None,
         before_operation: Optional[Callable[[], None]] = None,
+        before_handoff: Optional[Callable[[Dict[str, Any]], None]] = None,
+        handoff_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         namespace = self.namespace()
         try:
@@ -256,6 +261,21 @@ class KubectlRunnerService:
             # check/use interval.
             if before_operation is not None:
                 before_operation()
+            # P2.1: the durable operation-evidence handoff is committed by
+            # the engine through this seam — after every preflight (policy,
+            # identity binding, command policy, sandbox resolution) and
+            # after the lease-ownership re-check, but BEFORE the sandbox
+            # receives the mutating step. A callback that cannot commit the
+            # fenced record raises, so no sandbox invocation happens at all
+            # and no mutation can begin unrecorded. Capacity refusals and
+            # lease loss propagate unchanged: the runner never converts
+            # them into results.
+            if (
+                operation is KubectlOperation.APPLY
+                and before_handoff is not None
+                and handoff_context is not None
+            ):
+                before_handoff(handoff_context)
             result = sandbox.execute(
                 step,
                 manifest_yaml=manifest_yaml,
@@ -321,13 +341,33 @@ class KubectlRunnerService:
     def apply(self, manifest_path: str, namespace: Optional[str] = None,
               approved_identity: Optional[KubernetesExecutionIdentity] = None,
               cancel_event: Optional[threading.Event] = None,
-              before_operation: Optional[Callable[[], None]] = None) -> Dict[str, Any]:
+              before_operation: Optional[Callable[[], None]] = None,
+              before_handoff: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         blocked = self._check_namespace(namespace)
         if blocked:
             return blocked
         approved, error = self._approved_manifest(manifest_path)
         if error:
             return error
+        # P2.1: trusted handoff metadata, derived ONLY from the already
+        # validated manifest policy result and the approved execution
+        # identity — never from raw request fields. The engine commits
+        # this record through the fenced execution lease BEFORE the
+        # sandbox receives the step; the runner itself never mutates
+        # durable state. When the caller supplies no approved identity the
+        # binding check below refuses before any handoff, so the empty
+        # digest here can never reach the evidence record.
+        handoff_context = {
+            "operation": KubectlOperation.APPLY.value,
+            "schema_version": EVIDENCE_SCHEMA_VERSION,
+            "manifest_sha256": approved.manifest_sha256,
+            "manifest_policy_identity": approved.policy_identity,
+            "namespace": self.namespace(),
+            "resources": [dict(resource) for resource in approved.resources],
+            "approved_identity_digest": (
+                approved_identity.digest() if approved_identity is not None
+                else ""),
+        }
         return self._execute(
             KubectlOperation.APPLY,
             approved_identity=approved_identity,
@@ -339,6 +379,8 @@ class KubectlRunnerService:
             },
             cancel_event=cancel_event,
             before_operation=before_operation,
+            before_handoff=before_handoff,
+            handoff_context=handoff_context,
         )
 
     def rollout_status(
