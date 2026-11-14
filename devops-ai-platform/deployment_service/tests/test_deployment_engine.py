@@ -13,6 +13,7 @@ from deployment_service.application.services.kubernetes_operation_evidence impor
     EVIDENCE_KEY,
     EVIDENCE_SCHEMA_VERSION,
     HANDOFF_PENDING,
+    LEGACY_UNCERTAINTY_KEY,
     MAX_CANONICAL_RESOURCES,
     MAX_DETAILED_ATTEMPTS,
     RESULT_RECORDED,
