@@ -1200,7 +1200,8 @@ def test_12_a_failed_result_never_downgrades_the_mutation_fact():
     evidence = empty_evidence()
     attempt = record_attempt(evidence, _attempt_context())
     record_attempt_result(
-        evidence, {"status": "FAIL", "exit_code": 1},
+        evidence, {"status": "FAIL", "exit_code": 1,
+         "timed_out": False, "cancelled": False},
         attempt_id=attempt["attempt_id"],
     )
     assert evidence["may_have_mutated"] is True
@@ -1255,7 +1256,8 @@ def test_16_any_handoff_blocks_automatic_compensation():
     assert pending["evidence_state"] == STATE_HANDOFF_PENDING
     assert pending["may_have_mutated"] is True
     record_attempt_result(
-        execution[EVIDENCE_KEY], {"status": "PASS", "exit_code": 0},
+        execution[EVIDENCE_KEY], {"status": "PASS", "exit_code": 0,
+         "timed_out": False, "cancelled": False},
         attempt_id=attempt["attempt_id"],
     )
     finalized = classify_compensation(
