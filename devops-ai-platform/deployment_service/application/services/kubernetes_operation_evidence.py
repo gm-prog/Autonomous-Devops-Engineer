@@ -404,17 +404,19 @@ def record_attempt_result(
     evidence: Dict[str, Any],
     result_payload: Dict[str, Any],
     *,
-    attempt_id: str,
+    attempt_id: Optional[str] = None,
     timestamp: Optional[float] = None,
-) -> str:
-    """Attach the received runner result to its exact pending attempt.
+) -> Optional[str]:
+    """Attach a result to the exact pending attempt identified by the caller.
 
-    Returns the attempt id, or None when no pending attempt exists (a
-    pre-handoff refusal produced a result but never reached the sandbox —
-    nothing to finalize). A FAIL/TIMEOUT/CANCELLED result still keeps
+    Returns the attempt ID, or None when no handoff occurred in this
+    invocation. The helper never guesses which historical pending attempt
+    a result belongs to. A FAIL/TIMEOUT/CANCELLED result still keeps
     ``may_have_mutated`` true: a failed command is not proof of a no-op.
     """
     validate_evidence(evidence)
+    if attempt_id is None:
+        return None
     if not isinstance(attempt_id, str) or not _ATTEMPT_ID.fullmatch(attempt_id):
         raise KubernetesEvidenceError("attempt result is missing a valid attempt ID")
     payload = result_payload
