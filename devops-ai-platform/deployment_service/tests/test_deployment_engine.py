@@ -1169,11 +1169,11 @@ def test_10_the_resource_cap_refuses_an_oversized_context():
 def test_11_recorded_results_are_bounded_and_finalized_on_the_newest():
     evidence = empty_evidence()
     record_attempt(evidence, _attempt_context())
-    record_attempt(evidence, _attempt_context())
+    newest_attempt = record_attempt(evidence, _attempt_context())
     attempt_id = record_attempt_result(evidence, {
         "status": "FAIL", "exit_code": 7, "timed_out": True,
         "cancelled": False, "stdout": "secret-output", "stderr": "secret-err",
-    })
+    }, attempt_id=newest_attempt["attempt_id"])
     newest = evidence["attempts"][-1]
     assert attempt_id == newest["attempt_id"]
     assert newest["state"] == RESULT_RECORDED
@@ -1191,18 +1191,29 @@ def test_11_recorded_results_are_bounded_and_finalized_on_the_newest():
 # 12 --------------------------------------------------------------------
 def test_12_a_failed_result_never_downgrades_the_mutation_fact():
     evidence = empty_evidence()
-    record_attempt(evidence, _attempt_context())
-    record_attempt_result(evidence, {"status": "FAIL", "exit_code": 1})
+    attempt = record_attempt(evidence, _attempt_context())
+    record_attempt_result(
+        evidence, {"status": "FAIL", "exit_code": 1},
+        attempt_id=attempt["attempt_id"],
+    )
     assert evidence["may_have_mutated"] is True
     assert evidence["attempts"][0]["may_have_mutated"] is True
 
 
 # 13 --------------------------------------------------------------------
-def test_13_result_recording_without_a_pending_attempt_is_a_no_op():
+def test_13_result_recording_without_an_attempt_id_is_a_no_op():
     evidence = empty_evidence()
     assert record_attempt_result(evidence, {"status": "PASS"}) is None
     assert evidence["attempt_count"] == 0
     assert evidence["may_have_mutated"] is False
+
+    # A result without this invocation's handoff ID must not finalize an
+    # older HANDOFF_PENDING attempt left by a previous worker.
+    pending = record_attempt(evidence, _attempt_context())
+    assert record_attempt_result(evidence, {"status": "PASS"}) is None
+    assert pending["state"] == HANDOFF_PENDING
+    assert evidence["attempt_count"] == 1
+    assert evidence["may_have_mutated"] is True
 
 
 # 14 --------------------------------------------------------------------
@@ -1229,7 +1240,7 @@ def test_15_a_zero_attempt_protocol_record_proves_not_attempted():
 # 16 --------------------------------------------------------------------
 def test_16_any_handoff_blocks_automatic_compensation():
     execution = {EVIDENCE_KEY: empty_evidence()}
-    record_attempt(execution[EVIDENCE_KEY], _attempt_context())
+    attempt = record_attempt(execution[EVIDENCE_KEY], _attempt_context())
     pending = classify_compensation(
         execution=execution, state_value="DEPLOYMENT_FAILED",
         kubernetes_declared=True)
@@ -1237,7 +1248,9 @@ def test_16_any_handoff_blocks_automatic_compensation():
     assert pending["evidence_state"] == STATE_HANDOFF_PENDING
     assert pending["may_have_mutated"] is True
     record_attempt_result(
-        execution[EVIDENCE_KEY], {"status": "PASS", "exit_code": 0})
+        execution[EVIDENCE_KEY], {"status": "PASS", "exit_code": 0},
+        attempt_id=attempt["attempt_id"],
+    )
     finalized = classify_compensation(
         execution=execution, state_value="DEPLOYMENT_FAILED",
         kubernetes_declared=True)
