@@ -909,7 +909,7 @@ class DeploymentEngine:
 
     # ------------------------------------- P2.1: operation evidence seam
 
-    def _record_kubernetes_attempt(self, run, guard, context) -> None:
+    def _record_kubernetes_attempt(self, run, guard, context) -> str:
         """Persist the sandbox handoff BEFORE the sandbox receives the step.
 
         Invoked as the runner's ``before_handoff`` seam: every preflight
@@ -924,13 +924,18 @@ class DeploymentEngine:
         :class:`KubernetesAttemptCapacityRefused` — deliberately distinct
         from lease loss: the worker still owns its lease, the run simply
         refuses the next external mutation.
+
+        Returns the ID of the exact attempt whose handoff was committed.
         """
         evidence = ensure_evidence(run.execution)
-        record_attempt(evidence, context)
+        attempt = record_attempt(evidence, context)
         self._commit(run, guard)
+        return attempt["attempt_id"]
 
-    def _record_kubernetes_result(self, run, guard, result_payload) -> None:
-        """Attach the returned runner result to the newest pending attempt.
+    def _record_kubernetes_result(
+        self, run, guard, result_payload, *, attempt_id: Optional[str] = None
+    ) -> None:
+        """Attach the returned runner result to this invocation's exact handoff.
 
         Called IMMEDIATELY after ``apply`` returns — before health checks,
         rollback, or any recovery branch — so the durable record answers
@@ -948,7 +953,9 @@ class DeploymentEngine:
             return
         snapshot = deepcopy(evidence)
         try:
-            record_attempt_result(evidence, result_payload)
+            record_attempt_result(
+                evidence, result_payload, attempt_id=attempt_id
+            )
             self._commit(run, guard)
         except LeaseLostDuringExecutionError:
             run.execution[EVIDENCE_KEY] = snapshot
@@ -1474,6 +1481,17 @@ class DeploymentEngine:
             # create_dry_run); apply it byte-for-byte with no further
             # mutation after the hash check.
             approved_k8s_identity = self._approved_kubernetes_identity(run)
+            # Keep the exact ID created by THIS apply invocation. Historical
+            # HANDOFF_PENDING attempts may belong to a prior worker and must
+            # never be finalized with this invocation's result.
+            kubernetes_attempt_id = None
+
+            def _record_handoff(context):
+                nonlocal kubernetes_attempt_id
+                kubernetes_attempt_id = self._record_kubernetes_attempt(
+                    run, guard, context
+                )
+
             try:
                 kubernetes_apply = (
                     self.kubectl.apply(
@@ -1485,8 +1503,7 @@ class DeploymentEngine:
                         # authorization for the sandbox invocation. It
                         # happens inside the runner after every preflight
                         # and immediately before the sandbox step.
-                        before_handoff=lambda context: self._record_kubernetes_attempt(
-                            run, guard, context),
+                        before_handoff=_record_handoff,
                     )
                     if self._kubernetes_is_declared(effective_payload)
                     else self._kubernetes_not_applicable()
@@ -1525,7 +1542,10 @@ class DeploymentEngine:
             # P2.1: the result is committed IMMEDIATELY — before health
             # checks, rollback, or any recovery branch — so the durable
             # evidence always answers whether the handoff was finalized.
-            self._record_kubernetes_result(run, guard, kubernetes_apply)
+            self._record_kubernetes_result(
+                run, guard, kubernetes_apply,
+                attempt_id=kubernetes_attempt_id,
+            )
             run.execution["kubernetes_applied"] = kubernetes_apply.get("status") in (
                 "PASS", "SKIPPED", "NOT_APPLICABLE")
             if not run.execution["kubernetes_applied"]:
