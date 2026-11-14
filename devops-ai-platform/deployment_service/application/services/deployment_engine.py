@@ -951,6 +951,12 @@ class DeploymentEngine:
             # there is nothing to finalize (the result payload itself is
             # still committed with the run by the caller's next save).
             return
+        if attempt_id is None:
+            # This invocation never crossed the durable handoff seam
+            # (for example, a preflight BLOCKED result). Do not commit an
+            # unchanged evidence snapshot or guess at a historical pending
+            # attempt left by a prior worker.
+            return
         snapshot = deepcopy(evidence)
         try:
             record_attempt_result(
