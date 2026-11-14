@@ -296,6 +296,12 @@ class KubectlRunnerService:
                 else ("PASS" if exit_code == 0 else "FAIL")
             ),
             "exit_code": exit_code,
+            # Stable result contract consumed by the durable operation-
+            # evidence protocol. Keep the raw booleans as well as the
+            # derived status so evidence finalization never has to infer
+            # timeout/cancellation from provider output.
+            "timed_out": timed_out,
+            "cancelled": cancelled,
             "operation": operation.value,
             "stdout": getattr(result, "stdout", ""),
             "stderr": getattr(result, "stderr", ""),
