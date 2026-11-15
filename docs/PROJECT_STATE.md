@@ -127,3 +127,76 @@ A GitHub repository lookup confirmed that commit `72189146ceb3206a9ecd7a8734d26c
 ### Immediate next action
 
 Continue the P2.1 manual audit from the current local working tree. Do not reimplement P2.1, begin P2.2, or make any Git history/remote/production changes. Keep a test ledger with exact commands, exit codes, counts, and failing node IDs. Update this file and append `docs/WORK_LOG.md` after meaningful audit milestones. Update `docs/ARCHITECTURE.md` only after source inspection verifies an implemented architecture fact.
+
+
+<!-- P2.1-PR16-HANDOFF-2026-11-15 -->
+## Latest snapshot override — 2026-11-15 (P2.1 PR #16)
+
+This is the authoritative current handoff for the P2.1 Kubernetes apply-attempt evidence and result-correlation task. It supersedes earlier branch/HEAD/working-tree and next-task statements above where they conflict. Earlier history is retained.
+
+### Verified remote state
+
+- Repository: `gm-prog/Autonomous-Devops-Engineer`.
+- PR: [#16](https://github.com/gm-prog/Autonomous-Devops-Engineer/pull/16), open, not merged, non-draft; GitHub reports mergeable.
+- Head branch: `fix/p2.1-kubernetes-attempt-correlation`.
+- Head SHA: `1ccf210451920f2015b954bdec9fb4527606813a` (`fix: finalize Kubernetes attempt evidence contract`).
+- Base branch: `arena/p2.1-result-contract-fix-20261114`, base SHA `334c87a2341da1393922a405e780c5e371e61ed8`.
+- PR reports 6 changed files, 118 additions, 39 deletions, 9 commits.
+- No PR reviews are recorded yet. No approval is recorded.
+- The remote head and PR metadata were checked through the GitHub connection on 2026-11-15.
+
+### P2.1 scope delivered in PR #16
+
+- Durable, lease-fenced Kubernetes handoff evidence is persisted immediately before sandbox apply.
+- The runner result is correlated only to the attempt ID created by that exact invocation; a new worker cannot finalize a historical pending attempt.
+- If a stale worker's fenced result commit is rejected, uncertainty remains monotonic and the shared approved workspace is retained for the current owner.
+- Automatic Kubernetes compensation remains blocked: attempt provenance is not rollback authorization.
+- Kubernetes runner results expose the explicit `exit_code`, `timed_out`, and `cancelled` contract.
+- Test fakes were updated to satisfy that contract.
+- Evidence artifacts and SHA-256 sidecars are written from the exact UTF-8 bytes hashed, avoiding platform newline translation.
+
+### Six-file PR review scope
+
+1. `devops-ai-platform/deployment_service/application/services/deployment_engine.py`
+2. `devops-ai-platform/deployment_service/application/services/kubectl_runner.py`
+3. `devops-ai-platform/deployment_service/application/services/kubernetes_operation_evidence.py`
+4. `devops-ai-platform/deployment_service/tests/test_deployment_engine.py`
+5. `devops-ai-platform/deployment_service/tests/test_execution_lease.py`
+6. `devops-ai-platform/e2e/evidence_provenance.py`
+
+The full PR patch is available in PR #16. The final independent six-file code review is still outstanding; do not describe this PR as approved or merge-ready.
+
+### Verification ledger
+
+Operator-supplied local Ubuntu WSL2 evidence, Python 3.11.18, hash-pinned `requirements-test.txt`, Redis container `p2-1-fullsuite-redis` exposed on port 6399:
+
+- Targeted command covering `test_deployment_engine.py`, `test_execution_lease.py`, and `test_evidence_provenance.py`: **96 passed** (7.73s).
+- Full `deployment_service/tests` suite: **687 passed, 1 skipped, 34 subtests passed** (27.64s).
+- `git diff --check`: passed before commit.
+- Commit pushed successfully; reported clean branch status tracking origin after push.
+- These local test outputs were supplied by the operator; they were not rerun by this remote reviewer.
+
+Remote GitHub check-runs for exact head SHA `1ccf210451920f2015b954bdec9fb4527606813a` (12 total at inspection):
+
+- **9 success**: Android embedded-secret/transport static guards; Real-Redis integration; live Kind Kubernetes E2E; containerized deployment-service E2E; focused security suites; real deployment-service-to-Kind E2E; Kubernetes trust-boundary unit; canonical compose smoke; structural security/runtime guards.
+- **1 failure**: `Phase 8.5-A terraform execution trust boundary` — inspect its annotations/logs and determine whether this is a regression, platform mismatch, or unrelated failure.
+- **1 in progress**: Android unit tests + debug build.
+- **1 skipped**: CodeRabbit, explicitly because reviews are disabled for the PR's base branch. This is not an approval.
+- Commit status endpoint reported `pending` with zero legacy statuses. Do not interpret that as all checks green.
+- CI run: [43691344471](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/43691344471).
+
+Windows full-suite attempt is not authoritative: 11 failures were caused by Windows-only lack of symlink privilege, `os.mkfifo`, POSIX ownership/mode semantics, and `signal.SIGKILL`. Do not change production code solely to satisfy those Windows-host limitations; the later Ubuntu full-suite result is the relevant local regression evidence.
+
+### Merge disposition
+
+**NO-GO / not merge-ready yet.** Reasons: one hosted required-looking check is failing, Android build/test check is still running, and no human/automated PR approval exists. The repository's exact required-check policy for this PR base was not independently verified in this snapshot. Do not merge until the failure is investigated/resolved, all applicable checks are green, and the six-file review is complete with approval.
+
+### Exact next-agent pickup
+
+1. Read `AGENTS.md`, `docs/PROJECT_STATE.md`, `docs/ARCHITECTURE.md`, and this latest entry in `docs/WORK_LOG.md`.
+2. Inspect the Terraform trust-boundary failure in run `43691344471`, job `132742465191`; capture the failing test/annotation and classify it before changing anything.
+3. Recheck the Android job `132742465278` until it reaches a terminal conclusion.
+4. Perform a strict independent review of all six paths listed above against the full PR #16 diff and the P2.1 safety decisions recorded in the rollback-safety research amendment.
+5. Verify the actual required checks for base branch `arena/p2.1-result-contract-fix-20261114`, then request/obtain review approval. Merge only after all gates pass.
+
+Do not start P2.2 compensation work or P2.3 acceptance work as part of this PR review. Do not weaken evidence monotonicity, attempt-ID correlation, lease fencing, or the rule that evidence alone never authorizes rollback.
