@@ -169,6 +169,10 @@ class TestPostApprovalTampering:
     def _assert_blocked_without_applying(self, done, engine):
         assert done.state == DeploymentState.DEPLOYMENT_FAILED
         assert not done.execution.get("terraform_applied")
+        assert engine.terraform.init_calls == 0, (
+            "Terraform must not initialize a workspace after approved-plan "
+            "preflight verification fails"
+        )
         assert engine.terraform.applied_with_hash is None, (
             "apply must never be reached once the approved plan is in doubt"
         )
