@@ -172,3 +172,18 @@ not assumptions that permit automatic rollback.
 **Disposition: NO-GO for merge.** Independently inspect the Terraform failure, wait for the Android job, review the complete six-file diff, verify the actual required-check policy for the base branch, and obtain review approval. Only then reassess merge readiness. No merge was performed.
 
 **Next-agent start.** Follow `AGENTS.md` read order. First inspect run 43691344471 / job 132742465191 logs and annotations; then recheck job 132742465278; then complete the six-file security/correctness review. Preserve the safety invariant: operation evidence records possible mutation but never authorizes automatic rollback. P2.2 and P2.3 remain separate follow-on scopes.
+
+
+## 2026-11-15 — PR #16 Terraform preflight hardening and exact-head CI recheck
+
+**Scope.** Follow-up hardening for Terraform approved-plan integrity: all post-approval tampering/preflight rejection cases now assert that Terraform initialization is never reached (`engine.terraform.init_calls == 0`), as well as asserting no Terraform apply. This makes the no-side-effect boundary explicit rather than merely proving that apply did not happen.
+
+**Commit/head.** Follow-up commit: `3a59df5cc59939c0a2f882c1986e922e06d170b1` on `fix/p2.1-kubernetes-attempt-correlation`, PR #16. The PR base remains `arena/p2.1-result-contract-fix-20261114` at `334c87a2341da1393922a405e780c5e371e61ed8`.
+
+**Hosted verification.** Exact-head workflow [43694354310](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/43694354310) completed with **11 jobs, all success**. In particular, `Phase 8.5-A terraform execution trust boundary` passed, including its approval-integrity and mutation-probe steps. This supersedes the earlier failure/in-progress snapshot from run 43691344471; that older run is historical and must not be used as current status.
+
+**Current PR/review state.** PR #16 remains open, not merged, non-draft, and reported mergeable. The current changed-file list contains nine paths (six implementation/test paths plus the two handoff docs and the additional Terraform approval-integrity test file). The submitted-review list is empty. CodeRabbit's status says review skipped because auto-review is disabled for this non-default base branch; it is not approval.
+
+**Independent review disposition.** CI is green, but this log does not claim a complete independent review of all nine changed paths or verification of the base branch's required-check rules. Merge remains **NO-GO** until those review/policy gates are completed and approval is obtained. No merge was performed by this update.
+
+**Safety boundary retained.** Do not weaken attempt/result ID correlation, monotonic uncertainty, lease fencing, or the rule that operation evidence alone never authorizes automatic Kubernetes rollback. P2.2 conditional compensation and P2.3 broader acceptance remain out of scope.
