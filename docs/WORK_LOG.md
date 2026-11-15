@@ -147,3 +147,28 @@ not assumptions that permit automatic rollback.
 **Priority risks to resolve.** Rollback `status` versus `outcome` consumer compatibility; legacy in-flight uncertainty; unambiguous attempt/result ID association; canonical resource cap behavior; stale-worker deletion of the shared approved workspace; Terraform timeout/cancellation ambiguity; `PARTIAL` versus `COMPLETE` aggregation; result-commit failure after durable handoff; Windows path assertion strength; and mutation-test child-interpreter validity.
 
 **Disposition.** Audit kickoff only. No application changes, test execution, or merge-readiness approval is claimed by this entry. Preserve all local work and keep the original checkout untouched. See [P2.1-MANUAL-AUDIT-CHECKPOINT-2026-11-14.md](P2.1-MANUAL-AUDIT-CHECKPOINT-2026-11-14.md) for the detailed resume packet.
+
+
+## 2026-11-15 — P2.1 PR #16 pushed; CI and review handoff
+
+**Objective.** Preserve the exact state and next actions for a fresh agent reviewing P2.1 PR #16.
+
+**Verified remote GitHub state.** PR #16 is open, not merged, non-draft, and reported mergeable. Head `fix/p2.1-kubernetes-attempt-correlation` at `1ccf210451920f2015b954bdec9fb4527606813a`; base `arena/p2.1-result-contract-fix-20261114` at `334c87a2341da1393922a405e780c5e371e61ed8`. PR contains six changed files, 118 additions, 39 deletions, and nine commits. No PR reviews are recorded. See https://github.com/gm-prog/Autonomous-Devops-Engineer/pull/16.
+
+**Implementation delivered.** Lease-fenced pre-apply handoff evidence; exact per-invocation attempt-ID/result correlation; stale-worker result-commit rejection preserves uncertainty and shared approval workspace; no automatic Kubernetes compensation authorization; explicit runner `exit_code`/`timed_out`/`cancelled` result fields; updated strict test fakes; byte-identical UTF-8 artifact/sidecar hashing and writing.
+
+**Changed paths.**
+- `devops-ai-platform/deployment_service/application/services/deployment_engine.py`
+- `devops-ai-platform/deployment_service/application/services/kubectl_runner.py`
+- `devops-ai-platform/deployment_service/application/services/kubernetes_operation_evidence.py`
+- `devops-ai-platform/deployment_service/tests/test_deployment_engine.py`
+- `devops-ai-platform/deployment_service/tests/test_execution_lease.py`
+- `devops-ai-platform/e2e/evidence_provenance.py`
+
+**Local validation (operator-provided terminal output).** Ubuntu WSL2, Python 3.11.18, hash-pinned test dependencies, Redis integration container on port 6399. Targeted three-file selection: 96 passed in 7.73s. Full `deployment_service/tests`: 687 passed, 1 skipped, 34 subtests passed in 27.64s. `git diff --check` passed. The earlier Windows full-suite attempt had 11 platform-related failures involving symlinks, FIFO support, POSIX ownership/mode bits, and `signal.SIGKILL`; do not make production changes merely to accommodate those Windows limitations.
+
+**Hosted CI at exact PR head SHA.** Workflow run [43691344471](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/43691344471) had 12 check-runs at inspection: 9 success, 1 failure (`Phase 8.5-A terraform execution trust boundary`, job 132742465191), 1 in progress (Android unit tests + debug build, job 132742465278), and CodeRabbit skipped because reviews are disabled for the base branch. The legacy commit status endpoint was pending with zero statuses. No PR reviews/approvals exist. Do not call CI green.
+
+**Disposition: NO-GO for merge.** Independently inspect the Terraform failure, wait for the Android job, review the complete six-file diff, verify the actual required-check policy for the base branch, and obtain review approval. Only then reassess merge readiness. No merge was performed.
+
+**Next-agent start.** Follow `AGENTS.md` read order. First inspect run 43691344471 / job 132742465191 logs and annotations; then recheck job 132742465278; then complete the six-file security/correctness review. Preserve the safety invariant: operation evidence records possible mutation but never authorizes automatic rollback. P2.2 and P2.3 remain separate follow-on scopes.
