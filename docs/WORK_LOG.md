@@ -187,3 +187,25 @@ not assumptions that permit automatic rollback.
 **Independent review disposition.** CI is green, but this log does not claim a complete independent review of all nine changed paths or verification of the base branch's required-check rules. Merge remains **NO-GO** until those review/policy gates are completed and approval is obtained. No merge was performed by this update.
 
 **Safety boundary retained.** Do not weaken attempt/result ID correlation, monotonic uncertainty, lease fencing, or the rule that operation evidence alone never authorizes automatic Kubernetes rollback. P2.2 conditional compensation and P2.3 broader acceptance remain out of scope.
+
+
+## 2026-11-15 — P2.1 final runner-boundary hardening and architecture refresh
+
+**Source snapshot audited.** PR #16 at `25e077031aaa37d46c42aa5584ffa70069d5c9c3`, base `arena/p2.1-result-contract-fix-20261114` at `334c87a2341da1393922a405e780c5e371e61ed8`. The PR was open and unmerged, reported mergeable; 9 changed files, 14 commits, 254 additions, 39 deletions. No review submissions or review threads. Exact-head CI run [43696475320](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/43696475320) completed successfully with 11/11 jobs; this result applies to the pre-follow-up SHA only.
+
+**Architecture correction.** Updated `docs/ARCHITECTURE.md` to remove stale rollback/workspace defect statements inherited from the pre-P2.1 source snapshot. The current engine uses durable evidence classification, blocks all P2.1 Kubernetes auto-undo, returns `NOT_REQUIRED` when no compensation is necessary, blocks Terraform provenance uncertainty, and only enters `ROLLED_BACK` for `COMPLETE`. The execution `finally` discards the shared approval workspace only after a terminal fenced commit is positively confirmed. The architecture now describes the 16-attempt/32-resource evidence protocol and its limitations, including that conditional Kubernetes compensation remains P2.2.
+
+**New low-level guard finding.** Review of `KubectlRunnerService._execute()` showed that `APPLY` called the sandbox when the optional `before_handoff` callback/context was absent. The production `DeploymentEngine` passes the callback, but a future/internal caller could omit it and dispatch an unrecorded mutation. Hardened the runner to return `BLOCKED` before sandbox dispatch if either the callback or handoff context is absent. Updated runner-boundary tests to supply an explicit callback on the positive path, verify it executes before sandbox dispatch, prove missing callback fails closed with no sandbox call, and keep the credentials-redaction and approved-target success tests aligned with the new contract.
+
+**Files changed in this follow-up.**
+- `devops-ai-platform/deployment_service/application/services/kubectl_runner.py`
+- `devops-ai-platform/deployment_service/tests/test_kubernetes_trust_boundary.py`
+- `docs/ARCHITECTURE.md`
+- `docs/PROJECT_STATE.md`
+- `docs/WORK_LOG.md`
+
+**Branch protection read.** Repository rulesets endpoints returned `[]` with `includes_parents=true` and `false`. The classic branch-protection API for `arena/p2.1-result-contract-fix-20261114` returned 403 `Resource not accessible by integration`. Thus classic branch settings are **unverified**, not absent. The owner must query with authenticated `gh api repos/gm-prog/Autonomous-Devops-Engineer/branches/arena%2Fp2.1-result-contract-fix-20261114/protection` and `gh pr checks 16 --repo gm-prog/Autonomous-Devops-Engineer --required`.
+
+**Test/CI disposition.** The prior operator-provided local evidence (96 targeted passed; full deployment-service suite 687 passed, 1 skipped, 34 subtests passed) predates this last runner callback guard. No new local execution result is claimed here. Run CI on the resulting exact branch tip; do not treat run 43696475320 as passing the follow-up commit. No PR approval, merge, deploy, or main-branch change was made.
+
+**Merge disposition: NO-GO** until the follow-up head has green CI, classic branch protection is verified by the owner, and an independent review approval is present. Preserve monotonic uncertainty, lease fencing, and the P2.1 rule that attempt evidence is not rollback authorization.

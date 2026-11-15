@@ -270,11 +270,16 @@ class KubectlRunnerService:
             # and no mutation can begin unrecorded. Capacity refusals and
             # lease loss propagate unchanged: the runner never converts
             # them into results.
-            if (
-                operation is KubectlOperation.APPLY
-                and before_handoff is not None
-                and handoff_context is not None
-            ):
+            if operation is KubectlOperation.APPLY:
+                # A mutating apply is never allowed to reach the sandbox
+                # without the durable, fenced handoff committed by the
+                # deployment engine. Optional callbacks are useful for
+                # read-only operations, but fail closed for APPLY.
+                if before_handoff is None or handoff_context is None:
+                    return self._blocked(
+                        "Kubernetes apply requires a durable operation-evidence "
+                        "handoff before sandbox dispatch"
+                    )
                 before_handoff(handoff_context)
             result = sandbox.execute(
                 step,
