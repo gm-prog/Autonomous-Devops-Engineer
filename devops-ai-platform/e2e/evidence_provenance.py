@@ -133,8 +133,9 @@ def seal(evidence: Dict[str, Any], path: str | Path) -> Dict[str, str]:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(evidence, indent=2, sort_keys=True) + "\n"
-    target.write_text(body, encoding="utf-8")
-    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    artifact_bytes = body.encode("utf-8")
+    target.write_bytes(artifact_bytes)
+    digest = hashlib.sha256(artifact_bytes).hexdigest()
     record = {
         "artifact": target.name,
         "artifact_sha256": digest,
@@ -143,5 +144,5 @@ def seal(evidence: Dict[str, Any], path: str | Path) -> Dict[str, str]:
     }
     sidecar = target.with_name(target.name + ".sha256")
     # `sha256sum -c` compatible: "<digest>  <filename>"
-    sidecar.write_text(f"{digest}  {target.name}\n", encoding="utf-8")
+    sidecar.write_bytes(f"{digest}  {target.name}\n".encode("utf-8"))
     return record
