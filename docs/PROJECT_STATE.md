@@ -200,3 +200,22 @@ Windows full-suite attempt is not authoritative: 11 failures were caused by Wind
 5. Verify the actual required checks for base branch `arena/p2.1-result-contract-fix-20261114`, then request/obtain review approval. Merge only after all gates pass.
 
 Do not start P2.2 compensation work or P2.3 acceptance work as part of this PR review. Do not weaken evidence monotonicity, attempt-ID correlation, lease fencing, or the rule that evidence alone never authorizes rollback.
+
+
+<!-- P2.1-PR16-CI-UPDATE-2026-11-15 -->
+## Latest remote verification override — 2026-11-15 (PR #16 follow-up)
+
+This section supersedes the earlier PR #16 head, changed-file count, and CI snapshot above.
+
+- PR: [#16](https://github.com/gm-prog/Autonomous-Devops-Engineer/pull/16), still **OPEN / NOT MERGED**, non-draft; GitHub reports mergeable.
+- Head branch: `fix/p2.1-kubernetes-attempt-correlation`.
+- Exact head: `3a59df5cc59939c0a2f882c1986e922e06d170b1`.
+- Base: `arena/p2.1-result-contract-fix-20261114` at `334c87a2341da1393922a405e780c5e371e61ed8`.
+- Current PR changed-file inventory: **9 paths**, including `docs/PROJECT_STATE.md` and `docs/WORK_LOG.md`; see the live PR Files changed tab for the authoritative list.
+- Follow-up security-test assertion: `TestPostApprovalTampering._assert_blocked_without_applying` now requires `engine.terraform.init_calls == 0` after approved-plan preflight rejection, in addition to no Terraform apply. This proves tampered/missing/changed-credential approval state is rejected before Terraform initialization.
+- Hosted workflow run [43694354310](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/43694354310) is tied to this exact head SHA and completed **11/11 jobs successfully**. The Terraform execution trust-boundary job, including approval-integrity tests and mutation probes, passed.
+- CodeRabbit posted a review-skipped status because automatic reviews are disabled for non-default base branches. It is **not** an approval.
+- GitHub PR review list currently contains **zero submitted reviews**. No human approval is recorded.
+- Operator-supplied local Ubuntu evidence remains: 96 targeted tests passed; full deployment-service suite 687 passed, 1 skipped, 34 subtests passed. Windows-only failures remain non-authoritative platform limitations.
+
+**Disposition: CI GREEN; MERGE STILL NO-GO pending independent review/approval.** The full nine-file review and verification of the base branch's actual required-check policy remain outstanding. Do not merge solely because CI is green. Preserve the invariant that attempt evidence is not rollback authorization; do not begin P2.2/P2.3 here.
