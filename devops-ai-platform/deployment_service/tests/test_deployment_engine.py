@@ -13,6 +13,7 @@ from deployment_service.application.services.kubernetes_operation_evidence impor
     EVIDENCE_KEY,
     EVIDENCE_SCHEMA_VERSION,
     HANDOFF_PENDING,
+    LEGACY_UNCERTAINTY_KEY,
     MAX_CANONICAL_RESOURCES,
     MAX_DETAILED_ATTEMPTS,
     RESULT_RECORDED,
@@ -363,7 +364,11 @@ class FakeKubectl:
             before_handoff(_fake_handoff_context(
                 manifest_path, namespace, approved_identity))
         self.applied_calls.append((manifest_path, namespace, approved_identity))
-        return {"status": "PASS", "stdout": "apply-ok", "cluster_access": True}
+        return {
+            "status": "PASS", "exit_code": 0,
+            "timed_out": False, "cancelled": False,
+            "stdout": "apply-ok", "cluster_access": True,
+        }
     def rollout_status(self, deployment_name, namespace=None, timeout_seconds=300, cancel_event=None): return {"status": "PASS", "stdout": "rollout-ok", "cluster_access": True}
     def rollout_undo(self, deployment_name, namespace=None, approved_identity=None,
                      cancel_event=None, before_operation=None):
@@ -847,6 +852,7 @@ def test_rollback_mutations_each_receive_a_fresh_authoritative_check(monkeypatch
         def apply(self, *args, **kwargs):
             result = super().apply(*args, **kwargs)
             result["status"] = "FAIL"
+            result["exit_code"] = 1
             return result
 
     kubectl = FailedKubernetesApply()
@@ -895,6 +901,7 @@ def test_lease_loss_at_rollback_entry_prevents_undo_and_terraform_rollback(monke
         def apply(self, *args, **kwargs):
             result = super().apply(*args, **kwargs)
             result["status"] = "FAIL"
+            result["exit_code"] = 1
             return result
 
     kubectl = FailedKubernetesApply()
@@ -1059,10 +1066,10 @@ def test_01_the_empty_evidence_record_is_versioned_and_zeroed():
 def test_02_ensure_evidence_is_idempotent_and_never_overwrites():
     execution = {}
     first = ensure_evidence(execution)
-    first["attempt_count"] = 3  # simulate a record that already has work
+    first[LEGACY_UNCERTAINTY_KEY] = True
     second = ensure_evidence(execution)
-    assert second is first, "an existing record is returned untouched"
-    assert execution[EVIDENCE_KEY]["attempt_count"] == 3
+    assert second is first, "an existing valid record is returned unchanged"
+    assert execution[EVIDENCE_KEY]["legacy_uncertainty"] is True
 
 
 # 3 ---------------------------------------------------------------------
@@ -1076,7 +1083,8 @@ def test_03_ensure_evidence_refuses_a_malformed_record():
 def test_04_a_schema_less_record_is_never_evidence():
     assert get_evidence({}) is None
     assert get_evidence({"kubernetes_apply": {"status": "PASS"}}) is None
-    assert get_evidence({EVIDENCE_KEY: "garbage"}) is None
+    with pytest.raises(KubernetesEvidenceError):
+        get_evidence({EVIDENCE_KEY: "garbage"})
 
 
 # 5 ---------------------------------------------------------------------
@@ -1169,11 +1177,11 @@ def test_10_the_resource_cap_refuses_an_oversized_context():
 def test_11_recorded_results_are_bounded_and_finalized_on_the_newest():
     evidence = empty_evidence()
     record_attempt(evidence, _attempt_context())
-    record_attempt(evidence, _attempt_context())
+    newest_attempt = record_attempt(evidence, _attempt_context())
     attempt_id = record_attempt_result(evidence, {
         "status": "FAIL", "exit_code": 7, "timed_out": True,
         "cancelled": False, "stdout": "secret-output", "stderr": "secret-err",
-    })
+    }, attempt_id=newest_attempt["attempt_id"])
     newest = evidence["attempts"][-1]
     assert attempt_id == newest["attempt_id"]
     assert newest["state"] == RESULT_RECORDED
@@ -1191,18 +1199,30 @@ def test_11_recorded_results_are_bounded_and_finalized_on_the_newest():
 # 12 --------------------------------------------------------------------
 def test_12_a_failed_result_never_downgrades_the_mutation_fact():
     evidence = empty_evidence()
-    record_attempt(evidence, _attempt_context())
-    record_attempt_result(evidence, {"status": "FAIL", "exit_code": 1})
+    attempt = record_attempt(evidence, _attempt_context())
+    record_attempt_result(
+        evidence, {"status": "FAIL", "exit_code": 1,
+         "timed_out": False, "cancelled": False},
+        attempt_id=attempt["attempt_id"],
+    )
     assert evidence["may_have_mutated"] is True
     assert evidence["attempts"][0]["may_have_mutated"] is True
 
 
 # 13 --------------------------------------------------------------------
-def test_13_result_recording_without_a_pending_attempt_is_a_no_op():
+def test_13_result_recording_without_an_attempt_id_is_a_no_op():
     evidence = empty_evidence()
     assert record_attempt_result(evidence, {"status": "PASS"}) is None
     assert evidence["attempt_count"] == 0
     assert evidence["may_have_mutated"] is False
+
+    # A result without this invocation's handoff ID must not finalize an
+    # older HANDOFF_PENDING attempt left by a previous worker.
+    pending = record_attempt(evidence, _attempt_context())
+    assert record_attempt_result(evidence, {"status": "PASS"}) is None
+    assert pending["state"] == HANDOFF_PENDING
+    assert evidence["attempt_count"] == 1
+    assert evidence["may_have_mutated"] is True
 
 
 # 14 --------------------------------------------------------------------
@@ -1229,7 +1249,7 @@ def test_15_a_zero_attempt_protocol_record_proves_not_attempted():
 # 16 --------------------------------------------------------------------
 def test_16_any_handoff_blocks_automatic_compensation():
     execution = {EVIDENCE_KEY: empty_evidence()}
-    record_attempt(execution[EVIDENCE_KEY], _attempt_context())
+    attempt = record_attempt(execution[EVIDENCE_KEY], _attempt_context())
     pending = classify_compensation(
         execution=execution, state_value="DEPLOYMENT_FAILED",
         kubernetes_declared=True)
@@ -1237,7 +1257,10 @@ def test_16_any_handoff_blocks_automatic_compensation():
     assert pending["evidence_state"] == STATE_HANDOFF_PENDING
     assert pending["may_have_mutated"] is True
     record_attempt_result(
-        execution[EVIDENCE_KEY], {"status": "PASS", "exit_code": 0})
+        execution[EVIDENCE_KEY], {"status": "PASS", "exit_code": 0,
+         "timed_out": False, "cancelled": False},
+        attempt_id=attempt["attempt_id"],
+    )
     finalized = classify_compensation(
         execution=execution, state_value="DEPLOYMENT_FAILED",
         kubernetes_declared=True)
@@ -1463,13 +1486,24 @@ def test_23_a_capacity_refusal_is_not_lease_loss(monkeypatch):
     seeded["may_have_mutated"] = True
     seeded["attempts"] = [
         {"attempt_id": f"kat-{n:016x}", "operation": "apply",
+         "schema_version": EVIDENCE_SCHEMA_VERSION,
+         "manifest_sha256": "a" * 64,
+         "approved_identity_digest": "b" * 64,
+         "namespace": "devops-production-namespace",
+         "resource_set_identity": "fixture-resource-set",
+         "handed_off_at": 1.0,
          "state": RESULT_RECORDED, "may_have_mutated": True,
-         "result": {"status": "PASS", "exit_code": 0}}
+         "result": {"status": "PASS", "exit_code": 0,
+                    "timed_out": False, "cancelled": False},
+         "recorded_at": 2.0}
         for n in range(MAX_DETAILED_ATTEMPTS)
     ]
     seeded["resources"] = [{
         "resource_key": "apps/v1/Deployment/devops-production-namespace/demo",
-        "kind": "Deployment", "name": "demo", "may_have_mutated": True,
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "namespace": "devops-production-namespace", "name": "demo",
+        "may_have_mutated": True, "first_may_have_mutated_at": 1.0,
+        "last_attempt_id": f"kat-{MAX_DETAILED_ATTEMPTS - 1:016x}",
     }]
     stored["execution"][EVIDENCE_KEY] = seeded
     engine.store.data[run.id] = stored
@@ -1513,6 +1547,7 @@ def test_24_blocked_kubernetes_components_demand_operator_action(monkeypatch):
         def apply(self, *args, **kwargs):
             result = super().apply(*args, **kwargs)
             result["status"] = "FAIL"
+            result["exit_code"] = 1
             return result
 
     kubectl = FailedKubernetesApply()
@@ -1551,6 +1586,7 @@ def test_25_without_a_previous_terraform_config_the_rollback_is_blocked(monkeypa
         def apply(self, *args, **kwargs):
             result = super().apply(*args, **kwargs)
             result["status"] = "FAIL"
+            result["exit_code"] = 1
             return result
 
     engine.kubectl = FailedKubernetesApply()
@@ -1624,12 +1660,23 @@ def test_27_provenance_uncertainty_dominates_a_blocked_kubernetes_leg(monkeypatc
     seeded["may_have_mutated"] = True
     seeded["attempts"] = [{
         "attempt_id": "kat-" + "0" * 16, "operation": "apply",
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "manifest_sha256": "a" * 64,
+        "approved_identity_digest": "b" * 64,
+        "namespace": "devops-production-namespace",
+        "resource_set_identity": "fixture-resource-set",
+        "handed_off_at": 1.0,
         "state": RESULT_RECORDED, "may_have_mutated": True,
-        "result": {"status": "PASS", "exit_code": 0},
+        "result": {"status": "PASS", "exit_code": 0,
+                   "timed_out": False, "cancelled": False},
+        "recorded_at": 2.0,
     }]
     seeded["resources"] = [{
         "resource_key": "apps/v1/Deployment/devops-production-namespace/demo",
-        "kind": "Deployment", "name": "demo", "may_have_mutated": True,
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "namespace": "devops-production-namespace", "name": "demo",
+        "may_have_mutated": True, "first_may_have_mutated_at": 1.0,
+        "last_attempt_id": "kat-" + "0" * 16,
     }]
     stored["execution"][EVIDENCE_KEY] = seeded
     engine.store.data[run.id] = stored

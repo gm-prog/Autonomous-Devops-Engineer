@@ -886,8 +886,7 @@ def test_31_durable_handoff_visible_mid_flight_and_truthful_result(
                 raise AssertionError("the test did not resume the worker")
             self.applied_calls.append(
                 (manifest_path, namespace, approved_identity))
-            return {"status": "FAIL", "stdout": "apply-failed",
-                    "cluster_access": True}
+            return {"status": "FAIL", "exit_code": 1, "timed_out": False, "cancelled": False, "stdout": "apply-failed", "cluster_access": True}
 
     kubectl = HandoffPausingKubectl()
     guards = []
@@ -1042,8 +1041,7 @@ def test_32_superseded_worker_retains_workspace_and_redelivery_completes(
                     raise AssertionError("worker A was never resumed")
             self.applied_calls.append(
                 (manifest_path, namespace, approved_identity))
-            return {"status": "PASS", "stdout": "apply-ok",
-                    "cluster_access": True}
+            return {"status": "PASS", "exit_code": 0, "timed_out": False, "cancelled": False, "stdout": "apply-ok", "cluster_access": True}
 
     kubectl = PausingKubectl()
     guards = []
@@ -1354,8 +1352,7 @@ def test_35_legacy_in_flight_record_is_never_backfilled_before_handoff(
                     manifest_path, namespace, approved_identity))
             self.applied_calls.append(
                 (manifest_path, namespace, approved_identity))
-            return {"status": "PASS", "stdout": "apply-ok",
-                    "cluster_access": True}
+            return {"status": "PASS", "exit_code": 0, "timed_out": False, "cancelled": False, "stdout": "apply-ok", "cluster_access": True}
 
     kubectl = PreHandoffPauseKubectl()
     guards = []

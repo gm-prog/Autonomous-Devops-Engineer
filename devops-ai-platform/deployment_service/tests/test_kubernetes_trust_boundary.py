@@ -598,14 +598,49 @@ def test_runner_module_cannot_spawn_a_process():
 
 def test_apply_goes_through_the_sandbox_with_the_canonical_manifest(wired):
     runner, sandbox, manifest = wired
-    result = runner.apply(str(manifest),
-                          approved_identity=runner.execution_identity())
+    order = []
+    original_execute = sandbox.execute
+
+    def observe_execute(*args, **kwargs):
+        order.append("sandbox")
+        return original_execute(*args, **kwargs)
+
+    sandbox.execute = observe_execute
+
+    def persist_handoff(context):
+        assert context["operation"] == "apply"
+        assert len(context["manifest_sha256"]) == 64
+        assert context["approved_identity_digest"]
+        assert context["resources"]
+        order.append("handoff")
+
+    result = runner.apply(
+        str(manifest),
+        approved_identity=runner.execution_identity(),
+        before_handoff=persist_handoff,
+    )
     assert result["status"] == "PASS"
     assert result["sandboxed"] is True
+    assert order == ["handoff", "sandbox"], (
+        "the durable handoff must be committed before sandbox dispatch"
+    )
     assert len(sandbox.calls) == 1
     sent = sandbox.calls[0]["manifest"]
     for doc in yaml.safe_load_all(sent):
         assert doc["metadata"]["namespace"] == NAMESPACE
+
+
+def test_apply_without_durable_handoff_callback_fails_closed(wired):
+    runner, sandbox, manifest = wired
+    result = runner.apply(
+        str(manifest),
+        approved_identity=runner.execution_identity(),
+    )
+    assert result["status"] == "BLOCKED"
+    assert "durable operation-evidence handoff" in result["stderr"]
+    assert sandbox.calls == [], (
+        "an apply without a durable handoff must never reach the sandbox"
+    )
 
 
 def test_dry_run_is_server_side_against_the_real_cluster(wired):
@@ -725,8 +760,11 @@ def test_mutating_kubernetes_operations_fail_closed_at_the_sandbox_boundary(wire
 
 def test_runner_evidence_never_leaks_credentials(wired):
     runner, _, manifest = wired
-    blob = repr(runner.apply(str(manifest),
-                             approved_identity=runner.execution_identity()))
+    blob = repr(runner.apply(
+        str(manifest),
+        approved_identity=runner.execution_identity(),
+        before_handoff=lambda context: None,
+    ))
     for secret in ("redacted-test-token", "BEGIN CERTIFICATE", CA_B64):
         assert secret not in blob
 
@@ -806,7 +844,11 @@ def bound(tmp_path, monkeypatch):
 def test_legitimate_execution_against_the_approved_target_succeeds(bound):
     runner, sandbox, manifest, _ = bound
     approved = runner.execution_identity()
-    result = runner.apply(str(manifest), approved_identity=approved)
+    result = runner.apply(
+        str(manifest),
+        approved_identity=approved,
+        before_handoff=lambda context: None,
+    )
     assert result["status"] == "PASS", result.get("stderr")
     assert len(sandbox.calls) == 1
 

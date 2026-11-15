@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes source inspected on `fix/p2-recovery-cleanup` at `72189146ceb3206a9ecd7a8734d26cac7ab16275`. It separates implemented behavior from planned/operational claims.
+This document describes implemented behavior inspected on PR #16 head `25e077031aaa37d46c42aa5584ffa70069d5c9c3` (`fix/p2.1-kubernetes-attempt-correlation`) on 2026-11-15. It separates source-backed behavior from planned/operational claims. The exact PR head and CI evidence must be refreshed after subsequent commits; this document does not imply a production deployment.
 
 ## Implemented topology
 
@@ -71,9 +71,19 @@ Dispatch is intentionally not provider execution. P1-2 records an attempt before
 
 `DeploymentRun` transitions are defined in `domain/value_objects/deployment_state.py`. `DEPLOYMENT_FAILED -> ROLLBACK_PENDING/LEASE_LOST` and `ROLLBACK_PENDING -> ROLLED_BACK/ROLLBACK_FAILED/LEASE_LOST` are implemented. Execution leases use unique owner tokens and monotonic fences; a stale release is a no-op and stale fence commits are rejected. The watchdog renews while the worker is active, while authoritative assertion fails closed on store errors/mismatch and signals sandbox cancellation.
 
-The worker admits approved, dispatch-requested, and orphaned in-flight states. Terminal redelivery returns persisted outcome; concurrent duplicate delivery is refused while a lease is held. P2 cleanup uses an `ExitStack` after successful acquisition for release/watchdog shutdown and execution workspace deletion. Setup re-reads discard approval workspaces only for positively confirmed terminal/absent records; research on 2026-11-14 found the execution `finally` still discards on local terminal state after a rejected fenced LEASE_LOST commit, which the next task must gate on fencing-confirmed terminality (verified in `PHASE-8.8A-KUBERNETES-ROLLBACK-SAFETY-RESEARCH.md`).
+The worker admits approved, dispatch-requested, and orphaned in-flight states. Terminal redelivery returns the persisted outcome; concurrent duplicate delivery is refused while a lease is held. Execution setup and teardown use an `ExitStack` to stop the lease watchdog and release the lease. The shared approval workspace is discarded only after the worker's terminal state has been positively confirmed by a fenced commit (`cleanup_authorization["terminal_commit_confirmed"]`). A stale worker whose terminal commit is rejected cannot delete the shared approved workspace needed by a newer owner. Setup-time disposal likewise requires a positively confirmed terminal/absent record; uncertain reads preserve the workspace.
 
-Known current defects: rollback does not yet have durable evidence sufficient to tell an untouched Kubernetes workload from an attempted-but-unsuccessful apply — `_rollback()` can currently call rollout undo after Terraform fails before Kubernetes begins; an empty rollback component list is computed as PASS and reported `ROLLED_BACK`. See `PROJECT_STATE.md` for the required next task.
+P2.1 rollback is now evidence-gated. `_rollback()` classifies Kubernetes state from the durable `kubernetes_operation_evidence` record before selecting compensation. A versioned zero-attempt record proves `NOT_ATTEMPTED`; any handoff or malformed/legacy uncertainty blocks automatic Kubernetes compensation. Terraform restore is attempted only after a proven successful Terraform apply. Terraform `FAIL`, `TIMEOUT`, or `CANCELLED` status is treated as uncertain provenance and blocks compensation. A no-op rollback is reported as `NOT_REQUIRED` without entering `ROLLBACK_PENDING`; an empty component list cannot be misrepresented as a completed rollback. Only `COMPLETE` moves the run to `ROLLED_BACK`; blocked/partial/failed outcomes are represented as `ROLLBACK_FAILED`.
+
+P2.1 deliberately does **not** implement automatic Kubernetes undo. The low-level runner retains a `rollout_undo()` adapter method, but the deployment engine's P2.1 rollback path never invokes it: every possible or uncertain Kubernetes mutation is operator-blocked because the current-resource conditional authorization required for safe restoration belongs to P2.2. The runner now also refuses an `APPLY` if the caller omits the durable `before_handoff` callback/context; the normal deployment-engine path supplies that callback, which records the attempt through the current fenced lease before sandbox dispatch.
+
+## P2.1 durable Kubernetes operation evidence
+
+For a declared Kubernetes manifest, `DeploymentEngine.execute()` passes two callbacks to `KubectlRunnerService.apply()`: a lease-ownership preflight and `before_handoff`. After manifest, kubeconfig, execution-identity, command-policy, and sandbox-configuration preflights, the runner requires the handoff callback and context. It invokes the callback immediately before `sandbox.execute()`; if the callback/context is missing, the runner returns `BLOCKED` without dispatching the sandbox. The production callback records a bounded attempt and commits the run through the active execution fence.
+
+The evidence record is versioned and bounded: at most 16 detailed attempts and 32 canonical resource summaries. It stores manifest and approved-identity digests, resource identities, timestamps, exact attempt IDs, and the minimal result contract (`status`, `exit_code`, `timed_out`, `cancelled`); raw stdout/stderr and credentials are not copied into this evidence object. An attempt transitions from `HANDOFF_PENDING` to `RESULT_RECORDED` only when the exact attempt ID created by that invocation is supplied. Failed apply results do not clear `may_have_mutated`; a stale worker's rejected result commit leaves the durable attempt pending.
+
+This protocol is provenance, not authorization. P2.1 never uses `kubectl rollout undo`; any recorded handoff or legacy/malformed uncertainty produces an operator-blocked classification. Terraform restoration is separately restricted to a proven successful Terraform apply. The low-level runner exposes a `rollout_undo()` adapter method, but P2.1's deployment-engine rollback does not call it.
 
 ## Trust boundaries and integrations
 
@@ -86,8 +96,8 @@ Known current defects: rollback does not yet have durable evidence sufficient to
 
 ## Limitations and planned/incomplete capabilities
 
-- No production deployment or hosted CI success is established by this document.
+- No production deployment is verified. PR #16 CI was observed successful (11 jobs) on exact source head `25e077031aaa37d46c42aa5584ffa70069d5c9c3` in run [43696475320](https://github.com/gm-prog/Autonomous-Devops-Engineer/actions/runs/43696475320); any follow-up source or documentation commit requires a new exact-head CI check.
 - Docker/Kind E2E and live Redis validation require the pinned Linux CI environment.
 - The legacy backend and the hardened platform coexist; source presence does not prove they form one deployed control plane.
 - Incident investigation/remediation workflow behavior requires its own evidence-backed end-to-end review.
-- The rollback-attempt-evidence defect above is unresolved and blocks a complete recovery-safety disposition.
+- Conditional Kubernetes compensation remains intentionally unimplemented in P2.1. P2.2 must define and prove a current-resource read/compare/conditional-write authorization protocol before any automatic Kubernetes restore is enabled; P2.3 remains broader crash/retry/operator-concurrency acceptance.
